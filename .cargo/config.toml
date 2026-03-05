@@ -1,0 +1,6 @@
+# Disable HTTP proxy for this project so crate downloads hit the mirror directly.
+# Cargo otherwise falls back to git's http.proxy, which can cause SSL errors.
+[http]
+proxy = ""
+# Avoid SSL revocation check failures that can break downloads on some networks.
+check-revoke = false

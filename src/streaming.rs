@@ -1,0 +1,1108 @@
+//! SSE streaming: passthrough when formats match, otherwise transform chunks (upstream → openai → client).
+//!
+//! Reference: 9router open-sse/handlers/chatCore/streamingHandler.js, utils/stream.js.
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures_util::Stream;
+use serde_json::Value;
+
+use crate::formats::UpstreamFormat;
+
+/// Whether we need to transform the upstream SSE stream for the client.
+pub fn needs_stream_translation(upstream_format: UpstreamFormat, client_format: UpstreamFormat) -> bool {
+    upstream_format != client_format
+}
+
+/// Stream transformer state (per 9router initState).
+#[derive(Debug, Default)]
+pub struct StreamState {
+    pub message_id: Option<String>,
+    pub model: Option<String>,
+    pub tool_call_index: usize,
+    pub tool_calls: std::collections::HashMap<usize, ToolCallState>,
+    pub server_tool_block_index: Option<usize>,
+    pub text_block_started: bool,
+    pub in_thinking_block: bool,
+    pub current_block_index: Option<usize>,
+    pub finish_reason: Option<String>,
+    pub finish_reason_sent: bool,
+    pub usage: Option<serde_json::Value>,
+    // OpenAI → Claude output state
+    pub message_start_sent: bool,
+    pub next_block_index: usize,
+    pub thinking_block_started: bool,
+    pub thinking_block_index: usize,
+    pub text_block_index: usize,
+    pub text_block_closed: bool,
+    pub tool_block_indices: std::collections::HashMap<usize, usize>,
+    // Gemini state
+    pub function_index: usize,
+    // OpenAI Responses API client output state
+    pub responses_seq: u64,
+    pub responses_started: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct ToolCallState {
+    pub index: usize,
+    pub id: Option<Value>,
+    pub name: String,
+    pub arguments: String,
+    pub block_index: Option<usize>,
+}
+
+/// Extract one SSE event from buffer (up to and including first "\n\n"). Returns parsed JSON from "data: " line, or None.
+/// Buffer is updated: consumed bytes are removed.
+pub fn take_one_sse_event(buffer: &mut Vec<u8>) -> Option<Value> {
+    let pos = buffer.windows(2).position(|w| w == b"\n\n")?;
+    let event_bytes = buffer.drain(..=pos + 1).collect::<Vec<_>>();
+    let event_str = String::from_utf8_lossy(&event_bytes);
+    for line in event_str.lines() {
+        let line = line.trim();
+        if line.starts_with("data: ") {
+            let data = line.strip_prefix("data: ").unwrap_or("").trim();
+            if data == "[DONE]" || data.is_empty() {
+                return Some(serde_json::json!({ "_done": true }));
+            }
+            return serde_json::from_str(data).ok();
+        }
+    }
+    None
+}
+
+/// Format one JSON value as SSE "data: {json}\n\n".
+pub fn format_sse_data(value: &Value) -> Vec<u8> {
+    let s = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    let mut out = b"data: ".to_vec();
+    out.extend_from_slice(s.as_bytes());
+    out.extend_from_slice(b"\n\n");
+    out
+}
+
+/// Format SSE with event type line: "event: {ty}\ndata: {json}\n\n".
+pub fn format_sse_event(event_type: &str, value: &Value) -> Vec<u8> {
+    let s = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    let mut out = format!("event: {}\n", event_type).into_bytes();
+    out.extend_from_slice(b"data: ");
+    out.extend_from_slice(s.as_bytes());
+    out.extend_from_slice(b"\n\n");
+    out
+}
+
+/// Convert Claude SSE event to one or more OpenAI-format chunks. Updates state.
+pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> Vec<Value> {
+    let ty = event.get("type").and_then(Value::as_str);
+    let mut out = vec![];
+    match ty {
+        Some("message_start") => {
+            state.message_id = event.get("message").and_then(|m| m.get("id")).and_then(Value::as_str).map(String::from);
+            state.model = event.get("message").and_then(|m| m.get("model")).and_then(Value::as_str).map(String::from);
+            state.tool_call_index = 0;
+            out.push(openai_chunk(state, serde_json::json!({ "role": "assistant" }), None));
+        }
+        Some("content_block_start") => {
+            let block = event.get("content_block");
+            let block_ty = block.and_then(|b| b.get("type").and_then(Value::as_str));
+            if block_ty == Some("server_tool_use") {
+                state.server_tool_block_index = event.get("index").and_then(Value::as_u64).map(|i| i as usize);
+                return out;
+            }
+            if block_ty == Some("text") {
+                state.text_block_started = true;
+            } else if block_ty == Some("thinking") {
+                state.in_thinking_block = true;
+                state.current_block_index = event.get("index").and_then(Value::as_u64).map(|i| i as usize);
+                out.push(openai_chunk(state, serde_json::json!({ "reasoning_content": "<think>" }), None));
+            } else if block_ty == Some("tool_use") {
+                let block = block.unwrap();
+                let idx = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let tc_index = state.tool_call_index;
+                state.tool_call_index += 1;
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                let tc = serde_json::json!({
+                    "index": tc_index,
+                    "id": block.get("id"),
+                    "type": "function",
+                    "function": { "name": name, "arguments": "" }
+                });
+                state.tool_calls.insert(idx, ToolCallState {
+                    index: tc_index,
+                    id: block.get("id").cloned(),
+                    name: name.clone(),
+                    arguments: String::new(),
+                    block_index: None,
+                });
+                out.push(openai_chunk(state, serde_json::json!({ "tool_calls": [tc] }), None));
+            }
+        }
+        Some("content_block_delta") => {
+            let idx = event.get("index").and_then(Value::as_u64).map(|i| i as usize);
+            if state.server_tool_block_index == idx {
+                return out;
+            }
+            let delta = event.get("delta");
+            let delta_ty = delta.and_then(|d| d.get("type").and_then(Value::as_str));
+            if delta_ty == Some("text_delta") {
+                if let Some(t) = delta.and_then(|d| d.get("text").and_then(Value::as_str)) {
+                    if !t.is_empty() {
+                        out.push(openai_chunk(state, serde_json::json!({ "content": t }), None));
+                    }
+                }
+            } else if delta_ty == Some("thinking_delta") {
+                if let Some(t) = delta.and_then(|d| d.get("thinking").and_then(Value::as_str)) {
+                    if !t.is_empty() {
+                        out.push(openai_chunk(state, serde_json::json!({ "reasoning_content": t }), None));
+                    }
+                }
+            } else if delta_ty == Some("input_json_delta") {
+                if let Some(pj) = delta.and_then(|d| d.get("partial_json").and_then(Value::as_str)) {
+                    let chunk_json = if let Some(tc) = idx.and_then(|i| state.tool_calls.get_mut(&i)) {
+                        tc.arguments.push_str(pj);
+                        Some(serde_json::json!({
+                            "tool_calls": [{
+                                "index": tc.index,
+                                "id": tc.id,
+                                "function": { "arguments": pj }
+                            }]
+                        }))
+                    } else {
+                        None
+                    };
+                    if let Some(cj) = chunk_json {
+                        out.push(openai_chunk(state, cj, None));
+                    }
+                }
+            }
+        }
+        Some("content_block_stop") => {
+            let idx = event.get("index").and_then(Value::as_u64).map(|i| i as usize);
+            if state.server_tool_block_index == idx {
+                state.server_tool_block_index = None;
+                return out;
+            }
+            if state.in_thinking_block && state.current_block_index == idx {
+                out.push(openai_chunk(state, serde_json::json!({ "reasoning_content": "" }), None));
+                state.in_thinking_block = false;
+            }
+        }
+        Some("message_delta") => {
+            if let Some(stop) = event.get("delta").and_then(|d| d.get("stop_reason")).and_then(Value::as_str) {
+                state.finish_reason = Some(convert_claude_stop_reason(stop));
+            }
+            if let Some(u) = event.get("usage") {
+                state.usage = Some(u.clone());
+            }
+        }
+        Some("message_stop") => {
+            if !state.finish_reason_sent {
+                let fr = state.finish_reason.clone().unwrap_or_else(|| {
+                    if state.tool_calls.is_empty() {
+                        "stop".to_string()
+                    } else {
+                        "tool_calls".to_string()
+                    }
+                });
+                let mut chunk = openai_chunk(state, serde_json::json!({}), Some(&fr));
+                if let Some(ref u) = state.usage {
+                    chunk["usage"] = serde_json::json!({
+                        "prompt_tokens": u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                        "completion_tokens": u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+                        "total_tokens": u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) + u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
+                    });
+                }
+                out.push(chunk);
+                state.finish_reason_sent = true;
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn openai_chunk(state: &StreamState, delta: Value, finish_reason: Option<&str>) -> Value {
+    let mut c = serde_json::json!({
+        "id": state.message_id.as_deref().map(|s| format!("chatcmpl-{}", s)).unwrap_or_else(|| "chatcmpl-0".to_string()),
+        "object": "chat.completion.chunk",
+        "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        "model": state.model.as_deref().unwrap_or(""),
+        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }]
+    });
+    if let Some(fr) = finish_reason {
+        c["choices"][0]["finish_reason"] = serde_json::json!(fr);
+    }
+    c
+}
+
+fn convert_claude_stop_reason(r: &str) -> String {
+    match r {
+        "end_turn" => "stop",
+        "max_tokens" => "length",
+        "tool_use" => "tool_calls",
+        "stop_sequence" => "stop",
+        _ => "stop",
+    }
+    .to_string()
+}
+
+/// If event is OpenAI chunk (has choices[].delta), return as single-item vec. Else return empty.
+pub fn openai_event_as_chunk(event: &Value) -> Option<Value> {
+    if event.get("_done").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    if event.get("choices").and_then(Value::as_array).map(|c| !c.is_empty()).unwrap_or(false) {
+        return Some(event.clone());
+    }
+    None
+}
+
+/// Convert Gemini SSE event (response with candidates[0].content.parts) to OpenAI-format chunks.
+pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> Vec<Value> {
+    let response = event.get("response").unwrap_or(event);
+    let candidates = match response.get("candidates").and_then(Value::as_array) {
+        Some(c) if !c.is_empty() => c,
+        _ => return vec![],
+    };
+    let candidate = &candidates[0];
+    let content = candidate.get("content");
+    let parts = content.and_then(|c| c.get("parts")).and_then(Value::as_array);
+    let mut out = vec![];
+
+    if state.message_id.is_none() {
+        state.message_id = response
+            .get("responseId")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| Some("msg_gemini".to_string()));
+        state.model = response
+            .get("modelVersion")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| Some("gemini".to_string()));
+        state.function_index = 0;
+        out.push(openai_chunk(state, serde_json::json!({ "role": "assistant" }), None));
+    }
+
+    if let Some(parts) = parts {
+        for part in parts {
+            let has_thought_sig = part.get("thoughtSignature").is_some() || part.get("thought_signature").is_some();
+            let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
+            if has_thought_sig {
+                if let Some(t) = part.get("text").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        let delta = if is_thought {
+                            serde_json::json!({ "reasoning_content": t })
+                        } else {
+                            serde_json::json!({ "content": t })
+                        };
+                        out.push(openai_chunk(state, delta, None));
+                    }
+                }
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                    let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                    let tc_index = state.function_index;
+                    state.function_index += 1;
+                    let id = fc.get("id").cloned().unwrap_or_else(|| serde_json::json!(format!("{}-{}", name, tc_index)));
+                    let tc = serde_json::json!({
+                        "index": tc_index,
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": args_str }
+                    });
+                    state.tool_calls.insert(tc_index, ToolCallState {
+                        index: tc_index,
+                        id: Some(id.clone()),
+                        name: name.clone(),
+                        arguments: args_str,
+                        block_index: None,
+                    });
+                    out.push(openai_chunk(state, serde_json::json!({ "tool_calls": [tc] }), None));
+                }
+                continue;
+            }
+            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                if !t.is_empty() {
+                    out.push(openai_chunk(state, serde_json::json!({ "content": t }), None));
+                }
+            }
+            if let Some(fc) = part.get("functionCall") {
+                let name = fc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                let args = fc.get("args").cloned().unwrap_or(serde_json::json!({}));
+                let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                let tc_index = state.function_index;
+                state.function_index += 1;
+                let id = fc.get("id").cloned().unwrap_or_else(|| serde_json::json!(format!("{}-{}", name, tc_index)));
+                let tc = serde_json::json!({
+                    "index": tc_index,
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args_str }
+                });
+                state.tool_calls.insert(tc_index, ToolCallState {
+                    index: tc_index,
+                    id: Some(id.clone()),
+                    name,
+                    arguments: args_str,
+                    block_index: None,
+                });
+                out.push(openai_chunk(state, serde_json::json!({ "tool_calls": [tc] }), None));
+            }
+        }
+    }
+
+    if let Some(usage_meta) = response.get("usageMetadata").or(event.get("usageMetadata")) {
+        state.usage = Some(serde_json::json!({
+            "prompt_tokens": usage_meta.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0),
+            "completion_tokens": usage_meta.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0)
+                + usage_meta.get("thoughtsTokenCount").and_then(Value::as_u64).unwrap_or(0),
+            "total_tokens": usage_meta.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0)
+        }));
+    }
+
+    if let Some(finish) = candidate.get("finishReason").and_then(Value::as_str) {
+        let mut fr = finish.to_lowercase();
+        if fr == "stop" && !state.tool_calls.is_empty() {
+            fr = "tool_calls".to_string();
+        }
+        let mut chunk = openai_chunk(state, serde_json::json!({}), Some(&fr));
+        if let Some(ref u) = state.usage {
+            chunk["usage"] = u.clone();
+        }
+        out.push(chunk);
+        state.finish_reason = Some(fr);
+        state.finish_reason_sent = true;
+    }
+    out
+}
+
+/// Convert OpenAI Responses API SSE event to OpenAI completion chunks.
+/// Event type is in data.type (e.g. response.output_text.delta).
+pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> Vec<Value> {
+    let ty = event.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut out = vec![];
+
+    if ty == "response.created" {
+        let resp = event.get("response").unwrap_or(event);
+        state.message_id = resp.get("id").and_then(Value::as_str).map(String::from);
+        state.model = Some("unknown".to_string());
+        out.push(openai_chunk(state, serde_json::json!({ "role": "assistant" }), None));
+        return out;
+    }
+
+    if ty == "response.output_text.delta" {
+        let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+        if !delta.is_empty() {
+            out.push(openai_chunk(state, serde_json::json!({ "content": delta }), None));
+        }
+        return out;
+    }
+
+    if ty == "response.reasoning_summary_text.delta" {
+        let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+        if !delta.is_empty() {
+            out.push(openai_chunk(state, serde_json::json!({ "reasoning_content": delta }), None));
+        }
+        return out;
+    }
+
+    if ty == "response.output_item.added" {
+        let item = event.get("item").unwrap_or(&serde_json::Value::Null);
+        let item_ty = item.get("type").and_then(Value::as_str);
+        if item_ty == Some("function_call") || item_ty == Some("custom_tool_call") {
+            let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let call_id = item.get("call_id").and_then(Value::as_str).map(String::from);
+            let idx = state.tool_call_index;
+            state.tool_call_index += 1;
+            let id = call_id.unwrap_or_else(|| format!("call_{}", idx));
+            let tc = serde_json::json!({
+                "index": idx,
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": "" }
+            });
+            state.tool_calls.insert(idx, ToolCallState {
+                index: idx,
+                id: Some(serde_json::json!(id)),
+                name,
+                arguments: String::new(),
+                block_index: None,
+            });
+            out.push(openai_chunk(state, serde_json::json!({ "tool_calls": [tc] }), None));
+        }
+        return out;
+    }
+
+    if ty == "response.function_call_arguments.delta" || ty == "response.custom_tool_call_input.delta" {
+        let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+        if !delta.is_empty() {
+            let idx = state.tool_call_index.saturating_sub(1);
+            if let Some(tc) = state.tool_calls.get_mut(&idx) {
+                tc.arguments.push_str(delta);
+            }
+            out.push(openai_chunk(state, serde_json::json!({
+                "tool_calls": [{ "index": idx, "function": { "arguments": delta } }]
+            }), None));
+        }
+        return out;
+    }
+
+    if ty == "response.completed" {
+        if let Some(resp) = event.get("response") {
+            if let Some(u) = resp.get("usage") {
+                state.usage = Some(serde_json::json!({
+                    "prompt_tokens": u.get("input_tokens").or(u.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0),
+                    "completion_tokens": u.get("output_tokens").or(u.get("completion_tokens")).and_then(Value::as_u64).unwrap_or(0)
+                }));
+            }
+        }
+        if !state.finish_reason_sent {
+            let mut chunk = openai_chunk(state, serde_json::json!({}), Some("stop"));
+            if let Some(ref u) = state.usage {
+                chunk["usage"] = u.clone();
+            }
+            out.push(chunk);
+            state.finish_reason_sent = true;
+        }
+        return out;
+    }
+
+    out
+}
+
+/// Translate one parsed SSE event (JSON) from upstream format to client format. Returns bytes to send (one or more "data: ...\n\n").
+pub fn translate_sse_event(
+    upstream_format: UpstreamFormat,
+    client_format: UpstreamFormat,
+    event: &Value,
+    state: &mut StreamState,
+) -> Vec<Vec<u8>> {
+    if upstream_format == client_format {
+        if event.get("_done").and_then(Value::as_bool) == Some(true) {
+            return vec![b"data: [DONE]\n\n".to_vec()];
+        }
+        return vec![format_sse_data(event)];
+    }
+    let openai_chunks: Vec<Value> = match upstream_format {
+        UpstreamFormat::OpenAiCompletion => openai_event_as_chunk(event).into_iter().collect(),
+        UpstreamFormat::Anthropic => claude_event_to_openai_chunks(event, state),
+        UpstreamFormat::Google => gemini_event_to_openai_chunks(event, state),
+        UpstreamFormat::OpenAiResponses => responses_event_to_openai_chunks(event, state),
+    };
+    if client_format == UpstreamFormat::OpenAiCompletion {
+        return openai_chunks.into_iter().map(|c| format_sse_data(&c)).collect();
+    }
+    if client_format == UpstreamFormat::Anthropic {
+        let mut out = Vec::new();
+        for c in &openai_chunks {
+            out.extend(openai_chunk_to_claude_sse(c, state));
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if client_format == UpstreamFormat::Google {
+        let mut out = Vec::new();
+        for c in &openai_chunks {
+            out.extend(openai_chunk_to_gemini_sse(c, state));
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if client_format == UpstreamFormat::OpenAiResponses {
+        let mut out = Vec::new();
+        for c in &openai_chunks {
+            out.extend(openai_chunk_to_responses_sse(c, state));
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    openai_chunks.into_iter().map(|c| format_sse_data(&c)).collect()
+}
+
+fn stop_thinking_block_claude(state: &mut StreamState, out: &mut Vec<Vec<u8>>) {
+    if !state.thinking_block_started {
+        return;
+    }
+    out.push(format_sse_event(
+        "content_block_stop",
+        &serde_json::json!({ "type": "content_block_stop", "index": state.thinking_block_index }),
+    ));
+    state.thinking_block_started = false;
+}
+
+fn stop_text_block_claude(state: &mut StreamState, out: &mut Vec<Vec<u8>>) {
+    if !state.text_block_started || state.text_block_closed {
+        return;
+    }
+    state.text_block_closed = true;
+    out.push(format_sse_event(
+        "content_block_stop",
+        &serde_json::json!({ "type": "content_block_stop", "index": state.text_block_index }),
+    ));
+}
+
+fn convert_openai_finish_to_claude(reason: &str) -> &'static str {
+    match reason {
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+fn openai_chunk_to_claude_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let choices = match chunk.get("choices").and_then(Value::as_array) {
+        Some(c) if !c.is_empty() => c,
+        _ => return out,
+    };
+    let choice = &choices[0];
+    let delta = choice.get("delta").unwrap_or(&serde_json::Value::Null);
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+
+    if !state.message_start_sent {
+        state.message_start_sent = true;
+        state.message_id = chunk
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|s| s.strip_prefix("chatcmpl-").unwrap_or(s).to_string())
+            .filter(|s| !s.is_empty() && s != "chat" && s.len() >= 8)
+            .or_else(|| Some("msg_0".to_string()));
+        state.model = choice.get("model").or(chunk.get("model")).and_then(Value::as_str).map(String::from);
+        state.next_block_index = 0;
+        let msg = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": state.message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": state.model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
+            }
+        });
+        out.push(format_sse_event("message_start", &msg));
+    }
+
+    if let Some(reasoning) = delta.get("reasoning_content").or(delta.get("reasoning")).and_then(Value::as_str) {
+        if !reasoning.is_empty() {
+            stop_text_block_claude(state, &mut out);
+            if !state.thinking_block_started {
+                state.thinking_block_index = state.next_block_index;
+                state.next_block_index += 1;
+                state.thinking_block_started = true;
+                let ev = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": state.thinking_block_index,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                });
+                out.push(format_sse_event("content_block_start", &ev));
+            }
+            let ev = serde_json::json!({
+                "type": "content_block_delta",
+                "index": state.thinking_block_index,
+                "delta": { "type": "thinking_delta", "thinking": reasoning }
+            });
+            out.push(format_sse_event("content_block_delta", &ev));
+        }
+    }
+
+    if let Some(content) = delta.get("content").and_then(Value::as_str) {
+        if !content.is_empty() {
+            stop_thinking_block_claude(state, &mut out);
+            if !state.text_block_started {
+                state.text_block_index = state.next_block_index;
+                state.next_block_index += 1;
+                state.text_block_started = true;
+                state.text_block_closed = false;
+                let ev = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": state.text_block_index,
+                    "content_block": { "type": "text", "text": "" }
+                });
+                out.push(format_sse_event("content_block_start", &ev));
+            }
+            let ev = serde_json::json!({
+                "type": "content_block_delta",
+                "index": state.text_block_index,
+                "delta": { "type": "text_delta", "text": content }
+            });
+            out.push(format_sse_event("content_block_delta", &ev));
+        }
+    }
+
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for tc in tool_calls {
+            let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if tc.get("id").is_some() {
+                stop_thinking_block_claude(state, &mut out);
+                stop_text_block_claude(state, &mut out);
+                let block_index = state.next_block_index;
+                state.next_block_index += 1;
+                state.tool_block_indices.insert(idx, block_index);
+                let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+                let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                let ev = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+                });
+                out.push(format_sse_event("content_block_start", &ev));
+            }
+            if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+                if !args.is_empty() {
+                    if let Some(&block_index) = state.tool_block_indices.get(&idx) {
+                        let ev = serde_json::json!({
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": { "type": "input_json_delta", "partial_json": args }
+                        });
+                        out.push(format_sse_event("content_block_delta", &ev));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(usage) = chunk.get("usage") {
+        state.usage = Some(usage.clone());
+    }
+
+    if let Some(fr) = finish_reason {
+        stop_thinking_block_claude(state, &mut out);
+        stop_text_block_claude(state, &mut out);
+        for (_, &block_index) in &state.tool_block_indices {
+            let ev = serde_json::json!({ "type": "content_block_stop", "index": block_index });
+            out.push(format_sse_event("content_block_stop", &ev));
+        }
+        let stop_reason = convert_openai_finish_to_claude(fr);
+        let usage = state.usage.clone().unwrap_or_else(|| serde_json::json!({ "input_tokens": 0, "output_tokens": 0 }));
+        let ev = serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": stop_reason },
+            "usage": usage
+        });
+        out.push(format_sse_event("message_delta", &ev));
+        out.push(format_sse_event("message_stop", &serde_json::json!({ "type": "message_stop" })));
+    }
+    out
+}
+
+fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let choices = match chunk.get("choices").and_then(Value::as_array) {
+        Some(c) if !c.is_empty() => c,
+        _ => return out,
+    };
+    let choice = &choices[0];
+    let delta = choice.get("delta").unwrap_or(&serde_json::Value::Null);
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+
+    if state.message_id.is_none() {
+        state.message_id = chunk.get("id").and_then(Value::as_str).map(String::from);
+        state.model = chunk.get("model").and_then(Value::as_str).map(String::from);
+    }
+
+    let model = state.model.as_deref().unwrap_or("gemini");
+    let mut parts: Vec<Value> = vec![];
+
+    if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+        if !r.is_empty() {
+            parts.push(serde_json::json!({ "text": r, "thought": true }));
+        }
+    }
+    if let Some(c) = delta.get("content").and_then(Value::as_str) {
+        if !c.is_empty() {
+            parts.push(serde_json::json!({ "text": c }));
+        }
+    }
+    if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+        for tc in tcs {
+            let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+            let args_str = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str).unwrap_or("{}");
+            let args_val: Value = serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({}));
+            let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+            parts.push(serde_json::json!({
+                "functionCall": { "name": name, "args": args_val, "id": id }
+            }));
+        }
+    }
+
+    if !parts.is_empty() || finish_reason.is_some() {
+        let fr = finish_reason.map(|s| s.to_uppercase()).unwrap_or_else(|| "".to_string());
+        let candidate = serde_json::json!({
+            "content": { "parts": parts },
+            "finishReason": fr
+        });
+        let payload = serde_json::json!({
+            "candidates": [candidate],
+            "modelVersion": model
+        });
+        out.push(format_sse_data(&payload));
+    }
+    out
+}
+
+fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let choices = match chunk.get("choices").and_then(Value::as_array) {
+        Some(c) if !c.is_empty() => c,
+        _ => return out,
+    };
+    let choice = &choices[0];
+    let delta = choice.get("delta").unwrap_or(&serde_json::Value::Null);
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    let idx = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+
+    let mut next_seq = || {
+        state.responses_seq += 1;
+        state.responses_seq
+    };
+
+    if !state.responses_started {
+        state.responses_started = true;
+        state.message_id = chunk.get("id").and_then(Value::as_str).map(|s| s.to_string());
+        let response_id = state.message_id.as_deref().unwrap_or("resp_0");
+        let created = chunk.get("created").and_then(Value::as_u64).unwrap_or(0);
+        let ev = serde_json::json!({
+            "type": "response.created",
+            "sequence_number": next_seq(),
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": created,
+                "status": "in_progress",
+                "background": false,
+                "error": null,
+                "output": []
+            }
+        });
+        out.push(format_sse_event("response.created", &ev));
+        let ev2 = serde_json::json!({
+            "type": "response.in_progress",
+            "sequence_number": next_seq(),
+            "response": { "id": response_id, "object": "response", "created_at": created, "status": "in_progress" }
+        });
+        out.push(format_sse_event("response.in_progress", &ev2));
+    }
+
+    if let Some(r) = delta.get("reasoning_content").or(delta.get("reasoning")).and_then(Value::as_str) {
+        if !r.is_empty() {
+            let ev = serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "sequence_number": next_seq(),
+                "item_id": format!("rs_{}_{}", state.message_id.as_deref().unwrap_or("r"), idx),
+                "output_index": idx,
+                "summary_index": 0,
+                "delta": r
+            });
+            out.push(format_sse_event("response.reasoning_summary_text.delta", &ev));
+        }
+    }
+    if let Some(c) = delta.get("content").and_then(Value::as_str) {
+        if !c.is_empty() {
+            let ev = serde_json::json!({
+                "type": "response.output_text.delta",
+                "sequence_number": next_seq(),
+                "output_index": idx,
+                "delta": c
+            });
+            out.push(format_sse_event("response.output_text.delta", &ev));
+        }
+    }
+    if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+        for tc in tcs {
+            let _tc_idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0);
+            if tc.get("id").is_some() {
+                let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+                let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                let ev = serde_json::json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": next_seq(),
+                    "output_index": idx,
+                    "item": { "type": "function_call", "call_id": id, "name": name }
+                });
+                out.push(format_sse_event("response.output_item.added", &ev));
+            }
+            if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+                if !args.is_empty() {
+                    let ev = serde_json::json!({
+                        "type": "response.function_call_arguments.delta",
+                        "sequence_number": next_seq(),
+                        "call_id": tc.get("id").and_then(Value::as_str),
+                        "delta": args
+                    });
+                    out.push(format_sse_event("response.function_call_arguments.delta", &ev));
+                }
+            }
+        }
+    }
+
+    if let Some(u) = chunk.get("usage") {
+        state.usage = Some(u.clone());
+    }
+    if finish_reason.is_some() {
+        let response_id = state.message_id.as_deref().unwrap_or("resp_0");
+        let created = chunk.get("created").and_then(Value::as_u64).unwrap_or(0);
+        let mut resp = serde_json::json!({
+            "id": response_id,
+            "object": "response",
+            "created_at": created,
+            "status": "completed",
+            "output": []
+        });
+        if let Some(ref u) = state.usage {
+            resp["usage"] = serde_json::json!({
+                "input_tokens": u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                "output_tokens": u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0)
+            });
+        }
+        let ev = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": next_seq(),
+            "response": resp
+        });
+        out.push(format_sse_event("response.completed", &ev));
+    }
+    out
+}
+
+/// Translate a single SSE chunk from upstream format to client format.
+/// Input is raw bytes (may be partial); call from a stream that buffers until full event.
+pub fn translate_response_chunk(
+    upstream_format: UpstreamFormat,
+    client_format: UpstreamFormat,
+    chunk: &[u8],
+    state: &mut StreamState,
+) -> Result<Vec<Vec<u8>>, String> {
+    if upstream_format == client_format {
+        return Ok(vec![chunk.to_vec()]);
+    }
+    let event: Value = serde_json::from_slice(chunk).map_err(|e| e.to_string())?;
+    Ok(translate_sse_event(upstream_format, client_format, &event, state))
+}
+
+/// Stream that buffers upstream bytes, parses SSE events, and yields translated SSE bytes.
+pub struct TranslateSseStream<S, E> {
+    inner: S,
+    buffer: Vec<u8>,
+    upstream_format: UpstreamFormat,
+    client_format: UpstreamFormat,
+    state: StreamState,
+    output_queue: Vec<Vec<u8>>,
+    output_pos: usize,
+    _error: std::marker::PhantomData<E>,
+}
+
+impl<S, E> TranslateSseStream<S, E> {
+    pub fn new(inner: S, upstream_format: UpstreamFormat, client_format: UpstreamFormat) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+            upstream_format,
+            client_format,
+            state: StreamState::default(),
+            output_queue: Vec::new(),
+            output_pos: 0,
+            _error: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<S, E> Stream for TranslateSseStream<S, E>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + Unpin,
+{
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if this.output_pos < this.output_queue.len() {
+                let next = this.output_queue[this.output_pos].clone();
+                this.output_pos += 1;
+                if this.output_pos >= this.output_queue.len() {
+                    this.output_queue.clear();
+                    this.output_pos = 0;
+                }
+                return Poll::Ready(Some(Ok(bytes::Bytes::from(next))));
+            }
+
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.buffer.extend_from_slice(&chunk);
+                    while let Some(event) = take_one_sse_event(&mut this.buffer) {
+                        let translated = translate_sse_event(
+                            this.upstream_format,
+                            this.client_format,
+                            &event,
+                            &mut this.state,
+                        );
+                        this.output_queue.extend(translated);
+                    }
+                    if !this.output_queue.is_empty() {
+                        continue;
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.into().to_string(),
+                    ))));
+                }
+                Poll::Ready(None) => {
+                    while let Some(event) = take_one_sse_event(&mut this.buffer) {
+                        let translated = translate_sse_event(
+                            this.upstream_format,
+                            this.client_format,
+                            &event,
+                            &mut this.state,
+                        );
+                        this.output_queue.extend(translated);
+                    }
+                    if !this.output_queue.is_empty() {
+                        continue;
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::UpstreamFormat;
+
+    #[test]
+    fn take_one_sse_event_parses_data_line() {
+        let mut buf = b"data: {\"type\":\"message_start\"}\n\n".to_vec();
+        let event = take_one_sse_event(&mut buf);
+        assert!(event.is_some());
+        assert_eq!(event.as_ref().unwrap().get("type").and_then(Value::as_str), Some("message_start"));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn take_one_sse_event_skips_event_line() {
+        let mut buf = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n".to_vec();
+        let event = take_one_sse_event(&mut buf);
+        assert!(event.is_some());
+        assert_eq!(event.as_ref().unwrap().get("type").and_then(Value::as_str), Some("message_start"));
+    }
+
+    #[test]
+    fn claude_message_start_produces_openai_chunk() {
+        let event = serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-3" }
+        });
+        let mut state = StreamState::default();
+        let chunks = claude_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(state.message_id.as_deref(), Some("msg_1"));
+        assert!(chunks[0].get("choices").is_some());
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_format_sse_data() {
+        let v = serde_json::json!({ "x": 1 });
+        let bytes = format_sse_data(&v);
+        assert!(bytes.starts_with(b"data: "));
+        assert!(bytes.ends_with(b"\n\n"));
+    }
+
+    #[test]
+    fn format_sse_event_includes_event_type() {
+        let v = serde_json::json!({ "type": "message_start" });
+        let bytes = format_sse_event("message_start", &v);
+        assert!(bytes.starts_with(b"event: message_start\n"));
+        assert!(bytes.windows(6).any(|w| w == b"data: "));
+        assert!(bytes.ends_with(b"\n\n"));
+    }
+
+    #[test]
+    fn gemini_event_with_text_produces_openai_chunks() {
+        let event = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "Hello" }] },
+                "finishReason": "STOP"
+            }],
+            "modelVersion": "gemini-1.5"
+        });
+        let mut state = StreamState::default();
+        let chunks = gemini_event_to_openai_chunks(&event, &mut state);
+        assert!(!chunks.is_empty());
+        assert_eq!(state.model.as_deref(), Some("gemini-1.5"));
+        let content_chunk = chunks.iter().find(|c| c["choices"][0]["delta"].get("content").is_some());
+        assert!(content_chunk.is_some());
+        assert_eq!(content_chunk.unwrap()["choices"][0]["delta"]["content"], "Hello");
+    }
+
+    #[test]
+    fn responses_event_output_text_delta_produces_openai_chunk() {
+        let event = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "hi",
+            "output_index": 0
+        });
+        let mut state = StreamState::default();
+        state.message_id = Some("resp_1".to_string());
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "hi");
+    }
+
+    #[test]
+    fn responses_event_created_inits_state_and_emits_role_chunk() {
+        let event = serde_json::json!({
+            "type": "response.created",
+            "response": { "id": "resp_abc", "object": "response", "status": "in_progress" }
+        });
+        let mut state = StreamState::default();
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(state.message_id.as_deref(), Some("resp_abc"));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    }
+
+    #[test]
+    fn translate_sse_event_passthrough_openai_sends_done() {
+        let event = serde_json::json!({ "_done": true });
+        let mut state = StreamState::default();
+        let out = translate_sse_event(UpstreamFormat::OpenAiCompletion, UpstreamFormat::OpenAiCompletion, &event, &mut state);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].starts_with(b"data: [DONE]"));
+    }
+
+    #[test]
+    fn openai_chunk_to_claude_sse_emits_message_start_then_content_block() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }]
+        });
+        let mut state = StreamState::default();
+        let out = openai_chunk_to_claude_sse(&chunk, &mut state);
+        assert!(!out.is_empty());
+        assert!(state.message_start_sent);
+        let chunk2 = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "choices": [{ "index": 0, "delta": { "content": "Hi" }, "finish_reason": null }]
+        });
+        let out2 = openai_chunk_to_claude_sse(&chunk2, &mut state);
+        assert!(!out2.is_empty());
+        let has_content_block = out2.iter().any(|b| String::from_utf8_lossy(b).contains("content_block"));
+        assert!(has_content_block);
+    }
+}
