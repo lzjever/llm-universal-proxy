@@ -1,91 +1,187 @@
 # LLM Universal Proxy
 
-A **single-binary** HTTP proxy that exposes one service URL and supports **four** LLM API formats on both the client and upstream sides. Clients can call in any of the four formats; the proxy forwards to a configured upstream. The proxy **discovers** which formats the upstream supports; when the client uses a format the upstream supports, it **passthroughs** (no translation) to reduce errors and improve efficiency. When the client format is not supported, the proxy **translates** to the default (most generic) upstream format. **Concurrent** requests are supported (async, non-blocking). Streaming is supported in all cases.
+[中文文档](./README_CN.md)
 
-## Formats
+A single-binary HTTP proxy that provides a unified interface for Large Language Model APIs. It accepts requests in multiple LLM API formats and automatically handles format conversion when needed.
 
-| Format | Description | Typical path / shape |
-|--------|-------------|------------------------|
-| **Google** | Gemini-style | `contents[]`, parts |
-| **Anthropic** | Claude | `/v1/messages`, `messages[]` + content blocks, `system` |
-| **OpenAI completion** | Chat Completions | `/v1/chat/completions`, `messages[]`, `stream` |
-| **OpenAI responses** | Responses API | `/v1/responses`, `input[]`, `instructions` |
+## Features
 
-## Requirements (summary)
+- **Multi-Format Support**: Accepts requests in 4 different LLM API formats:
+  - Google Gemini
+  - Anthropic Claude
+  - OpenAI Chat Completions
+  - OpenAI Responses API
+- **Auto-Discovery**: Automatically detects which formats the upstream service supports
+- **Smart Routing**: Passes through requests when client format matches upstream capabilities (no translation overhead)
+- **Format Translation**: Seamlessly converts between formats when needed
+- **Streaming Support**: Handles both streaming and non-streaming responses
+- **Concurrent Requests**: Asynchronous handling for high performance
 
-- **Single binary** — `cargo build --release` → one executable.
-- **Single service URL** — One listen address; one logical endpoint (e.g. `/v1/chat/completions` and `/v1/responses` both accepted).
-- **Client** can send requests in **any** of the four formats (detected from path + body).
-- **Upstream** is one base URL; the proxy **auto-discovers** which formats the upstream supports (or use `UPSTREAM_FORMAT` to fix one format and skip discovery).
-- **Passthrough** — If the client’s format is supported by the upstream: no translation, forward request and response in that format (reduces errors and improves efficiency).
-- **Streaming** — Must support streaming (SSE); when translating, convert upstream SSE chunks to client format.
-- **Preserve behavior** — Minimize information loss when translating (tool calls, reasoning, usage, etc.).
+## Installation
 
-## Reference
+### Download Binary
 
-Design and conversion logic follow the **9router** reference project:
+Download the latest release from the [Releases](https://github.com/lzjever/llm-universal-proxy/releases) page.
 
-- `for-reference-only/9router/open-sse/translator/` — request/response translation, pivot via OpenAI.
-- `for-reference-only/9router/open-sse/services/provider.js` — format detection.
-- `for-reference-only/9router/open-sse/handlers/chatCore/` — streaming and non-streaming handling.
-
-See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
-
-## Build and run
-
-From a normal terminal:
+### Build from Source
 
 ```bash
+# Clone the repository
+git clone https://github.com/lzjever/llm-universal-proxy.git
+cd llm-universal-proxy
+
+# Build release binary
 cargo build --release
-./target/release/llm-universal-proxy
+
+# The binary will be at ./target/release/llm-universal-proxy
 ```
 
-From **Cursor IDE’s integrated terminal**, Cursor can set `RUSTC_WRAPPER` (or similar) so that rustup reports “unknown proxy name: 'cursor'”. Use the Makefile so cargo is run with a workaround:
+### Using Make
 
 ```bash
-make build
-make test
-./target/release/llm-universal-proxy
+make build        # Build release binary
+make test         # Run all tests
+make run-release  # Build and run in release mode
 ```
 
-## Testing and reports
+## Configuration
 
-- **Run all tests:** `make test` (or `cargo test` with proxy env unset).
-- **Run tests and generate report:** `make test-report`
-  - Runs all tests with `--no-fail-fast`, writes logs and reports to `test-reports/`.
-  - **Markdown:** `test-reports/report-latest.md` — summary, pass/fail counts, failed test names, log tail.
-  - **JSON:** `test-reports/report-latest.json` — machine-readable (timestamp, success, passed, failed, total, failed_tests).
-  - **Log:** `test-reports/test-latest.log` — full `cargo test` output.
-- **Coverage:** 48 unit tests (config, detect, discovery, formats, streaming, translate), 6 detect integration tests, 18 proxy+mock integration tests (passthrough, translation, streaming, errors, health).
+The proxy is configured via environment variables:
 
-The Makefile uses `env -u RUSTC_WRAPPER` and prefers `$HOME/.cargo/bin/cargo` so that `make test` and `make check` work inside Cursor. See [Cursor forum](https://forum.cursor.com/t/rust-linux-error-unknown-proxy-name/19342).
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LISTEN` | Listen address | `0.0.0.0:8080` |
+| `UPSTREAM_URL` | Upstream service base URL | `https://api.openai.com/v1` |
+| `UPSTREAM_FORMAT` | Fixed upstream format (skips auto-discovery). Options: `google`, `anthropic`, `openai-completion`, `openai-responses` | *(auto-detect)* |
+| `UPSTREAM_TIMEOUT_SECS` | Request timeout in seconds | `120` |
 
-Config via environment:
+## Usage
 
-- `LISTEN` — Listen address (default `0.0.0.0:8080`)
-- `UPSTREAM_URL` — Upstream base URL (default `https://api.openai.com/v1`)
-- `UPSTREAM_FORMAT` — Optional; if set, use this format only (skip discovery). One of: `google` | `anthropic` | `openai-completion` | `openai-responses`
-- `UPSTREAM_TIMEOUT_SECS` — Optional; request timeout in seconds (default 120)
-
-Endpoints:
-
-- `POST /v1/chat/completions` — Chat completions (and any of the four body formats)
-- `POST /v1/responses` — OpenAI Responses API
-- `GET /health` — Health check (returns `{"status":"ok"}`). CORS is enabled for all routes.
-
-## Tests (TDD)
+### Basic Example
 
 ```bash
+# Start the proxy pointing to OpenAI
+UPSTREAM_URL=https://api.openai.com/v1 ./llm-universal-proxy
+
+# Start the proxy pointing to Anthropic Claude
+UPSTREAM_URL=https://api.anthropic.com/v1 ./llm-universal-proxy
+
+# Start the proxy pointing to Google Gemini
+UPSTREAM_URL=https://generativelanguage.googleapis.com/v1beta ./llm-universal-proxy
+```
+
+### Docker
+
+```bash
+# Build the image
+docker build -t llm-universal-proxy .
+
+# Run the container
+docker run -p 8080:8080 -e UPSTREAM_URL=https://api.openai.com/v1 llm-universal-proxy
+```
+
+### API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/chat/completions` | Main endpoint accepting all 4 formats |
+| `POST /v1/responses` | OpenAI Responses API endpoint |
+| `GET /health` | Health check (returns `{"status":"ok"}`) |
+
+### Example Requests
+
+#### OpenAI Chat Completions Format
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "gpt-4",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": false
+  }'
+```
+
+#### Anthropic Claude Format
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-3-opus-20240229",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 1024
+  }'
+```
+
+#### Google Gemini Format
+
+```bash
+curl "http://localhost:8080/v1/chat/completions?key=YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [{"parts": [{"text": "Hello!"}]}]
+  }'
+```
+
+## How It Works
+
+1. **Format Detection**: Analyzes the request path and body to determine the client's API format
+2. **Capability Discovery**: Probes the upstream service to determine supported formats
+3. **Smart Routing**:
+   - If client format matches upstream → **Passthrough** (zero overhead)
+   - If formats differ → **Translation** using OpenAI Chat Completions as pivot format
+4. **Streaming Support**: Handles SSE streams with chunk-by-chunk translation
+
+## Architecture
+
+```
+                    ┌──────────────────────┐
+                    │   LLM Universal      │
+   Client Request   │       Proxy          │   Upstream Request
+   (Any Format) ───▶│                      │──────────────────▶
+                    │  ┌────────────────┐  │   (Converted if needed)
+                    │  │   Detection    │  │
+                    │  └───────┬────────┘  │
+                    │          │           │
+                    │  ┌───────▼────────┐  │
+                    │  │   Translation  │  │
+                    │  └───────┬────────┘  │
+                    │          │           │
+                    │  ┌───────▼────────┐  │
+                    │  │   Upstream     │  │
+                    │  │   Client       │──┼──────▶ OpenAI / Anthropic / Google
+                    │  └────────────────┘  │
+                    └──────────────────────┘
+```
+
+## Supported Format Conversions
+
+| From → To | OpenAI | Anthropic | Gemini |
+|-----------|--------|-----------|--------|
+| OpenAI | ✅ Passthrough | ✅ Translate | ✅ Translate |
+| Anthropic | ✅ Translate | ✅ Passthrough | ✅ Translate |
+| Gemini | ✅ Translate | ✅ Translate | ✅ Passthrough |
+
+## Development
+
+```bash
+# Run tests
 cargo test
+
+# Run with detailed test report
+make test-report
+
+# Check code
+cargo clippy
+
+# Format code
+cargo fmt
 ```
-
-Tests cover:
-
-- Format detection (path + body).
-- Request translation (client → upstream).
-- Response translation (upstream → client).
-- Streaming passthrough and translation (as we implement).
 
 ## License
 
-MIT.
+MIT License
