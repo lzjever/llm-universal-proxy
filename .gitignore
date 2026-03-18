@@ -1,6 +1,5 @@
 /target/
 test-reports/
 *.log
-Cargo.lock
 test-codex-config.toml
 .tmp-codex-home.*/
