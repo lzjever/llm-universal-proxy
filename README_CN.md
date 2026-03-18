@@ -16,6 +16,7 @@
 - **格式转换**：在需要时无缝转换格式
 - **流式支持**：同时支持流式和非流式响应
 - **并发请求**：异步处理，高性能
+- **兼容 Codex CLI**：可作为 Responses 兼容入口，前接 Anthropic 兼容上游
 
 ## 安装
 
@@ -54,6 +55,12 @@ make run-release  # 构建并以 release 模式运行
 | `UPSTREAM_URL` | 上游服务基础 URL | `https://api.openai.com/v1` |
 | `UPSTREAM_FORMAT` | 固定上游格式（跳过自动发现）。选项：`google`、`anthropic`、`openai-completion`、`openai-responses` | *(自动检测)* |
 | `UPSTREAM_TIMEOUT_SECS` | 请求超时秒数 | `120` |
+| `UPSTREAM_API_KEY` | 当客户端未提供鉴权头时使用的上游回退 API Key | *(未设置)* |
+| `UPSTREAM_HEADERS` | 发送到上游的静态请求头，JSON 对象格式，例如 `{"anthropic-version":"2023-06-01"}` | *(未设置)* |
+
+说明：
+- Anthropic 兼容上游通常要求 `x-api-key` 和 `anthropic-version`。代理会优先透传客户端鉴权头；若客户端没有提供，可回退到 `UPSTREAM_API_KEY`，并会为 Anthropic 上游默认补上 `anthropic-version: 2023-06-01`。
+- `UPSTREAM_HEADERS` 会在默认头之上继续合并，适合补充服务商特定的协议头，而不需要改客户端。
 
 ## 使用方法
 
@@ -69,6 +76,38 @@ UPSTREAM_URL=https://api.anthropic.com/v1 ./llm-universal-proxy
 # 启动代理，指向 Google Gemini
 UPSTREAM_URL=https://generativelanguage.googleapis.com/v1beta ./llm-universal-proxy
 ```
+
+### 通过 Codex CLI 使用 Anthropic 兼容上游
+
+这是一个真实可用的场景：客户端是 Codex CLI，只会发 OpenAI Responses API；真实上游却是 Anthropic Messages 兼容接口。
+
+1. 先启动代理，指向 Anthropic 兼容上游：
+
+```bash
+LISTEN=127.0.0.1:8099 \
+UPSTREAM_URL=https://open.bigmodel.cn/api/anthropic/v1 \
+UPSTREAM_FORMAT=anthropic \
+UPSTREAM_API_KEY="$GLM_APIKEY" \
+./target/release/llm-universal-proxy
+```
+
+2. 再让 Codex CLI 指向本地代理，并使用隔离配置：
+
+```bash
+HOME="$(mktemp -d)" GLM_APIKEY="你的真实 Key" codex exec --ephemeral \
+  -c 'model="GLM-5"' \
+  -c 'model_provider="glm-proxy"' \
+  -c 'model_providers.glm-proxy.name="GLM Proxy"' \
+  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:8099/v1"' \
+  -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
+  -c 'model_providers.glm-proxy.wire_api="responses"' \
+  'Reply with exactly: codex-ok'
+```
+
+说明：
+- 这里用了临时 `HOME` 和 `--ephemeral`，不会污染你全局的 Codex CLI 配置。
+- 客户端访问的是代理的 `/v1/responses`；代理再把请求转换成 Anthropic Messages 发给上游。
+- 如果上游还需要额外静态协议头，可以通过 `UPSTREAM_HEADERS` 配置。
 
 ### Docker
 
@@ -175,10 +214,10 @@ cargo test
 make test-report
 
 # 代码检查
-cargo clippy
+cargo clippy --all-targets --all-features -- -D warnings
 
 # 格式化代码
-cargo fmt
+cargo fmt --all -- --check
 ```
 
 ## 许可证

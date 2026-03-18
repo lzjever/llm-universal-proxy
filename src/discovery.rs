@@ -89,6 +89,8 @@ fn minimal_probe_body(format: UpstreamFormat) -> serde_json::Value {
 pub async fn discover_supported_formats(
     base_url: &str,
     timeout: std::time::Duration,
+    api_key: Option<&str>,
+    extra_headers: &[(String, String)],
 ) -> HashSet<UpstreamFormat> {
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -96,24 +98,51 @@ pub async fn discover_supported_formats(
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut supported = HashSet::new();
     for &format in &DEFAULT_TARGET_ORDER {
-        let url = build_upstream_url(base_url, format, None);
+        let url = build_upstream_url(base_url, format, None, false);
         let body = minimal_probe_body(format);
-        let res = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await;
-        match res {
-            Ok(r) => {
-                let status = r.status();
-                if status.as_u16() != 404 {
-                    supported.insert(format);
-                }
+        let mut req = client.post(&url).json(&body);
+        for (name, value) in default_headers_for_format(format) {
+            req = req.header(name, value);
+        }
+        for (name, value) in extra_headers {
+            req = req.header(name, value);
+        }
+        if let Some(key) = api_key {
+            let (name, value) = auth_header_for_format(format, key);
+            req = req.header(name, value);
+        }
+        if let Ok(r) = req.send().await {
+            let status = r.status();
+            if status_indicates_support(status.as_u16()) {
+                supported.insert(format);
             }
-            Err(_) => {}
         }
     }
     supported
+}
+
+fn default_headers_for_format(format: UpstreamFormat) -> Vec<(&'static str, &'static str)> {
+    match format {
+        UpstreamFormat::Anthropic => vec![("anthropic-version", "2023-06-01")],
+        _ => Vec::new(),
+    }
+}
+
+fn auth_header_for_format(format: UpstreamFormat, api_key: &str) -> (&'static str, String) {
+    match format {
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses => {
+            ("authorization", format!("Bearer {}", api_key))
+        }
+        UpstreamFormat::Anthropic => ("x-api-key", api_key.to_string()),
+        UpstreamFormat::Google => ("x-goog-api-key", api_key.to_string()),
+    }
+}
+
+fn status_indicates_support(status: u16) -> bool {
+    matches!(
+        status,
+        200..=299 | 400 | 401 | 403 | 405 | 406 | 409 | 415 | 422 | 429
+    )
 }
 
 #[cfg(test)]
@@ -125,8 +154,14 @@ mod tests {
         let cap = UpstreamCapability::fixed(UpstreamFormat::Anthropic);
         assert!(cap.supported.contains(&UpstreamFormat::Anthropic));
         assert_eq!(cap.default_target, UpstreamFormat::Anthropic);
-        assert_eq!(cap.upstream_format_for_request(UpstreamFormat::Anthropic), UpstreamFormat::Anthropic);
-        assert_eq!(cap.upstream_format_for_request(UpstreamFormat::OpenAiCompletion), UpstreamFormat::Anthropic);
+        assert_eq!(
+            cap.upstream_format_for_request(UpstreamFormat::Anthropic),
+            UpstreamFormat::Anthropic
+        );
+        assert_eq!(
+            cap.upstream_format_for_request(UpstreamFormat::OpenAiCompletion),
+            UpstreamFormat::Anthropic
+        );
     }
 
     #[test]
@@ -136,8 +171,14 @@ mod tests {
         supported.insert(UpstreamFormat::OpenAiCompletion);
         let cap = UpstreamCapability::from_supported(supported);
         assert_eq!(cap.default_target, UpstreamFormat::OpenAiCompletion);
-        assert_eq!(cap.upstream_format_for_request(UpstreamFormat::OpenAiResponses), UpstreamFormat::OpenAiCompletion);
-        assert_eq!(cap.upstream_format_for_request(UpstreamFormat::OpenAiCompletion), UpstreamFormat::OpenAiCompletion);
+        assert_eq!(
+            cap.upstream_format_for_request(UpstreamFormat::OpenAiResponses),
+            UpstreamFormat::OpenAiCompletion
+        );
+        assert_eq!(
+            cap.upstream_format_for_request(UpstreamFormat::OpenAiCompletion),
+            UpstreamFormat::OpenAiCompletion
+        );
     }
 
     #[test]

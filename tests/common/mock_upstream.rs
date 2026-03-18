@@ -3,7 +3,7 @@
 
 use axum::{
     body::Body,
-    extract::Json,
+    extract::{Json, Path},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
@@ -127,10 +127,16 @@ pub async fn spawn_google_mock() -> (String, tokio::task::JoinHandle<()>) {
     (base, handle)
 }
 
-async fn google_handler(Json(body): Json<Value>) -> Response {
-    let stream = body.get("generationConfig").and_then(|g| g.get("stream")).and_then(Value::as_bool)
-        .or_else(|| Some(false))
-        .unwrap_or(false);
+async fn google_handler(path: Option<Path<String>>, Json(body): Json<Value>) -> Response {
+    let stream = path
+        .as_ref()
+        .map(|Path(model_action)| model_action.contains(":streamGenerateContent"))
+        .unwrap_or(false)
+        || body
+            .get("generationConfig")
+            .and_then(|g| g.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     if stream {
         let chunks = [
             r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-mock"}"#,

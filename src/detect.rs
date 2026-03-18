@@ -19,10 +19,10 @@ fn detect_by_path(path: &str, body: &Value) -> Option<UpstreamFormat> {
         return Some(UpstreamFormat::OpenAiResponses);
     }
     // /v1/chat/completions with input[] can be OpenAI Responses body on chat endpoint
-    if path.contains("/v1/chat/completions") {
-        if body.get("input").and_then(Value::as_array).is_some() {
-            return Some(UpstreamFormat::OpenAiResponses);
-        }
+    if path.contains("/v1/chat/completions")
+        && body.get("input").and_then(Value::as_array).is_some()
+    {
+        return Some(UpstreamFormat::OpenAiResponses);
     }
     None
 }
@@ -67,7 +67,8 @@ fn detect_by_body(body: &Value) -> UpstreamFormat {
                 let arr = content.and_then(Value::as_array).unwrap();
                 let has_claude_image = arr.iter().any(|c| {
                     c.get("type").and_then(Value::as_str) == Some("image")
-                        && c.get("source").and_then(|s| s.get("type").and_then(Value::as_str))
+                        && c.get("source")
+                            .and_then(|s| s.get("type").and_then(Value::as_str))
                             == Some("base64")
                 });
                 let has_claude_tool = arr.iter().any(|c| {
@@ -151,7 +152,10 @@ mod tests {
     fn detect_anthropic_by_anthropic_version() {
         let path = "/v1/chat/completions";
         let body = json!({ "messages": [{ "role": "user", "content": "Hi" }], "anthropic_version": "2023-01-01" });
-        assert_eq!(detect_request_format(path, &body), UpstreamFormat::Anthropic);
+        assert_eq!(
+            detect_request_format(path, &body),
+            UpstreamFormat::Anthropic
+        );
     }
 
     #[test]
@@ -165,7 +169,10 @@ mod tests {
                 ]
             }]
         });
-        assert_eq!(detect_request_format(path, &body), UpstreamFormat::Anthropic);
+        assert_eq!(
+            detect_request_format(path, &body),
+            UpstreamFormat::Anthropic
+        );
     }
 
     #[test]
@@ -174,20 +181,29 @@ mod tests {
         let body = json!({
             "messages": [{ "role": "user", "content": [{ "type": "tool_use", "id": "x", "name": "f", "input": {} }] }]
         });
-        assert_eq!(detect_request_format(path, &body), UpstreamFormat::Anthropic);
+        assert_eq!(
+            detect_request_format(path, &body),
+            UpstreamFormat::Anthropic
+        );
     }
 
     #[test]
     fn detect_responses_by_input_string() {
         let path = "/v1/chat/completions";
         let body = json!({ "input": "Hello", "model": "gpt-4o" });
-        assert_eq!(detect_request_format(path, &body), UpstreamFormat::OpenAiResponses);
+        assert_eq!(
+            detect_request_format(path, &body),
+            UpstreamFormat::OpenAiResponses
+        );
     }
 
     #[test]
     fn path_priority_over_body() {
         let path = "/v1/responses";
         let body = json!({ "messages": [{ "role": "user", "content": "Hi" }] });
-        assert_eq!(detect_request_format(path, &body), UpstreamFormat::OpenAiResponses);
+        assert_eq!(
+            detect_request_format(path, &body),
+            UpstreamFormat::OpenAiResponses
+        );
     }
 }

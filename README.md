@@ -16,6 +16,7 @@ A single-binary HTTP proxy that provides a unified interface for Large Language 
 - **Format Translation**: Seamlessly converts between formats when needed
 - **Streaming Support**: Handles both streaming and non-streaming responses
 - **Concurrent Requests**: Asynchronous handling for high performance
+- **Codex CLI Friendly**: Works as a Responses-compatible endpoint in front of Anthropic-compatible upstreams
 
 ## Installation
 
@@ -54,6 +55,12 @@ The proxy is configured via environment variables:
 | `UPSTREAM_URL` | Upstream service base URL | `https://api.openai.com/v1` |
 | `UPSTREAM_FORMAT` | Fixed upstream format (skips auto-discovery). Options: `google`, `anthropic`, `openai-completion`, `openai-responses` | *(auto-detect)* |
 | `UPSTREAM_TIMEOUT_SECS` | Request timeout in seconds | `120` |
+| `UPSTREAM_API_KEY` | Fallback upstream API key used when the client provides no auth header | *(unset)* |
+| `UPSTREAM_HEADERS` | Static upstream headers as a JSON object, for example `{"anthropic-version":"2023-06-01"}` | *(unset)* |
+
+Notes:
+- Anthropic-compatible upstreams usually require `x-api-key` and `anthropic-version`. The proxy forwards client auth headers when present, can fall back to `UPSTREAM_API_KEY`, and injects a default `anthropic-version: 2023-06-01` header for Anthropic upstreams.
+- `UPSTREAM_HEADERS` is merged on top of the defaults, so it can be used for provider-specific headers without changing clients.
 
 ## Usage
 
@@ -69,6 +76,38 @@ UPSTREAM_URL=https://api.anthropic.com/v1 ./llm-universal-proxy
 # Start the proxy pointing to Google Gemini
 UPSTREAM_URL=https://generativelanguage.googleapis.com/v1beta ./llm-universal-proxy
 ```
+
+### Codex CLI to an Anthropic-Compatible Upstream
+
+This is the practical setup for tools such as Codex CLI when the real upstream speaks the Anthropic Messages API but the client expects the OpenAI Responses API.
+
+1. Start the proxy against the Anthropic-compatible upstream:
+
+```bash
+LISTEN=127.0.0.1:8099 \
+UPSTREAM_URL=https://open.bigmodel.cn/api/anthropic/v1 \
+UPSTREAM_FORMAT=anthropic \
+UPSTREAM_API_KEY="$GLM_APIKEY" \
+./target/release/llm-universal-proxy
+```
+
+2. Point Codex CLI at the local proxy with an isolated config:
+
+```bash
+HOME="$(mktemp -d)" GLM_APIKEY="your-real-key" codex exec --ephemeral \
+  -c 'model="GLM-5"' \
+  -c 'model_provider="glm-proxy"' \
+  -c 'model_providers.glm-proxy.name="GLM Proxy"' \
+  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:8099/v1"' \
+  -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
+  -c 'model_providers.glm-proxy.wire_api="responses"' \
+  'Reply with exactly: codex-ok'
+```
+
+Notes:
+- This does not modify your global Codex CLI configuration because it uses a temporary `HOME` and `--ephemeral`.
+- The client talks OpenAI Responses to the proxy at `/v1/responses`; the proxy translates upstream to Anthropic Messages.
+- For providers that need extra static headers beyond the Anthropic default, set `UPSTREAM_HEADERS`.
 
 ### Docker
 
@@ -176,10 +215,10 @@ cargo test
 make test-report
 
 # Check code
-cargo clippy
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Format code
-cargo fmt
+cargo fmt --all -- --check
 ```
 
 ## License

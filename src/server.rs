@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{Response, StatusCode},
+    http::{HeaderMap, Response, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -13,13 +13,13 @@ use axum::{
 use reqwest::Client;
 use serde_json::Value;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{debug, error, info};
 
 use crate::config::Config;
 use crate::detect::detect_request_format;
 use crate::discovery::UpstreamCapability;
-use crate::translate::{translate_request, translate_response};
 use crate::streaming::{needs_stream_translation, TranslateSseStream};
+use crate::translate::{translate_request, translate_response};
 use crate::upstream;
 use futures_util::StreamExt;
 
@@ -28,12 +28,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     run_with_config(config).await
 }
 
-pub async fn run_with_config(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run_with_config(
+    config: Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("llm_universal_proxy=info".parse()?))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("llm_universal_proxy=info".parse()?),
+        )
         .init();
 
-    let listen = config.listen.parse::<std::net::SocketAddr>().map_err(|e| format!("listen addr: {}", e))?;
+    let listen = config
+        .listen
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("listen addr: {}", e))?;
     info!("listening on {}", listen);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     run_with_listener(config, listener).await
@@ -53,7 +61,11 @@ pub async fn run_with_listener(
     });
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::OPTIONS])
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::OPTIONS,
+        ])
         .allow_headers(Any);
 
     let app = Router::new()
@@ -75,7 +87,10 @@ struct AppState {
 }
 
 impl AppState {
-    fn upstream_format_for_request(&self, client_format: crate::formats::UpstreamFormat) -> crate::formats::UpstreamFormat {
+    fn upstream_format_for_request(
+        &self,
+        client_format: crate::formats::UpstreamFormat,
+    ) -> crate::formats::UpstreamFormat {
         self.capability.upstream_format_for_request(client_format)
     }
 }
@@ -91,6 +106,8 @@ async fn resolve_capability(config: &Config) -> UpstreamCapability {
         let supported = crate::discovery::discover_supported_formats(
             &config.upstream_url,
             config.upstream_timeout,
+            config.upstream_api_key.as_deref(),
+            &config.upstream_headers,
         )
         .await;
         if supported.is_empty() {
@@ -103,36 +120,45 @@ async fn resolve_capability(config: &Config) -> UpstreamCapability {
 
 async fn handle_chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_chat_inner(state, "/v1/chat/completions", body).await
+    handle_chat_inner(state, headers, "/v1/chat/completions", body).await
 }
 
 async fn handle_responses(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_chat_inner(state, "/v1/responses", body).await
+    handle_chat_inner(state, headers, "/v1/responses", body).await
 }
 
 async fn handle_chat_inner(
     state: Arc<AppState>,
+    headers: HeaderMap,
     path: &str,
     mut body: Value,
 ) -> impl IntoResponse {
+    debug!("Request path: {}", path);
+    debug!(
+        "Request body: {}",
+        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
+    );
     let client_format = detect_request_format(path, &body);
+    debug!("Detected client format: {:?}", client_format);
     let upstream_format = state.upstream_format_for_request(client_format);
 
-    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(true);
-    let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if client_format != upstream_format {
-        if let Err(e) = translate_request(
-            client_format,
-            upstream_format,
-            &model,
-            &mut body,
-            stream,
-        ) {
+        if let Err(e) = translate_request(client_format, upstream_format, &model, &mut body, stream)
+        {
+            error!("Translation failed: {}", e);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": { "message": e } })),
@@ -140,6 +166,42 @@ async fn handle_chat_inner(
                 .into_response();
         }
     }
+    debug!(
+        "Translated body for upstream: {}",
+        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
+    );
+
+    // Extract auth headers to forward
+    let mut auth_headers = extract_forwardable_headers(&headers);
+
+    // Check if client provided any auth headers
+    let has_client_auth = auth_headers.iter().any(|(k, _)| {
+        let k = k.to_lowercase();
+        k == "authorization"
+            || k == "x-api-key"
+            || k == "api-key"
+            || k == "openai-api-key"
+            || k == "x-goog-api-key"
+    });
+
+    // If client didn't provide auth, use configured upstream API key as fallback
+    if !has_client_auth {
+        if let Some(ref api_key) = state.config.upstream_api_key {
+            debug!("No client auth provided, using upstream API key from config as fallback");
+            // Add auth header in the format appropriate for the upstream
+            let auth_header = auth_header_for_format(upstream_format, api_key);
+            auth_headers.push(auth_header);
+        }
+    } else {
+        debug!("Using client-provided auth headers");
+        // Normalize client auth headers for upstream format
+        normalize_auth_headers(&mut auth_headers, upstream_format);
+    }
+    apply_upstream_headers(
+        &mut auth_headers,
+        &state.config.upstream_headers,
+        upstream_format,
+    );
 
     let url = upstream::upstream_url(
         &state.config,
@@ -149,8 +211,11 @@ async fn handle_chat_inner(
         } else {
             None
         },
+        stream,
     );
-    let res = match upstream::call_upstream(&state.client, &url, &body, stream).await {
+    debug!("Calling upstream URL: {}", url);
+    let res = match upstream::call_upstream(&state.client, &url, &body, stream, &auth_headers).await
+    {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -163,20 +228,30 @@ async fn handle_chat_inner(
 
     if stream {
         let status = res.status();
+        debug!("Upstream streaming response status: {}", status);
+        if !status.is_success() {
+            // For streaming requests with errors, read the body and return as error
+            let error_body = res
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            error!(
+                "Upstream returned error for streaming request: {} - {}",
+                status, error_body
+            );
+            return (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(serde_json::json!({ "error": { "message": error_body } })),
+            )
+                .into_response();
+        }
         let upstream_stream = res.bytes_stream();
         let body = if needs_stream_translation(upstream_format, client_format) {
-            let translated = TranslateSseStream::new(
-                upstream_stream,
-                upstream_format,
-                client_format,
-            );
-            Body::from_stream(translated.map(|r| {
-                r.map(axum::body::Bytes::from).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            }))
+            let translated =
+                TranslateSseStream::new(upstream_stream, upstream_format, client_format);
+            Body::from_stream(translated.map(|r| r.map_err(std::io::Error::other)))
         } else {
-            let pass = upstream_stream.map(|r| {
-                r.map(axum::body::Bytes::from).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            });
+            let pass = upstream_stream.map(|r| r.map_err(std::io::Error::other));
             Body::from_stream(pass)
         };
         return Response::builder()
@@ -201,6 +276,11 @@ async fn handle_chat_inner(
         }
     };
     if !status.is_success() {
+        error!("Upstream returned non-success status: {}", status);
+        error!(
+            "Upstream response body: {}",
+            String::from_utf8_lossy(&bytes)
+        );
         return (
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             Json(serde_json::json!({ "error": { "message": String::from_utf8_lossy(&bytes) } })),
@@ -212,7 +292,9 @@ async fn handle_chat_inner(
         Err(_) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": { "message": "upstream returned invalid JSON" } })),
+                Json(
+                    serde_json::json!({ "error": { "message": "upstream returned invalid JSON" } }),
+                ),
             )
                 .into_response();
         }
@@ -228,4 +310,166 @@ async fn handle_chat_inner(
         }
     };
     (StatusCode::OK, Json(out)).into_response()
+}
+
+fn apply_upstream_headers(
+    headers: &mut Vec<(String, String)>,
+    extra_headers: &[(String, String)],
+    target_format: crate::formats::UpstreamFormat,
+) {
+    for (name, value) in default_protocol_headers(target_format) {
+        if !headers
+            .iter()
+            .any(|(existing_name, _)| existing_name.eq_ignore_ascii_case(name))
+        {
+            headers.push((name.to_string(), value.to_string()));
+        }
+    }
+    for (name, value) in extra_headers {
+        upsert_header(headers, name.to_lowercase(), value.clone());
+    }
+}
+
+fn default_protocol_headers(
+    target_format: crate::formats::UpstreamFormat,
+) -> Vec<(&'static str, &'static str)> {
+    match target_format {
+        crate::formats::UpstreamFormat::Anthropic => vec![("anthropic-version", "2023-06-01")],
+        _ => Vec::new(),
+    }
+}
+
+fn upsert_header(headers: &mut Vec<(String, String)>, name: String, value: String) {
+    if let Some(existing) = headers
+        .iter_mut()
+        .find(|(existing_name, _)| existing_name.eq_ignore_ascii_case(&name))
+    {
+        existing.1 = value;
+        return;
+    }
+    headers.push((name, value));
+}
+
+/// Extract all headers that should be forwarded to upstream.
+/// This forwards all headers except hop-by-hop headers and content-related ones.
+fn extract_forwardable_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    // Headers that should NOT be forwarded
+    const HOP_BY_HOP: &[&str] = &[
+        "host",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "content-type",
+    ];
+
+    let mut result = Vec::new();
+    debug!("Extracting headers from request:");
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str().to_lowercase();
+        if !HOP_BY_HOP.contains(&name_str.as_str()) {
+            if let Ok(v) = value.to_str() {
+                let display_value = if name_str.contains("key")
+                    || name_str.contains("auth")
+                    || name_str.contains("token")
+                {
+                    "***"
+                } else {
+                    v
+                };
+                debug!("Forwarding header: {} = {}", name_str, display_value);
+                result.push((name_str, v.to_string()));
+            }
+        } else {
+            debug!("Skipping hop-by-hop header: {}", name_str);
+        }
+    }
+    debug!("Total headers to forward: {}", result.len());
+    result
+}
+
+/// Generate auth header for the given upstream format.
+/// Different providers use different header names:
+/// - OpenAI/Responses: `Authorization: Bearer xxx`
+/// - Anthropic: `x-api-key: xxx`
+/// - Google: `x-goog-api-key: xxx`
+fn auth_header_for_format(
+    format: crate::formats::UpstreamFormat,
+    api_key: &str,
+) -> (String, String) {
+    match format {
+        crate::formats::UpstreamFormat::OpenAiCompletion
+        | crate::formats::UpstreamFormat::OpenAiResponses => {
+            ("authorization".to_string(), format!("Bearer {}", api_key))
+        }
+        crate::formats::UpstreamFormat::Anthropic => ("x-api-key".to_string(), api_key.to_string()),
+        crate::formats::UpstreamFormat::Google => {
+            ("x-goog-api-key".to_string(), api_key.to_string())
+        }
+    }
+}
+
+/// Normalize auth headers for the target upstream format.
+/// Converts client-provided auth to the format expected by upstream.
+fn normalize_auth_headers(
+    headers: &mut Vec<(String, String)>,
+    target_format: crate::formats::UpstreamFormat,
+) {
+    // Extract the API key from whatever auth header the client provided
+    let extracted_key = extract_api_key_from_headers(headers);
+
+    if let Some(key) = extracted_key {
+        // Remove all existing auth-related headers
+        headers.retain(|(k, _)| {
+            let k = k.to_lowercase();
+            !matches!(
+                k.as_str(),
+                "authorization"
+                    | "x-api-key"
+                    | "api-key"
+                    | "openai-api-key"
+                    | "x-goog-api-key"
+                    | "anthropic-api-key"
+                    | "bearer"
+            )
+        });
+
+        // Add auth header in the correct format for upstream
+        let auth_header = auth_header_for_format(target_format, &key);
+        headers.push(auth_header);
+    }
+}
+
+/// Extract API key from various auth header formats.
+fn extract_api_key_from_headers(headers: &[(String, String)]) -> Option<String> {
+    for (name, value) in headers {
+        let name_lower = name.to_lowercase();
+        match name_lower.as_str() {
+            "authorization" | "bearer" => {
+                // Handle "Bearer xxx" format
+                if let Some(key) = value
+                    .strip_prefix("Bearer ")
+                    .or_else(|| value.strip_prefix("bearer "))
+                {
+                    return Some(key.to_string());
+                }
+                // Handle raw token
+                if !value.is_empty() {
+                    return Some(value.clone());
+                }
+            }
+            "x-api-key" | "api-key" | "openai-api-key" | "x-goog-api-key" | "anthropic-api-key" => {
+                if !value.is_empty() {
+                    return Some(value.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

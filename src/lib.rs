@@ -7,8 +7,8 @@ pub mod detect;
 pub mod discovery;
 pub mod formats;
 pub mod server;
-pub mod translate;
 pub mod streaming;
+pub mod translate;
 pub mod upstream;
 
 pub use config::Config;

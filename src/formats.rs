@@ -48,28 +48,58 @@ mod tests {
 
     #[test]
     fn from_str_google_gemini() {
-        assert_eq!("google".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::Google);
-        assert_eq!("gemini".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::Google);
-        assert_eq!("GOOGLE".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::Google);
+        assert_eq!(
+            "google".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::Google
+        );
+        assert_eq!(
+            "gemini".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::Google
+        );
+        assert_eq!(
+            "GOOGLE".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::Google
+        );
     }
 
     #[test]
     fn from_str_anthropic_claude() {
-        assert_eq!("anthropic".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::Anthropic);
-        assert_eq!("claude".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::Anthropic);
+        assert_eq!(
+            "anthropic".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::Anthropic
+        );
+        assert_eq!(
+            "claude".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::Anthropic
+        );
     }
 
     #[test]
     fn from_str_openai_completion() {
-        assert_eq!("openai".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::OpenAiCompletion);
-        assert_eq!("openai-completion".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::OpenAiCompletion);
-        assert_eq!("chat".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::OpenAiCompletion);
+        assert_eq!(
+            "openai".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::OpenAiCompletion
+        );
+        assert_eq!(
+            "openai-completion".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::OpenAiCompletion
+        );
+        assert_eq!(
+            "chat".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::OpenAiCompletion
+        );
     }
 
     #[test]
     fn from_str_openai_responses() {
-        assert_eq!("openai-responses".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::OpenAiResponses);
-        assert_eq!("responses".parse::<UpstreamFormat>().unwrap(), UpstreamFormat::OpenAiResponses);
+        assert_eq!(
+            "openai-responses".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::OpenAiResponses
+        );
+        assert_eq!(
+            "responses".parse::<UpstreamFormat>().unwrap(),
+            UpstreamFormat::OpenAiResponses
+        );
     }
 
     #[test]
@@ -82,7 +112,13 @@ mod tests {
     fn display() {
         assert_eq!(UpstreamFormat::Google.to_string(), "google");
         assert_eq!(UpstreamFormat::Anthropic.to_string(), "anthropic");
-        assert_eq!(UpstreamFormat::OpenAiCompletion.to_string(), "openai-completion");
-        assert_eq!(UpstreamFormat::OpenAiResponses.to_string(), "openai-responses");
+        assert_eq!(
+            UpstreamFormat::OpenAiCompletion.to_string(),
+            "openai-completion"
+        );
+        assert_eq!(
+            UpstreamFormat::OpenAiResponses.to_string(),
+            "openai-responses"
+        );
     }
 }

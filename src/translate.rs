@@ -24,7 +24,10 @@ pub fn translate_response(
 }
 
 /// Convert upstream non-streaming response to OpenAI completion shape.
-fn upstream_response_to_openai(upstream_format: UpstreamFormat, body: &Value) -> Result<Value, String> {
+fn upstream_response_to_openai(
+    upstream_format: UpstreamFormat,
+    body: &Value,
+) -> Result<Value, String> {
     match upstream_format {
         UpstreamFormat::OpenAiCompletion => Ok(body.clone()),
         UpstreamFormat::Anthropic => claude_response_to_openai(body),
@@ -44,7 +47,10 @@ fn openai_response_to_client(client_format: UpstreamFormat, body: &Value) -> Res
 }
 
 fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
-    let content = body.get("content").and_then(Value::as_array).ok_or("missing content")?;
+    let content = body
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or("missing content")?;
     let mut text_content = String::new();
     let mut reasoning_content = String::new();
     let mut tool_calls: Vec<Value> = vec![];
@@ -78,7 +84,11 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
     if message.get("content").is_none() && message.get("tool_calls").is_none() {
         message["content"] = Value::String(String::new());
     }
-    let mut finish_reason = body.get("stop_reason").and_then(Value::as_str).unwrap_or("stop").to_string();
+    let mut finish_reason = body
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop")
+        .to_string();
     if finish_reason == "end_turn" {
         finish_reason = "stop".to_string();
     }
@@ -92,19 +102,54 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
         "model": body.get("model").cloned().unwrap_or(serde_json::json!("claude")),
         "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }]
     });
+    // Usage with cache token reporting
+    // Reference: 9router claude-to-openai.js - include cache_read_input_tokens, cache_creation_input_tokens
     if let Some(usage) = body.get("usage") {
-        result["usage"] = serde_json::json!({
-            "prompt_tokens": usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-            "completion_tokens": usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
-            "total_tokens": usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) + usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_creation = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        // prompt_tokens = input_tokens + cache_read + cache_creation (matches 9router)
+        let prompt_tokens = input_tokens + cache_read + cache_creation;
+
+        let mut usage_json = serde_json::json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": prompt_tokens + output_tokens
         });
+
+        // Add cache details if present
+        if cache_read > 0 {
+            usage_json["cache_read_input_tokens"] = Value::Number(cache_read.into());
+        }
+        if cache_creation > 0 {
+            usage_json["cache_creation_input_tokens"] = Value::Number(cache_creation.into());
+        }
+
+        result["usage"] = usage_json;
     }
     Ok(result)
 }
 
 fn gemini_response_to_openai(body: &Value) -> Result<Value, String> {
     let response = body.get("response").unwrap_or(body);
-    let candidates = response.get("candidates").and_then(Value::as_array).ok_or("missing candidates")?;
+    let candidates = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .ok_or("missing candidates")?;
     let candidate = candidates.first().ok_or("empty candidates")?;
     let content = candidate.get("content");
     let parts: Vec<&Value> = content
@@ -148,7 +193,11 @@ fn gemini_response_to_openai(body: &Value) -> Result<Value, String> {
     if message.get("content").is_none() && message.get("tool_calls").is_none() {
         message["content"] = Value::String(String::new());
     }
-    let mut finish_reason = candidate.get("finishReason").and_then(Value::as_str).unwrap_or("stop").to_lowercase();
+    let mut finish_reason = candidate
+        .get("finishReason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop")
+        .to_lowercase();
     if finish_reason == "stop" && has_tool_calls {
         finish_reason = "tool_calls".to_string();
     }
@@ -160,18 +209,56 @@ fn gemini_response_to_openai(body: &Value) -> Result<Value, String> {
         "model": response.get("modelVersion").cloned().unwrap_or(serde_json::json!("gemini")),
         "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }]
     });
+    // Usage with cache token reporting
+    // Reference: 9router gemini-to-openai.js - include cachedContentTokenCount as prompt_tokens_details.cached_tokens
     if let Some(u) = usage {
-        result["usage"] = serde_json::json!({
-            "prompt_tokens": u.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0) + u.get("thoughtsTokenCount").and_then(Value::as_u64).unwrap_or(0),
-            "completion_tokens": u.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0),
-            "total_tokens": u.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0)
+        let prompt_tokens = u
+            .get("promptTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let candidates_tokens = u
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let thoughts_tokens = u
+            .get("thoughtsTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let total_tokens = u
+            .get("totalTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cached_tokens = u
+            .get("cachedContentTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        // completion_tokens = candidatesTokenCount + thoughtsTokenCount (matches 9router)
+        let completion_tokens = candidates_tokens + thoughts_tokens;
+
+        let mut usage_json = serde_json::json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
         });
+
+        // Add prompt_tokens_details if cached tokens exist
+        if cached_tokens > 0 {
+            usage_json["prompt_tokens_details"] = serde_json::json!({
+                "cached_tokens": cached_tokens
+            });
+        }
+
+        result["usage"] = usage_json;
     }
     Ok(result)
 }
 
 fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
-    let choices = body.get("choices").and_then(Value::as_array).ok_or("missing choices")?;
+    let choices = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or("missing choices")?;
     let choice = choices.first().ok_or("empty choices")?;
     let message = choice.get("message").ok_or("missing message")?;
     let mut content: Vec<Value> = vec![];
@@ -190,8 +277,13 @@ fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
     }
     if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
         for t in tc {
-            let args = t.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str);
-            let input = args.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(serde_json::json!({}));
+            let args = t
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str);
+            let input = args
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::json!({}));
             content.push(serde_json::json!({
                 "type": "tool_use",
                 "id": t.get("id"),
@@ -200,7 +292,11 @@ fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
             }));
         }
     }
-    let mut finish = choice.get("finish_reason").and_then(Value::as_str).unwrap_or("stop").to_string();
+    let mut finish = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop")
+        .to_string();
     if finish == "tool_calls" {
         finish = "tool_use".to_string();
     }
@@ -222,7 +318,10 @@ fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
 }
 
 fn openai_response_to_gemini(body: &Value) -> Result<Value, String> {
-    let choices = body.get("choices").and_then(Value::as_array).ok_or("missing choices")?;
+    let choices = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or("missing choices")?;
     let choice = choices.first().ok_or("empty choices")?;
     let message = choice.get("message").ok_or("missing message")?;
     let mut parts: Vec<Value> = vec![];
@@ -238,8 +337,13 @@ fn openai_response_to_gemini(body: &Value) -> Result<Value, String> {
     }
     if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
         for t in tc {
-            let args = t.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str);
-            let args_val = args.and_then(|s| serde_json::from_str(s).ok()).unwrap_or(serde_json::json!({}));
+            let args = t
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str);
+            let args_val = args
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::json!({}));
             parts.push(serde_json::json!({
                 "functionCall": {
                     "id": t.get("id"),
@@ -252,13 +356,16 @@ fn openai_response_to_gemini(body: &Value) -> Result<Value, String> {
     if parts.is_empty() {
         parts.push(serde_json::json!({ "text": "" }));
     }
-    let finish = choice.get("finish_reason").and_then(Value::as_str).unwrap_or("stop");
+    let finish = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
     let mut result = serde_json::json!({
         "candidates": [{
             "content": { "role": "model", "parts": parts },
             "finishReason": finish
         }],
-        "usageMetadata": body.get("usage").cloned().unwrap_or(serde_json::json!({})),
+        "usageMetadata": openai_usage_to_gemini_usage(body.get("usage")),
         "modelVersion": body.get("model").cloned().unwrap_or(serde_json::Value::Null)
     });
     if let Some(id) = body.get("id") {
@@ -311,21 +418,24 @@ fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
         "choices": [{ "index": 0, "message": message, "finish_reason": finish }]
     });
     if let Some(u) = body.get("usage") {
-        result["usage"] = u.clone();
+        result["usage"] = responses_usage_to_openai_usage(u);
     }
     Ok(result)
 }
 
 fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
-    let choices = body.get("choices").and_then(Value::as_array).ok_or("missing choices")?;
+    let choices = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or("missing choices")?;
     let choice = choices.first().ok_or("empty choices")?;
     let message = choice.get("message").ok_or("missing message")?;
-    let content = message.get("content").and_then(Value::as_str).unwrap_or("");
     let mut output: Vec<Value> = vec![];
+    let content = openai_message_content_to_responses_output(message.get("content"));
     output.push(serde_json::json!({
         "type": "message",
         "role": "assistant",
-        "content": [{ "type": "output_text", "text": content }]
+        "content": content
     }));
     if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
         for t in tc {
@@ -337,10 +447,12 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
             }));
         }
     }
-    let created_at = body
-        .get("created")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()));
+    let created_at = body.get("created").cloned().unwrap_or_else(|| {
+        serde_json::json!(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs())
+    });
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or(serde_json::Value::Null),
         "object": "response",
@@ -349,7 +461,7 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
         "status": "completed"
     });
     if let Some(u) = body.get("usage") {
-        result["usage"] = u.clone();
+        result["usage"] = openai_usage_to_responses_usage(u);
     }
     Ok(result)
 }
@@ -428,9 +540,7 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
         body.get("input")
             .and_then(Value::as_array)
             .ok_or("input must be array or string")?
-            .iter()
-            .cloned()
-            .collect()
+            .to_vec()
     };
     let mut current_assistant: Option<Value> = None;
     for item in items {
@@ -449,8 +559,15 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
             }
             "function_call" => {
                 let call_id = item.get("call_id").cloned();
-                let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                let args = item.get("arguments").cloned().unwrap_or(serde_json::json!("{}"));
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let args = item
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::json!("{}"));
                 let tc = serde_json::json!({
                     "id": call_id,
                     "type": "function",
@@ -490,6 +607,47 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
     }
     flush_assistant(&mut messages, &mut current_assistant);
     body["messages"] = Value::Array(messages);
+
+    // Convert tools from Responses API format to Chat Completions format
+    // Responses: { "name": "...", "description": "...", "parameters": {...} }
+    // Chat: { "type": "function", "function": { "name": "...", "description": "...", "parameters": {...} } }
+    // Note: Responses API may include non-function tools like web_search which don't have names.
+    // We only convert tools that have a "name" field (function tools).
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let converted_tools: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| {
+                // Check if already in Chat Completions format (has "type" = "function" and nested "function")
+                if t.get("type").and_then(Value::as_str) == Some("function") && t.get("function").is_some() {
+                    return Some(t.clone());
+                }
+                // Only convert tools that have a name field (skip non-function tools like web_search)
+                let name = match t.get("name").and_then(Value::as_str) {
+                    Some(n) if !n.is_empty() => n,
+                    _ => return None, // Skip tools without a valid name
+                };
+                let description = t.get("description").and_then(Value::as_str);
+                let parameters = t.get("parameters").cloned();
+                Some(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters.unwrap_or(serde_json::json!({"type": "object", "properties": {}}))
+                    }
+                }))
+            })
+            .collect();
+        if converted_tools.is_empty() {
+            // Remove tools array if all tools were filtered out
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("tools");
+            }
+        } else {
+            body["tools"] = Value::Array(converted_tools);
+        }
+    }
+
     if let Some(obj) = body.as_object_mut() {
         obj.remove("input");
         obj.remove("instructions");
@@ -518,7 +676,10 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
         .map(|c| {
             let ty = c.get("type").and_then(Value::as_str);
             if ty == Some("input_text") || ty == Some("output_text") {
-                let text = c.get("text").cloned().unwrap_or(Value::String(String::new()));
+                let text = c
+                    .get("text")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()));
                 return serde_json::json!({ "type": "text", "text": text });
             }
             c
@@ -528,7 +689,10 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
 }
 
 fn messages_to_responses(body: &mut Value) -> Result<(), String> {
-    let messages = body.get("messages").and_then(Value::as_array).ok_or("missing messages")?;
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("missing messages")?;
     let mut input: Vec<Value> = vec![];
     let mut instructions = String::new();
     for msg in messages {
@@ -541,7 +705,11 @@ fn messages_to_responses(body: &mut Value) -> Result<(), String> {
         }
         if role == "user" || role == "assistant" {
             let content = msg.get("content").cloned();
-            let content_type = if role == "user" { "input_text" } else { "output_text" };
+            let content_type = if role == "user" {
+                "input_text"
+            } else {
+                "output_text"
+            };
             let content_arr = map_openai_content_to_responses(content, content_type);
             if !content_arr.is_empty() {
                 input.push(serde_json::json!({
@@ -582,7 +750,9 @@ fn messages_to_responses(body: &mut Value) -> Result<(), String> {
 fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -> Vec<Value> {
     let content = match content {
         None => return vec![],
-        Some(Value::String(s)) => return vec![serde_json::json!({ "type": content_type, "text": s })],
+        Some(Value::String(s)) => {
+            return vec![serde_json::json!({ "type": content_type, "text": s })]
+        }
         Some(Value::Array(a)) => a,
         Some(_) => return vec![],
     };
@@ -591,17 +761,144 @@ fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -
         .map(|c| {
             let ty = c.get("type").and_then(Value::as_str);
             if ty == Some("text") {
-                let text = c.get("text").cloned().unwrap_or(Value::String(String::new()));
+                let text = c
+                    .get("text")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()));
                 return serde_json::json!({ "type": content_type, "text": text });
             }
             if ty == Some("image_url") {
                 return serde_json::json!({ "type": "image_url", "image_url": c.get("image_url") });
             }
             let text = c.get("text").or(c.get("content")).cloned();
-            let text = text.and_then(|t| t.as_str().map(String::from)).unwrap_or_else(|| serde_json::to_string(&c).unwrap_or_default());
+            let text = text
+                .and_then(|t| t.as_str().map(String::from))
+                .unwrap_or_else(|| serde_json::to_string(&c).unwrap_or_default());
             serde_json::json!({ "type": content_type, "text": text })
         })
         .collect()
+}
+
+fn openai_message_content_to_responses_output(content: Option<&Value>) -> Vec<Value> {
+    let items = map_openai_content_to_responses(content.cloned(), "output_text");
+    if items.is_empty() {
+        vec![serde_json::json!({ "type": "output_text", "text": "" })]
+    } else {
+        items
+    }
+}
+
+fn responses_usage_to_openai_usage(usage: &Value) -> Value {
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(input_tokens + output_tokens);
+
+    let mut mapped = serde_json::json!({
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": total_tokens
+    });
+
+    if let Some(details) = usage.get("input_tokens_details") {
+        if let Some(cached) = details.get("cached_tokens").and_then(Value::as_u64) {
+            mapped["prompt_tokens_details"] = serde_json::json!({ "cached_tokens": cached });
+        }
+    }
+    if let Some(details) = usage.get("output_tokens_details") {
+        if let Some(reasoning) = details.get("reasoning_tokens").and_then(Value::as_u64) {
+            mapped["completion_tokens_details"] =
+                serde_json::json!({ "reasoning_tokens": reasoning });
+        }
+    }
+
+    mapped
+}
+
+fn openai_usage_to_responses_usage(usage: &Value) -> Value {
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(input_tokens + output_tokens);
+
+    let mut mapped = serde_json::json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens
+    });
+
+    if let Some(details) = usage.get("prompt_tokens_details") {
+        if let Some(cached) = details.get("cached_tokens").and_then(Value::as_u64) {
+            mapped["input_tokens_details"] = serde_json::json!({ "cached_tokens": cached });
+        }
+    }
+    if let Some(details) = usage.get("completion_tokens_details") {
+        if let Some(reasoning) = details.get("reasoning_tokens").and_then(Value::as_u64) {
+            mapped["output_tokens_details"] = serde_json::json!({ "reasoning_tokens": reasoning });
+        }
+    }
+
+    mapped
+}
+
+fn openai_usage_to_gemini_usage(usage: Option<&Value>) -> Value {
+    let Some(usage) = usage else {
+        return serde_json::json!({});
+    };
+
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(prompt_tokens + completion_tokens);
+    let reasoning_tokens = usage
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let mut mapped = serde_json::json!({
+        "promptTokenCount": prompt_tokens,
+        "candidatesTokenCount": completion_tokens.saturating_sub(reasoning_tokens),
+        "totalTokenCount": total_tokens
+    });
+
+    if reasoning_tokens > 0 {
+        mapped["thoughtsTokenCount"] = reasoning_tokens.into();
+    }
+    if cached_tokens > 0 {
+        mapped["cachedContentTokenCount"] = cached_tokens.into();
+    }
+
+    mapped
 }
 
 fn claude_to_openai(body: &mut Value) -> Result<(), String> {
@@ -616,12 +913,17 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
     if let Some(t) = body.get("temperature") {
         result["temperature"] = t.clone();
     }
+    // System: strip cache_control from blocks
+    // Reference: 9router claudeHelper.js - remove all cache_control, add only to last block
     if let Some(system) = body.get("system") {
         let text = if system.is_string() {
             system.as_str().unwrap_or("").to_string()
         } else if let Some(arr) = system.as_array() {
             arr.iter()
-                .filter_map(|s| s.get("text").and_then(Value::as_str))
+                .filter_map(|s| {
+                    // Strip cache_control - just extract text
+                    s.get("text").and_then(Value::as_str)
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
@@ -643,22 +945,26 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
             }
         }
     }
+    // Tools: strip cache_control
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        result["tools"] = serde_json::Value::Array(
-            tools
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.get("name"),
-                            "description": t.get("description"),
-                            "parameters": t.get("input_schema").or(t.get("parameters")).unwrap_or(&serde_json::json!({ "type": "object", "properties": {} }))
-                        }
-                    })
-                })
-                .collect(),
-        );
+        let converted_tools: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| {
+                // Skip if no name (invalid tool)
+                let name = t.get("name")?;
+                Some(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": t.get("description"),
+                        "parameters": t.get("input_schema").or(t.get("parameters")).unwrap_or(&serde_json::json!({ "type": "object", "properties": {} }))
+                    }
+                }))
+            })
+            .collect();
+        if !converted_tools.is_empty() {
+            result["tools"] = Value::Array(converted_tools);
+        }
     }
     *body = result;
     Ok(())
@@ -673,7 +979,9 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
     };
     let content = msg.get("content")?;
     if content.is_string() {
-        return Some(vec![serde_json::json!({ "role": openai_role, "content": content })]);
+        return Some(vec![
+            serde_json::json!({ "role": openai_role, "content": content }),
+        ]);
     }
     let arr = content.as_array()?;
     let mut parts: Vec<Value> = vec![];
@@ -682,7 +990,12 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
     for block in arr {
         let ty = block.get("type").and_then(Value::as_str)?;
         match ty {
-            "text" => parts.push(serde_json::json!({ "type": "text", "text": block.get("text") })),
+            // Strip cache_control when converting from Claude to OpenAI
+            // Reference: 9router claudeHelper.js - remove all cache_control
+            "text" => {
+                let text = block.get("text").cloned().unwrap_or(Value::String(String::new()));
+                parts.push(serde_json::json!({ "type": "text", "text": text }));
+            }
             "image" => {
                 if block.get("source").and_then(|s| s.get("type").and_then(Value::as_str)) == Some("base64") {
                     let src = block.get("source").unwrap();
@@ -714,14 +1027,20 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
                     "content": content_str
                 }));
             }
+            // Skip thinking/redacted_thinking blocks - not part of OpenAI format
             _ => {}
         }
     }
     if !tool_results.is_empty() {
         let mut out: Vec<Value> = tool_results;
         if !parts.is_empty() {
-            let content = if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text") {
-                parts[0].get("text").cloned().unwrap_or(Value::String(String::new()))
+            let content = if parts.len() == 1
+                && parts[0].get("type").and_then(Value::as_str) == Some("text")
+            {
+                parts[0]
+                    .get("text")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()))
             } else {
                 Value::Array(parts)
             };
@@ -732,8 +1051,13 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
     if !tool_calls.is_empty() {
         let mut m = serde_json::json!({ "role": "assistant", "tool_calls": tool_calls });
         if !parts.is_empty() {
-            m["content"] = if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text") {
-                parts[0].get("text").cloned().unwrap_or(Value::String(String::new()))
+            m["content"] = if parts.len() == 1
+                && parts[0].get("type").and_then(Value::as_str) == Some("text")
+            {
+                parts[0]
+                    .get("text")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()))
             } else {
                 Value::Array(parts)
             };
@@ -741,14 +1065,22 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
         return Some(vec![m]);
     }
     if parts.is_empty() {
-        return Some(vec![serde_json::json!({ "role": openai_role, "content": "" })]);
+        return Some(vec![
+            serde_json::json!({ "role": openai_role, "content": "" }),
+        ]);
     }
-    let content = if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text") {
-        parts[0].get("text").cloned().unwrap_or(Value::String(String::new()))
-    } else {
-        Value::Array(parts)
-    };
-    Some(vec![serde_json::json!({ "role": openai_role, "content": content })])
+    let content =
+        if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text") {
+            parts[0]
+                .get("text")
+                .cloned()
+                .unwrap_or(Value::String(String::new()))
+        } else {
+            Value::Array(parts)
+        };
+    Some(vec![
+        serde_json::json!({ "role": openai_role, "content": content }),
+    ])
 }
 
 fn openai_to_claude(body: &mut Value) -> Result<(), String> {
@@ -761,43 +1093,86 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
     if let Some(t) = body.get("temperature") {
         result["temperature"] = t.clone();
     }
-    let messages = body.get("messages").and_then(Value::as_array).ok_or("missing messages")?;
-    let mut system_parts: Vec<String> = vec![];
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("missing messages")?;
+
+    // System message: convert to array of blocks with cache_control on last block
+    // Reference: 9router claudeHelper.js - add cache_control { type: "ephemeral", ttl: "1h" } to last system block
+    let mut system_blocks: Vec<Value> = vec![];
     for msg in messages {
         if msg.get("role").and_then(Value::as_str) != Some("system") {
             continue;
         }
         let c = msg.get("content");
-        let text = c.and_then(Value::as_str).map(String::from).unwrap_or_else(|| extract_text_content(c));
+        let text = c
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| extract_text_content(c));
         if !text.is_empty() {
-            system_parts.push(text);
+            system_blocks.push(serde_json::json!({ "type": "text", "text": text }));
         }
     }
-    if !system_parts.is_empty() {
-        result["system"] = serde_json::Value::String(system_parts.join("\n"));
+    if !system_blocks.is_empty() {
+        // Add cache_control to last system block
+        let last_idx = system_blocks.len() - 1;
+        system_blocks[last_idx]["cache_control"] =
+            serde_json::json!({ "type": "ephemeral", "ttl": "1h" });
+        result["system"] = Value::Array(system_blocks);
     }
-    let non_system: Vec<_> = messages.iter().filter(|m| m.get("role").and_then(Value::as_str) != Some("system")).cloned().collect();
-    for msg in non_system {
-        if let Some(claude_blocks) = openai_message_to_claude_blocks(&msg) {
+
+    let non_system: Vec<_> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+        .cloned()
+        .collect();
+
+    // Find last assistant message index (for cache_control)
+    // Reference: 9router openai-to-claude.js - add cache_control to last assistant message's last block
+    let mut last_assistant_idx: Option<usize> = None;
+    for (i, msg) in non_system.iter().enumerate() {
+        if msg.get("role").and_then(Value::as_str) == Some("assistant") {
+            last_assistant_idx = Some(i);
+        }
+    }
+
+    for (i, msg) in non_system.into_iter().enumerate() {
+        if let Some(mut claude_blocks) = openai_message_to_claude_blocks(&msg) {
+            // Add cache_control to last assistant message's last block
+            if last_assistant_idx == Some(i) && !claude_blocks.is_empty() {
+                let last_block_idx = claude_blocks.len() - 1;
+                claude_blocks[last_block_idx]["cache_control"] =
+                    serde_json::json!({ "type": "ephemeral" });
+            }
             result["messages"]
                 .as_array_mut()
                 .unwrap()
                 .push(serde_json::json!({ "role": if msg.get("role").and_then(Value::as_str) == Some("user") || msg.get("role").and_then(Value::as_str) == Some("tool") { "user" } else { "assistant" }, "content": claude_blocks }));
         }
     }
+
+    // Tools: add cache_control to last tool
+    // Reference: 9router claudeHelper.js - add cache_control { type: "ephemeral", ttl: "1h" } to last tool
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        result["tools"] = serde_json::Value::Array(
-            tools
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.get("function").and_then(|f| f.get("name")),
-                        "description": t.get("function").and_then(|f| f.get("description")),
-                        "input_schema": t.get("function").and_then(|f| f.get("parameters"))
-                    })
+        let claude_tools: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.get("function").and_then(|f| f.get("name")),
+                    "description": t.get("function").and_then(|f| f.get("description")),
+                    "input_schema": t.get("function").and_then(|f| f.get("parameters"))
                 })
-                .collect(),
-        );
+            })
+            .collect();
+        if !claude_tools.is_empty() {
+            let mut claude_tools = claude_tools;
+            // Add cache_control to last tool
+            let last_idx = claude_tools.len() - 1;
+            claude_tools[last_idx]["cache_control"] =
+                serde_json::json!({ "type": "ephemeral", "ttl": "1h" });
+            result["tools"] = Value::Array(claude_tools);
+        }
     }
     *body = result;
     Ok(())
@@ -847,7 +1222,10 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Option<Vec<Value>> {
         if ty == Some("text") {
             blocks.push(serde_json::json!({ "type": "text", "text": c.get("text") }));
         } else if ty == Some("image_url") {
-            let url = c.get("image_url").and_then(|u| u.get("url").and_then(Value::as_str)).unwrap_or("");
+            let url = c
+                .get("image_url")
+                .and_then(|u| u.get("url").and_then(Value::as_str))
+                .unwrap_or("");
             if url.starts_with("data:") {
                 let rest = url.strip_prefix("data:").unwrap_or("");
                 let (media, b64) = rest.split_once(";base64,").unwrap_or(("image/png", ""));
@@ -959,7 +1337,10 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
             openai_parts.push(serde_json::json!({ "type": "text", "text": part.get("text") }));
         }
         if let Some(inline) = part.get("inlineData") {
-            let mime = inline.get("mimeType").and_then(Value::as_str).unwrap_or("image/png");
+            let mime = inline
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
             let data = inline.get("data").and_then(Value::as_str).unwrap_or("");
             openai_parts.push(serde_json::json!({
                 "type": "image_url",
@@ -967,7 +1348,10 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
             }));
         }
         if let Some(fc) = part.get("functionCall") {
-            let id = fc.get("id").cloned().unwrap_or_else(|| serde_json::json!(format!("call_{}", uuid_simple())));
+            let id = fc
+                .get("id")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(format!("call_{}", uuid_simple())));
             tool_calls.push(serde_json::json!({
                 "id": id,
                 "type": "function",
@@ -995,8 +1379,13 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
     if !tool_calls.is_empty() {
         let mut m = serde_json::json!({ "role": "assistant", "tool_calls": tool_calls });
         if !openai_parts.is_empty() {
-            m["content"] = if openai_parts.len() == 1 && openai_parts[0].get("type").and_then(Value::as_str) == Some("text") {
-                openai_parts[0].get("text").cloned().unwrap_or(Value::String(String::new()))
+            m["content"] = if openai_parts.len() == 1
+                && openai_parts[0].get("type").and_then(Value::as_str) == Some("text")
+            {
+                openai_parts[0]
+                    .get("text")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()))
             } else {
                 Value::Array(openai_parts)
             };
@@ -1006,8 +1395,13 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
     if openai_parts.is_empty() {
         return None;
     }
-    let content = if openai_parts.len() == 1 && openai_parts[0].get("type").and_then(Value::as_str) == Some("text") {
-        openai_parts[0].get("text").cloned().unwrap_or(Value::String(String::new()))
+    let content = if openai_parts.len() == 1
+        && openai_parts[0].get("type").and_then(Value::as_str) == Some("text")
+    {
+        openai_parts[0]
+            .get("text")
+            .cloned()
+            .unwrap_or(Value::String(String::new()))
     } else {
         Value::Array(openai_parts)
     };
@@ -1016,7 +1410,10 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
 
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     format!("{:x}", t)
 }
 
@@ -1036,7 +1433,10 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
     if let Some(p) = body.get("top_p") {
         result["generationConfig"]["topP"] = p.clone();
     }
-    let messages = body.get("messages").and_then(Value::as_array).ok_or("missing messages")?;
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("missing messages")?;
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
         if role == "system" {
@@ -1092,7 +1492,10 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
         }
         if role == "tool" {
             let call_id = msg.get("tool_call_id").cloned();
-            let content = msg.get("content").cloned().unwrap_or(Value::String(String::new()));
+            let content = msg
+                .get("content")
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
             result["contents"]
                 .as_array_mut()
                 .unwrap()
@@ -1146,8 +1549,14 @@ fn openai_content_to_gemini_parts(content: Option<&Value>) -> Vec<Value> {
                 parts.push(serde_json::json!({ "text": t }));
             }
         } else if c.get("type").and_then(Value::as_str) == Some("image_url") {
-            let url = c.get("image_url").and_then(|u| u.get("url").and_then(Value::as_str)).unwrap_or("");
-            if let Some((mime, data)) = url.strip_prefix("data:").and_then(|r| r.split_once(";base64,")) {
+            let url = c
+                .get("image_url")
+                .and_then(|u| u.get("url").and_then(Value::as_str))
+                .unwrap_or("");
+            if let Some((mime, data)) = url
+                .strip_prefix("data:")
+                .and_then(|r| r.split_once(";base64,"))
+            {
                 parts.push(serde_json::json!({
                     "inlineData": { "mimeType": mime, "data": data }
                 }));
@@ -1214,7 +1623,8 @@ mod tests {
 
     #[test]
     fn translate_request_same_format_passthrough() {
-        let mut body = json!({ "model": "gpt-4o", "messages": [{ "role": "user", "content": "Hi" }] });
+        let mut body =
+            json!({ "model": "gpt-4o", "messages": [{ "role": "user", "content": "Hi" }] });
         let orig = body.clone();
         translate_request(
             UpstreamFormat::OpenAiCompletion,
@@ -1262,9 +1672,17 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(body["system"], "Sys");
+        // System should be array with cache_control on last block
+        let system = body
+            .get("system")
+            .and_then(Value::as_array)
+            .expect("system should be array");
+        assert!(!system.is_empty());
+        assert_eq!(system[0]["text"], "Sys");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(system[0]["cache_control"]["ttl"], "1h");
         assert!(body.get("messages").is_some());
-        assert!(body["messages"].as_array().unwrap().len() >= 1);
+        assert!(!body["messages"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1337,6 +1755,104 @@ mod tests {
         )
         .unwrap();
         assert!(out.get("content").is_some());
-        assert!(out["content"].as_array().unwrap().iter().any(|b| b.get("type").and_then(Value::as_str) == Some("text")));
+        assert!(out["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.get("type").and_then(Value::as_str) == Some("text")));
+    }
+
+    #[test]
+    fn translate_response_responses_to_openai_maps_usage_fields() {
+        let body = json!({
+            "id": "resp_1",
+            "object": "response",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Hi" }]
+            }],
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+                "input_tokens_details": { "cached_tokens": 3 },
+                "output_tokens_details": { "reasoning_tokens": 2 }
+            }
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["usage"]["prompt_tokens"], 11);
+        assert_eq!(out["usage"]["completion_tokens"], 7);
+        assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            out["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_maps_usage_fields() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 18,
+                "prompt_tokens_details": { "cached_tokens": 3 },
+                "completion_tokens_details": { "reasoning_tokens": 2 }
+            }
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["usage"]["input_tokens"], 11);
+        assert_eq!(out["usage"]["output_tokens"], 7);
+        assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(out["usage"]["output_tokens_details"]["reasoning_tokens"], 2);
+    }
+
+    #[test]
+    fn translate_response_openai_to_gemini_maps_usage_fields() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 18,
+                "prompt_tokens_details": { "cached_tokens": 3 },
+                "completion_tokens_details": { "reasoning_tokens": 2 }
+            }
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["usageMetadata"]["promptTokenCount"], 11);
+        assert_eq!(out["usageMetadata"]["candidatesTokenCount"], 5);
+        assert_eq!(out["usageMetadata"]["thoughtsTokenCount"], 2);
+        assert_eq!(out["usageMetadata"]["cachedContentTokenCount"], 3);
     }
 }

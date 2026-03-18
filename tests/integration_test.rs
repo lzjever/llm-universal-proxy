@@ -3,12 +3,15 @@
 
 mod common;
 
+use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use common::*;
 use llm_universal_proxy::config::Config;
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::run_with_listener;
 use reqwest::Client;
 use serde_json::json;
+use serde_json::Value;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -18,11 +21,18 @@ fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
         upstream_url: upstream_base.to_string(),
         fixed_upstream_format: Some(format),
         upstream_timeout: Duration::from_secs(30),
+        upstream_api_key: None,
+        upstream_headers: Vec::new(),
     }
 }
 
 /// Start proxy with config; returns (proxy_base_url, _handle).
-async fn start_proxy(config: Config) -> (String, tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>) {
+async fn start_proxy(
+    config: Config,
+) -> (
+    String,
+    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let base = format!("http://127.0.0.1:{}", port);
@@ -53,6 +63,36 @@ async fn upstream_openai_completion_passthrough_non_streaming() {
     assert_eq!(body["object"], "chat.completion");
     assert!(body.get("choices").and_then(|c| c.get(0)).is_some());
     assert_eq!(body["choices"][0]["message"]["content"], "Hi"); // mock returns "Hi"
+}
+
+#[tokio::test]
+async fn openai_completion_omitted_stream_defaults_to_non_streaming() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let ct = res
+        .headers()
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        !ct.contains("event-stream"),
+        "default stream should be false"
+    );
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
 }
 
 #[tokio::test]
@@ -173,10 +213,93 @@ async fn upstream_openai_responses_passthrough_non_streaming() {
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["object"], "response");
     assert_eq!(body["status"], "completed");
+    assert_eq!(body["usage"]["input_tokens"], 1);
+    assert_eq!(body["usage"]["output_tokens"], 1);
     let output = body["output"].as_array().unwrap();
     let msg = output.iter().find(|o| o["type"] == "message").unwrap();
-    let text_part = msg["content"].as_array().unwrap().iter().find(|p| p["type"] == "output_text").unwrap();
+    let text_part = msg["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["type"] == "output_text")
+        .unwrap();
     assert_eq!(text_part["text"], "Hi");
+}
+
+#[derive(Clone, Default)]
+struct CapturedHeaders {
+    headers: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+async fn spawn_header_capture_anthropic_mock(
+) -> (String, tokio::task::JoinHandle<()>, CapturedHeaders) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+    let state = CapturedHeaders::default();
+    let app = Router::new()
+        .route("/messages", post(capture_anthropic_handler))
+        .with_state(state.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle, state)
+}
+
+async fn capture_anthropic_handler(
+    State(state): State<CapturedHeaders>,
+    headers: HeaderMap,
+    Json(_body): Json<Value>,
+) -> impl axum::response::IntoResponse {
+    let captured = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect::<Vec<_>>();
+    *state.headers.lock().unwrap() = captured;
+    (
+        axum::http::StatusCode::OK,
+        Json(json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "Hi" }],
+            "model": "claude-3",
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        })),
+    )
+}
+
+#[tokio::test]
+async fn upstream_anthropic_injects_required_version_header() {
+    let (mock_base, _mock, captured) = spawn_header_capture_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+
+    let headers = captured.headers.lock().unwrap();
+    let version = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-version"))
+        .map(|(_, value)| value.clone());
+    assert_eq!(version.as_deref(), Some("2023-06-01"));
 }
 
 #[tokio::test]
@@ -198,7 +321,9 @@ async fn upstream_openai_completion_streaming_passthrough() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     assert_eq!(
-        res.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+        res.headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok()),
         Some("text/event-stream")
     );
     let text = res.text().await.unwrap();
@@ -225,12 +350,16 @@ async fn upstream_anthropic_streaming_translated_to_openai() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     assert_eq!(
-        res.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+        res.headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok()),
         Some("text/event-stream")
     );
     let text = res.text().await.unwrap();
     assert!(text.contains("data:"));
-    assert!(text.contains("chat.completion.chunk") || text.contains("Hi") || text.contains("[DONE]"));
+    assert!(
+        text.contains("chat.completion.chunk") || text.contains("Hi") || text.contains("[DONE]")
+    );
 }
 
 #[tokio::test]
@@ -298,11 +427,15 @@ async fn upstream_openai_responses_streaming_passthrough() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     assert_eq!(
-        res.headers().get("Content-Type").and_then(|v| v.to_str().ok()),
+        res.headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok()),
         Some("text/event-stream")
     );
     let text = res.text().await.unwrap();
-    assert!(text.contains("response.created") || text.contains("output_text") || text.contains("Hi"));
+    assert!(
+        text.contains("response.created") || text.contains("output_text") || text.contains("Hi")
+    );
 }
 
 #[tokio::test]
@@ -312,7 +445,11 @@ async fn health_returns_ok() {
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let client = Client::new();
-    let res = client.get(format!("{}/health", proxy_base)).send().await.unwrap();
+    let res = client
+        .get(format!("{}/health", proxy_base))
+        .send()
+        .await
+        .unwrap();
     assert!(res.status().is_success());
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["status"], "ok");
@@ -334,7 +471,11 @@ async fn post_invalid_json_returns_422_or_400() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_client_error(), "expected 4xx, got {}", res.status());
+    assert!(
+        res.status().is_client_error(),
+        "expected 4xx, got {}",
+        res.status()
+    );
 }
 
 #[tokio::test]
@@ -351,7 +492,11 @@ async fn post_empty_body_returns_4xx() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success() || res.status().is_client_error(), "got {}", res.status());
+    assert!(
+        res.status().is_success() || res.status().is_client_error(),
+        "got {}",
+        res.status()
+    );
 }
 
 #[tokio::test]
@@ -361,6 +506,8 @@ async fn upstream_unreachable_returns_502() {
         upstream_url: "http://127.0.0.1:31999".to_string(),
         fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
         upstream_timeout: Duration::from_millis(100),
+        upstream_api_key: None,
+        upstream_headers: Vec::new(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -371,7 +518,11 @@ async fn upstream_unreachable_returns_502() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status().as_u16(), 502, "expected 502 Bad Gateway when upstream unreachable");
+    assert_eq!(
+        res.status().as_u16(),
+        502,
+        "expected 502 Bad Gateway when upstream unreachable"
+    );
 }
 
 #[tokio::test]
@@ -407,8 +558,15 @@ async fn openai_completion_non_streaming_explicit_false() {
         .await
         .unwrap();
     assert!(res.status().is_success());
-    let ct = res.headers().get("Content-Type").and_then(|v| v.to_str().ok()).unwrap_or("");
-    assert!(!ct.contains("event-stream"), "non-streaming must not return SSE");
+    let ct = res
+        .headers()
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        !ct.contains("event-stream"),
+        "non-streaming must not return SSE"
+    );
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "Hi");
 }
@@ -431,11 +589,15 @@ async fn upstream_google_streaming_client_openai() {
         .await
         .unwrap();
     assert!(res.status().is_success());
+    assert_eq!(
+        res.headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
     let text = res.text().await.unwrap();
-    let has_sse = text.contains("data:");
-    let parsed: Option<serde_json::Value> = serde_json::from_str(&text).ok();
-    let has_choices = parsed.as_ref().and_then(|b| b.get("choices").and_then(|c| c.as_array())).map(|a| !a.is_empty()).unwrap_or(false);
-    let has_candidates = parsed.as_ref().and_then(|b| b.get("candidates").and_then(|c| c.as_array())).map(|a| !a.is_empty()).unwrap_or(false);
-    // When proxy does not send stream to Gemini, mock returns JSON; proxy may forward as stream and translation may yield empty. Accept any success response.
-    assert!(has_sse || has_choices || has_candidates || text.is_empty(), "expected SSE, OpenAI choices, or Gemini candidates");
+    assert!(text.contains("data:"));
+    assert!(
+        text.contains("chat.completion.chunk") || text.contains("Hi") || text.contains("[DONE]")
+    );
 }
