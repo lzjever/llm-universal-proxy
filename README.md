@@ -18,7 +18,18 @@ A single-binary HTTP proxy that provides a unified interface for Large Language 
 - **Concurrent Requests**: Asynchronous handling for high performance
 - **Named Upstreams**: Route requests to multiple upstream providers from one proxy instance
 - **Local Model Aliases**: Expose one unique local model name for any upstream model
+- **Audit Hooks**: Optional async `exchange` / `usage` HTTP hooks for request-response capture and metering
+- **Credential Policy**: Supports fallback credentials, direct configured credentials, and force-server auth
 - **Codex CLI Friendly**: Works as a Responses-compatible endpoint in front of Anthropic-compatible upstreams
+- **Model Unification Layer**: Map models from different providers to one stable local naming scheme, such as `opus`, `sonnet`, `haiku`, or team-specific coding aliases
+
+## Why It Is Useful
+
+- **One stable model namespace across providers**: You can map models from different vendors into one local naming layer. For example, different upstream models can be exposed as stable names such as `opus`, `sonnet`, `haiku`, or any team-specific alias. That makes tools that assume fixed model names easier to operate.
+- **Useful for Claude Code style workflows**: If you want Claude-style routing semantics but your real upstreams come from different vendors, the proxy can present a consistent set of local model names while routing to whichever provider you choose underneath.
+- **Useful for modern Codex CLI**: Newer Codex CLI versions only speak the OpenAI Responses API. This proxy lets Codex use upstreams that speak Anthropic Messages, OpenAI Chat Completions, or other non-Responses-compatible APIs. That is especially useful when you want to use coding-capable providers such as GLM, MiniMax, or Kimi behind a Responses-only client.
+- **Cross-provider protocol bridge**: You can place Anthropic-compatible, OpenAI-compatible, and Gemini-style upstreams behind one consistent interface instead of teaching each client multiple protocols.
+- **Built-in observability for analysis**: `usage` hooks export metering data; `exchange` hooks export full client-facing query/response pairs. That makes it practical to persist production traffic for auditing, analytics, evaluation, or later model-training pipelines.
 
 ## Installation
 
@@ -60,22 +71,37 @@ upstreams:
     base_url: https://open.bigmodel.cn/api/anthropic
     format: anthropic
     credential_env: GLM_APIKEY
+    auth_policy: client_or_fallback
 
   OPENAI:
     base_url: https://api.openai.com
     format: openai-responses
     credential_env: OPENAI_API_KEY
+    auth_policy: force_server
 
 model_aliases:
   GLM-5: GLM-OFFICIAL:GLM-5
   gpt-4o: OPENAI:gpt-4o
+
+hooks:
+  max_pending_bytes: 104857600
+  timeout_secs: 30
+  failure_threshold: 3
+  cooldown_secs: 300
+  usage:
+    url: https://example.com/hooks/usage
+  exchange:
+    url: https://example.com/hooks/exchange
 ```
 
 Notes:
-- Best practice is to keep upstream `base_url` versionless. The proxy appends `/v1` or `/v1beta` internally.
+- Best practice is to keep upstream `base_url` versionless. The proxy appends `/v1` or `/v1beta` internally, but it also supports compatibility roots that already contain a version segment such as `.../api/paas/v4`.
 - Anthropic-compatible upstreams usually require `x-api-key` and `anthropic-version`. The proxy forwards client auth headers when present, can fall back to the upstream's configured `credential_env`, and injects a default `anthropic-version: 2023-06-01` header for Anthropic upstreams.
 - Provider-specific headers belong inside each upstream entry's `headers` object.
 - `credential_env` is the environment variable name holding that upstream's fallback credential. The secret stays out of the YAML file.
+- `credential_actual` can be used instead of `credential_env` when you want to place a fallback credential directly in YAML. `credential_env` and `credential_actual` are mutually exclusive.
+- `auth_policy` supports `client_or_fallback` and `force_server`.
+- Hooks are best-effort and asynchronous. `usage` is usually enough; `exchange` captures the full client-facing request/response pair after the request completes.
 
 ## Usage
 
@@ -91,11 +117,13 @@ upstreams:
     base_url: https://open.bigmodel.cn/api/anthropic
     format: anthropic
     credential_env: GLM_APIKEY
+    auth_policy: client_or_fallback
 
   OPENAI:
     base_url: https://api.openai.com
     format: openai-responses
     credential_env: OPENAI_API_KEY
+    auth_policy: force_server
 
 model_aliases:
   GLM-5: GLM-OFFICIAL:GLM-5
@@ -113,6 +141,21 @@ Clients can then select a model in either of these ways:
 - Local alias: `GLM-5`
 
 If more than one upstream is configured and a model is not an explicit `upstream:model` reference or a configured alias, the proxy returns `400`.
+
+### Stable Local Model Names
+
+One practical pattern is to expose a provider-neutral local naming layer and hide vendor-specific model IDs behind it:
+
+```yaml
+model_aliases:
+  opus: ANTHROPIC:claude-opus-4-1
+  sonnet: ANTHROPIC:claude-sonnet-4
+  haiku: ANTHROPIC:claude-haiku-4
+  coder-fast: GLM-OFFICIAL:GLM-4.5-Air
+  coder-strong: KIMI:kimi-k2
+```
+
+Clients can then request `opus`, `sonnet`, `haiku`, `coder-fast`, or `coder-strong` without caring which upstream vendor actually serves the request.
 
 ### Codex CLI to an Anthropic-Compatible Upstream
 
@@ -154,7 +197,24 @@ HOME="$(mktemp -d)" GLM_APIKEY="your-real-key" codex exec --ephemeral \
 Notes:
 - This does not modify your global Codex CLI configuration because it uses a temporary `HOME` and `--ephemeral`.
 - The client talks OpenAI Responses to the proxy at `/v1/responses`; the proxy resolves local model `GLM-5` to `GLM-OFFICIAL:GLM-5`, then translates upstream to Anthropic Messages.
-- For providers that need extra static headers beyond the Anthropic default, set the upstream's `headers` field in `UPSTREAMS`.
+- For providers that need extra static headers beyond the Anthropic default, set the upstream's `headers` field in the matching upstream entry.
+
+### Real Upstream Smoke Matrix
+
+The repository includes a real smoke script that exercises Anthropic-compatible and OpenAI-compatible upstreams through the proxy:
+
+```bash
+GLM_APIKEY="your-real-key" python3 scripts/real_endpoint_matrix.py
+```
+
+It covers these client entrypoints:
+- `/v1/chat/completions`
+- `/v1/responses`
+- `/v1/messages`
+
+And validates both non-streaming and streaming paths against:
+- Anthropic-compatible upstreams
+- OpenAI-compatible upstreams
 
 ### Docker
 
@@ -175,6 +235,7 @@ docker run -p 8080:8080 \
 |----------|-------------|
 | `POST /v1/chat/completions` | Main endpoint accepting all 4 formats |
 | `POST /v1/responses` | OpenAI Responses API endpoint |
+| `POST /v1/messages` | Anthropic Messages API endpoint |
 | `GET /health` | Health check (returns `{"status":"ok"}`) |
 
 ### Example Requests

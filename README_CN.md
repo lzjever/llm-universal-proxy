@@ -18,7 +18,18 @@
 - **并发请求**：异步处理，高性能
 - **命名上游**：一个代理实例可同时连接多个上游
 - **本地模型别名**：可为任意上游模型暴露一个本地唯一模型名
+- **审计 Hooks**：可选异步 `exchange` / `usage` HTTP hooks，用于请求响应审计与用量统计
+- **凭证策略**：支持 fallback credential、直接配置 credential，以及强制使用服务端凭证
 - **兼容 Codex CLI**：可作为 Responses 兼容入口，前接 Anthropic 兼容上游
+- **模型统一层**：可把不同供应商的真实模型，映射成稳定的本地模型名，例如 `opus`、`sonnet`、`haiku`
+
+## 这个代理为什么有用
+
+- **给不同供应商建立统一模型命名空间**：你可以把不同来源的模型统一映射成稳定的本地名字，例如 `opus`、`sonnet`、`haiku`，或者团队内部自己的 coding model 名称。这样很多依赖固定模型名的工具会更容易接入。
+- **适合 Claude Code 风格的使用方式**：如果你希望上层工具始终使用一组固定模型名，但底层真实模型来自不同厂商，这个代理可以把这层差异收掉。
+- **适合新版 Codex CLI**：新版 Codex CLI 只支持 OpenAI Responses API，不再支持 Completions。通过这个代理，Codex 仍然可以使用 Anthropic Messages、OpenAI Chat Completions，或者其他非 Responses 兼容接口。这对接入 GLM、MiniMax、Kimi 这类 coding 能力很强的模型特别有用。
+- **跨协议统一入口**：你可以把 Anthropic 兼容、OpenAI 兼容、Gemini 风格的上游统一放到一个接口后面，而不是让每个客户端分别适配多套协议。
+- **自带可观测性和数据导出能力**：`usage` hook 可以导出用量统计；`exchange` hook 可以导出完整的 client-facing query/response pair。这样就可以把线上数据持久化，用于分析、评估、审计，或者后续模型训练流程。
 
 ## 安装
 
@@ -60,22 +71,37 @@ upstreams:
     base_url: https://open.bigmodel.cn/api/anthropic
     format: anthropic
     credential_env: GLM_APIKEY
+    auth_policy: client_or_fallback
 
   OPENAI:
     base_url: https://api.openai.com
     format: openai-responses
     credential_env: OPENAI_API_KEY
+    auth_policy: force_server
 
 model_aliases:
   GLM-5: GLM-OFFICIAL:GLM-5
   gpt-4o: OPENAI:gpt-4o
+
+hooks:
+  max_pending_bytes: 104857600
+  timeout_secs: 30
+  failure_threshold: 3
+  cooldown_secs: 300
+  usage:
+    url: https://example.com/hooks/usage
+  exchange:
+    url: https://example.com/hooks/exchange
 ```
 
 说明：
-- 最佳实践是让上游 `base_url` 不带协议版本号。代理会在内部按协议补上 `/v1` 或 `/v1beta`。
+- 最佳实践是让上游 `base_url` 不带协议版本号。代理会在内部按协议补上 `/v1` 或 `/v1beta`，但也兼容已经带版本根路径的兼容地址，例如 `.../api/paas/v4`。
 - Anthropic 兼容上游通常要求 `x-api-key` 和 `anthropic-version`。代理会优先透传客户端鉴权头；若客户端没有提供，可回退到该上游配置的 `credential_env`，并会为 Anthropic 上游默认补上 `anthropic-version: 2023-06-01`。
 - 服务商特定静态头应配置在 `upstreams` 中对应上游的 `headers` 字段里。
 - `credential_env` 表示“去哪个环境变量读取该上游的 fallback credential”，密钥本身不写进 YAML。
+- `credential_actual` 可用于直接在 YAML 中写 fallback credential；它与 `credential_env` 互斥。
+- `auth_policy` 支持 `client_or_fallback` 和 `force_server`。
+- hooks 是异步 best-effort 模式。通常只开 `usage` 就够；`exchange` 会在请求结束后上报完整的 client-facing request/response pair。
 
 ## 使用方法
 
@@ -114,6 +140,21 @@ export OPENAI_API_KEY="你的 OpenAI Key"
 
 如果配置了多个上游，而模型既不是显式 `上游名:模型名`，也不是已配置的本地 alias，代理会返回 `400`。
 
+### 稳定的本地模型命名
+
+一个很实用的模式是：对外暴露一层与供应商无关的本地模型名，把真实的厂商模型 ID 隐藏在后面：
+
+```yaml
+model_aliases:
+  opus: ANTHROPIC:claude-opus-4-1
+  sonnet: ANTHROPIC:claude-sonnet-4
+  haiku: ANTHROPIC:claude-haiku-4
+  coder-fast: GLM-OFFICIAL:GLM-4.5-Air
+  coder-strong: KIMI:kimi-k2
+```
+
+这样客户端只需要请求 `opus`、`sonnet`、`haiku`、`coder-fast`、`coder-strong`，不需要关心底层到底接的是哪家模型。
+
 ### 通过 Codex CLI 使用 Anthropic 兼容上游
 
 这是一个真实可用的场景：客户端是 Codex CLI，只会发 OpenAI Responses API；真实上游却是 Anthropic Messages 兼容接口。
@@ -129,6 +170,7 @@ upstreams:
     base_url: https://open.bigmodel.cn/api/anthropic
     format: anthropic
     credential_env: GLM_APIKEY
+    auth_policy: client_or_fallback
 
 model_aliases:
   GLM-5: GLM-OFFICIAL:GLM-5
@@ -153,7 +195,26 @@ HOME="$(mktemp -d)" GLM_APIKEY="你的真实 Key" codex exec --ephemeral \
 说明：
 - 这里用了临时 `HOME` 和 `--ephemeral`，不会污染你全局的 Codex CLI 配置。
 - 客户端访问的是代理的 `/v1/responses`；代理会先把本地模型名 `GLM-5` 解析成 `GLM-OFFICIAL:GLM-5`，再转换成 Anthropic Messages 发给上游。
-- 如果上游还需要额外静态协议头，可以在 `UPSTREAMS` 的对应上游里配置 `headers`。
+- 如果上游还需要额外静态协议头，可以在对应 upstream 条目里配置 `headers`。
+
+### 真实上游 Smoke 矩阵
+
+仓库里带了一个真实 smoke 脚本，可通过代理联调 Anthropic 兼容和 OpenAI 兼容上游：
+
+```bash
+GLM_APIKEY="你的真实 Key" python3 scripts/real_endpoint_matrix.py
+```
+
+覆盖的客户端入口包括：
+- `/v1/chat/completions`
+- `/v1/responses`
+- `/v1/messages`
+
+同时验证：
+- 非流式路径
+- 流式路径
+- Anthropic 兼容上游
+- OpenAI 兼容上游
 
 ### Docker
 
@@ -174,6 +235,7 @@ docker run -p 8080:8080 \
 |------|------|
 | `POST /v1/chat/completions` | 主端点，接受所有 4 种格式 |
 | `POST /v1/responses` | OpenAI Responses API 端点 |
+| `POST /v1/messages` | Anthropic Messages API 端点 |
 | `GET /health` | 健康检查（返回 `{"status":"ok"}`） |
 
 ### 示例请求
