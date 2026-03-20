@@ -5,10 +5,10 @@ use llm_universal_proxy::formats::UpstreamFormat;
 use serde_json::json;
 
 #[test]
-fn path_v1_responses_is_openai_responses() {
+fn path_openai_responses_is_openai_responses() {
     let body = json!({});
     assert_eq!(
-        detect_request_format("/v1/responses", &body),
+        detect_request_format("/openai/v1/responses", &body),
         UpstreamFormat::OpenAiResponses
     );
 }
@@ -17,7 +17,7 @@ fn path_v1_responses_is_openai_responses() {
 fn path_chat_completions_with_input_array_is_openai_responses() {
     let body = json!({ "input": [], "model": "gpt-4o" });
     assert_eq!(
-        detect_request_format("/v1/chat/completions", &body),
+        detect_request_format("/openai/v1/chat/completions", &body),
         UpstreamFormat::OpenAiResponses
     );
 }
@@ -28,7 +28,7 @@ fn body_contents_is_google() {
         "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
     });
     assert_eq!(
-        detect_request_format("/v1/chat/completions", &body),
+        detect_request_format("/google/v1beta/models/gemini-local:generateContent", &body),
         UpstreamFormat::Google
     );
 }
@@ -40,7 +40,7 @@ fn body_system_with_messages_is_anthropic() {
         "system": "You are helpful."
     });
     assert_eq!(
-        detect_request_format("/v1/chat/completions", &body),
+        detect_request_format("/openai/v1/chat/completions", &body),
         UpstreamFormat::Anthropic
     );
 }
@@ -52,7 +52,7 @@ fn body_response_format_is_openai_completion() {
         "response_format": { "type": "json_object" }
     });
     assert_eq!(
-        detect_request_format("/v1/chat/completions", &body),
+        detect_request_format("/openai/v1/chat/completions", &body),
         UpstreamFormat::OpenAiCompletion
     );
 }
@@ -64,7 +64,7 @@ fn default_messages_only_is_openai_completion() {
         "model": "gpt-4o"
     });
     assert_eq!(
-        detect_request_format("/v1/chat/completions", &body),
+        detect_request_format("/openai/v1/chat/completions", &body),
         UpstreamFormat::OpenAiCompletion
     );
 }

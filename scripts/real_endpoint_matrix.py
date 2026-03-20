@@ -75,12 +75,12 @@ listen: 127.0.0.1:{listen_port}
 upstream_timeout_secs: 120
 upstreams:
   GLM-ANTHROPIC:
-    base_url: {json.dumps(anthropic_base)}
+    api_root: {json.dumps(anthropic_base)}
     format: anthropic
     credential_actual: {json.dumps(anthropic_key)}
     auth_policy: force_server
   GLM-OPENAI:
-    base_url: {json.dumps(openai_base)}
+    api_root: {json.dumps(openai_base)}
     format: openai-completion
     credential_actual: {json.dumps(openai_key)}
     auth_policy: force_server
@@ -94,35 +94,35 @@ model_aliases:
 def run_matrix(base_url: str) -> None:
     expect_json_case(
         base_url,
-        "/v1/chat/completions",
+        "/openai/v1/chat/completions",
         {"model": "glm-anthropic", "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": False},
         '"content": "OK',
         "anthropic upstream via chat completions",
     )
     expect_json_case(
         base_url,
-        "/v1/responses",
+        "/openai/v1/responses",
         {"model": "glm-anthropic", "input": "Reply with exactly OK", "stream": False},
         '"text": "OK',
         "anthropic upstream via responses",
     )
     expect_json_case(
         base_url,
-        "/v1/messages",
+        "/anthropic/v1/messages",
         {"model": "glm-anthropic", "max_tokens": 32, "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": False},
         '"text": "OK',
         "anthropic upstream via messages",
     )
     expect_sse_case(
         base_url,
-        "/v1/responses",
+        "/openai/v1/responses",
         {"model": "glm-anthropic", "input": "Reply with exactly OK", "stream": True},
         ["response.completed", "OK"],
         "anthropic upstream via responses stream",
     )
     expect_sse_case(
         base_url,
-        "/v1/messages",
+        "/anthropic/v1/messages",
         {"model": "glm-anthropic", "max_tokens": 32, "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": True},
         ["message_start", "message_stop"],
         "anthropic upstream via messages stream",
@@ -130,42 +130,42 @@ def run_matrix(base_url: str) -> None:
 
     expect_json_case(
         base_url,
-        "/v1/chat/completions",
+        "/openai/v1/chat/completions",
         {"model": "glm-openai", "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": False},
         '"content": "OK',
         "openai upstream via chat completions",
     )
     expect_json_case(
         base_url,
-        "/v1/responses",
+        "/openai/v1/responses",
         {"model": "glm-openai", "input": "Reply with exactly OK", "stream": False},
         '"text": "OK',
         "openai upstream via responses",
     )
     expect_json_case(
         base_url,
-        "/v1/messages",
+        "/anthropic/v1/messages",
         {"model": "glm-openai", "max_tokens": 32, "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": False},
         ['"type": "message"', '"role": "assistant"'],
         "openai upstream via messages",
     )
     expect_sse_case(
         base_url,
-        "/v1/chat/completions",
+        "/openai/v1/chat/completions",
         {"model": "glm-openai", "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": True},
         ["data:", "[DONE]"],
         "openai upstream via chat completions stream",
     )
     expect_sse_case(
         base_url,
-        "/v1/responses",
+        "/openai/v1/responses",
         {"model": "glm-openai", "input": "Reply with exactly OK", "stream": True},
         ["response.completed", "OK"],
         "openai upstream via responses stream",
     )
     expect_sse_case(
         base_url,
-        "/v1/messages",
+        "/anthropic/v1/messages",
         {"model": "glm-openai", "max_tokens": 32, "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": True},
         ["message_start", "message_stop"],
         "openai upstream via messages stream",
@@ -175,7 +175,7 @@ def run_matrix(base_url: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="./target/debug/llm-universal-proxy")
-    parser.add_argument("--anthropic-base-url", default=os.environ.get("ANTHROPIC_UPSTREAM_BASE_URL", "https://open.bigmodel.cn/api/anthropic"))
+    parser.add_argument("--anthropic-base-url", default=os.environ.get("ANTHROPIC_UPSTREAM_BASE_URL", "https://open.bigmodel.cn/api/anthropic/v1"))
     parser.add_argument("--openai-base-url", default=os.environ.get("OPENAI_UPSTREAM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"))
     parser.add_argument("--anthropic-model", default=os.environ.get("ANTHROPIC_UPSTREAM_MODEL", "GLM-5"))
     parser.add_argument("--openai-model", default=os.environ.get("OPENAI_UPSTREAM_MODEL", "glm-4.7-flash"))

@@ -194,6 +194,22 @@ pub struct HookDispatcher {
 }
 
 #[derive(Debug, Clone)]
+pub struct HookSnapshot {
+    pub pending_bytes: usize,
+    pub max_pending_bytes: usize,
+    pub failure_threshold: usize,
+    pub exchange: CircuitSnapshot,
+    pub usage: CircuitSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct CircuitSnapshot {
+    pub consecutive_failures: usize,
+    pub open: bool,
+    pub remaining_cooldown_secs: u64,
+}
+
+#[derive(Debug, Clone)]
 struct HookSender {
     client: reqwest::Client,
     config: HookEndpointConfig,
@@ -329,6 +345,17 @@ impl HookDispatcher {
         })
     }
 
+    pub fn snapshot(&self) -> HookSnapshot {
+        let breaker = self.runtime.breaker.lock().unwrap();
+        HookSnapshot {
+            pending_bytes: self.runtime.pending_bytes.load(Ordering::Relaxed),
+            max_pending_bytes: self.runtime.max_pending_bytes,
+            failure_threshold: self.runtime.failure_threshold,
+            exchange: CircuitSnapshot::from_state(&breaker.exchange),
+            usage: CircuitSnapshot::from_state(&breaker.usage),
+        }
+    }
+
     pub fn emit_non_stream(
         &self,
         ctx: HookRequestContext,
@@ -443,6 +470,22 @@ impl HookDispatcher {
             "usage": usage,
         });
         sender.spawn_send(payload);
+    }
+}
+
+impl CircuitSnapshot {
+    fn from_state(state: &CircuitState) -> Self {
+        let now = Instant::now();
+        let remaining_cooldown_secs = state
+            .open_until
+            .and_then(|deadline| deadline.checked_duration_since(now))
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        Self {
+            consecutive_failures: state.consecutive_failures,
+            open: remaining_cooldown_secs > 0,
+            remaining_cooldown_secs,
+        }
     }
 }
 

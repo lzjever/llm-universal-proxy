@@ -68,13 +68,13 @@ upstream_timeout_secs: 120
 
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_env: GLM_APIKEY
     auth_policy: client_or_fallback
 
   OPENAI:
-    base_url: https://api.openai.com
+    api_root: https://api.openai.com/v1
     format: openai-responses
     credential_env: OPENAI_API_KEY
     auth_policy: force_server
@@ -95,7 +95,8 @@ hooks:
 ```
 
 说明：
-- 最佳实践是让上游 `base_url` 不带协议版本号。代理会在内部按协议补上 `/v1` 或 `/v1beta`，但也兼容已经带版本根路径的兼容地址，例如 `.../api/paas/v4`。
+- `api_root` 应直接填写官方上游 API root，并且必须包含版本号，例如 `https://api.openai.com/v1`、`https://api.anthropic.com/v1`、`https://generativelanguage.googleapis.com/v1beta`。
+- 代理对外只提供按协议分 namespace 的正式 API：`/openai/v1/...`、`/anthropic/v1/...`、`/google/v1beta/...`。旧的混合 `/v1/...` 路由刻意不再提供。
 - Anthropic 兼容上游通常要求 `x-api-key` 和 `anthropic-version`。代理会优先透传客户端鉴权头；若客户端没有提供，可回退到该上游配置的 `credential_env`，并会为 Anthropic 上游默认补上 `anthropic-version: 2023-06-01`。
 - 服务商特定静态头应配置在 `upstreams` 中对应上游的 `headers` 字段里。
 - `credential_env` 表示“去哪个环境变量读取该上游的 fallback credential”，密钥本身不写进 YAML。
@@ -111,7 +112,7 @@ upstream_timeout_secs: 120
 
 upstreams:
   UPSTREAM_NAME:
-    base_url: https://example.com
+    api_root: https://example.com/v1
     format: anthropic
     credential_env: EXAMPLE_API_KEY
     # credential_actual: sk-xxx
@@ -152,7 +153,7 @@ hooks:
 ```yaml
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_env: GLM_APIKEY
 ```
@@ -161,7 +162,7 @@ upstreams:
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `base_url` | string | 是 | 无 | 上游基础 URL |
+| `api_root` | string | 是 | 无 | 包含版本号的官方上游 API root |
 | `format` | enum | 否 | 自动探测 | 固定指定上游协议格式 |
 | `credential_env` | string | 否 | 无 | 指向 fallback credential 的环境变量名 |
 | `credential_actual` | string | 否 | 无 | 直接写在 YAML 里的 fallback credential |
@@ -250,12 +251,12 @@ upstream_timeout_secs: 120
 
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_env: GLM_APIKEY
 
   OPENAI:
-    base_url: https://api.openai.com
+    api_root: https://api.openai.com/v1
     format: openai-responses
     credential_env: OPENAI_API_KEY
 
@@ -303,7 +304,7 @@ listen: 127.0.0.1:8099
 
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_env: GLM_APIKEY
     auth_policy: client_or_fallback
@@ -322,7 +323,7 @@ HOME="$(mktemp -d)" GLM_APIKEY="你的真实 Key" codex exec --ephemeral \
   -c 'model="GLM-5"' \
   -c 'model_provider="glm-proxy"' \
   -c 'model_providers.glm-proxy.name="GLM Proxy"' \
-  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:8099/v1"' \
+  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:8099/openai/v1"' \
   -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
   -c 'model_providers.glm-proxy.wire_api="responses"' \
   'Reply with exactly: codex-ok'
@@ -330,8 +331,87 @@ HOME="$(mktemp -d)" GLM_APIKEY="你的真实 Key" codex exec --ephemeral \
 
 说明：
 - 这里用了临时 `HOME` 和 `--ephemeral`，不会污染你全局的 Codex CLI 配置。
-- 客户端访问的是代理的 `/v1/responses`；代理会先把本地模型名 `GLM-5` 解析成 `GLM-OFFICIAL:GLM-5`，再转换成 Anthropic Messages 发给上游。
+- 客户端访问的是代理的 `/openai/v1/responses`；代理会先把本地模型名 `GLM-5` 解析成 `GLM-OFFICIAL:GLM-5`，再转换成 Anthropic Messages 发给上游。
 - 如果上游还需要额外静态协议头，可以在对应 upstream 条目里配置 `headers`。
+
+### 隔离的 CLI Smoke 测试
+
+下面这些模式可以让你在不碰用户级配置的前提下，用真实 CLI 通过代理做联调。所有示例都使用临时 `HOME` 和占位符密钥。
+
+先启动代理：
+
+```yaml
+listen: 127.0.0.1:18129
+upstream_timeout_secs: 120
+
+upstreams:
+  GLM-ANTHROPIC:
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
+    format: anthropic
+    credential_env: GLM_APIKEY
+    auth_policy: force_server
+
+  GLM-OPENAI:
+    api_root: https://open.bigmodel.cn/api/coding/paas/v4
+    format: openai-completion
+    credential_env: GLM_APIKEY
+    auth_policy: force_server
+
+model_aliases:
+  claude-local: GLM-ANTHROPIC:GLM-5
+  codex-local: GLM-OPENAI:glm-4.7
+  gemini-local: GLM-OPENAI:glm-4.7
+```
+
+启动命令：
+
+```bash
+GLM_APIKEY="your-real-key" ./target/release/llm-universal-proxy --config proxec-test.yaml
+```
+
+Codex CLI 通过 `/openai/v1`：
+
+```bash
+HOME="$(mktemp -d)" GLM_APIKEY=dummy codex exec --ephemeral \
+  -C /path/to/llm-universal-proxy \
+  -c 'model="codex-local"' \
+  -c 'model_provider="proxec"' \
+  -c 'model_providers.proxec.name="proxec"' \
+  -c 'model_providers.proxec.base_url="http://127.0.0.1:18129/openai/v1"' \
+  -c 'model_providers.proxec.env_key="GLM_APIKEY"' \
+  -c 'model_providers.proxec.wire_api="responses"' \
+  'Reply with exactly: codex-ok'
+```
+
+Claude Code 通过 `/anthropic/v1`：
+
+```bash
+HOME="$(mktemp -d)" \
+ANTHROPIC_API_KEY=dummy \
+ANTHROPIC_BASE_URL='http://127.0.0.1:18129/anthropic' \
+claude --print --output-format text --no-session-persistence \
+  --model claude-local \
+  'Reply with exactly: claude-ok'
+```
+
+Gemini CLI 通过 `/google/v1beta`：
+
+```bash
+HOME="$(mktemp -d)" \
+GEMINI_API_KEY=dummy \
+GOOGLE_GEMINI_BASE_URL='http://127.0.0.1:18129/google' \
+HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= \
+NO_PROXY='127.0.0.1,localhost' no_proxy='127.0.0.1,localhost' \
+gemini --prompt 'Reply with exactly: gemini-ok' \
+  --model gemini-local \
+  --sandbox=false \
+  --output-format text
+```
+
+说明：
+- 因为这里配置了 `auth_policy: force_server`，所以真正使用的是代理侧配置的上游凭证；客户端传入的 dummy key 只是为了满足各个 CLI 自身的校验。
+- 当代理跑在 `127.0.0.1` 时，Gemini CLI 建议显式清空代理环境变量；某些 Node 代理栈否则会尝试把本地流量也走全局 HTTP 代理。
+- 把 `/path/to/llm-universal-proxy` 替换成你的实际仓库路径；如果你已经在仓库目录里执行，也可以直接去掉 `-C`。
 
 ### 真实上游 Smoke 矩阵
 
@@ -342,9 +422,9 @@ GLM_APIKEY="你的真实 Key" python3 scripts/real_endpoint_matrix.py
 ```
 
 覆盖的客户端入口包括：
-- `/v1/chat/completions`
-- `/v1/responses`
-- `/v1/messages`
+- `/openai/v1/chat/completions`
+- `/openai/v1/responses`
+- `/anthropic/v1/messages`
 
 同时验证：
 - 非流式路径
@@ -369,9 +449,17 @@ docker run -p 8080:8080 \
 
 | 端点 | 描述 |
 |------|------|
-| `POST /v1/chat/completions` | 主端点，接受所有 4 种格式 |
-| `POST /v1/responses` | OpenAI Responses API 端点 |
-| `POST /v1/messages` | Anthropic Messages API 端点 |
+| `POST /openai/v1/chat/completions` | OpenAI Chat Completions 视图 |
+| `POST /openai/v1/responses` | OpenAI Responses 视图 |
+| `GET /openai/v1/models` | OpenAI 兼容本地模型目录 |
+| `GET /openai/v1/models/{id}` | OpenAI 兼容本地模型详情 |
+| `POST /anthropic/v1/messages` | Anthropic Messages 视图 |
+| `GET /anthropic/v1/models` | Anthropic 兼容本地模型目录 |
+| `GET /anthropic/v1/models/{id}` | Anthropic 兼容本地模型详情 |
+| `GET /google/v1beta/models` | Gemini 兼容本地模型目录 |
+| `GET /google/v1beta/models/{id}` | Gemini 兼容本地模型详情 |
+| `POST /google/v1beta/models/{model}:generateContent` | Gemini GenerateContent 视图 |
+| `POST /google/v1beta/models/{model}:streamGenerateContent` | Gemini 流式视图 |
 | `GET /health` | 健康检查（返回 `{"status":"ok"}`） |
 
 ### 示例请求
@@ -379,7 +467,7 @@ docker run -p 8080:8080 \
 #### OpenAI Chat Completions 格式
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8080/openai/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
@@ -392,7 +480,7 @@ curl http://localhost:8080/v1/chat/completions \
 #### Anthropic Claude 格式
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8080/anthropic/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: YOUR_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
@@ -406,7 +494,7 @@ curl http://localhost:8080/v1/chat/completions \
 #### Google Gemini 格式
 
 ```bash
-curl "http://localhost:8080/v1/chat/completions?key=YOUR_API_KEY" \
+curl "http://localhost:8080/google/v1beta/models/gemini-local:generateContent" \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [{"parts": [{"text": "Hello!"}]}]

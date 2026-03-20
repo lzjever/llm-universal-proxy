@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, Response, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -19,13 +20,14 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 
 use crate::config::{AuthPolicy, Config, UpstreamConfig};
-use crate::detect::detect_request_format;
+use crate::dashboard::run_dashboard;
 use crate::discovery::UpstreamCapability;
 use crate::hooks::{
     capture_headers, fingerprint_credential, json_response_headers, new_request_id,
     now_timestamp_ms, sse_response_headers, CredentialSource, HookDispatcher, HookRequestContext,
 };
 use crate::streaming::{needs_stream_translation, TranslateSseStream};
+use crate::telemetry::RuntimeMetrics;
 use crate::translate::{translate_request, translate_response};
 use crate::upstream;
 use futures_util::StreamExt;
@@ -37,8 +39,28 @@ pub async fn run_with_config_path(
     run_with_config(config).await
 }
 
+pub async fn run_with_config_path_and_dashboard(
+    path: impl AsRef<std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = Config::from_yaml_path(path).map_err(std::io::Error::other)?;
+    run_with_config_and_dashboard(config).await
+}
+
 pub async fn run_with_config(
     config: Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_internal(config, false).await
+}
+
+pub async fn run_with_config_and_dashboard(
+    config: Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_internal(config, true).await
+}
+
+async fn run_internal(
+    config: Config,
+    dashboard_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     config
         .validate()
@@ -56,7 +78,11 @@ pub async fn run_with_config(
         .map_err(|e| format!("listen addr: {}", e))?;
     info!("listening on {}", listen);
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    run_with_listener(config, listener).await
+    if dashboard_enabled {
+        run_with_listener_and_dashboard(config, listener).await
+    } else {
+        run_with_listener(config, listener).await
+    }
 }
 
 /// Run the proxy on an already-bound listener. Used by integration tests to bind to port 0 and get the port.
@@ -69,12 +95,54 @@ pub async fn run_with_listener(
         .map_err(|e| format!("invalid config: {}", e))?;
     let upstreams = resolve_upstreams(&config).await;
     let client = upstream::build_client(&config);
+    let metrics = RuntimeMetrics::new(&config);
     let state = Arc::new(AppState {
         config: config.clone(),
         upstreams,
         client,
         hooks: HookDispatcher::new(&config.hooks),
+        metrics,
     });
+    run_server(state, listener).await
+}
+
+pub async fn run_with_listener_and_dashboard(
+    config: Config,
+    listener: tokio::net::TcpListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    config
+        .validate()
+        .map_err(|e| format!("invalid config: {}", e))?;
+    let upstreams = resolve_upstreams(&config).await;
+    let client = upstream::build_client(&config);
+    let metrics = RuntimeMetrics::new(&config);
+    let state = Arc::new(AppState {
+        config: config.clone(),
+        upstreams,
+        client,
+        hooks: HookDispatcher::new(&config.hooks),
+        metrics: metrics.clone(),
+    });
+    let server_state = state.clone();
+    let config = Arc::new(config);
+    let dashboard_hooks = state.hooks.clone();
+    let mut server = tokio::spawn(async move { run_server(server_state, listener).await });
+    tokio::select! {
+        server_result = &mut server => {
+            server_result.map_err(|e| std::io::Error::other(e.to_string()))?
+        }
+        dashboard_result = run_dashboard(config, metrics, dashboard_hooks) => {
+            server.abort();
+            dashboard_result.map_err(std::io::Error::other)?;
+            Ok(())
+        }
+    }
+}
+
+async fn run_server(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([
@@ -86,9 +154,21 @@ pub async fn run_with_listener(
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/v1/chat/completions", post(handle_chat_completions))
-        .route("/v1/responses", post(handle_responses))
-        .route("/v1/messages", post(handle_messages))
+        .route(
+            "/openai/v1/chat/completions",
+            post(handle_openai_chat_completions),
+        )
+        .route("/openai/v1/responses", post(handle_openai_responses))
+        .route("/openai/v1/models", get(handle_openai_models))
+        .route("/openai/v1/models/:id", get(handle_openai_model))
+        .route("/anthropic/v1/messages", post(handle_anthropic_messages))
+        .route("/anthropic/v1/models", get(handle_anthropic_models))
+        .route("/anthropic/v1/models/:id", get(handle_anthropic_model))
+        .route("/google/v1beta/models", get(handle_google_models))
+        .route(
+            "/google/v1beta/models/:id",
+            get(handle_google_model).post(handle_google_model_action),
+        )
         .layer(cors)
         .with_state(state);
 
@@ -102,6 +182,7 @@ struct AppState {
     upstreams: BTreeMap<String, UpstreamState>,
     client: Client,
     hooks: Option<HookDispatcher>,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 #[derive(Clone)]
@@ -116,6 +197,49 @@ struct EffectiveCredential {
     fingerprint: Option<String>,
 }
 
+struct TrackedBodyStream<S> {
+    inner: S,
+    tracker: Option<crate::telemetry::RequestTracker>,
+    status: u16,
+}
+
+impl<S> TrackedBodyStream<S> {
+    fn new(inner: S, tracker: crate::telemetry::RequestTracker, status: u16) -> Self {
+        Self {
+            inner,
+            tracker: Some(tracker),
+            status,
+        }
+    }
+}
+
+impl<S> futures_util::Stream for TrackedBodyStream<S>
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
+            Poll::Ready(Some(Err(err))) => {
+                if let Some(mut tracker) = this.tracker.take() {
+                    tracker.finish(502);
+                }
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(None) => {
+                if let Some(mut tracker) = this.tracker.take() {
+                    tracker.finish(this.status);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }
@@ -127,7 +251,7 @@ async fn resolve_upstreams(config: &Config) -> BTreeMap<String, UpstreamState> {
             UpstreamCapability::fixed(f)
         } else {
             let supported = crate::discovery::discover_supported_formats(
-                &upstream.base_url,
+                &upstream.api_root,
                 config.upstream_timeout,
                 upstream.fallback_api_key.as_deref(),
                 &upstream.upstream_headers,
@@ -150,104 +274,196 @@ async fn resolve_upstreams(config: &Config) -> BTreeMap<String, UpstreamState> {
     upstreams
 }
 
-async fn handle_chat_completions(
+async fn handle_openai_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_chat_inner(state, headers, "/v1/chat/completions", body).await
-}
-
-async fn handle_responses(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    handle_chat_inner(state, headers, "/v1/responses", body).await
-}
-
-async fn handle_messages(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    handle_chat_inner(state, headers, "/v1/messages", body).await
-}
-
-async fn handle_chat_inner(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    path: &str,
-    mut body: Value,
-) -> impl IntoResponse {
-    let request_id = new_request_id();
-    let request_timestamp = now_timestamp_ms();
-    let original_body = body.clone();
-    let original_headers = capture_headers(&headers);
-    debug!("Request path: {}", path);
-    debug!(
-        "Request body: {}",
-        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
-    );
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    handle_request_core(
+        state,
+        headers,
+        "/openai/v1/chat/completions".to_string(),
+        body,
+        requested_model,
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await
+}
+
+async fn handle_openai_responses(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    handle_request_core(
+        state,
+        headers,
+        "/openai/v1/responses".to_string(),
+        body,
+        requested_model,
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await
+}
+
+async fn handle_anthropic_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    handle_request_core(
+        state,
+        headers,
+        "/anthropic/v1/messages".to_string(),
+        body,
+        requested_model,
+        crate::formats::UpstreamFormat::Anthropic,
+        None,
+    )
+    .await
+}
+
+async fn handle_google_model_action(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let Some((requested_model, action)) = id.split_once(':') else {
+        return error_response(
+            crate::formats::UpstreamFormat::Google,
+            StatusCode::BAD_REQUEST,
+            "google model action path must end with :generateContent or :streamGenerateContent",
+        );
+    };
+    let forced_stream = match action {
+        "generateContent" => false,
+        "streamGenerateContent" => true,
+        _ => {
+            return error_response(
+                crate::formats::UpstreamFormat::Google,
+                StatusCode::BAD_REQUEST,
+                "unsupported google model action",
+            );
+        }
+    };
+    handle_request_core(
+        state,
+        headers,
+        format!("/google/v1beta/models/{id}"),
+        body,
+        requested_model.to_string(),
+        crate::formats::UpstreamFormat::Google,
+        Some(forced_stream),
+    )
+    .await
+}
+
+async fn handle_request_core(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    path: String,
+    mut body: Value,
+    requested_model: String,
+    client_format: crate::formats::UpstreamFormat,
+    forced_stream: Option<bool>,
+) -> Response<Body> {
+    let request_id = new_request_id();
+    let request_timestamp = now_timestamp_ms();
+    let original_body = body.clone();
+    let original_headers = capture_headers(&headers);
+    let stream = forced_stream
+        .unwrap_or_else(|| body.get("stream").and_then(Value::as_bool).unwrap_or(false));
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(forced_stream) = forced_stream {
+            obj.insert("stream".to_string(), Value::Bool(forced_stream));
+        }
+    }
+
+    debug!("Request path: {}", path);
+    debug!(
+        "Request body: {}",
+        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
+    );
+
+    let mut tracker = state
+        .metrics
+        .start_request(path.as_str(), requested_model.clone(), stream);
     let resolved_model = match state.config.resolve_model(&requested_model) {
         Ok(v) => v,
         Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": { "message": e } })),
-            )
-                .into_response();
+            tracker.finish(StatusCode::BAD_REQUEST.as_u16());
+            return error_response(client_format, StatusCode::BAD_REQUEST, &e);
         }
     };
     let upstream_state = match state.upstreams.get(&resolved_model.upstream_name) {
         Some(v) => v,
         None => {
-            return (
+            tracker.finish(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+            return error_response(
+                client_format,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("resolved upstream `{}` is not configured", resolved_model.upstream_name)
-                    }
-                })),
-            )
-                .into_response();
+                &format!(
+                    "resolved upstream `{}` is not configured",
+                    resolved_model.upstream_name
+                ),
+            );
         }
     };
+    tracker.set_upstream(
+        resolved_model.upstream_name.clone(),
+        resolved_model.upstream_model.clone(),
+    );
 
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "model".to_string(),
-            Value::String(resolved_model.upstream_model.clone()),
-        );
-    }
-    let client_format = detect_request_format(path, &body);
-    debug!("Detected client format: {:?}", client_format);
     let upstream_format = upstream_state
         .capability
         .upstream_format_for_request(client_format);
 
-    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
     if client_format != upstream_format {
-        if let Err(e) = translate_request(client_format, upstream_format, &model, &mut body, stream)
-        {
+        if let Err(e) = translate_request(
+            client_format,
+            upstream_format,
+            &resolved_model.upstream_model,
+            &mut body,
+            stream,
+        ) {
             error!("Translation failed: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": { "message": e } })),
-            )
-                .into_response();
+            tracker.finish(StatusCode::BAD_REQUEST.as_u16());
+            return error_response(client_format, StatusCode::BAD_REQUEST, &e);
         }
     }
+
+    if let Some(obj) = body.as_object_mut() {
+        match upstream_format {
+            crate::formats::UpstreamFormat::Google => {
+                obj.remove("model");
+            }
+            _ => {
+                obj.insert(
+                    "model".to_string(),
+                    Value::String(resolved_model.upstream_model.clone()),
+                );
+            }
+        }
+    }
+
     debug!(
         "Translated body for upstream: {}",
         serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
@@ -263,7 +479,7 @@ async fn handle_chat_inner(
     let hook_ctx = state.hooks.as_ref().map(|_| HookRequestContext {
         request_id,
         timestamp_ms: request_timestamp,
-        path: path.to_string(),
+        path: path.clone(),
         method: "POST".to_string(),
         stream,
         client_model: requested_model.clone(),
@@ -282,7 +498,7 @@ async fn handle_chat_inner(
         &upstream_state.config,
         upstream_format,
         if upstream_format == crate::formats::UpstreamFormat::Google {
-            Some(model.as_str())
+            Some(resolved_model.upstream_model.as_str())
         } else {
             None
         },
@@ -293,11 +509,8 @@ async fn handle_chat_inner(
     {
         Ok(r) => r,
         Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": { "message": e.to_string() } })),
-            )
-                .into_response();
+            tracker.finish(StatusCode::BAD_GATEWAY.as_u16());
+            return error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string());
         }
     };
 
@@ -305,7 +518,6 @@ async fn handle_chat_inner(
         let status = res.status();
         debug!("Upstream streaming response status: {}", status);
         if !status.is_success() {
-            // For streaming requests with errors, read the body and return as error
             let error_body = res
                 .text()
                 .await
@@ -314,11 +526,12 @@ async fn handle_chat_inner(
                 "Upstream returned error for streaming request: {} - {}",
                 status, error_body
             );
-            return (
+            tracker.finish(status.as_u16());
+            return error_response(
+                client_format,
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                Json(serde_json::json!({ "error": { "message": error_body } })),
-            )
-                .into_response();
+                &error_body,
+            );
         }
         let upstream_stream = res.bytes_stream();
         let body_stream: Pin<
@@ -333,9 +546,13 @@ async fn handle_chat_inner(
         let body = if let (Some(dispatcher), Some(ctx)) = (state.hooks.clone(), hook_ctx.clone()) {
             let captured =
                 dispatcher.wrap_stream(body_stream, ctx, status.as_u16(), sse_response_headers());
-            Body::from_stream(captured)
+            Body::from_stream(TrackedBodyStream::new(captured, tracker, status.as_u16()))
         } else {
-            Body::from_stream(body_stream)
+            Body::from_stream(TrackedBodyStream::new(
+                body_stream,
+                tracker,
+                status.as_u16(),
+            ))
         };
         return Response::builder()
             .status(status)
@@ -343,19 +560,15 @@ async fn handle_chat_inner(
             .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive")
             .body(body)
-            .unwrap()
-            .into_response();
+            .unwrap();
     }
 
     let status = res.status();
     let bytes = match res.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": { "message": e.to_string() } })),
-            )
-                .into_response();
+            tracker.finish(StatusCode::BAD_GATEWAY.as_u16());
+            return error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string());
         }
     };
     if !status.is_success() {
@@ -364,38 +577,249 @@ async fn handle_chat_inner(
             "Upstream response body: {}",
             String::from_utf8_lossy(&bytes)
         );
-        return (
+        tracker.finish(status.as_u16());
+        return error_response(
+            client_format,
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(serde_json::json!({ "error": { "message": String::from_utf8_lossy(&bytes) } })),
-        )
-            .into_response();
+            &String::from_utf8_lossy(&bytes),
+        );
     }
     let upstream_body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => {
-            return (
+            tracker.finish(StatusCode::BAD_GATEWAY.as_u16());
+            return error_response(
+                client_format,
                 StatusCode::BAD_GATEWAY,
-                Json(
-                    serde_json::json!({ "error": { "message": "upstream returned invalid JSON" } }),
-                ),
-            )
-                .into_response();
+                "upstream returned invalid JSON",
+            );
         }
     };
     let out = match translate_response(upstream_format, client_format, &upstream_body) {
         Ok(v) => v,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": { "message": e } })),
-            )
-                .into_response();
+            tracker.finish(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+            return error_response(client_format, StatusCode::INTERNAL_SERVER_ERROR, &e);
         }
     };
     if let (Some(dispatcher), Some(ctx)) = (state.hooks.as_ref(), hook_ctx) {
         dispatcher.emit_non_stream(ctx, 200, json_response_headers(), out.clone());
     }
+    tracker.finish(StatusCode::OK.as_u16());
     (StatusCode::OK, Json(out)).into_response()
+}
+
+async fn handle_openai_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (StatusCode::OK, Json(openai_model_list(&state.config))).into_response()
+}
+
+async fn handle_openai_model(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match openai_model_object(&state.config, &id) {
+        Some(model) => (StatusCode::OK, Json(model)).into_response(),
+        None => error_response(
+            crate::formats::UpstreamFormat::OpenAiCompletion,
+            StatusCode::NOT_FOUND,
+            &format!("model `{}` not found", id),
+        ),
+    }
+}
+
+async fn handle_anthropic_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (StatusCode::OK, Json(anthropic_model_list(&state.config))).into_response()
+}
+
+async fn handle_anthropic_model(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match anthropic_model_object(&state.config, &id) {
+        Some(model) => (StatusCode::OK, Json(model)).into_response(),
+        None => error_response(
+            crate::formats::UpstreamFormat::Anthropic,
+            StatusCode::NOT_FOUND,
+            &format!("model `{}` not found", id),
+        ),
+    }
+}
+
+async fn handle_google_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (StatusCode::OK, Json(google_model_list(&state.config))).into_response()
+}
+
+async fn handle_google_model(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match google_model_object(&state.config, &id) {
+        Some(model) => (StatusCode::OK, Json(model)).into_response(),
+        None => error_response(
+            crate::formats::UpstreamFormat::Google,
+            StatusCode::NOT_FOUND,
+            &format!("model `{}` not found", id),
+        ),
+    }
+}
+
+fn configured_aliases(config: &Config) -> Vec<(&String, &crate::config::ModelAlias)> {
+    config.model_aliases.iter().collect()
+}
+
+fn openai_model_list(config: &Config) -> Value {
+    serde_json::json!({
+        "object": "list",
+        "data": configured_aliases(config)
+            .into_iter()
+            .map(|(alias, target)| serde_json::json!({
+                "id": alias,
+                "object": "model",
+                "created": 0,
+                "owned_by": "proxec",
+                "proxec": {
+                    "upstream_name": target.upstream_name,
+                    "upstream_model": target.upstream_model,
+                }
+            }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn openai_model_object(config: &Config, id: &str) -> Option<Value> {
+    let target = config.model_aliases.get(id)?;
+    Some(serde_json::json!({
+        "id": id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "proxec",
+        "proxec": {
+            "upstream_name": target.upstream_name,
+            "upstream_model": target.upstream_model,
+        }
+    }))
+}
+
+fn anthropic_model_list(config: &Config) -> Value {
+    let data = configured_aliases(config)
+        .into_iter()
+        .map(|(alias, target)| anthropic_model_value(alias, target))
+        .collect::<Vec<_>>();
+    let first_id = data
+        .first()
+        .and_then(|model| model.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let last_id = data
+        .last()
+        .and_then(|model| model.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    serde_json::json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id
+    })
+}
+
+fn anthropic_model_object(config: &Config, id: &str) -> Option<Value> {
+    let target = config.model_aliases.get(id)?;
+    Some(anthropic_model_value(id, target))
+}
+
+fn anthropic_model_value(id: &str, target: &crate::config::ModelAlias) -> Value {
+    serde_json::json!({
+        "id": id,
+        "type": "model",
+        "display_name": id,
+        "created_at": "1970-01-01T00:00:00Z",
+        "proxec": {
+            "upstream_name": target.upstream_name,
+            "upstream_model": target.upstream_model,
+        }
+    })
+}
+
+fn google_model_list(config: &Config) -> Value {
+    serde_json::json!({
+        "models": configured_aliases(config)
+            .into_iter()
+            .map(|(alias, target)| google_model_value(alias, target))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn google_model_object(config: &Config, id: &str) -> Option<Value> {
+    let target = config.model_aliases.get(id)?;
+    Some(google_model_value(id, target))
+}
+
+fn google_model_value(id: &str, target: &crate::config::ModelAlias) -> Value {
+    serde_json::json!({
+        "name": format!("models/{}", id),
+        "baseModelId": id,
+        "version": "proxec",
+        "displayName": id,
+        "description": format!("proxec alias -> {}:{}", target.upstream_name, target.upstream_model),
+        "inputTokenLimit": 0,
+        "outputTokenLimit": 0,
+        "supportedGenerationMethods": ["generateContent"],
+        "thinking": false
+    })
+}
+
+fn error_response(
+    format: crate::formats::UpstreamFormat,
+    status: StatusCode,
+    message: &str,
+) -> Response<Body> {
+    match format {
+        crate::formats::UpstreamFormat::OpenAiCompletion
+        | crate::formats::UpstreamFormat::OpenAiResponses => (
+            status,
+            Json(serde_json::json!({ "error": { "message": message } })),
+        )
+            .into_response(),
+        crate::formats::UpstreamFormat::Anthropic => (
+            status,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": message
+                }
+            })),
+        )
+            .into_response(),
+        crate::formats::UpstreamFormat::Google => (
+            status,
+            Json(serde_json::json!({
+                "error": {
+                    "code": status.as_u16(),
+                    "message": message,
+                    "status": google_status_text(status),
+                }
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn google_status_text(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "INVALID_ARGUMENT",
+        StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
+        StatusCode::FORBIDDEN => "PERMISSION_DENIED",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::TOO_MANY_REQUESTS => "RESOURCE_EXHAUSTED",
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
+            "UNAVAILABLE"
+        }
+        _ => "INTERNAL",
+    }
 }
 
 fn apply_upstream_headers(

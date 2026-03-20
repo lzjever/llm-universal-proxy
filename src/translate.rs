@@ -1384,7 +1384,10 @@ fn gemini_to_openai(body: &mut Value) -> Result<(), String> {
 }
 
 fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
-    let role = content.get("role").and_then(Value::as_str)?;
+    let role = content
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user");
     let openai_role = if role == "user" { "user" } else { "assistant" };
     let parts = content.get("parts").and_then(Value::as_array)?;
     let mut openai_parts: Vec<Value> = vec![];
@@ -1861,6 +1864,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["stream"], false);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "Hi");
+    }
+
+    #[test]
+    fn translate_request_gemini_to_openai_missing_role_preserves_text() {
+        let mut body = json!({
+            "model": "gemini-1.5",
+            "contents": [{ "parts": [{ "text": "Reply with exactly: ok" }] }]
+        });
+        translate_request(
+            UpstreamFormat::Google,
+            UpstreamFormat::OpenAiCompletion,
+            "gemini-1.5",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "Reply with exactly: ok");
     }
 
     #[test]

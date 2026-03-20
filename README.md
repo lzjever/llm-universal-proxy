@@ -68,13 +68,13 @@ upstream_timeout_secs: 120
 
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_env: GLM_APIKEY
     auth_policy: client_or_fallback
 
   OPENAI:
-    base_url: https://api.openai.com
+    api_root: https://api.openai.com/v1
     format: openai-responses
     credential_env: OPENAI_API_KEY
     auth_policy: force_server
@@ -95,7 +95,8 @@ hooks:
 ```
 
 Notes:
-- Best practice is to keep upstream `base_url` versionless. The proxy appends `/v1` or `/v1beta` internally, but it also supports compatibility roots that already contain a version segment such as `.../api/paas/v4`.
+- `api_root` should be the official upstream API root and must include the version segment, for example `https://api.openai.com/v1`, `https://api.anthropic.com/v1`, or `https://generativelanguage.googleapis.com/v1beta`.
+- The proxy's public API is namespaced by protocol. Use `/openai/v1/...`, `/anthropic/v1/...`, and `/google/v1beta/...`. The older mixed `/v1/...` routes are intentionally not provided.
 - Anthropic-compatible upstreams usually require `x-api-key` and `anthropic-version`. The proxy forwards client auth headers when present, can fall back to the upstream's configured `credential_env`, and injects a default `anthropic-version: 2023-06-01` header for Anthropic upstreams.
 - Provider-specific headers belong inside each upstream entry's `headers` object.
 - `credential_env` is the environment variable name holding that upstream's fallback credential. The secret stays out of the YAML file.
@@ -111,7 +112,7 @@ upstream_timeout_secs: 120
 
 upstreams:
   UPSTREAM_NAME:
-    base_url: https://example.com
+    api_root: https://example.com/v1
     format: anthropic
     credential_env: EXAMPLE_API_KEY
     # credential_actual: sk-xxx
@@ -152,7 +153,7 @@ hooks:
 ```yaml
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_env: GLM_APIKEY
 ```
@@ -161,7 +162,7 @@ Each upstream supports these fields:
 
 | Field | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `base_url` | string | Yes | none | Upstream base URL |
+| `api_root` | string | Yes | none | Official upstream API root including version |
 | `format` | enum | No | auto-discover | Fixed upstream protocol format |
 | `credential_env` | string | No | none | Environment variable name containing the fallback credential |
 | `credential_actual` | string | No | none | Fallback credential written directly in YAML |
@@ -250,13 +251,13 @@ upstream_timeout_secs: 120
 
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_env: GLM_APIKEY
     auth_policy: client_or_fallback
 
   OPENAI:
-    base_url: https://api.openai.com
+    api_root: https://api.openai.com/v1
     format: openai-responses
     credential_env: OPENAI_API_KEY
     auth_policy: force_server
@@ -305,7 +306,7 @@ listen: 127.0.0.1:8099
 
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_env: GLM_APIKEY
 
@@ -313,8 +314,7 @@ model_aliases:
   GLM-5: GLM-OFFICIAL:GLM-5
 YAML
 
-./target/release/llm-universal-proxy
-  --config codex-proxy.yaml
+./target/release/llm-universal-proxy --config codex-proxy.yaml
 ```
 
 2. Point Codex CLI at the local proxy with an isolated config:
@@ -324,7 +324,7 @@ HOME="$(mktemp -d)" GLM_APIKEY="your-real-key" codex exec --ephemeral \
   -c 'model="GLM-5"' \
   -c 'model_provider="glm-proxy"' \
   -c 'model_providers.glm-proxy.name="GLM Proxy"' \
-  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:8099/v1"' \
+  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:8099/openai/v1"' \
   -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
   -c 'model_providers.glm-proxy.wire_api="responses"' \
   'Reply with exactly: codex-ok'
@@ -332,8 +332,87 @@ HOME="$(mktemp -d)" GLM_APIKEY="your-real-key" codex exec --ephemeral \
 
 Notes:
 - This does not modify your global Codex CLI configuration because it uses a temporary `HOME` and `--ephemeral`.
-- The client talks OpenAI Responses to the proxy at `/v1/responses`; the proxy resolves local model `GLM-5` to `GLM-OFFICIAL:GLM-5`, then translates upstream to Anthropic Messages.
+- The client talks OpenAI Responses to the proxy at `/openai/v1/responses`; the proxy resolves local model `GLM-5` to `GLM-OFFICIAL:GLM-5`, then translates upstream to Anthropic Messages.
 - For providers that need extra static headers beyond the Anthropic default, set the upstream's `headers` field in the matching upstream entry.
+
+### Isolated CLI Smoke Tests
+
+The following patterns let you verify real CLI clients against the proxy without touching user-level configuration. Every example uses a temporary `HOME` and placeholder credentials.
+
+Start the proxy first:
+
+```yaml
+listen: 127.0.0.1:18129
+upstream_timeout_secs: 120
+
+upstreams:
+  GLM-ANTHROPIC:
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
+    format: anthropic
+    credential_env: GLM_APIKEY
+    auth_policy: force_server
+
+  GLM-OPENAI:
+    api_root: https://open.bigmodel.cn/api/coding/paas/v4
+    format: openai-completion
+    credential_env: GLM_APIKEY
+    auth_policy: force_server
+
+model_aliases:
+  claude-local: GLM-ANTHROPIC:GLM-5
+  codex-local: GLM-OPENAI:glm-4.7
+  gemini-local: GLM-OPENAI:glm-4.7
+```
+
+Run it with:
+
+```bash
+GLM_APIKEY="your-real-key" ./target/release/llm-universal-proxy --config proxec-test.yaml
+```
+
+Codex CLI via `/openai/v1`:
+
+```bash
+HOME="$(mktemp -d)" GLM_APIKEY=dummy codex exec --ephemeral \
+  -C /path/to/llm-universal-proxy \
+  -c 'model="codex-local"' \
+  -c 'model_provider="proxec"' \
+  -c 'model_providers.proxec.name="proxec"' \
+  -c 'model_providers.proxec.base_url="http://127.0.0.1:18129/openai/v1"' \
+  -c 'model_providers.proxec.env_key="GLM_APIKEY"' \
+  -c 'model_providers.proxec.wire_api="responses"' \
+  'Reply with exactly: codex-ok'
+```
+
+Claude Code via `/anthropic/v1`:
+
+```bash
+HOME="$(mktemp -d)" \
+ANTHROPIC_API_KEY=dummy \
+ANTHROPIC_BASE_URL='http://127.0.0.1:18129/anthropic' \
+claude --print --output-format text --no-session-persistence \
+  --model claude-local \
+  'Reply with exactly: claude-ok'
+```
+
+Gemini CLI via `/google/v1beta`:
+
+```bash
+HOME="$(mktemp -d)" \
+GEMINI_API_KEY=dummy \
+GOOGLE_GEMINI_BASE_URL='http://127.0.0.1:18129/google' \
+HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= \
+NO_PROXY='127.0.0.1,localhost' no_proxy='127.0.0.1,localhost' \
+gemini --prompt 'Reply with exactly: gemini-ok' \
+  --model gemini-local \
+  --sandbox=false \
+  --output-format text
+```
+
+Notes:
+- The proxy uses the configured upstream credential because `auth_policy: force_server` is set. The dummy client-side keys only satisfy CLI validation.
+- Clearing proxy environment variables for Gemini CLI is recommended when the proxy is running on `127.0.0.1`, because some Node-based proxy stacks will otherwise try to send local traffic through the global HTTP proxy.
+- Replace `/path/to/llm-universal-proxy` with your actual repository path or remove `-C` if you are already in the repository.
 
 ### Real Upstream Smoke Matrix
 
@@ -344,9 +423,9 @@ GLM_APIKEY="your-real-key" python3 scripts/real_endpoint_matrix.py
 ```
 
 It covers these client entrypoints:
-- `/v1/chat/completions`
-- `/v1/responses`
-- `/v1/messages`
+- `/openai/v1/chat/completions`
+- `/openai/v1/responses`
+- `/anthropic/v1/messages`
 
 And validates both non-streaming and streaming paths against:
 - Anthropic-compatible upstreams
@@ -361,7 +440,7 @@ docker build -t llm-universal-proxy .
 # Run the container
 docker run -p 8080:8080 \
   -v "$PWD/proxy.yaml:/app/proxy.yaml:ro" \
-  llm-universal-proxy
+  llm-universal-proxy \
   --config /app/proxy.yaml
 ```
 
@@ -369,9 +448,17 @@ docker run -p 8080:8080 \
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /v1/chat/completions` | Main endpoint accepting all 4 formats |
-| `POST /v1/responses` | OpenAI Responses API endpoint |
-| `POST /v1/messages` | Anthropic Messages API endpoint |
+| `POST /openai/v1/chat/completions` | OpenAI Chat Completions view |
+| `POST /openai/v1/responses` | OpenAI Responses view |
+| `GET /openai/v1/models` | OpenAI-compatible local model catalog |
+| `GET /openai/v1/models/{id}` | OpenAI-compatible local model detail |
+| `POST /anthropic/v1/messages` | Anthropic Messages view |
+| `GET /anthropic/v1/models` | Anthropic-compatible local model catalog |
+| `GET /anthropic/v1/models/{id}` | Anthropic-compatible local model detail |
+| `GET /google/v1beta/models` | Gemini-compatible local model catalog |
+| `GET /google/v1beta/models/{id}` | Gemini-compatible local model detail |
+| `POST /google/v1beta/models/{model}:generateContent` | Gemini GenerateContent view |
+| `POST /google/v1beta/models/{model}:streamGenerateContent` | Gemini streaming view |
 | `GET /health` | Health check (returns `{"status":"ok"}`) |
 
 ### Example Requests
@@ -379,7 +466,7 @@ docker run -p 8080:8080 \
 #### OpenAI Chat Completions Format
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8080/openai/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
@@ -392,7 +479,7 @@ curl http://localhost:8080/v1/chat/completions \
 #### Anthropic Claude Format
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:8080/anthropic/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: YOUR_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
@@ -406,7 +493,7 @@ curl http://localhost:8080/v1/chat/completions \
 #### Google Gemini Format
 
 ```bash
-curl "http://localhost:8080/v1/chat/completions?key=YOUR_API_KEY" \
+curl "http://localhost:8080/google/v1beta/models/gemini-local:generateContent" \
   -H "Content-Type: application/json" \
   -d '{
     "contents": [{"parts": [{"text": "Hello!"}]}]

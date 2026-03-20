@@ -13,16 +13,16 @@ pub fn detect_request_format(path: &str, body: &Value) -> UpstreamFormat {
     detect_by_body(body)
 }
 
-/// Path-based detection (e.g. /v1/responses → openai-responses).
+/// Path-based detection.
 fn detect_by_path(path: &str, body: &Value) -> Option<UpstreamFormat> {
-    if path.contains("/v1/responses") {
+    if path.contains("/openai/v1/responses") {
         return Some(UpstreamFormat::OpenAiResponses);
     }
-    if path.contains("/v1/messages") {
+    if path.contains("/anthropic/v1/messages") {
         return Some(UpstreamFormat::Anthropic);
     }
-    // /v1/chat/completions with input[] can be OpenAI Responses body on chat endpoint
-    if path.contains("/v1/chat/completions")
+    // /openai/v1/chat/completions with input[] can be OpenAI Responses body on chat endpoint
+    if path.contains("/openai/v1/chat/completions")
         && body.get("input").and_then(Value::as_array).is_some()
     {
         return Some(UpstreamFormat::OpenAiResponses);
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn detect_openai_responses_by_path() {
-        let path = "/v1/responses";
+        let path = "/openai/v1/responses";
         let body = json!({});
         assert_eq!(
             detect_request_format(path, &body),
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn detect_anthropic_by_messages_path() {
-        let path = "/v1/messages";
+        let path = "/anthropic/v1/messages";
         let body = json!({ "messages": [{ "role": "user", "content": "Hi" }] });
         assert_eq!(
             detect_request_format(path, &body),
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn detect_openai_responses_by_body_input_array() {
-        let path = "/v1/chat/completions";
+        let path = "/openai/v1/chat/completions";
         let body = json!({ "input": [], "model": "gpt-4o" });
         assert_eq!(
             detect_request_format(path, &body),
@@ -126,14 +126,14 @@ mod tests {
 
     #[test]
     fn detect_google_by_contents() {
-        let path = "/v1/chat/completions";
+        let path = "/google/v1beta/models/gemini-local:generateContent";
         let body = json!({ "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }] });
         assert_eq!(detect_request_format(path, &body), UpstreamFormat::Google);
     }
 
     #[test]
     fn detect_openai_by_specific_fields() {
-        let path = "/v1/chat/completions";
+        let path = "/openai/v1/chat/completions";
         let body = json!({ "messages": [{ "role": "user", "content": "Hi" }], "response_format": { "type": "json_object" } });
         assert_eq!(
             detect_request_format(path, &body),
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn detect_anthropic_by_system() {
-        let path = "/v1/chat/completions";
+        let path = "/openai/v1/chat/completions";
         let body = json!({ "messages": [{ "role": "user", "content": "Hi" }], "system": "You are helpful." });
         assert_eq!(
             detect_request_format(path, &body),
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn default_openai_completion() {
-        let path = "/v1/chat/completions";
+        let path = "/openai/v1/chat/completions";
         let body = json!({ "messages": [{ "role": "user", "content": "Hi" }], "model": "gpt-4o" });
         assert_eq!(
             detect_request_format(path, &body),
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn detect_anthropic_by_anthropic_version() {
-        let path = "/v1/chat/completions";
+        let path = "/openai/v1/chat/completions";
         let body = json!({ "messages": [{ "role": "user", "content": "Hi" }], "anthropic_version": "2023-01-01" });
         assert_eq!(
             detect_request_format(path, &body),
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn detect_anthropic_by_content_array_with_image() {
-        let path = "/v1/chat/completions";
+        let path = "/openai/v1/chat/completions";
         let body = json!({
             "messages": [{
                 "role": "user",
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn detect_anthropic_by_content_array_with_tool_use() {
-        let path = "/v1/chat/completions";
+        let path = "/openai/v1/chat/completions";
         let body = json!({
             "messages": [{ "role": "user", "content": [{ "type": "tool_use", "id": "x", "name": "f", "input": {} }] }]
         });
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn detect_responses_by_input_string() {
-        let path = "/v1/chat/completions";
+        let path = "/openai/v1/chat/completions";
         let body = json!({ "input": "Hello", "model": "gpt-4o" });
         assert_eq!(
             detect_request_format(path, &body),
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn path_priority_over_body() {
-        let path = "/v1/responses";
+        let path = "/openai/v1/responses";
         let body = json!({ "messages": [{ "role": "user", "content": "Hi" }] });
         assert_eq!(
             detect_request_format(path, &body),

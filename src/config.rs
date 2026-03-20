@@ -57,8 +57,8 @@ pub struct HookEndpointConfig {
 pub struct UpstreamConfig {
     /// Stable upstream name referenced by `upstream:model`.
     pub name: String,
-    /// Base URL without protocol version suffix, for example `https://api.openai.com`.
-    pub base_url: String,
+    /// Official upstream API root including version suffix, for example `https://api.openai.com/v1`.
+    pub api_root: String,
     /// Optional fixed upstream format. When unset, capability discovery is used.
     pub fixed_upstream_format: Option<UpstreamFormat>,
     /// Optional fallback credential env var name, for example `GLM_APIKEY`.
@@ -118,8 +118,8 @@ struct FileConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 struct UpstreamConfigFile {
-    #[serde(alias = "url", alias = "upstream_url")]
-    base_url: String,
+    #[serde(alias = "url", alias = "upstream_url", alias = "base_url")]
+    api_root: String,
     #[serde(default, alias = "upstream_format", alias = "format")]
     fixed_upstream_format: Option<UpstreamFormat>,
     #[serde(
@@ -205,7 +205,7 @@ impl Config {
                 });
                 UpstreamConfig {
                     name,
-                    base_url: item.base_url,
+                    api_root: item.api_root,
                     fixed_upstream_format: item.fixed_upstream_format,
                     fallback_credential_env: item.fallback_credential_env,
                     fallback_credential_actual: item.fallback_credential_actual,
@@ -264,9 +264,15 @@ impl Config {
             if upstream.name.trim().is_empty() {
                 return Err("upstream name must not be empty".to_string());
             }
-            if upstream.base_url.trim().is_empty() {
+            if upstream.api_root.trim().is_empty() {
                 return Err(format!(
-                    "upstream `{}` base_url must not be empty",
+                    "upstream `{}` api_root must not be empty",
+                    upstream.name
+                ));
+            }
+            if !has_version_root(&upstream.api_root) {
+                return Err(format!(
+                    "upstream `{}` api_root must end with an explicit version segment like `/v1` or `/v1beta`",
                     upstream.name
                 ));
             }
@@ -400,7 +406,7 @@ impl Config {
         model: Option<&str>,
         stream: bool,
     ) -> String {
-        build_upstream_url(&upstream.base_url, format, model, stream)
+        build_upstream_url(&upstream.api_root, format, model, stream)
     }
 }
 
@@ -430,56 +436,27 @@ fn default_hook_cooldown_secs() -> u64 {
 
 /// Build full upstream POST URL for a format.
 ///
-/// Best practice is to keep the base URL versionless:
-/// - OpenAI: `https://api.openai.com`
-/// - Anthropic: `https://api.anthropic.com`
-/// - Google: `https://generativelanguage.googleapis.com`
-///
-/// The builder will also tolerate legacy bases that already end with `/v1` or `/v1beta`.
+/// Best practice is to configure the official API root with an explicit version suffix:
+/// - OpenAI: `https://api.openai.com/v1`
+/// - Anthropic: `https://api.anthropic.com/v1`
+/// - Google: `https://generativelanguage.googleapis.com/v1beta`
 pub fn build_upstream_url(
-    base_url: &str,
+    api_root: &str,
     format: UpstreamFormat,
     model: Option<&str>,
     stream: bool,
 ) -> String {
-    let base = base_url.trim_end_matches('/');
+    let base = api_root.trim_end_matches('/');
     match format {
-        UpstreamFormat::OpenAiCompletion => {
-            if has_version_root(base) {
-                format!("{}/chat/completions", base)
-            } else {
-                format!("{}/v1/chat/completions", base)
-            }
-        }
-        UpstreamFormat::OpenAiResponses => {
-            if has_version_root(base) {
-                format!("{}/responses", base)
-            } else {
-                format!("{}/v1/responses", base)
-            }
-        }
-        UpstreamFormat::Anthropic => {
-            if has_version_root(base) {
-                format!("{}/messages", base)
-            } else {
-                format!("{}/v1/messages", base)
-            }
-        }
+        UpstreamFormat::OpenAiCompletion => format!("{}/chat/completions", base),
+        UpstreamFormat::OpenAiResponses => format!("{}/responses", base),
+        UpstreamFormat::Anthropic => format!("{}/messages", base),
         UpstreamFormat::Google => {
             let model = model.filter(|s| !s.is_empty()).unwrap_or("gemini-1.5");
-            if base.ends_with("/v1beta") {
-                if stream {
-                    format!("{}/models/{}:streamGenerateContent?alt=sse", base, model)
-                } else {
-                    format!("{}/models/{}:generateContent", base, model)
-                }
-            } else if stream {
-                format!(
-                    "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
-                    base, model
-                )
+            if stream {
+                format!("{}/models/{}:streamGenerateContent?alt=sse", base, model)
             } else {
-                format!("{}/v1beta/models/{}:generateContent", base, model)
+                format!("{}/models/{}:generateContent", base, model)
             }
         }
     }
@@ -507,7 +484,7 @@ mod tests {
     fn build_upstream_url_openai_completion() {
         assert_eq!(
             build_upstream_url(
-                "https://api.openai.com",
+                "https://api.openai.com/v1",
                 UpstreamFormat::OpenAiCompletion,
                 None,
                 false
@@ -520,7 +497,7 @@ mod tests {
     fn build_upstream_url_openai_responses() {
         assert_eq!(
             build_upstream_url(
-                "https://api.openai.com",
+                "https://api.openai.com/v1",
                 UpstreamFormat::OpenAiResponses,
                 None,
                 false
@@ -533,7 +510,7 @@ mod tests {
     fn build_upstream_url_anthropic() {
         assert_eq!(
             build_upstream_url(
-                "https://api.anthropic.com",
+                "https://api.anthropic.com/v1",
                 UpstreamFormat::Anthropic,
                 None,
                 false
@@ -546,7 +523,7 @@ mod tests {
     fn build_upstream_url_google() {
         assert_eq!(
             build_upstream_url(
-                "https://generativelanguage.googleapis.com",
+                "https://generativelanguage.googleapis.com/v1beta",
                 UpstreamFormat::Google,
                 None,
                 false
@@ -555,7 +532,7 @@ mod tests {
         );
         assert_eq!(
             build_upstream_url(
-                "https://generativelanguage.googleapis.com",
+                "https://generativelanguage.googleapis.com/v1beta",
                 UpstreamFormat::Google,
                 Some("gemini-2.0-flash"),
                 true
@@ -613,11 +590,11 @@ listen: 127.0.0.1:8080
 upstream_timeout_secs: 45
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_env: GLM_APIKEY
   OPENAI:
-    base_url: https://api.openai.com
+    api_root: https://api.openai.com/v1
     format: openai-responses
 model_aliases:
   GLM-5: GLM-OFFICIAL:GLM-5
@@ -629,7 +606,7 @@ model_aliases:
         assert_eq!(c.upstream_timeout.as_secs(), 45);
         assert_eq!(c.upstreams.len(), 2);
         let glm = c.upstream("GLM-OFFICIAL").unwrap();
-        assert_eq!(glm.base_url, "https://open.bigmodel.cn/api/anthropic");
+        assert_eq!(glm.api_root, "https://open.bigmodel.cn/api/anthropic/v1");
         assert_eq!(glm.fixed_upstream_format, Some(UpstreamFormat::Anthropic));
         assert_eq!(glm.fallback_credential_env.as_deref(), Some("GLM_APIKEY"));
         assert_eq!(glm.fallback_api_key.as_deref(), Some("glm-secret"));
@@ -651,7 +628,7 @@ model_aliases:
         let c = Config {
             upstreams: vec![UpstreamConfig {
                 name: "default".to_string(),
-                base_url: "https://api.openai.com".to_string(),
+                api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                 fallback_credential_env: None,
                 fallback_credential_actual: None,
@@ -684,7 +661,7 @@ model_aliases:
             upstreams: vec![
                 UpstreamConfig {
                     name: "glm".to_string(),
-                    base_url: "https://example.com".to_string(),
+                    api_root: "https://example.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::Anthropic),
                     fallback_credential_env: None,
                     fallback_credential_actual: None,
@@ -694,7 +671,7 @@ model_aliases:
                 },
                 UpstreamConfig {
                     name: "openai".to_string(),
-                    base_url: "https://api.openai.com".to_string(),
+                    api_root: "https://api.openai.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                     fallback_credential_env: None,
                     fallback_credential_actual: None,
@@ -715,7 +692,7 @@ model_aliases:
         let mut c = Config {
             upstreams: vec![UpstreamConfig {
                 name: "glm".to_string(),
-                base_url: "https://example.com".to_string(),
+                api_root: "https://example.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::Anthropic),
                 fallback_credential_env: None,
                 fallback_credential_actual: None,
@@ -742,7 +719,7 @@ model_aliases:
         let c = Config {
             upstreams: vec![UpstreamConfig {
                 name: "default".to_string(),
-                base_url: "https://api.openai.com".to_string(),
+                api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                 fallback_credential_env: None,
                 fallback_credential_actual: None,
@@ -763,7 +740,7 @@ model_aliases:
             upstreams: vec![
                 UpstreamConfig {
                     name: "a".to_string(),
-                    base_url: "https://a.example.com".to_string(),
+                    api_root: "https://a.example.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::Anthropic),
                     fallback_credential_env: None,
                     fallback_credential_actual: None,
@@ -773,7 +750,7 @@ model_aliases:
                 },
                 UpstreamConfig {
                     name: "b".to_string(),
-                    base_url: "https://b.example.com".to_string(),
+                    api_root: "https://b.example.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
                     fallback_credential_env: None,
                     fallback_credential_actual: None,
@@ -813,7 +790,7 @@ hooks:
     url: https://example.com/usage
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
     credential_actual: secret
     auth_policy: force_server
@@ -849,7 +826,7 @@ upstreams:
             r#"
 upstreams:
   demo:
-    base_url: https://api.openai.com
+    api_root: https://api.openai.com/v1
     format: openai-completion
     credential_env: OPENAI_API_KEY
     credential_actual: secret
@@ -868,7 +845,7 @@ hooks:
     url: ftp://example.com/usage
 upstreams:
   demo:
-    base_url: https://api.openai.com
+    api_root: https://api.openai.com/v1
     format: openai-completion
 "#,
         )

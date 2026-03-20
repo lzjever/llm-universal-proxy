@@ -24,7 +24,7 @@ fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
         upstream_timeout: Duration::from_secs(30),
         upstreams: vec![UpstreamConfig {
             name: "default".to_string(),
-            base_url: upstream_base.to_string(),
+            api_root: upstream_api_root(upstream_base, format),
             fixed_upstream_format: Some(format),
             fallback_credential_env: None,
             fallback_credential_actual: None,
@@ -45,13 +45,41 @@ fn named_upstream(
 ) -> UpstreamConfig {
     UpstreamConfig {
         name: name.to_string(),
-        base_url: upstream_base.to_string(),
+        api_root: upstream_api_root(upstream_base, format),
         fixed_upstream_format: Some(format),
         fallback_credential_env: fallback_api_key.map(|_| format!("{}_KEY_ENV", name)),
         fallback_credential_actual: None,
         fallback_api_key: fallback_api_key.map(ToString::to_string),
         auth_policy: AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
+    }
+}
+
+fn upstream_api_root(upstream_base: &str, format: UpstreamFormat) -> String {
+    let upstream_base = upstream_base.trim_end_matches('/');
+    match format {
+        UpstreamFormat::Google => format!("{}/v1beta", upstream_base),
+        _ => format!("{}/v1", upstream_base),
+    }
+}
+
+fn config_with_alias(
+    upstream_base: &str,
+    format: UpstreamFormat,
+    alias: &str,
+    upstream_model: &str,
+) -> Config {
+    let mut model_aliases = std::collections::BTreeMap::new();
+    model_aliases.insert(
+        alias.to_string(),
+        ModelAlias {
+            upstream_name: "default".to_string(),
+            upstream_model: upstream_model.to_string(),
+        },
+    );
+    Config {
+        model_aliases,
+        ..proxy_config(upstream_base, format)
     }
 }
 
@@ -95,7 +123,7 @@ listen: 127.0.0.1:9090
 upstream_timeout_secs: 33
 upstreams:
   GLM-OFFICIAL:
-    base_url: https://open.bigmodel.cn/api/anthropic
+    api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
 model_aliases:
   GLM-5: GLM-OFFICIAL:GLM-5
@@ -112,6 +140,271 @@ model_aliases:
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn config_rejects_versionless_api_root() {
+    let config = llm_universal_proxy::config::Config::from_yaml_str(
+        r#"
+upstreams:
+  demo:
+    api_root: https://api.openai.com
+    format: openai-completion
+"#,
+    )
+    .unwrap();
+    let err = config.validate().unwrap_err();
+    assert!(err.contains("api_root must end with an explicit version segment"));
+}
+
+#[tokio::test]
+async fn openai_namespace_chat_completions_works() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+}
+
+#[tokio::test]
+async fn openai_namespace_responses_works() {
+    let (mock_base, _mock) = spawn_openai_responses_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "input": "Hi",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+}
+
+#[tokio::test]
+async fn openai_namespace_responses_stream_works() {
+    let (mock_base, _mock) = spawn_openai_responses_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "input": "Hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("response.output_text.delta"));
+    assert!(body.contains("response.completed"));
+}
+
+#[tokio::test]
+async fn anthropic_namespace_messages_works() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .json(&json!({
+            "model": "claude-3",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "message");
+}
+
+#[tokio::test]
+async fn anthropic_namespace_messages_stream_works() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .json(&json!({
+            "model": "claude-3",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("event: message_start"));
+    assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn google_namespace_generate_content_works() {
+    let (mock_base, _mock) = spawn_google_mock().await;
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::Google,
+        "gemini-local",
+        "gemini-1.5",
+    );
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "{}/google/v1beta/models/gemini-local:generateContent",
+            proxy_base
+        ))
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "Hi");
+}
+
+#[tokio::test]
+async fn google_namespace_stream_generate_content_works() {
+    let (mock_base, _mock) = spawn_google_mock().await;
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::Google,
+        "gemini-local",
+        "gemini-1.5",
+    );
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "{}/google/v1beta/models/gemini-local:streamGenerateContent",
+            proxy_base
+        ))
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = res.text().await.unwrap();
+    assert!(content_type.contains("text/event-stream"));
+    assert!(body.contains("\"candidates\""));
+}
+
+#[tokio::test]
+async fn openai_models_endpoint_lists_local_aliases() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::OpenAiCompletion,
+        "sonnet",
+        "gpt-4o",
+    );
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .get(format!("{}/openai/v1/models", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["data"][0]["id"], "sonnet");
+    assert_eq!(body["data"][0]["proxec"]["upstream_model"], "gpt-4o");
+}
+
+#[tokio::test]
+async fn anthropic_models_endpoint_retrieves_local_alias() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::Anthropic,
+        "haiku",
+        "claude-3-haiku",
+    );
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .get(format!("{}/anthropic/v1/models/haiku", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "haiku");
+    assert_eq!(body["type"], "model");
+}
+
+#[tokio::test]
+async fn google_models_endpoint_lists_local_aliases() {
+    let (mock_base, _mock) = spawn_google_mock().await;
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::Google,
+        "flash",
+        "gemini-2.0-flash",
+    );
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .get(format!("{}/google/v1beta/models", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["models"][0]["name"], "models/flash");
+    assert_eq!(
+        body["models"][0]["supportedGenerationMethods"][0],
+        "generateContent"
+    );
+}
+
 #[tokio::test]
 async fn upstream_openai_completion_passthrough_non_streaming() {
     let (mock_base, _mock) = spawn_openai_completion_mock().await;
@@ -120,7 +413,7 @@ async fn upstream_openai_completion_passthrough_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -144,7 +437,7 @@ async fn openai_completion_omitted_stream_defaults_to_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }]
@@ -175,7 +468,7 @@ async fn upstream_openai_completion_client_anthropic_translated_non_streaming() 
     // Client sends Anthropic format (system + messages) → proxy translates to OpenAI for upstream, then response back to Anthropic shape.
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
         .json(&json!({
             "model": "claude-3",
             "system": "You are helpful.",
@@ -187,7 +480,6 @@ async fn upstream_openai_completion_client_anthropic_translated_non_streaming() 
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body: serde_json::Value = res.json().await.unwrap();
-    // Response is translated to Anthropic format (content array).
     assert!(body.get("content").and_then(|c| c.as_array()).is_some());
     assert_eq!(body["content"][0]["text"], "Hi");
 }
@@ -200,7 +492,7 @@ async fn upstream_anthropic_passthrough_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
         .json(&json!({
             "model": "claude-3",
             "max_tokens": 100,
@@ -225,7 +517,7 @@ async fn upstream_anthropic_client_openai_translated_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -248,7 +540,7 @@ async fn anthropic_messages_endpoint_passthrough_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/messages", proxy_base))
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
         .json(&json!({
             "model": "claude-3",
             "max_tokens": 32,
@@ -272,7 +564,7 @@ async fn anthropic_messages_endpoint_translates_to_openai_upstream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/messages", proxy_base))
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "max_tokens": 32,
@@ -296,7 +588,7 @@ async fn responses_endpoint_translates_to_anthropic_upstream_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/responses", proxy_base))
+        .post(format!("{}/openai/v1/responses", proxy_base))
         .json(&json!({
             "model": "GLM-5",
             "input": "Hi",
@@ -319,7 +611,7 @@ async fn responses_endpoint_preserves_anthropic_reasoning_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/responses", proxy_base))
+        .post(format!("{}/openai/v1/responses", proxy_base))
         .json(&json!({
             "model": "GLM-5",
             "input": "Hi",
@@ -339,15 +631,22 @@ async fn responses_endpoint_preserves_anthropic_reasoning_non_streaming() {
 #[tokio::test]
 async fn upstream_google_passthrough_non_streaming() {
     let (mock_base, _mock) = spawn_google_mock().await;
-    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::Google,
+        "gemini-1.5",
+        "gemini-1.5",
+    );
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!(
+            "{}/google/v1beta/models/gemini-1.5:generateContent",
+            proxy_base
+        ))
         .json(&json!({
-            "contents": [{ "parts": [{ "text": "Hi" }] }],
-            "model": "gemini-1.5"
+            "contents": [{ "parts": [{ "text": "Hi" }] }]
         }))
         .send()
         .await
@@ -367,7 +666,7 @@ async fn upstream_openai_responses_passthrough_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/responses", proxy_base))
+        .post(format!("{}/openai/v1/responses", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "input": [{ "type": "message", "role": "user", "content": "Hi" }],
@@ -602,7 +901,7 @@ async fn upstream_anthropic_injects_required_version_header() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -644,7 +943,7 @@ async fn multi_upstream_supports_explicit_upstream_model_selector() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "GLM-OFFICIAL:GLM-5",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -690,7 +989,7 @@ async fn multi_upstream_supports_local_model_alias() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "GLM-5",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -728,7 +1027,7 @@ async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "shared-model",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -759,7 +1058,7 @@ async fn multi_upstream_uses_per_upstream_fallback_credential() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "GLM-OFFICIAL:GLM-5",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -788,7 +1087,7 @@ async fn force_server_auth_policy_ignores_client_key() {
         upstream_timeout: Duration::from_secs(30),
         upstreams: vec![UpstreamConfig {
             name: "GLM-OFFICIAL".to_string(),
-            base_url: glm_base,
+            api_root: upstream_api_root(&glm_base, UpstreamFormat::Anthropic),
             fixed_upstream_format: Some(UpstreamFormat::Anthropic),
             fallback_credential_env: None,
             fallback_credential_actual: Some("server-secret".to_string()),
@@ -803,7 +1102,7 @@ async fn force_server_auth_policy_ignores_client_key() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .header("authorization", "Bearer client-secret")
         .json(&json!({
             "model": "GLM-OFFICIAL:GLM-5",
@@ -848,7 +1147,7 @@ async fn usage_and_exchange_hooks_fire_for_non_streaming_requests() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .header("authorization", "Bearer client-secret")
         .json(&json!({
             "model": "gpt-4",
@@ -906,7 +1205,7 @@ async fn exchange_hook_captures_complete_streaming_response_after_done() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -962,7 +1261,7 @@ async fn hooks_capture_reasoning_for_responses_stream_passthrough() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/responses", proxy_base))
+        .post(format!("{}/openai/v1/responses", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "input": "Hi",
@@ -1022,7 +1321,7 @@ async fn hooks_capture_translated_thinking_blocks_for_messages_stream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/messages", proxy_base))
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "max_tokens": 32,
@@ -1067,7 +1366,7 @@ async fn concurrent_openai_to_anthropic_requests_keep_headers_and_cache_control_
         let proxy_base = proxy_base.clone();
         async move {
             client
-                .post(format!("{}/v1/chat/completions", proxy_base))
+                .post(format!("{}/openai/v1/chat/completions", proxy_base))
                 .json(&json!({
                     "model": "gpt-4",
                     "messages": [
@@ -1146,7 +1445,7 @@ async fn upstream_openai_completion_streaming_passthrough() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1175,7 +1474,7 @@ async fn upstream_anthropic_streaming_translated_to_openai() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1206,7 +1505,7 @@ async fn anthropic_messages_endpoint_streaming_translates_to_openai_upstream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/messages", proxy_base))
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "max_tokens": 32,
@@ -1236,7 +1535,7 @@ async fn responses_endpoint_streaming_translates_to_anthropic_upstream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/responses", proxy_base))
+        .post(format!("{}/openai/v1/responses", proxy_base))
         .json(&json!({
             "model": "GLM-5",
             "input": "Hi",
@@ -1265,7 +1564,7 @@ async fn responses_endpoint_streaming_preserves_anthropic_reasoning() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/responses", proxy_base))
+        .post(format!("{}/openai/v1/responses", proxy_base))
         .json(&json!({
             "model": "GLM-5",
             "input": "Hi",
@@ -1296,7 +1595,7 @@ async fn chat_completions_endpoint_preserves_responses_reasoning_stream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1320,7 +1619,7 @@ async fn messages_endpoint_preserves_responses_reasoning_stream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/messages", proxy_base))
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "max_tokens": 32,
@@ -1348,7 +1647,7 @@ async fn upstream_google_client_openai_translated_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1371,7 +1670,7 @@ async fn upstream_openai_responses_client_openai_completion_translated_non_strea
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1394,7 +1693,7 @@ async fn upstream_openai_responses_streaming_passthrough() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/responses", proxy_base))
+        .post(format!("{}/openai/v1/responses", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Hi" }] }],
@@ -1443,7 +1742,7 @@ async fn post_invalid_json_returns_422_or_400() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .header("Content-Type", "application/json")
         .body("not json")
         .send()
@@ -1464,7 +1763,7 @@ async fn post_empty_body_returns_4xx() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .header("Content-Type", "application/json")
         .body("{}")
         .send()
@@ -1484,7 +1783,7 @@ async fn upstream_unreachable_returns_502() {
         upstream_timeout: Duration::from_millis(100),
         upstreams: vec![UpstreamConfig {
             name: "default".to_string(),
-            base_url: "http://127.0.0.1:31999".to_string(),
+            api_root: "http://127.0.0.1:31999/v1".to_string(),
             fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
             fallback_credential_env: None,
             fallback_credential_actual: None,
@@ -1499,7 +1798,7 @@ async fn upstream_unreachable_returns_502() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({ "model": "gpt-4", "messages": [{ "role": "user", "content": "Hi" }], "stream": false }))
         .send()
         .await
@@ -1519,7 +1818,7 @@ async fn nonexistent_path_returns_404() {
 
     let client = Client::new();
     let res = client
-        .get(format!("{}/v1/nonexistent", proxy_base))
+        .get(format!("{}/openai/v1/nonexistent", proxy_base))
         .send()
         .await
         .unwrap();
@@ -1534,7 +1833,7 @@ async fn openai_completion_non_streaming_explicit_false() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1565,7 +1864,7 @@ async fn upstream_google_streaming_client_openai() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/v1/chat/completions", proxy_base))
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
