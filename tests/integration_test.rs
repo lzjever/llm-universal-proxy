@@ -5,6 +5,7 @@ mod common;
 
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use common::*;
+use futures_util::future::join_all;
 use llm_universal_proxy::config::Config;
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::run_with_listener;
@@ -231,6 +232,17 @@ struct CapturedHeaders {
     headers: Arc<Mutex<Vec<(String, String)>>>,
 }
 
+#[derive(Clone, Default)]
+struct CapturedAnthropicRequests {
+    requests: Arc<Mutex<Vec<CapturedAnthropicRequest>>>,
+}
+
+#[derive(Clone, Debug)]
+struct CapturedAnthropicRequest {
+    headers: Vec<(String, String)>,
+    body: Value,
+}
+
 async fn spawn_header_capture_anthropic_mock(
 ) -> (String, tokio::task::JoinHandle<()>, CapturedHeaders) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -275,6 +287,53 @@ async fn capture_anthropic_handler(
     )
 }
 
+async fn spawn_concurrent_capture_anthropic_mock(
+) -> (String, tokio::task::JoinHandle<()>, CapturedAnthropicRequests) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+    let state = CapturedAnthropicRequests::default();
+    let app = Router::new()
+        .route("/messages", post(capture_concurrent_anthropic_handler))
+        .with_state(state.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle, state)
+}
+
+async fn capture_concurrent_anthropic_handler(
+    State(state): State<CapturedAnthropicRequests>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl axum::response::IntoResponse {
+    let captured_headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect::<Vec<_>>();
+    state.requests.lock().unwrap().push(CapturedAnthropicRequest {
+        headers: captured_headers,
+        body,
+    });
+    (
+        axum::http::StatusCode::OK,
+        Json(json!({
+            "id": "msg_concurrent",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "Hi" }],
+            "model": "claude-3",
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        })),
+    )
+}
+
 #[tokio::test]
 async fn upstream_anthropic_injects_required_version_header() {
     let (mock_base, _mock, captured) = spawn_header_capture_anthropic_mock().await;
@@ -300,6 +359,88 @@ async fn upstream_anthropic_injects_required_version_header() {
         .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-version"))
         .map(|(_, value)| value.clone());
     assert_eq!(version.as_deref(), Some("2023-06-01"));
+}
+
+#[tokio::test]
+async fn concurrent_openai_to_anthropic_requests_keep_headers_and_cache_control_isolated() {
+    let (mock_base, _mock, captured) = spawn_concurrent_capture_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let request_count = 24usize;
+    let futures = (0..request_count).map(|i| {
+        let client = client.clone();
+        let proxy_base = proxy_base.clone();
+        async move {
+            client
+                .post(format!("{}/v1/chat/completions", proxy_base))
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [
+                        { "role": "system", "content": format!("System {}", i) },
+                        { "role": "user", "content": format!("Hello {}", i) },
+                        { "role": "assistant", "content": format!("Answer {}", i) }
+                    ]
+                }))
+                .send()
+                .await
+        }
+    });
+
+    let responses = join_all(futures).await;
+    for res in responses {
+        let res = res.unwrap();
+        assert!(res.status().is_success(), "status: {}", res.status());
+    }
+
+    let requests = captured.requests.lock().unwrap();
+    assert_eq!(requests.len(), request_count);
+
+    for req in requests.iter() {
+        let version = req
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-version"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(version, Some("2023-06-01"));
+
+        assert_eq!(req.body["stream"], false);
+
+        let system = req.body["system"]
+            .as_array()
+            .expect("system should be array");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(system[0]["cache_control"]["ttl"], "1h");
+
+        let messages = req.body["messages"]
+            .as_array()
+            .expect("messages should be array");
+        assert_eq!(messages.len(), 2);
+
+        let user_blocks = messages[0]["content"]
+            .as_array()
+            .expect("user content should be array");
+        assert!(
+            user_blocks
+                .iter()
+                .all(|block| block.get("cache_control").is_none()),
+            "user blocks should not carry cache_control"
+        );
+
+        let assistant_blocks = messages[1]["content"]
+            .as_array()
+            .expect("assistant content should be array");
+        let last = assistant_blocks.last().expect("assistant block should exist");
+        assert_eq!(last["cache_control"]["type"], "ephemeral");
+        assert!(
+            assistant_blocks[..assistant_blocks.len() - 1]
+                .iter()
+                .all(|block| block.get("cache_control").is_none()),
+            "only last assistant block should carry cache_control"
+        );
+    }
 }
 
 #[tokio::test]

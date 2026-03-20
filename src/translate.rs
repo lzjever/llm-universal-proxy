@@ -905,7 +905,7 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
     let mut result = serde_json::json!({
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "messages": [],
-        "stream": body.get("stream").cloned().unwrap_or(serde_json::json!(true))
+        "stream": body.get("stream").cloned().unwrap_or(serde_json::json!(false))
     });
     if let Some(max_tokens) = body.get("max_tokens") {
         result["max_tokens"] = max_tokens.clone();
@@ -1088,7 +1088,7 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "max_tokens": body.get("max_tokens").cloned().unwrap_or(serde_json::json!(4096)),
         "messages": [],
-        "stream": body.get("stream").cloned().unwrap_or(serde_json::json!(true))
+        "stream": body.get("stream").cloned().unwrap_or(serde_json::json!(false))
     });
     if let Some(t) = body.get("temperature") {
         result["temperature"] = t.clone();
@@ -1275,7 +1275,7 @@ fn gemini_to_openai(body: &mut Value) -> Result<(), String> {
     let mut result = serde_json::json!({
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "messages": [],
-        "stream": body.get("stream").cloned().unwrap_or(serde_json::json!(true))
+        "stream": body.get("stream").cloned().unwrap_or(serde_json::json!(false))
     });
     if let Some(gc) = body.get("generationConfig") {
         if let Some(n) = gc.get("maxOutputTokens") {
@@ -1704,6 +1704,56 @@ mod tests {
         .unwrap();
         assert!(body.get("contents").is_some());
         assert!(body.get("systemInstruction").is_some());
+    }
+
+    #[test]
+    fn translate_request_openai_to_claude_omitted_stream_defaults_false() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn translate_request_claude_to_openai_omitted_stream_defaults_false() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }]
+        });
+        translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn translate_request_gemini_to_openai_omitted_stream_defaults_false() {
+        let mut body = json!({
+            "contents": [{ "parts": [{ "text": "Hi" }] }]
+        });
+        translate_request(
+            UpstreamFormat::Google,
+            UpstreamFormat::OpenAiCompletion,
+            "gemini-1.5",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["stream"], false);
     }
 
     #[test]
