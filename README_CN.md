@@ -103,6 +103,142 @@ hooks:
 - `auth_policy` 支持 `client_or_fallback` 和 `force_server`。
 - hooks 是异步 best-effort 模式。通常只开 `usage` 就够；`exchange` 会在请求结束后上报完整的 client-facing request/response pair。
 
+### 完整 YAML 参考
+
+```yaml
+listen: 0.0.0.0:8080
+upstream_timeout_secs: 120
+
+upstreams:
+  UPSTREAM_NAME:
+    base_url: https://example.com
+    format: anthropic
+    credential_env: EXAMPLE_API_KEY
+    # credential_actual: sk-xxx
+    auth_policy: client_or_fallback
+    headers:
+      x-example-header: example-value
+
+model_aliases:
+  local-model-name: UPSTREAM_NAME:real-upstream-model
+
+hooks:
+  max_pending_bytes: 104857600
+  timeout_secs: 30
+  failure_threshold: 3
+  cooldown_secs: 300
+  usage:
+    url: https://example.com/hooks/usage
+    authorization: Bearer usage-hook-token
+  exchange:
+    url: https://example.com/hooks/exchange
+    authorization: Bearer exchange-hook-token
+```
+
+### 顶层字段
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `listen` | string | 否 | `0.0.0.0:8080` | 代理监听地址，格式为 `host:port` |
+| `upstream_timeout_secs` | integer | 否 | `120` | 请求上游时的 HTTP 超时 |
+| `upstreams` | map | 是 | 无 | 命名上游配置 |
+| `model_aliases` | map | 否 | 空 | 把本地模型名映射到 `upstream:model` |
+| `hooks` | object | 否 | 关闭 | 可选的异步审计与用量导出 hooks |
+
+### `upstreams`
+
+`upstreams` 是一个以“上游名字”为 key 的 YAML 对象：
+
+```yaml
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+    credential_env: GLM_APIKEY
+```
+
+每个 upstream 支持这些字段：
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `base_url` | string | 是 | 无 | 上游基础 URL |
+| `format` | enum | 否 | 自动探测 | 固定指定上游协议格式 |
+| `credential_env` | string | 否 | 无 | 指向 fallback credential 的环境变量名 |
+| `credential_actual` | string | 否 | 无 | 直接写在 YAML 里的 fallback credential |
+| `auth_policy` | enum | 否 | `client_or_fallback` | 控制是否接受客户端传入的认证信息 |
+| `headers` | map<string,string> | 否 | 空 | 注入到该上游每个请求的静态头 |
+
+规则：
+- `credential_env` 和 `credential_actual` 互斥。
+- 如果使用 `auth_policy: force_server`，则该 upstream 必须配置 `credential_env` 或 `credential_actual`。
+- `headers` 是按 upstream 单独配置，不是全局配置。
+
+#### `format` 枚举
+
+允许的值：
+
+| 值 | 含义 |
+|----|------|
+| `openai-completion` | OpenAI Chat Completions 风格上游 |
+| `openai-responses` | OpenAI Responses 风格上游 |
+| `anthropic` | Anthropic Messages 风格上游 |
+| `google` | Google Gemini GenerateContent / streamGenerateContent 风格上游 |
+| `responses` | `openai-responses` 的别名 |
+
+如果省略，代理会主动探测该上游支持哪些格式。
+
+#### `auth_policy` 枚举
+
+| 值 | 含义 |
+|----|------|
+| `client_or_fallback` | 优先使用客户端传入的认证；如果客户端没传，再使用上游 fallback credential |
+| `force_server` | 忽略客户端传入的认证，只使用上游 fallback credential |
+
+### `model_aliases`
+
+`model_aliases` 用于把稳定的本地模型名映射到一个具体上游模型：
+
+```yaml
+model_aliases:
+  sonnet: ANTHROPIC:claude-sonnet-4
+  coder-fast: GLM-OFFICIAL:GLM-4.5-Air
+```
+
+规则：
+- key：暴露给客户端的本地模型名
+- value：`UPSTREAM_NAME:REAL_MODEL_NAME`
+- 本地模型名应保持唯一
+- 如果配置了多个上游，而客户端请求了一个未映射的裸模型名，代理会返回 `400`
+
+### `hooks`
+
+`hooks` 用于配置可选的异步 HTTP 审计和统计导出。
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `max_pending_bytes` | integer | 否 | `104857600` | 所有待发送 hook payload 的内存预算上限 |
+| `timeout_secs` | integer | 否 | `30` | hook HTTP 请求超时 |
+| `failure_threshold` | integer | 否 | `3` | 连续失败多少次后进入 cooldown |
+| `cooldown_secs` | integer | 否 | `300` | 熔断后等待多久再尝试恢复 |
+| `usage` | object | 否 | 关闭 | 用量导出 hook |
+| `exchange` | object | 否 | 关闭 | 完整 request/response 导出 hook |
+
+Hook 行为：
+- hooks 是异步、best-effort 的。
+- `usage` 通常就足够做计费或观测。
+- `exchange` 会在请求完成后导出完整的 client-facing request/response pair，包括完成后的流式结果。
+- 当待发送 hook payload 总大小超过 `max_pending_bytes` 时，新 hook payload 会被丢弃，直到压力下降。
+- `usage` 和 `exchange` 各自有独立熔断器；连续失败到达 `failure_threshold` 后，会暂停 `cooldown_secs`。
+
+#### `hooks.usage` 与 `hooks.exchange`
+
+这两个 endpoint 都支持：
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `url` | string | 是 | 无 | 接收 hook payload 的 HTTP/HTTPS 地址 |
+| `authorization` | string | 否 | 无 | 可选的 `Authorization` 请求头值 |
+
 ## 使用方法
 
 ### 多上游示例

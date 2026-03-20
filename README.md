@@ -103,6 +103,142 @@ Notes:
 - `auth_policy` supports `client_or_fallback` and `force_server`.
 - Hooks are best-effort and asynchronous. `usage` is usually enough; `exchange` captures the full client-facing request/response pair after the request completes.
 
+### Full YAML Reference
+
+```yaml
+listen: 0.0.0.0:8080
+upstream_timeout_secs: 120
+
+upstreams:
+  UPSTREAM_NAME:
+    base_url: https://example.com
+    format: anthropic
+    credential_env: EXAMPLE_API_KEY
+    # credential_actual: sk-xxx
+    auth_policy: client_or_fallback
+    headers:
+      x-example-header: example-value
+
+model_aliases:
+  local-model-name: UPSTREAM_NAME:real-upstream-model
+
+hooks:
+  max_pending_bytes: 104857600
+  timeout_secs: 30
+  failure_threshold: 3
+  cooldown_secs: 300
+  usage:
+    url: https://example.com/hooks/usage
+    authorization: Bearer usage-hook-token
+  exchange:
+    url: https://example.com/hooks/exchange
+    authorization: Bearer exchange-hook-token
+```
+
+### Top-Level Fields
+
+| Field | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `listen` | string | No | `0.0.0.0:8080` | Proxy listen address in `host:port` form |
+| `upstream_timeout_secs` | integer | No | `120` | Timeout for upstream HTTP requests |
+| `upstreams` | map | Yes | none | Named upstream definitions |
+| `model_aliases` | map | No | empty | Maps local model names to `upstream:model` |
+| `hooks` | object | No | disabled | Optional async audit and usage export hooks |
+
+### `upstreams`
+
+`upstreams` is a YAML object keyed by upstream name:
+
+```yaml
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+    credential_env: GLM_APIKEY
+```
+
+Each upstream supports these fields:
+
+| Field | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `base_url` | string | Yes | none | Upstream base URL |
+| `format` | enum | No | auto-discover | Fixed upstream protocol format |
+| `credential_env` | string | No | none | Environment variable name containing the fallback credential |
+| `credential_actual` | string | No | none | Fallback credential written directly in YAML |
+| `auth_policy` | enum | No | `client_or_fallback` | Controls whether client auth is honored |
+| `headers` | map<string,string> | No | empty | Static headers injected into every upstream request |
+
+Rules:
+- `credential_env` and `credential_actual` are mutually exclusive.
+- If `auth_policy: force_server` is used, the upstream must define either `credential_env` or `credential_actual`.
+- `headers` are per-upstream, not global.
+
+#### `format` enum
+
+Allowed values:
+
+| Value | Meaning |
+|------|---------|
+| `openai-completion` | OpenAI Chat Completions style upstream |
+| `openai-responses` | OpenAI Responses style upstream |
+| `anthropic` | Anthropic Messages style upstream |
+| `google` | Google Gemini GenerateContent / streamGenerateContent style upstream |
+| `responses` | Alias of `openai-responses` |
+
+If omitted, the proxy probes the upstream to determine supported formats.
+
+#### `auth_policy` enum
+
+| Value | Meaning |
+|------|---------|
+| `client_or_fallback` | Use client-provided auth if present; otherwise use the upstream fallback credential |
+| `force_server` | Ignore client-provided auth and always use the upstream fallback credential |
+
+### `model_aliases`
+
+`model_aliases` maps one stable local model name to one concrete upstream model:
+
+```yaml
+model_aliases:
+  sonnet: ANTHROPIC:claude-sonnet-4
+  coder-fast: GLM-OFFICIAL:GLM-4.5-Air
+```
+
+Rules:
+- Key: local model name exposed to clients
+- Value: `UPSTREAM_NAME:REAL_MODEL_NAME`
+- Local model names should be unique
+- If multiple upstreams are configured and a request uses an unmapped bare model name, the proxy returns `400`
+
+### `hooks`
+
+`hooks` configures optional async HTTP exports for audit and metering.
+
+| Field | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `max_pending_bytes` | integer | No | `104857600` | Max combined in-memory bytes pending for hook delivery |
+| `timeout_secs` | integer | No | `30` | Per-hook HTTP timeout |
+| `failure_threshold` | integer | No | `3` | Consecutive failures before a hook enters cooldown |
+| `cooldown_secs` | integer | No | `300` | Cooldown period before retrying a failed hook |
+| `usage` | object | No | disabled | Usage export hook |
+| `exchange` | object | No | disabled | Full request/response export hook |
+
+Hook behavior:
+- Hooks are asynchronous and best-effort.
+- `usage` is usually enough for billing or observability.
+- `exchange` captures the full client-facing request/response pair after completion, including completed streaming responses.
+- When pending hook payloads exceed `max_pending_bytes`, new hook payloads are dropped until pressure falls.
+- Each hook type has its own circuit breaker. After `failure_threshold` consecutive failures, that hook pauses for `cooldown_secs`.
+
+#### `hooks.usage` and `hooks.exchange`
+
+Each endpoint supports:
+
+| Field | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `url` | string | Yes | none | HTTP or HTTPS endpoint to receive hook payloads |
+| `authorization` | string | No | none | Optional `Authorization` header value for the hook request |
+
 ## Usage
 
 ### Multi-Upstream Example
