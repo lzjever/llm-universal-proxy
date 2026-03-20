@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.4 - 2026-03-20
+
+- Fixed `run_with_listener()` to validate config before serving, which prevents invalid-config startup hangs and unblocks the `missing_upstreams_config_is_rejected` integration test in CI.
+- Re-ran the release gate after the YAML/CLI configuration work: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --locked`.
+
 ## v0.1.3 - 2026-03-20
 
 - Replaced environment-variable-based proxy configuration with a YAML config file loaded via `--config` / `-c`.

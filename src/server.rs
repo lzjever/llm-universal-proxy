@@ -58,6 +58,9 @@ pub async fn run_with_listener(
     config: Config,
     listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    config
+        .validate()
+        .map_err(|e| format!("invalid config: {}", e))?;
     let upstreams = resolve_upstreams(&config).await;
     let client = upstream::build_client(&config);
     let state = Arc::new(AppState {
