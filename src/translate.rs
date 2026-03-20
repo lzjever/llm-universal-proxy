@@ -431,6 +431,14 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
     let choice = choices.first().ok_or("empty choices")?;
     let message = choice.get("message").ok_or("missing message")?;
     let mut output: Vec<Value> = vec![];
+    if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+        if !reasoning.is_empty() {
+            output.push(serde_json::json!({
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": reasoning }]
+            }));
+        }
+    }
     let content = openai_message_content_to_responses_output(message.get("content"));
     output.push(serde_json::json!({
         "type": "message",
@@ -551,11 +559,18 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
         let Some(ty) = item_type else { continue };
         match ty {
             "message" => {
-                flush_assistant(&mut messages, &mut current_assistant);
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let content = item.get("content").cloned();
                 let content = map_responses_content_to_openai(content);
-                messages.push(serde_json::json!({ "role": role, "content": content }));
+                if role == "assistant" && current_assistant.is_some() {
+                    if let Some(ref mut a) = current_assistant {
+                        a["role"] = Value::String("assistant".to_string());
+                        a["content"] = content;
+                    }
+                } else {
+                    flush_assistant(&mut messages, &mut current_assistant);
+                    messages.push(serde_json::json!({ "role": role, "content": content }));
+                }
             }
             "function_call" => {
                 let call_id = item.get("call_id").cloned();
@@ -601,7 +616,39 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                     "content": content
                 }));
             }
-            "reasoning" => {}
+            "reasoning" => {
+                let summary = item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                                Some("summary_text") => {
+                                    part.get("text").and_then(Value::as_str).map(str::to_string)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default();
+                if !summary.is_empty() {
+                    if current_assistant.is_none() {
+                        current_assistant = Some(serde_json::json!({
+                            "role": "assistant",
+                            "content": null
+                        }));
+                    }
+                    if let Some(ref mut a) = current_assistant {
+                        let existing = a
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        a["reasoning_content"] = Value::String(format!("{}{}", existing, summary));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -704,6 +751,16 @@ fn messages_to_responses(body: &mut Value) -> Result<(), String> {
             continue;
         }
         if role == "user" || role == "assistant" {
+            if role == "assistant" {
+                if let Some(reasoning) = msg.get("reasoning_content").and_then(Value::as_str) {
+                    if !reasoning.is_empty() {
+                        input.push(serde_json::json!({
+                            "type": "reasoning",
+                            "summary": [{ "type": "summary_text", "text": reasoning }]
+                        }));
+                    }
+                }
+            }
             let content = msg.get("content").cloned();
             let content_type = if role == "user" {
                 "input_text"
@@ -1622,6 +1679,32 @@ mod tests {
     }
 
     #[test]
+    fn messages_to_responses_preserves_reasoning_items() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "reasoning_content": "thinking",
+                    "content": "Hi"
+                }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["summary"][0]["text"], "thinking");
+        assert_eq!(input[1]["type"], "message");
+    }
+
+    #[test]
     fn translate_request_same_format_passthrough() {
         let mut body =
             json!({ "model": "gpt-4o", "messages": [{ "role": "user", "content": "Hi" }] });
@@ -1653,6 +1736,30 @@ mod tests {
         .unwrap();
         assert!(body.get("messages").is_some());
         assert!(body.get("input").is_none());
+    }
+
+    #[test]
+    fn translate_request_responses_to_openai_preserves_reasoning_items() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "input": [
+                { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "thinking" }] },
+                { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Hi" }] }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["reasoning_content"], "thinking");
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        assert_eq!(messages[0]["content"][0]["text"], "Hi");
     }
 
     #[test]
@@ -1873,6 +1980,32 @@ mod tests {
         assert_eq!(out["usage"]["output_tokens"], 7);
         assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 3);
         assert_eq!(out["usage"]["output_tokens_details"]["reasoning_tokens"], 2);
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_preserves_reasoning_output() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "thinking",
+                    "content": "Hi"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["output"][0]["type"], "reasoning");
+        assert_eq!(out["output"][0]["summary"][0]["text"], "thinking");
+        assert_eq!(out["output"][1]["type"], "message");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! HTTP server: single POST endpoint, format detection, proxy to upstream with optional translation.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::{
@@ -11,14 +12,19 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use bytes::Bytes;
 use reqwest::Client;
 use serde_json::Value;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 
-use crate::config::{Config, UpstreamConfig};
+use crate::config::{AuthPolicy, Config, UpstreamConfig};
 use crate::detect::detect_request_format;
 use crate::discovery::UpstreamCapability;
+use crate::hooks::{
+    capture_headers, fingerprint_credential, json_response_headers, new_request_id,
+    now_timestamp_ms, sse_response_headers, CredentialSource, HookDispatcher, HookRequestContext,
+};
 use crate::streaming::{needs_stream_translation, TranslateSseStream};
 use crate::translate::{translate_request, translate_response};
 use crate::upstream;
@@ -67,6 +73,7 @@ pub async fn run_with_listener(
         config: config.clone(),
         upstreams,
         client,
+        hooks: HookDispatcher::new(&config.hooks),
     });
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -81,6 +88,7 @@ pub async fn run_with_listener(
         .route("/health", get(health))
         .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/v1/responses", post(handle_responses))
+        .route("/v1/messages", post(handle_messages))
         .layer(cors)
         .with_state(state);
 
@@ -93,12 +101,19 @@ struct AppState {
     config: Config,
     upstreams: BTreeMap<String, UpstreamState>,
     client: Client,
+    hooks: Option<HookDispatcher>,
 }
 
 #[derive(Clone)]
 struct UpstreamState {
     config: UpstreamConfig,
     capability: UpstreamCapability,
+}
+
+#[derive(Clone)]
+struct EffectiveCredential {
+    source: CredentialSource,
+    fingerprint: Option<String>,
 }
 
 async fn health() -> impl IntoResponse {
@@ -151,12 +166,24 @@ async fn handle_responses(
     handle_chat_inner(state, headers, "/v1/responses", body).await
 }
 
+async fn handle_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    handle_chat_inner(state, headers, "/v1/messages", body).await
+}
+
 async fn handle_chat_inner(
     state: Arc<AppState>,
     headers: HeaderMap,
     path: &str,
     mut body: Value,
 ) -> impl IntoResponse {
+    let request_id = new_request_id();
+    let request_timestamp = now_timestamp_ms();
+    let original_body = body.clone();
+    let original_headers = capture_headers(&headers);
     debug!("Request path: {}", path);
     debug!(
         "Request body: {}",
@@ -226,37 +253,29 @@ async fn handle_chat_inner(
         serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
     );
 
-    // Extract auth headers to forward
-    let mut auth_headers = extract_forwardable_headers(&headers);
-
-    // Check if client provided any auth headers
-    let has_client_auth = auth_headers.iter().any(|(k, _)| {
-        let k = k.to_lowercase();
-        k == "authorization"
-            || k == "x-api-key"
-            || k == "api-key"
-            || k == "openai-api-key"
-            || k == "x-goog-api-key"
-    });
-
-    // If client didn't provide auth, use configured upstream API key as fallback
-    if !has_client_auth {
-        if let Some(ref api_key) = upstream_state.config.fallback_api_key {
-            debug!("No client auth provided, using upstream API key from config as fallback");
-            // Add auth header in the format appropriate for the upstream
-            let auth_header = auth_header_for_format(upstream_format, api_key);
-            auth_headers.push(auth_header);
-        }
-    } else {
-        debug!("Using client-provided auth headers");
-        // Normalize client auth headers for upstream format
-        normalize_auth_headers(&mut auth_headers, upstream_format);
-    }
+    let (mut auth_headers, effective_credential) =
+        build_auth_headers(&headers, upstream_state, upstream_format);
     apply_upstream_headers(
         &mut auth_headers,
         &upstream_state.config.upstream_headers,
         upstream_format,
     );
+    let hook_ctx = state.hooks.as_ref().map(|_| HookRequestContext {
+        request_id,
+        timestamp_ms: request_timestamp,
+        path: path.to_string(),
+        method: "POST".to_string(),
+        stream,
+        client_model: requested_model.clone(),
+        upstream_name: resolved_model.upstream_name.clone(),
+        upstream_model: resolved_model.upstream_model.clone(),
+        client_format,
+        upstream_format,
+        credential_source: effective_credential.source,
+        credential_fingerprint: effective_credential.fingerprint.clone(),
+        client_request_headers: original_headers,
+        client_request_body: original_body,
+    });
 
     let url = upstream::upstream_url(
         &state.config,
@@ -302,13 +321,21 @@ async fn handle_chat_inner(
                 .into_response();
         }
         let upstream_stream = res.bytes_stream();
-        let body = if needs_stream_translation(upstream_format, client_format) {
+        let body_stream: Pin<
+            Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+        > = if needs_stream_translation(upstream_format, client_format) {
             let translated =
                 TranslateSseStream::new(upstream_stream, upstream_format, client_format);
-            Body::from_stream(translated.map(|r| r.map_err(std::io::Error::other)))
+            Box::pin(translated.map(|r| r.map_err(std::io::Error::other)))
         } else {
-            let pass = upstream_stream.map(|r| r.map_err(std::io::Error::other));
-            Body::from_stream(pass)
+            Box::pin(upstream_stream.map(|r| r.map_err(std::io::Error::other)))
+        };
+        let body = if let (Some(dispatcher), Some(ctx)) = (state.hooks.clone(), hook_ctx.clone()) {
+            let captured =
+                dispatcher.wrap_stream(body_stream, ctx, status.as_u16(), sse_response_headers());
+            Body::from_stream(captured)
+        } else {
+            Body::from_stream(body_stream)
         };
         return Response::builder()
             .status(status)
@@ -365,6 +392,9 @@ async fn handle_chat_inner(
                 .into_response();
         }
     };
+    if let (Some(dispatcher), Some(ctx)) = (state.hooks.as_ref(), hook_ctx) {
+        dispatcher.emit_non_stream(ctx, 200, json_response_headers(), out.clone());
+    }
     (StatusCode::OK, Json(out)).into_response()
 }
 
@@ -383,6 +413,74 @@ fn apply_upstream_headers(
     }
     for (name, value) in extra_headers {
         upsert_header(headers, name.to_lowercase(), value.clone());
+    }
+}
+
+fn build_auth_headers(
+    request_headers: &HeaderMap,
+    upstream_state: &UpstreamState,
+    upstream_format: crate::formats::UpstreamFormat,
+) -> (Vec<(String, String)>, EffectiveCredential) {
+    let mut headers = extract_forwardable_headers(request_headers);
+    let client_key = extract_api_key_from_headers(&headers);
+    match upstream_state.config.auth_policy {
+        AuthPolicy::ForceServer => {
+            headers.retain(|(k, _)| {
+                let k = k.to_lowercase();
+                !matches!(
+                    k.as_str(),
+                    "authorization"
+                        | "x-api-key"
+                        | "api-key"
+                        | "openai-api-key"
+                        | "x-goog-api-key"
+                        | "anthropic-api-key"
+                        | "bearer"
+                )
+            });
+            let server_key = upstream_state
+                .config
+                .fallback_api_key
+                .as_ref()
+                .expect("validated force_server requires fallback_api_key");
+            headers.push(auth_header_for_format(upstream_format, server_key));
+            (
+                headers,
+                EffectiveCredential {
+                    source: CredentialSource::Server,
+                    fingerprint: Some(fingerprint_credential(server_key)),
+                },
+            )
+        }
+        AuthPolicy::ClientOrFallback => {
+            if let Some(client_key) = client_key {
+                normalize_auth_headers(&mut headers, upstream_format);
+                (
+                    headers,
+                    EffectiveCredential {
+                        source: CredentialSource::Client,
+                        fingerprint: Some(fingerprint_credential(&client_key)),
+                    },
+                )
+            } else if let Some(server_key) = upstream_state.config.fallback_api_key.as_ref() {
+                headers.push(auth_header_for_format(upstream_format, server_key));
+                (
+                    headers,
+                    EffectiveCredential {
+                        source: CredentialSource::Server,
+                        fingerprint: Some(fingerprint_credential(server_key)),
+                    },
+                )
+            } else {
+                (
+                    headers,
+                    EffectiveCredential {
+                        source: CredentialSource::Client,
+                        fingerprint: None,
+                    },
+                )
+            }
+        }
     }
 }
 

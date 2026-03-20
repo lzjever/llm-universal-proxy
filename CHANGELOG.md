@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.0 - 2026-03-20
+
+- Added product-grade multi-upstream audit hooks with asynchronous `exchange` and `usage` delivery, request/response capture, normalized usage reporting, credential fingerprinting, and per-hook circuit breaker / pending-byte protections.
+- Added upstream credential policy controls: `credential_actual`, `auth_policy`, and force-server credential enforcement.
+- Added first-class Anthropic Messages client support at `POST /v1/messages`, including request detection, translation, and streaming.
+- Improved upstream URL construction to support both versionless roots and versioned compatibility bases such as `.../api/paas/v4`.
+- Expanded reasoning / thinking support across OpenAI Chat, OpenAI Responses, Anthropic Messages, and Gemini translation paths, including non-streaming response mapping and streaming lifecycle conversion.
+- Added extensive regression coverage for reasoning/thinking, streaming, hooks, and protocol translation, plus a real upstream smoke script covering Anthropic-compatible and OpenAI-compatible services.
+
 ## v0.1.4 - 2026-03-20
 
 - Fixed `run_with_listener()` to validate config before serving, which prevents invalid-config startup hangs and unblocks the `missing_upstreams_config_is_rejected` integration test in CI.

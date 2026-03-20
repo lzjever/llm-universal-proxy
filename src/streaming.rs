@@ -1653,6 +1653,58 @@ mod tests {
     }
 
     #[test]
+    fn gemini_thought_part_produces_openai_reasoning_chunk() {
+        let event = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "think",
+                        "thought": true,
+                        "thoughtSignature": "sig"
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let mut state = StreamState::default();
+        let chunks = gemini_event_to_openai_chunks(&event, &mut state);
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["delta"]["reasoning_content"] == "think"));
+    }
+
+    #[test]
+    fn claude_thinking_delta_produces_openai_reasoning_chunk() {
+        let mut state = StreamState::default();
+        let _ = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-3" }
+            }),
+            &mut state,
+        );
+        let _ = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "thinking", "thinking": "" }
+            }),
+            &mut state,
+        );
+        let chunks = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "think" }
+            }),
+            &mut state,
+        );
+        assert!(chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["delta"]["reasoning_content"] == "think"));
+    }
+
+    #[test]
     fn responses_event_output_text_delta_produces_openai_chunk() {
         let event = serde_json::json!({
             "type": "response.output_text.delta",
@@ -1679,6 +1731,21 @@ mod tests {
         assert_eq!(state.message_id.as_deref(), Some("resp_abc"));
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    }
+
+    #[test]
+    fn responses_reasoning_delta_produces_openai_reasoning_chunk() {
+        let event = serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "think"
+        });
+        let mut state = StreamState::default();
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0]["choices"][0]["delta"]["reasoning_content"],
+            "think"
+        );
     }
 
     #[test]
@@ -1715,6 +1782,48 @@ mod tests {
             .iter()
             .any(|b| String::from_utf8_lossy(b).contains("content_block"));
         assert!(has_content_block);
+    }
+
+    #[test]
+    fn openai_chunk_to_claude_sse_emits_thinking_blocks() {
+        let reasoning_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "choices": [{ "index": 0, "delta": { "reasoning_content": "think" }, "finish_reason": null }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+        let mut state = StreamState::default();
+        let out1 = openai_chunk_to_claude_sse(&reasoning_chunk, &mut state);
+        let out2 = openai_chunk_to_claude_sse(&finish_chunk, &mut state);
+        let joined = out1
+            .into_iter()
+            .chain(out2)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"type\":\"thinking\""));
+        assert!(joined.contains("thinking_delta"));
+        assert!(joined.contains("message_stop"));
+    }
+
+    #[test]
+    fn openai_chunk_to_gemini_sse_emits_thought_parts() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": { "reasoning_content": "think" }, "finish_reason": null }]
+        });
+        let mut state = StreamState::default();
+        let out = openai_chunk_to_gemini_sse(&chunk, &mut state);
+        let joined = out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"thought\":true"));
+        assert!(joined.contains("\"text\":\"think\""));
     }
 
     #[test]

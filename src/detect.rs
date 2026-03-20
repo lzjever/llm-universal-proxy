@@ -18,6 +18,9 @@ fn detect_by_path(path: &str, body: &Value) -> Option<UpstreamFormat> {
     if path.contains("/v1/responses") {
         return Some(UpstreamFormat::OpenAiResponses);
     }
+    if path.contains("/v1/messages") {
+        return Some(UpstreamFormat::Anthropic);
+    }
     // /v1/chat/completions with input[] can be OpenAI Responses body on chat endpoint
     if path.contains("/v1/chat/completions")
         && body.get("input").and_then(Value::as_array).is_some()
@@ -98,6 +101,16 @@ mod tests {
         assert_eq!(
             detect_request_format(path, &body),
             UpstreamFormat::OpenAiResponses
+        );
+    }
+
+    #[test]
+    fn detect_anthropic_by_messages_path() {
+        let path = "/v1/messages";
+        let body = json!({ "messages": [{ "role": "user", "content": "Hi" }] });
+        assert_eq!(
+            detect_request_format(path, &body),
+            UpstreamFormat::Anthropic
         );
     }
 

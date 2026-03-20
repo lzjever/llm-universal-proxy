@@ -6,6 +6,7 @@ pub mod config;
 pub mod detect;
 pub mod discovery;
 pub mod formats;
+pub mod hooks;
 pub mod server;
 pub mod streaming;
 pub mod translate;

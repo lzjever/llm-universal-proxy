@@ -8,6 +8,50 @@ use serde::Deserialize;
 
 use crate::formats::UpstreamFormat;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum AuthPolicy {
+    #[serde(rename = "client_or_fallback", alias = "client-or-fallback")]
+    #[default]
+    ClientOrFallback,
+    #[serde(rename = "force_server", alias = "force-server")]
+    ForceServer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookConfig {
+    pub max_pending_bytes: usize,
+    pub timeout: Duration,
+    pub failure_threshold: usize,
+    pub cooldown: Duration,
+    pub exchange: Option<HookEndpointConfig>,
+    pub usage: Option<HookEndpointConfig>,
+}
+
+impl HookConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.exchange.is_some() || self.usage.is_some()
+    }
+}
+
+impl Default for HookConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_bytes: default_hook_max_pending_bytes(),
+            timeout: Duration::from_secs(default_hook_timeout_secs()),
+            failure_threshold: default_hook_failure_threshold(),
+            cooldown: Duration::from_secs(default_hook_cooldown_secs()),
+            exchange: None,
+            usage: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookEndpointConfig {
+    pub url: String,
+    pub authorization: Option<String>,
+}
+
 /// Runtime configuration for one named upstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamConfig {
@@ -19,8 +63,12 @@ pub struct UpstreamConfig {
     pub fixed_upstream_format: Option<UpstreamFormat>,
     /// Optional fallback credential env var name, for example `GLM_APIKEY`.
     pub fallback_credential_env: Option<String>,
+    /// Optional fallback credential value loaded directly from config.
+    pub fallback_credential_actual: Option<String>,
     /// Resolved fallback credential value loaded from the env var above.
     pub fallback_api_key: Option<String>,
+    /// Credential policy for this upstream.
+    pub auth_policy: AuthPolicy,
     /// Optional static headers to inject into every upstream request.
     pub upstream_headers: Vec<(String, String)>,
 }
@@ -50,6 +98,8 @@ pub struct Config {
     pub upstreams: Vec<UpstreamConfig>,
     /// Local unique model names mapped to named upstream models.
     pub model_aliases: BTreeMap<String, ModelAlias>,
+    /// Optional audit and metering hooks.
+    pub hooks: HookConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +112,8 @@ struct FileConfig {
     upstreams: BTreeMap<String, UpstreamConfigFile>,
     #[serde(default)]
     model_aliases: BTreeMap<String, String>,
+    #[serde(default)]
+    hooks: HooksFileConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,8 +130,40 @@ struct UpstreamConfigFile {
         alias = "api_key_env"
     )]
     fallback_credential_env: Option<String>,
+    #[serde(
+        default,
+        alias = "credential_actual",
+        alias = "fallback_credential_actual",
+        alias = "api_key"
+    )]
+    fallback_credential_actual: Option<String>,
+    #[serde(default)]
+    auth_policy: AuthPolicy,
     #[serde(default, alias = "headers", alias = "upstream_headers")]
     upstream_headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct HooksFileConfig {
+    #[serde(default = "default_hook_max_pending_bytes")]
+    max_pending_bytes: usize,
+    #[serde(default = "default_hook_timeout_secs")]
+    timeout_secs: u64,
+    #[serde(default = "default_hook_failure_threshold")]
+    failure_threshold: usize,
+    #[serde(default = "default_hook_cooldown_secs")]
+    cooldown_secs: u64,
+    #[serde(default)]
+    exchange: Option<HookEndpointConfigFile>,
+    #[serde(default)]
+    usage: Option<HookEndpointConfigFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HookEndpointConfigFile {
+    url: String,
+    #[serde(default)]
+    authorization: Option<String>,
 }
 
 impl Default for Config {
@@ -89,6 +173,7 @@ impl Default for Config {
             upstream_timeout: Duration::from_secs(default_upstream_timeout_secs()),
             upstreams: Vec::new(),
             model_aliases: BTreeMap::new(),
+            hooks: HookConfig::default(),
         }
     }
 }
@@ -113,16 +198,19 @@ impl Config {
             .upstreams
             .into_iter()
             .map(|(name, item)| {
-                let fallback_api_key = item
-                    .fallback_credential_env
-                    .as_deref()
-                    .and_then(|env_name| std::env::var(env_name).ok());
+                let fallback_api_key = item.fallback_credential_actual.clone().or_else(|| {
+                    item.fallback_credential_env
+                        .as_deref()
+                        .and_then(|env_name| std::env::var(env_name).ok())
+                });
                 UpstreamConfig {
                     name,
                     base_url: item.base_url,
                     fixed_upstream_format: item.fixed_upstream_format,
                     fallback_credential_env: item.fallback_credential_env,
+                    fallback_credential_actual: item.fallback_credential_actual,
                     fallback_api_key,
+                    auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers.into_iter().collect(),
                 }
             })
@@ -148,6 +236,20 @@ impl Config {
             upstream_timeout: Duration::from_secs(parsed.upstream_timeout_secs),
             upstreams,
             model_aliases,
+            hooks: HookConfig {
+                max_pending_bytes: parsed.hooks.max_pending_bytes,
+                timeout: Duration::from_secs(parsed.hooks.timeout_secs),
+                failure_threshold: parsed.hooks.failure_threshold,
+                cooldown: Duration::from_secs(parsed.hooks.cooldown_secs),
+                exchange: parsed.hooks.exchange.map(|hook| HookEndpointConfig {
+                    url: hook.url,
+                    authorization: hook.authorization,
+                }),
+                usage: parsed.hooks.usage.map(|hook| HookEndpointConfig {
+                    url: hook.url,
+                    authorization: hook.authorization,
+                }),
+            },
         })
     }
 
@@ -168,8 +270,38 @@ impl Config {
                     upstream.name
                 ));
             }
+            if upstream.fallback_credential_env.is_some()
+                && upstream.fallback_credential_actual.is_some()
+            {
+                return Err(format!(
+                    "upstream `{}` cannot set both credential_env and credential_actual",
+                    upstream.name
+                ));
+            }
+            if upstream.auth_policy == AuthPolicy::ForceServer
+                && upstream.fallback_api_key.is_none()
+            {
+                return Err(format!(
+                    "upstream `{}` auth_policy=force-server requires a server credential",
+                    upstream.name
+                ));
+            }
             if !seen.insert(upstream.name.clone()) {
                 return Err(format!("duplicate upstream name `{}`", upstream.name));
+            }
+        }
+
+        self.validate_hook("exchange", self.hooks.exchange.as_ref())?;
+        self.validate_hook("usage", self.hooks.usage.as_ref())?;
+        if self.hooks.is_enabled() {
+            if self.hooks.timeout.is_zero() {
+                return Err("hook timeout must be greater than zero".to_string());
+            }
+            if self.hooks.failure_threshold == 0 {
+                return Err("hook failure_threshold must be greater than zero".to_string());
+            }
+            if self.hooks.cooldown.is_zero() {
+                return Err("hook cooldown must be greater than zero".to_string());
             }
         }
 
@@ -191,6 +323,31 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_hook(
+        &self,
+        hook_name: &str,
+        hook: Option<&HookEndpointConfig>,
+    ) -> Result<(), String> {
+        let Some(hook) = hook else {
+            return Ok(());
+        };
+        if hook.url.trim().is_empty() {
+            return Err(format!("{} hook url must not be empty", hook_name));
+        }
+        let parsed = url::Url::parse(&hook.url)
+            .map_err(|e| format!("{} hook url is invalid: {}", hook_name, e))?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            scheme => {
+                return Err(format!(
+                    "{} hook url must use http or https, got `{}`",
+                    hook_name, scheme
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -255,6 +412,22 @@ fn default_upstream_timeout_secs() -> u64 {
     120
 }
 
+fn default_hook_timeout_secs() -> u64 {
+    30
+}
+
+fn default_hook_max_pending_bytes() -> usize {
+    100 * 1024 * 1024
+}
+
+fn default_hook_failure_threshold() -> usize {
+    3
+}
+
+fn default_hook_cooldown_secs() -> u64 {
+    300
+}
+
 /// Build full upstream POST URL for a format.
 ///
 /// Best practice is to keep the base URL versionless:
@@ -269,14 +442,38 @@ pub fn build_upstream_url(
     model: Option<&str>,
     stream: bool,
 ) -> String {
-    let base = normalize_base_url(base_url, format);
+    let base = base_url.trim_end_matches('/');
     match format {
-        UpstreamFormat::OpenAiCompletion => format!("{}/v1/chat/completions", base),
-        UpstreamFormat::OpenAiResponses => format!("{}/v1/responses", base),
-        UpstreamFormat::Anthropic => format!("{}/v1/messages", base),
+        UpstreamFormat::OpenAiCompletion => {
+            if has_version_root(base) {
+                format!("{}/chat/completions", base)
+            } else {
+                format!("{}/v1/chat/completions", base)
+            }
+        }
+        UpstreamFormat::OpenAiResponses => {
+            if has_version_root(base) {
+                format!("{}/responses", base)
+            } else {
+                format!("{}/v1/responses", base)
+            }
+        }
+        UpstreamFormat::Anthropic => {
+            if has_version_root(base) {
+                format!("{}/messages", base)
+            } else {
+                format!("{}/v1/messages", base)
+            }
+        }
         UpstreamFormat::Google => {
             let model = model.filter(|s| !s.is_empty()).unwrap_or("gemini-1.5");
-            if stream {
+            if base.ends_with("/v1beta") {
+                if stream {
+                    format!("{}/models/{}:streamGenerateContent?alt=sse", base, model)
+                } else {
+                    format!("{}/models/{}:generateContent", base, model)
+                }
+            } else if stream {
                 format!(
                     "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
                     base, model
@@ -288,23 +485,18 @@ pub fn build_upstream_url(
     }
 }
 
-fn normalize_base_url(base_url: &str, format: UpstreamFormat) -> String {
-    let mut base = base_url.trim_end_matches('/').to_string();
-    match format {
-        UpstreamFormat::OpenAiCompletion
-        | UpstreamFormat::OpenAiResponses
-        | UpstreamFormat::Anthropic => {
-            if base.ends_with("/v1") {
-                base.truncate(base.len() - 3);
-            }
-        }
-        UpstreamFormat::Google => {
-            if base.ends_with("/v1beta") {
-                base.truncate(base.len() - 7);
-            }
-        }
-    }
-    base
+fn has_version_root(base_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(last) = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+    else {
+        return false;
+    };
+    let suffix = last.strip_prefix('v').unwrap_or("");
+    !suffix.is_empty() && suffix.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -373,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn build_upstream_url_strips_legacy_version_suffix() {
+    fn build_upstream_url_handles_versioned_roots() {
         assert_eq!(
             build_upstream_url(
                 "https://api.openai.com/v1",
@@ -400,6 +592,15 @@ mod tests {
                 false
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        );
+        assert_eq!(
+            build_upstream_url(
+                "https://open.bigmodel.cn/api/paas/v4",
+                UpstreamFormat::OpenAiCompletion,
+                None,
+                false
+            ),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         );
     }
 
@@ -432,6 +633,7 @@ model_aliases:
         assert_eq!(glm.fixed_upstream_format, Some(UpstreamFormat::Anthropic));
         assert_eq!(glm.fallback_credential_env.as_deref(), Some("GLM_APIKEY"));
         assert_eq!(glm.fallback_api_key.as_deref(), Some("glm-secret"));
+        assert_eq!(glm.auth_policy, AuthPolicy::ClientOrFallback);
         let alias = c.model_aliases.get("GLM-5").unwrap();
         assert_eq!(alias.upstream_name, "GLM-OFFICIAL");
         assert_eq!(alias.upstream_model, "GLM-5");
@@ -452,7 +654,9 @@ model_aliases:
                 base_url: "https://api.openai.com".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                 fallback_credential_env: None,
+                fallback_credential_actual: None,
                 fallback_api_key: None,
+                auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
             }],
             ..Config::default()
@@ -483,7 +687,9 @@ model_aliases:
                     base_url: "https://example.com".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::Anthropic),
                     fallback_credential_env: None,
+                    fallback_credential_actual: None,
                     fallback_api_key: None,
+                    auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
                 },
                 UpstreamConfig {
@@ -491,7 +697,9 @@ model_aliases:
                     base_url: "https://api.openai.com".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                     fallback_credential_env: None,
+                    fallback_credential_actual: None,
                     fallback_api_key: None,
+                    auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
                 },
             ],
@@ -510,7 +718,9 @@ model_aliases:
                 base_url: "https://example.com".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::Anthropic),
                 fallback_credential_env: None,
+                fallback_credential_actual: None,
                 fallback_api_key: None,
+                auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
             }],
             ..Config::default()
@@ -535,7 +745,9 @@ model_aliases:
                 base_url: "https://api.openai.com".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                 fallback_credential_env: None,
+                fallback_credential_actual: None,
                 fallback_api_key: None,
+                auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
             }],
             ..Config::default()
@@ -554,7 +766,9 @@ model_aliases:
                     base_url: "https://a.example.com".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::Anthropic),
                     fallback_credential_env: None,
+                    fallback_credential_actual: None,
                     fallback_api_key: None,
+                    auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
                 },
                 UpstreamConfig {
@@ -562,7 +776,9 @@ model_aliases:
                     base_url: "https://b.example.com".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
                     fallback_credential_env: None,
+                    fallback_credential_actual: None,
                     fallback_api_key: None,
+                    auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
                 },
             ],
@@ -581,6 +797,82 @@ model_aliases:
                 upstream_model: "GLM-5".to_string(),
             },
         );
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn config_from_yaml_str_parses_hooks_and_force_server_policy() {
+        let c = Config::from_yaml_str(
+            r#"
+hooks:
+  timeout_secs: 8
+  exchange:
+    url: https://example.com/exchange
+    authorization: Bearer hook-token
+  usage:
+    url: https://example.com/usage
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+    credential_actual: secret
+    auth_policy: force_server
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            c.hooks.exchange.as_ref().unwrap().url,
+            "https://example.com/exchange"
+        );
+        assert_eq!(c.hooks.timeout.as_secs(), 8);
+        assert_eq!(
+            c.hooks.exchange.as_ref().unwrap().authorization.as_deref(),
+            Some("Bearer hook-token")
+        );
+        assert_eq!(
+            c.hooks.usage.as_ref().unwrap().url,
+            "https://example.com/usage"
+        );
+        let upstream = c.upstream("GLM-OFFICIAL").unwrap();
+        assert_eq!(
+            upstream.fallback_credential_actual.as_deref(),
+            Some("secret")
+        );
+        assert_eq!(upstream.fallback_api_key.as_deref(), Some("secret"));
+        assert_eq!(upstream.auth_policy, AuthPolicy::ForceServer);
+    }
+
+    #[test]
+    fn validate_rejects_conflicting_credential_sources() {
+        let c = Config::from_yaml_str(
+            r#"
+upstreams:
+  demo:
+    base_url: https://api.openai.com
+    format: openai-completion
+    credential_env: OPENAI_API_KEY
+    credential_actual: secret
+"#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_hook_url() {
+        let c = Config::from_yaml_str(
+            r#"
+hooks:
+  usage:
+    url: ftp://example.com/usage
+upstreams:
+  demo:
+    base_url: https://api.openai.com
+    format: openai-completion
+"#,
+        )
+        .unwrap();
         assert!(c.validate().is_err());
     }
 }

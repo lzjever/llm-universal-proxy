@@ -6,7 +6,9 @@ mod common;
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use common::*;
 use futures_util::future::join_all;
-use llm_universal_proxy::config::{Config, ModelAlias, UpstreamConfig};
+use llm_universal_proxy::config::{
+    AuthPolicy, Config, HookConfig, HookEndpointConfig, ModelAlias, UpstreamConfig,
+};
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::run_with_listener;
 use reqwest::Client;
@@ -25,10 +27,13 @@ fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
             base_url: upstream_base.to_string(),
             fixed_upstream_format: Some(format),
             fallback_credential_env: None,
+            fallback_credential_actual: None,
             fallback_api_key: None,
+            auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
         }],
         model_aliases: Default::default(),
+        hooks: Default::default(),
     }
 }
 
@@ -43,7 +48,9 @@ fn named_upstream(
         base_url: upstream_base.to_string(),
         fixed_upstream_format: Some(format),
         fallback_credential_env: fallback_api_key.map(|_| format!("{}_KEY_ENV", name)),
+        fallback_credential_actual: None,
         fallback_api_key: fallback_api_key.map(ToString::to_string),
+        auth_policy: AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
     }
 }
@@ -234,6 +241,102 @@ async fn upstream_anthropic_client_openai_translated_non_streaming() {
 }
 
 #[tokio::test]
+async fn anthropic_messages_endpoint_passthrough_non_streaming() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/messages", proxy_base))
+        .json(&json!({
+            "model": "claude-3",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["content"][0]["text"], "Hi");
+}
+
+#[tokio::test]
+async fn anthropic_messages_endpoint_translates_to_openai_upstream() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/messages", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["content"][0]["text"], "Hi");
+}
+
+#[tokio::test]
+async fn responses_endpoint_translates_to_anthropic_upstream_non_streaming() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "Hi",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["output"][0]["content"][0]["text"], "Hi");
+}
+
+#[tokio::test]
+async fn responses_endpoint_preserves_anthropic_reasoning_non_streaming() {
+    let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "Hi",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["output"][0]["type"], "reasoning");
+    assert_eq!(body["output"][0]["summary"][0]["text"], "think");
+    assert_eq!(body["output"][1]["type"], "message");
+    assert_eq!(body["usage"]["output_tokens"], 2);
+}
+
+#[tokio::test]
 async fn upstream_google_passthrough_non_streaming() {
     let (mock_base, _mock) = spawn_google_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
@@ -411,6 +514,11 @@ struct CapturedAuthRequests {
     requests: Arc<Mutex<Vec<CapturedAnthropicRequest>>>,
 }
 
+#[derive(Clone, Default)]
+struct CapturedHookPayloads {
+    payloads: Arc<Mutex<Vec<Value>>>,
+}
+
 async fn spawn_auth_capture_anthropic_mock(
 ) -> (String, tokio::task::JoinHandle<()>, CapturedAuthRequests) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -463,6 +571,29 @@ async fn capture_auth_anthropic_handler(
     )
 }
 
+async fn spawn_hook_capture_server() -> (String, tokio::task::JoinHandle<()>, CapturedHookPayloads)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+    let state = CapturedHookPayloads::default();
+    let app = Router::new()
+        .route("/hook", post(capture_hook_handler))
+        .with_state(state.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle, state)
+}
+
+async fn capture_hook_handler(
+    State(state): State<CapturedHookPayloads>,
+    Json(body): Json<Value>,
+) -> impl axum::response::IntoResponse {
+    state.payloads.lock().unwrap().push(body);
+    (axum::http::StatusCode::OK, Json(json!({"ok": true})))
+}
+
 #[tokio::test]
 async fn upstream_anthropic_injects_required_version_header() {
     let (mock_base, _mock, captured) = spawn_header_capture_anthropic_mock().await;
@@ -507,6 +638,7 @@ async fn multi_upstream_supports_explicit_upstream_model_selector() {
             ),
         ],
         model_aliases: Default::default(),
+        hooks: Default::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -552,6 +684,7 @@ async fn multi_upstream_supports_local_model_alias() {
             ),
         ],
         model_aliases,
+        hooks: Default::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -589,6 +722,7 @@ async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
             ),
         ],
         model_aliases: Default::default(),
+        hooks: Default::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -619,6 +753,7 @@ async fn multi_upstream_uses_per_upstream_fallback_credential() {
             Some("glm-secret"),
         )],
         model_aliases: Default::default(),
+        hooks: Default::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -643,6 +778,280 @@ async fn multi_upstream_uses_per_upstream_fallback_credential() {
         .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
         .map(|(_, value)| value.as_str());
     assert_eq!(api_key, Some("glm-secret"));
+}
+
+#[tokio::test]
+async fn force_server_auth_policy_ignores_client_key() {
+    let (glm_base, _mock, captured) = spawn_auth_capture_anthropic_mock().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![UpstreamConfig {
+            name: "GLM-OFFICIAL".to_string(),
+            base_url: glm_base,
+            fixed_upstream_format: Some(UpstreamFormat::Anthropic),
+            fallback_credential_env: None,
+            fallback_credential_actual: Some("server-secret".to_string()),
+            fallback_api_key: Some("server-secret".to_string()),
+            auth_policy: AuthPolicy::ForceServer,
+            upstream_headers: Vec::new(),
+        }],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .header("authorization", "Bearer client-secret")
+        .json(&json!({
+            "model": "GLM-OFFICIAL:GLM-5",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+
+    let requests = captured.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let api_key = requests[0]
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(api_key, Some("server-secret"));
+}
+
+#[tokio::test]
+async fn usage_and_exchange_hooks_fire_for_non_streaming_requests() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (hook_base, _hook, captured) = spawn_hook_capture_server().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    config.hooks = HookConfig {
+        max_pending_bytes: 100 * 1024 * 1024,
+        timeout: Duration::from_secs(3),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(300),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+        usage: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .header("authorization", "Bearer client-secret")
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let payloads = captured.payloads.lock().unwrap();
+    assert_eq!(payloads.len(), 2);
+    let exchange = payloads
+        .iter()
+        .find(|payload| payload.get("request").is_some())
+        .unwrap();
+    assert_eq!(exchange["request"]["body"]["messages"][0]["content"], "Hi");
+    assert_eq!(
+        exchange["response"]["body"]["choices"][0]["message"]["content"],
+        "Hi"
+    );
+    assert_eq!(exchange["credential_source"], "client");
+    assert!(exchange["credential_fingerprint"].as_str().unwrap().len() == 16);
+
+    let usage = payloads
+        .iter()
+        .find(|payload| payload.get("usage").is_some())
+        .unwrap();
+    assert_eq!(usage["usage"]["input_tokens"], 1);
+    assert_eq!(usage["usage"]["output_tokens"], 1);
+}
+
+#[tokio::test]
+async fn exchange_hook_captures_complete_streaming_response_after_done() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let (hook_base, _hook, captured) = spawn_hook_capture_server().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    config.hooks = HookConfig {
+        max_pending_bytes: 100 * 1024 * 1024,
+        timeout: Duration::from_secs(3),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(300),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+        usage: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("data:"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let payloads = captured.payloads.lock().unwrap();
+    let exchange = payloads
+        .iter()
+        .find(|payload| payload.get("request").is_some())
+        .unwrap();
+    assert_eq!(exchange["completed"], true);
+    assert_eq!(exchange["stream"], true);
+    assert_eq!(
+        exchange["response"]["body"]["choices"][0]["message"]["content"],
+        "Hi"
+    );
+    let usage = payloads
+        .iter()
+        .find(|payload| payload.get("usage").is_some())
+        .unwrap();
+    assert_eq!(usage["usage"]["input_tokens"], 1);
+    assert_eq!(usage["usage"]["output_tokens"], 1);
+}
+
+#[tokio::test]
+async fn hooks_capture_reasoning_for_responses_stream_passthrough() {
+    let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
+    let (hook_base, _hook, captured) = spawn_hook_capture_server().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    config.hooks = HookConfig {
+        max_pending_bytes: 100 * 1024 * 1024,
+        timeout: Duration::from_secs(3),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(300),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+        usage: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "input": "Hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("response.reasoning_summary_text.delta"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let payloads = captured.payloads.lock().unwrap();
+    let exchange = payloads
+        .iter()
+        .find(|payload| payload.get("request").is_some())
+        .unwrap();
+    assert_eq!(
+        exchange["response"]["body"]["output"][0]["type"],
+        "reasoning"
+    );
+    assert_eq!(
+        exchange["response"]["body"]["output"][0]["summary"][0]["text"],
+        "think"
+    );
+
+    let usage = payloads
+        .iter()
+        .find(|payload| payload.get("usage").is_some())
+        .unwrap();
+    assert_eq!(usage["usage"]["input_tokens"], 1);
+    assert_eq!(usage["usage"]["output_tokens"], 2);
+    assert_eq!(usage["usage"]["reasoning_tokens"], 1);
+}
+
+#[tokio::test]
+async fn hooks_capture_translated_thinking_blocks_for_messages_stream() {
+    let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
+    let (hook_base, _hook, captured) = spawn_hook_capture_server().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    config.hooks = HookConfig {
+        max_pending_bytes: 100 * 1024 * 1024,
+        timeout: Duration::from_secs(3),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(300),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+        usage: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/messages", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("thinking_delta"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let payloads = captured.payloads.lock().unwrap();
+    let exchange = payloads
+        .iter()
+        .find(|payload| payload.get("request").is_some())
+        .unwrap();
+    assert_eq!(
+        exchange["response"]["body"]["content"][0]["type"],
+        "thinking"
+    );
+    assert_eq!(
+        exchange["response"]["body"]["content"][0]["thinking"],
+        "think"
+    );
+    assert_eq!(exchange["response"]["body"]["content"][1]["type"], "text");
+    assert_eq!(exchange["response"]["body"]["content"][1]["text"], "Hi");
 }
 
 #[tokio::test]
@@ -787,6 +1196,148 @@ async fn upstream_anthropic_streaming_translated_to_openai() {
     assert!(
         text.contains("chat.completion.chunk") || text.contains("Hi") || text.contains("[DONE]")
     );
+}
+
+#[tokio::test]
+async fn anthropic_messages_endpoint_streaming_translates_to_openai_upstream() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/messages", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    assert_eq!(
+        res.headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = res.text().await.unwrap();
+    assert!(body.contains("message_start"), "body = {body}");
+    assert!(body.contains("message_stop"), "body = {body}");
+}
+
+#[tokio::test]
+async fn responses_endpoint_streaming_translates_to_anthropic_upstream() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "Hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    assert_eq!(
+        res.headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = res.text().await.unwrap();
+    assert!(body.contains("response.completed"), "body = {body}");
+    assert!(body.contains("\"Hi\""), "body = {body}");
+}
+
+#[tokio::test]
+async fn responses_endpoint_streaming_preserves_anthropic_reasoning() {
+    let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "Hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(
+        body.contains("response.reasoning_summary_text.delta"),
+        "body = {body}"
+    );
+    assert!(
+        body.contains("response.reasoning_summary_text.done"),
+        "body = {body}"
+    );
+    assert!(body.contains("\"think\""), "body = {body}");
+    assert!(body.contains("response.completed"), "body = {body}");
+}
+
+#[tokio::test]
+async fn chat_completions_endpoint_preserves_responses_reasoning_stream() {
+    let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("reasoning_content"), "body = {body}");
+    assert!(body.contains("think"), "body = {body}");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "body = {body}");
+}
+
+#[tokio::test]
+async fn messages_endpoint_preserves_responses_reasoning_stream() {
+    let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/messages", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(
+        body.contains("\"type\":\"thinking\"") || body.contains("\"type\": \"thinking\""),
+        "body = {body}"
+    );
+    assert!(body.contains("thinking_delta"), "body = {body}");
+    assert!(body.contains("message_stop"), "body = {body}");
 }
 
 #[tokio::test]
@@ -936,10 +1487,13 @@ async fn upstream_unreachable_returns_502() {
             base_url: "http://127.0.0.1:31999".to_string(),
             fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
             fallback_credential_env: None,
+            fallback_credential_actual: None,
             fallback_api_key: None,
+            auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
         }],
         model_aliases: Default::default(),
+        hooks: Default::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 

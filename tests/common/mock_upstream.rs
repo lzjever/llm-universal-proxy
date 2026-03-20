@@ -77,6 +77,67 @@ pub async fn spawn_anthropic_mock() -> (String, tokio::task::JoinHandle<()>) {
     (base, handle)
 }
 
+pub async fn spawn_anthropic_thinking_mock() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+
+    let app = Router::new()
+        .route("/v1/messages", post(anthropic_thinking_handler))
+        .route("/messages", post(anthropic_thinking_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn anthropic_thinking_handler(Json(body): Json<Value>) -> Response {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream {
+        let events = [
+            r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-3","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think"}}"#,
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi"}}"#,
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":1}"#,
+            r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":2}}"#,
+            r#"event: message_stop
+data: {"type":"message_stop"}"#,
+        ];
+        let body = events.join("\n\n") + "\n\n";
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    } else {
+        let resp = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                { "type": "thinking", "thinking": "think" },
+                { "type": "text", "text": "Hi" }
+            ],
+            "model": body.get("model").unwrap_or(&serde_json::json!("claude-3")),
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 1, "output_tokens": 2 }
+        });
+        (StatusCode::OK, Json(resp)).into_response()
+    }
+}
+
 async fn anthropic_handler(Json(body): Json<Value>) -> Response {
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
@@ -175,6 +236,55 @@ pub async fn spawn_openai_responses_mock() -> (String, tokio::task::JoinHandle<(
         axum::serve(listener, app).await.ok();
     });
     (base, handle)
+}
+
+pub async fn spawn_openai_responses_reasoning_mock() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+
+    let app = Router::new()
+        .route("/v1/responses", post(openai_responses_reasoning_handler))
+        .route("/responses", post(openai_responses_reasoning_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn openai_responses_reasoning_handler(Json(body): Json<Value>) -> Response {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream {
+        let events = [
+            r#"event: response.created
+data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_1","object":"response","created_at":1,"status":"in_progress","background":false,"error":null,"output":[]}}"#,
+            r#"event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","sequence_number":2,"output_index":0,"summary_index":0,"delta":"think"}"#,
+            r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"output_index":1,"delta":"Hi"}"#,
+            r#"event: response.completed
+data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_1","object":"response","created_at":1,"status":"completed","output":[{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"think"}]},{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}],"usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":1}}}}"#,
+        ];
+        let body = events.join("\n\n") + "\n\n";
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    } else {
+        let resp = serde_json::json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "output": [
+                { "id": "rs_1", "type": "reasoning", "summary": [{ "type": "summary_text", "text": "think" }] },
+                { "id": "msg_1", "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Hi" }] }
+            ],
+            "usage": { "input_tokens": 1, "output_tokens": 2, "output_tokens_details": { "reasoning_tokens": 1 } }
+        });
+        (StatusCode::OK, Json(resp)).into_response()
+    }
 }
 
 async fn openai_responses_handler(Json(body): Json<Value>) -> Response {
