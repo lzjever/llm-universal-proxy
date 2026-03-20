@@ -2,7 +2,7 @@
 
 [中文文档](./README_CN.md)
 
-A single-binary HTTP proxy that provides a unified interface for Large Language Model APIs. It accepts requests in multiple LLM API formats and automatically handles format conversion when needed.
+A single-binary HTTP proxy that provides a unified interface for Large Language Model APIs. It accepts requests in multiple LLM API formats, routes models to named upstreams, and automatically handles format conversion when needed.
 
 ## Features
 
@@ -16,6 +16,8 @@ A single-binary HTTP proxy that provides a unified interface for Large Language 
 - **Format Translation**: Seamlessly converts between formats when needed
 - **Streaming Support**: Handles both streaming and non-streaming responses
 - **Concurrent Requests**: Asynchronous handling for high performance
+- **Named Upstreams**: Route requests to multiple upstream providers from one proxy instance
+- **Local Model Aliases**: Expose one unique local model name for any upstream model
 - **Codex CLI Friendly**: Works as a Responses-compatible endpoint in front of Anthropic-compatible upstreams
 
 ## Installation
@@ -47,35 +49,70 @@ make run-release  # Build and run in release mode
 
 ## Configuration
 
-The proxy is configured via environment variables:
+The proxy is configured with a YAML file passed via `--config`:
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LISTEN` | Listen address | `0.0.0.0:8080` |
-| `UPSTREAM_URL` | Upstream service base URL | `https://api.openai.com/v1` |
-| `UPSTREAM_FORMAT` | Fixed upstream format (skips auto-discovery). Options: `google`, `anthropic`, `openai-completion`, `openai-responses` | *(auto-detect)* |
-| `UPSTREAM_TIMEOUT_SECS` | Request timeout in seconds | `120` |
-| `UPSTREAM_API_KEY` | Fallback upstream API key used when the client provides no auth header | *(unset)* |
-| `UPSTREAM_HEADERS` | Static upstream headers as a JSON object, for example `{"anthropic-version":"2023-06-01"}` | *(unset)* |
+```yaml
+listen: 0.0.0.0:8080
+upstream_timeout_secs: 120
+
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+    credential_env: GLM_APIKEY
+
+  OPENAI:
+    base_url: https://api.openai.com
+    format: openai-responses
+    credential_env: OPENAI_API_KEY
+
+model_aliases:
+  GLM-5: GLM-OFFICIAL:GLM-5
+  gpt-4o: OPENAI:gpt-4o
+```
 
 Notes:
-- Anthropic-compatible upstreams usually require `x-api-key` and `anthropic-version`. The proxy forwards client auth headers when present, can fall back to `UPSTREAM_API_KEY`, and injects a default `anthropic-version: 2023-06-01` header for Anthropic upstreams.
-- `UPSTREAM_HEADERS` is merged on top of the defaults, so it can be used for provider-specific headers without changing clients.
+- Best practice is to keep upstream `base_url` versionless. The proxy appends `/v1` or `/v1beta` internally.
+- Anthropic-compatible upstreams usually require `x-api-key` and `anthropic-version`. The proxy forwards client auth headers when present, can fall back to the upstream's configured `credential_env`, and injects a default `anthropic-version: 2023-06-01` header for Anthropic upstreams.
+- Provider-specific headers belong inside each upstream entry's `headers` object.
+- `credential_env` is the environment variable name holding that upstream's fallback credential. The secret stays out of the YAML file.
 
 ## Usage
 
-### Basic Example
+### Multi-Upstream Example
 
 ```bash
-# Start the proxy pointing to OpenAI
-UPSTREAM_URL=https://api.openai.com/v1 ./llm-universal-proxy
+cat > proxy.yaml <<'YAML'
+listen: 0.0.0.0:8080
+upstream_timeout_secs: 120
 
-# Start the proxy pointing to Anthropic Claude
-UPSTREAM_URL=https://api.anthropic.com/v1 ./llm-universal-proxy
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+    credential_env: GLM_APIKEY
 
-# Start the proxy pointing to Google Gemini
-UPSTREAM_URL=https://generativelanguage.googleapis.com/v1beta ./llm-universal-proxy
+  OPENAI:
+    base_url: https://api.openai.com
+    format: openai-responses
+    credential_env: OPENAI_API_KEY
+
+model_aliases:
+  GLM-5: GLM-OFFICIAL:GLM-5
+  gpt-4o: OPENAI:gpt-4o
+YAML
+
+export GLM_APIKEY="your-glm-key"
+export OPENAI_API_KEY="your-openai-key"
+
+./llm-universal-proxy --config proxy.yaml
 ```
+
+Clients can then select a model in either of these ways:
+- Explicit upstream selector: `GLM-OFFICIAL:GLM-5`
+- Local alias: `GLM-5`
+
+If more than one upstream is configured and a model is not an explicit `upstream:model` reference or a configured alias, the proxy returns `400`.
 
 ### Codex CLI to an Anthropic-Compatible Upstream
 
@@ -84,11 +121,21 @@ This is the practical setup for tools such as Codex CLI when the real upstream s
 1. Start the proxy against the Anthropic-compatible upstream:
 
 ```bash
-LISTEN=127.0.0.1:8099 \
-UPSTREAM_URL=https://open.bigmodel.cn/api/anthropic/v1 \
-UPSTREAM_FORMAT=anthropic \
-UPSTREAM_API_KEY="$GLM_APIKEY" \
+cat > codex-proxy.yaml <<'YAML'
+listen: 127.0.0.1:8099
+
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+    credential_env: GLM_APIKEY
+
+model_aliases:
+  GLM-5: GLM-OFFICIAL:GLM-5
+YAML
+
 ./target/release/llm-universal-proxy
+  --config codex-proxy.yaml
 ```
 
 2. Point Codex CLI at the local proxy with an isolated config:
@@ -106,8 +153,8 @@ HOME="$(mktemp -d)" GLM_APIKEY="your-real-key" codex exec --ephemeral \
 
 Notes:
 - This does not modify your global Codex CLI configuration because it uses a temporary `HOME` and `--ephemeral`.
-- The client talks OpenAI Responses to the proxy at `/v1/responses`; the proxy translates upstream to Anthropic Messages.
-- For providers that need extra static headers beyond the Anthropic default, set `UPSTREAM_HEADERS`.
+- The client talks OpenAI Responses to the proxy at `/v1/responses`; the proxy resolves local model `GLM-5` to `GLM-OFFICIAL:GLM-5`, then translates upstream to Anthropic Messages.
+- For providers that need extra static headers beyond the Anthropic default, set the upstream's `headers` field in `UPSTREAMS`.
 
 ### Docker
 
@@ -116,7 +163,10 @@ Notes:
 docker build -t llm-universal-proxy .
 
 # Run the container
-docker run -p 8080:8080 -e UPSTREAM_URL=https://api.openai.com/v1 llm-universal-proxy
+docker run -p 8080:8080 \
+  -v "$PWD/proxy.yaml:/app/proxy.yaml:ro" \
+  llm-universal-proxy
+  --config /app/proxy.yaml
 ```
 
 ### API Endpoints

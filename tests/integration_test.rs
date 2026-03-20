@@ -6,7 +6,7 @@ mod common;
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use common::*;
 use futures_util::future::join_all;
-use llm_universal_proxy::config::Config;
+use llm_universal_proxy::config::{Config, ModelAlias, UpstreamConfig};
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::run_with_listener;
 use reqwest::Client;
@@ -19,10 +19,31 @@ use tokio::net::TcpListener;
 fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
     Config {
         listen: "127.0.0.1:0".to_string(),
-        upstream_url: upstream_base.to_string(),
-        fixed_upstream_format: Some(format),
         upstream_timeout: Duration::from_secs(30),
-        upstream_api_key: None,
+        upstreams: vec![UpstreamConfig {
+            name: "default".to_string(),
+            base_url: upstream_base.to_string(),
+            fixed_upstream_format: Some(format),
+            fallback_credential_env: None,
+            fallback_api_key: None,
+            upstream_headers: Vec::new(),
+        }],
+        model_aliases: Default::default(),
+    }
+}
+
+fn named_upstream(
+    name: &str,
+    upstream_base: &str,
+    format: UpstreamFormat,
+    fallback_api_key: Option<&str>,
+) -> UpstreamConfig {
+    UpstreamConfig {
+        name: name.to_string(),
+        base_url: upstream_base.to_string(),
+        fixed_upstream_format: Some(format),
+        fallback_credential_env: fallback_api_key.map(|_| format!("{}_KEY_ENV", name)),
+        fallback_api_key: fallback_api_key.map(ToString::to_string),
         upstream_headers: Vec::new(),
     }
 }
@@ -40,6 +61,48 @@ async fn start_proxy(
     let handle = tokio::spawn(async move { run_with_listener(config, listener).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     (base, handle)
+}
+
+#[tokio::test]
+async fn missing_upstreams_config_is_rejected() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let err = run_with_listener(Config::default(), listener)
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("at least one upstream must be configured"));
+}
+
+#[test]
+fn config_loads_from_yaml_file() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "llm-universal-proxy-test-{}.yaml",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(
+        &path,
+        r#"
+listen: 127.0.0.1:9090
+upstream_timeout_secs: 33
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+model_aliases:
+  GLM-5: GLM-OFFICIAL:GLM-5
+"#,
+    )
+    .unwrap();
+
+    let config = llm_universal_proxy::config::Config::from_yaml_path(&path).unwrap();
+    assert_eq!(config.listen, "127.0.0.1:9090");
+    assert_eq!(config.upstream_timeout.as_secs(), 33);
+    assert_eq!(config.upstreams.len(), 1);
+    assert_eq!(config.model_aliases["GLM-5"].upstream_name, "GLM-OFFICIAL");
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -250,6 +313,7 @@ async fn spawn_header_capture_anthropic_mock(
     let base = format!("http://127.0.0.1:{}", port);
     let state = CapturedHeaders::default();
     let app = Router::new()
+        .route("/v1/messages", post(capture_anthropic_handler))
         .route("/messages", post(capture_anthropic_handler))
         .with_state(state.clone());
     let handle = tokio::spawn(async move {
@@ -287,13 +351,17 @@ async fn capture_anthropic_handler(
     )
 }
 
-async fn spawn_concurrent_capture_anthropic_mock(
-) -> (String, tokio::task::JoinHandle<()>, CapturedAnthropicRequests) {
+async fn spawn_concurrent_capture_anthropic_mock() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    CapturedAnthropicRequests,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let base = format!("http://127.0.0.1:{}", port);
     let state = CapturedAnthropicRequests::default();
     let app = Router::new()
+        .route("/v1/messages", post(capture_concurrent_anthropic_handler))
         .route("/messages", post(capture_concurrent_anthropic_handler))
         .with_state(state.clone());
     let handle = tokio::spawn(async move {
@@ -316,14 +384,75 @@ async fn capture_concurrent_anthropic_handler(
                 .map(|v| (name.as_str().to_string(), v.to_string()))
         })
         .collect::<Vec<_>>();
-    state.requests.lock().unwrap().push(CapturedAnthropicRequest {
-        headers: captured_headers,
-        body,
-    });
+    state
+        .requests
+        .lock()
+        .unwrap()
+        .push(CapturedAnthropicRequest {
+            headers: captured_headers,
+            body,
+        });
     (
         axum::http::StatusCode::OK,
         Json(json!({
             "id": "msg_concurrent",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "Hi" }],
+            "model": "claude-3",
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        })),
+    )
+}
+
+#[derive(Clone, Default)]
+struct CapturedAuthRequests {
+    requests: Arc<Mutex<Vec<CapturedAnthropicRequest>>>,
+}
+
+async fn spawn_auth_capture_anthropic_mock(
+) -> (String, tokio::task::JoinHandle<()>, CapturedAuthRequests) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+    let state = CapturedAuthRequests::default();
+    let app = Router::new()
+        .route("/v1/messages", post(capture_auth_anthropic_handler))
+        .route("/messages", post(capture_auth_anthropic_handler))
+        .with_state(state.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle, state)
+}
+
+async fn capture_auth_anthropic_handler(
+    State(state): State<CapturedAuthRequests>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl axum::response::IntoResponse {
+    let captured_headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect::<Vec<_>>();
+    state
+        .requests
+        .lock()
+        .unwrap()
+        .push(CapturedAnthropicRequest {
+            headers: captured_headers,
+            body,
+        });
+    (
+        axum::http::StatusCode::OK,
+        Json(json!({
+            "id": "msg_auth",
             "type": "message",
             "role": "assistant",
             "content": [{ "type": "text", "text": "Hi" }],
@@ -359,6 +488,161 @@ async fn upstream_anthropic_injects_required_version_header() {
         .find(|(name, _)| name.eq_ignore_ascii_case("anthropic-version"))
         .map(|(_, value)| value.clone());
     assert_eq!(version.as_deref(), Some("2023-06-01"));
+}
+
+#[tokio::test]
+async fn multi_upstream_supports_explicit_upstream_model_selector() {
+    let (glm_base, _glm_mock) = spawn_anthropic_mock().await;
+    let (openai_base, _openai_mock) = spawn_openai_completion_mock().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![
+            named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
+            named_upstream(
+                "OPENAI",
+                &openai_base,
+                UpstreamFormat::OpenAiCompletion,
+                None,
+            ),
+        ],
+        model_aliases: Default::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "GLM-OFFICIAL:GLM-5",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["message"]["content"], "Hi");
+}
+
+#[tokio::test]
+async fn multi_upstream_supports_local_model_alias() {
+    let (glm_base, _glm_mock) = spawn_anthropic_mock().await;
+    let (openai_base, _openai_mock) = spawn_openai_completion_mock().await;
+    let mut model_aliases = std::collections::BTreeMap::new();
+    model_aliases.insert(
+        "GLM-5".to_string(),
+        ModelAlias {
+            upstream_name: "GLM-OFFICIAL".to_string(),
+            upstream_model: "GLM-5".to_string(),
+        },
+    );
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![
+            named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
+            named_upstream(
+                "OPENAI",
+                &openai_base,
+                UpstreamFormat::OpenAiCompletion,
+                None,
+            ),
+        ],
+        model_aliases,
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "GLM-5",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["message"]["content"], "Hi");
+}
+
+#[tokio::test]
+async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
+    let (glm_base, _glm_mock) = spawn_anthropic_mock().await;
+    let (openai_base, _openai_mock) = spawn_openai_completion_mock().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![
+            named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
+            named_upstream(
+                "OPENAI",
+                &openai_base,
+                UpstreamFormat::OpenAiCompletion,
+                None,
+            ),
+        ],
+        model_aliases: Default::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "shared-model",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 400);
+}
+
+#[tokio::test]
+async fn multi_upstream_uses_per_upstream_fallback_credential() {
+    let (glm_base, _mock, captured) = spawn_auth_capture_anthropic_mock().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![named_upstream(
+            "GLM-OFFICIAL",
+            &glm_base,
+            UpstreamFormat::Anthropic,
+            Some("glm-secret"),
+        )],
+        model_aliases: Default::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "GLM-OFFICIAL:GLM-5",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+
+    let requests = captured.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let api_key = requests[0]
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(api_key, Some("glm-secret"));
 }
 
 #[tokio::test]
@@ -432,7 +716,9 @@ async fn concurrent_openai_to_anthropic_requests_keep_headers_and_cache_control_
         let assistant_blocks = messages[1]["content"]
             .as_array()
             .expect("assistant content should be array");
-        let last = assistant_blocks.last().expect("assistant block should exist");
+        let last = assistant_blocks
+            .last()
+            .expect("assistant block should exist");
         assert_eq!(last["cache_control"]["type"], "ephemeral");
         assert!(
             assistant_blocks[..assistant_blocks.len() - 1]
@@ -644,11 +930,16 @@ async fn post_empty_body_returns_4xx() {
 async fn upstream_unreachable_returns_502() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
-        upstream_url: "http://127.0.0.1:31999".to_string(),
-        fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
         upstream_timeout: Duration::from_millis(100),
-        upstream_api_key: None,
-        upstream_headers: Vec::new(),
+        upstreams: vec![UpstreamConfig {
+            name: "default".to_string(),
+            base_url: "http://127.0.0.1:31999".to_string(),
+            fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+            fallback_credential_env: None,
+            fallback_api_key: None,
+            upstream_headers: Vec::new(),
+        }],
+        model_aliases: Default::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 

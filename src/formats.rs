@@ -5,15 +5,18 @@ use std::fmt;
 
 /// The four supported endpoint formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum UpstreamFormat {
     /// Google (Gemini) — e.g. generateContent, contents[].
+    #[serde(rename = "google", alias = "gemini")]
     Google,
     /// Anthropic (Claude) — e.g. /v1/messages, messages[], content blocks.
+    #[serde(rename = "anthropic", alias = "claude")]
     Anthropic,
     /// OpenAI Chat Completions — /v1/chat/completions, messages[].
+    #[serde(rename = "openai-completion", alias = "openai", alias = "chat")]
     OpenAiCompletion,
     /// OpenAI Responses API — /v1/responses, input[], instructions.
+    #[serde(rename = "openai-responses", alias = "responses")]
     OpenAiResponses,
 }
 

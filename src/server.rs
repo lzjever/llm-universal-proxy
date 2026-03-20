@@ -1,5 +1,6 @@
 //! HTTP server: single POST endpoint, format detection, proxy to upstream with optional translation.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
@@ -15,7 +16,7 @@ use serde_json::Value;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 
-use crate::config::Config;
+use crate::config::{Config, UpstreamConfig};
 use crate::detect::detect_request_format;
 use crate::discovery::UpstreamCapability;
 use crate::streaming::{needs_stream_translation, TranslateSseStream};
@@ -23,14 +24,19 @@ use crate::translate::{translate_request, translate_response};
 use crate::upstream;
 use futures_util::StreamExt;
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = Config::from_env();
+pub async fn run_with_config_path(
+    path: impl AsRef<std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = Config::from_yaml_path(path).map_err(std::io::Error::other)?;
     run_with_config(config).await
 }
 
 pub async fn run_with_config(
     config: Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    config
+        .validate()
+        .map_err(|e| format!("invalid config: {}", e))?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -52,11 +58,11 @@ pub async fn run_with_listener(
     config: Config,
     listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let capability = resolve_capability(&config).await;
+    let upstreams = resolve_upstreams(&config).await;
     let client = upstream::build_client(&config);
     let state = Arc::new(AppState {
         config: config.clone(),
-        capability,
+        upstreams,
         client,
     });
     let cors = CorsLayer::new()
@@ -82,40 +88,48 @@ pub async fn run_with_listener(
 #[derive(Clone)]
 struct AppState {
     config: Config,
-    capability: UpstreamCapability,
+    upstreams: BTreeMap<String, UpstreamState>,
     client: Client,
 }
 
-impl AppState {
-    fn upstream_format_for_request(
-        &self,
-        client_format: crate::formats::UpstreamFormat,
-    ) -> crate::formats::UpstreamFormat {
-        self.capability.upstream_format_for_request(client_format)
-    }
+#[derive(Clone)]
+struct UpstreamState {
+    config: UpstreamConfig,
+    capability: UpstreamCapability,
 }
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }
 
-async fn resolve_capability(config: &Config) -> UpstreamCapability {
-    if let Some(f) = config.fixed_upstream_format {
-        UpstreamCapability::fixed(f)
-    } else {
-        let supported = crate::discovery::discover_supported_formats(
-            &config.upstream_url,
-            config.upstream_timeout,
-            config.upstream_api_key.as_deref(),
-            &config.upstream_headers,
-        )
-        .await;
-        if supported.is_empty() {
-            UpstreamCapability::fixed(crate::formats::UpstreamFormat::OpenAiCompletion)
+async fn resolve_upstreams(config: &Config) -> BTreeMap<String, UpstreamState> {
+    let mut upstreams = BTreeMap::new();
+    for upstream in &config.upstreams {
+        let capability = if let Some(f) = upstream.fixed_upstream_format {
+            UpstreamCapability::fixed(f)
         } else {
-            UpstreamCapability::from_supported(supported)
-        }
+            let supported = crate::discovery::discover_supported_formats(
+                &upstream.base_url,
+                config.upstream_timeout,
+                upstream.fallback_api_key.as_deref(),
+                &upstream.upstream_headers,
+            )
+            .await;
+            if supported.is_empty() {
+                UpstreamCapability::fixed(crate::formats::UpstreamFormat::OpenAiCompletion)
+            } else {
+                UpstreamCapability::from_supported(supported)
+            }
+        };
+        upstreams.insert(
+            upstream.name.clone(),
+            UpstreamState {
+                config: upstream.clone(),
+                capability,
+            },
+        );
     }
+    upstreams
 }
 
 async fn handle_chat_completions(
@@ -145,9 +159,47 @@ async fn handle_chat_inner(
         "Request body: {}",
         serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
     );
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let resolved_model = match state.config.resolve_model(&requested_model) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": { "message": e } })),
+            )
+                .into_response();
+        }
+    };
+    let upstream_state = match state.upstreams.get(&resolved_model.upstream_name) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("resolved upstream `{}` is not configured", resolved_model.upstream_name)
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "model".to_string(),
+            Value::String(resolved_model.upstream_model.clone()),
+        );
+    }
     let client_format = detect_request_format(path, &body);
     debug!("Detected client format: {:?}", client_format);
-    let upstream_format = state.upstream_format_for_request(client_format);
+    let upstream_format = upstream_state
+        .capability
+        .upstream_format_for_request(client_format);
 
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let model = body
@@ -186,7 +238,7 @@ async fn handle_chat_inner(
 
     // If client didn't provide auth, use configured upstream API key as fallback
     if !has_client_auth {
-        if let Some(ref api_key) = state.config.upstream_api_key {
+        if let Some(ref api_key) = upstream_state.config.fallback_api_key {
             debug!("No client auth provided, using upstream API key from config as fallback");
             // Add auth header in the format appropriate for the upstream
             let auth_header = auth_header_for_format(upstream_format, api_key);
@@ -199,12 +251,13 @@ async fn handle_chat_inner(
     }
     apply_upstream_headers(
         &mut auth_headers,
-        &state.config.upstream_headers,
+        &upstream_state.config.upstream_headers,
         upstream_format,
     );
 
     let url = upstream::upstream_url(
         &state.config,
+        &upstream_state.config,
         upstream_format,
         if upstream_format == crate::formats::UpstreamFormat::Google {
             Some(model.as_str())

@@ -3,7 +3,7 @@
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, UpstreamConfig};
 use crate::formats::UpstreamFormat;
 
 /// Build a reqwest client with timeout from config.
@@ -38,9 +38,10 @@ pub async fn call_upstream(
 /// For Google (Gemini), pass the model so the path is .../models/{model}:generateContent.
 pub fn upstream_url(
     config: &Config,
+    upstream: &UpstreamConfig,
     format: UpstreamFormat,
     model: Option<&str>,
     stream: bool,
 ) -> String {
-    config.upstream_url_for_format(format, model, stream)
+    config.upstream_url_for_format(upstream, format, model, stream)
 }

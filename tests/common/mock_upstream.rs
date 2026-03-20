@@ -20,7 +20,9 @@ pub async fn spawn_openai_completion_mock() -> (String, tokio::task::JoinHandle<
     let port = listener.local_addr().unwrap().port();
     let base = format!("http://127.0.0.1:{}", port);
 
-    let app = Router::new().route("/chat/completions", post(openai_completion_handler));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(openai_completion_handler))
+        .route("/chat/completions", post(openai_completion_handler));
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
@@ -66,7 +68,9 @@ pub async fn spawn_anthropic_mock() -> (String, tokio::task::JoinHandle<()>) {
     let port = listener.local_addr().unwrap().port();
     let base = format!("http://127.0.0.1:{}", port);
 
-    let app = Router::new().route("/messages", post(anthropic_handler));
+    let app = Router::new()
+        .route("/v1/messages", post(anthropic_handler))
+        .route("/messages", post(anthropic_handler));
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
@@ -119,6 +123,7 @@ pub async fn spawn_google_mock() -> (String, tokio::task::JoinHandle<()>) {
     let base = format!("http://127.0.0.1:{}", port);
 
     let app = Router::new()
+        .route("/v1beta/models/:model_action", post(google_handler))
         .route("/models/:model_action", post(google_handler))
         .route("/generateContent", post(google_handler));
     let handle = tokio::spawn(async move {
@@ -163,7 +168,9 @@ pub async fn spawn_openai_responses_mock() -> (String, tokio::task::JoinHandle<(
     let port = listener.local_addr().unwrap().port();
     let base = format!("http://127.0.0.1:{}", port);
 
-    let app = Router::new().route("/responses", post(openai_responses_handler));
+    let app = Router::new()
+        .route("/v1/responses", post(openai_responses_handler))
+        .route("/responses", post(openai_responses_handler));
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });

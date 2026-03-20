@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.3 - 2026-03-20
+
+- Replaced environment-variable-based proxy configuration with a YAML config file loaded via `--config` / `-c`.
+- Added named multi-upstream routing, local unique model aliases, and per-upstream fallback credential env support in the YAML schema.
+- Standardized upstream base URLs on versionless roots and moved `/v1` / `/v1beta` path composition into the proxy.
+- Removed the legacy single-upstream configuration path to reduce user-facing configuration ambiguity.
+- Added strict tests for YAML parsing, config-file loading, CLI argument parsing, multi-upstream routing, alias resolution, fallback credentials, and startup failure when no upstreams are configured.
+
 ## v0.1.2 - 2026-03-18
 
 - Tracked `Cargo.lock` in git so `cargo check/test/clippy --locked` works in CI and release jobs.

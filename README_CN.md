@@ -2,7 +2,7 @@
 
 [English](./README.md)
 
-一个单二进制 HTTP 代理，为大语言模型 API 提供统一接口。它接受多种 LLM API 格式的请求，并在需要时自动处理格式转换。
+一个单二进制 HTTP 代理，为大语言模型 API 提供统一接口。它接受多种 LLM API 格式的请求，可以把模型路由到多个命名上游，并在需要时自动处理格式转换。
 
 ## 功能特性
 
@@ -16,6 +16,8 @@
 - **格式转换**：在需要时无缝转换格式
 - **流式支持**：同时支持流式和非流式响应
 - **并发请求**：异步处理，高性能
+- **命名上游**：一个代理实例可同时连接多个上游
+- **本地模型别名**：可为任意上游模型暴露一个本地唯一模型名
 - **兼容 Codex CLI**：可作为 Responses 兼容入口，前接 Anthropic 兼容上游
 
 ## 安装
@@ -47,35 +49,70 @@ make run-release  # 构建并以 release 模式运行
 
 ## 配置
 
-通过环境变量配置代理：
+代理通过 YAML 文件配置，并通过 `--config` 指定：
 
-| 变量 | 描述 | 默认值 |
-|------|------|--------|
-| `LISTEN` | 监听地址 | `0.0.0.0:8080` |
-| `UPSTREAM_URL` | 上游服务基础 URL | `https://api.openai.com/v1` |
-| `UPSTREAM_FORMAT` | 固定上游格式（跳过自动发现）。选项：`google`、`anthropic`、`openai-completion`、`openai-responses` | *(自动检测)* |
-| `UPSTREAM_TIMEOUT_SECS` | 请求超时秒数 | `120` |
-| `UPSTREAM_API_KEY` | 当客户端未提供鉴权头时使用的上游回退 API Key | *(未设置)* |
-| `UPSTREAM_HEADERS` | 发送到上游的静态请求头，JSON 对象格式，例如 `{"anthropic-version":"2023-06-01"}` | *(未设置)* |
+```yaml
+listen: 0.0.0.0:8080
+upstream_timeout_secs: 120
+
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+    credential_env: GLM_APIKEY
+
+  OPENAI:
+    base_url: https://api.openai.com
+    format: openai-responses
+    credential_env: OPENAI_API_KEY
+
+model_aliases:
+  GLM-5: GLM-OFFICIAL:GLM-5
+  gpt-4o: OPENAI:gpt-4o
+```
 
 说明：
-- Anthropic 兼容上游通常要求 `x-api-key` 和 `anthropic-version`。代理会优先透传客户端鉴权头；若客户端没有提供，可回退到 `UPSTREAM_API_KEY`，并会为 Anthropic 上游默认补上 `anthropic-version: 2023-06-01`。
-- `UPSTREAM_HEADERS` 会在默认头之上继续合并，适合补充服务商特定的协议头，而不需要改客户端。
+- 最佳实践是让上游 `base_url` 不带协议版本号。代理会在内部按协议补上 `/v1` 或 `/v1beta`。
+- Anthropic 兼容上游通常要求 `x-api-key` 和 `anthropic-version`。代理会优先透传客户端鉴权头；若客户端没有提供，可回退到该上游配置的 `credential_env`，并会为 Anthropic 上游默认补上 `anthropic-version: 2023-06-01`。
+- 服务商特定静态头应配置在 `upstreams` 中对应上游的 `headers` 字段里。
+- `credential_env` 表示“去哪个环境变量读取该上游的 fallback credential”，密钥本身不写进 YAML。
 
 ## 使用方法
 
-### 基本示例
+### 多上游示例
 
 ```bash
-# 启动代理，指向 OpenAI
-UPSTREAM_URL=https://api.openai.com/v1 ./llm-universal-proxy
+cat > proxy.yaml <<'YAML'
+listen: 0.0.0.0:8080
+upstream_timeout_secs: 120
 
-# 启动代理，指向 Anthropic Claude
-UPSTREAM_URL=https://api.anthropic.com/v1 ./llm-universal-proxy
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+    credential_env: GLM_APIKEY
 
-# 启动代理，指向 Google Gemini
-UPSTREAM_URL=https://generativelanguage.googleapis.com/v1beta ./llm-universal-proxy
+  OPENAI:
+    base_url: https://api.openai.com
+    format: openai-responses
+    credential_env: OPENAI_API_KEY
+
+model_aliases:
+  GLM-5: GLM-OFFICIAL:GLM-5
+  gpt-4o: OPENAI:gpt-4o
+YAML
+
+export GLM_APIKEY="你的 GLM Key"
+export OPENAI_API_KEY="你的 OpenAI Key"
+
+./llm-universal-proxy --config proxy.yaml
 ```
+
+客户端随后可以用两种方式选模型：
+- 显式上游选择：`GLM-OFFICIAL:GLM-5`
+- 本地别名：`GLM-5`
+
+如果配置了多个上游，而模型既不是显式 `上游名:模型名`，也不是已配置的本地 alias，代理会返回 `400`。
 
 ### 通过 Codex CLI 使用 Anthropic 兼容上游
 
@@ -84,11 +121,20 @@ UPSTREAM_URL=https://generativelanguage.googleapis.com/v1beta ./llm-universal-pr
 1. 先启动代理，指向 Anthropic 兼容上游：
 
 ```bash
-LISTEN=127.0.0.1:8099 \
-UPSTREAM_URL=https://open.bigmodel.cn/api/anthropic/v1 \
-UPSTREAM_FORMAT=anthropic \
-UPSTREAM_API_KEY="$GLM_APIKEY" \
-./target/release/llm-universal-proxy
+cat > codex-proxy.yaml <<'YAML'
+listen: 127.0.0.1:8099
+
+upstreams:
+  GLM-OFFICIAL:
+    base_url: https://open.bigmodel.cn/api/anthropic
+    format: anthropic
+    credential_env: GLM_APIKEY
+
+model_aliases:
+  GLM-5: GLM-OFFICIAL:GLM-5
+YAML
+
+./target/release/llm-universal-proxy --config codex-proxy.yaml
 ```
 
 2. 再让 Codex CLI 指向本地代理，并使用隔离配置：
@@ -106,8 +152,8 @@ HOME="$(mktemp -d)" GLM_APIKEY="你的真实 Key" codex exec --ephemeral \
 
 说明：
 - 这里用了临时 `HOME` 和 `--ephemeral`，不会污染你全局的 Codex CLI 配置。
-- 客户端访问的是代理的 `/v1/responses`；代理再把请求转换成 Anthropic Messages 发给上游。
-- 如果上游还需要额外静态协议头，可以通过 `UPSTREAM_HEADERS` 配置。
+- 客户端访问的是代理的 `/v1/responses`；代理会先把本地模型名 `GLM-5` 解析成 `GLM-OFFICIAL:GLM-5`，再转换成 Anthropic Messages 发给上游。
+- 如果上游还需要额外静态协议头，可以在 `UPSTREAMS` 的对应上游里配置 `headers`。
 
 ### Docker
 
@@ -116,7 +162,10 @@ HOME="$(mktemp -d)" GLM_APIKEY="你的真实 Key" codex exec --ephemeral \
 docker build -t llm-universal-proxy .
 
 # 运行容器
-docker run -p 8080:8080 -e UPSTREAM_URL=https://api.openai.com/v1 llm-universal-proxy
+docker run -p 8080:8080 \
+  -v "$PWD/proxy.yaml:/app/proxy.yaml:ro" \
+  llm-universal-proxy \
+  --config /app/proxy.yaml
 ```
 
 ### API 端点

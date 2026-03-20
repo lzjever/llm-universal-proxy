@@ -12,4 +12,4 @@ pub mod translate;
 pub mod upstream;
 
 pub use config::Config;
-pub use server::run;
+pub use server::{run_with_config, run_with_config_path};
