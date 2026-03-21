@@ -3,9 +3,17 @@
 
 mod common;
 
-use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
+use bytes::Bytes;
 use common::*;
-use futures_util::future::join_all;
+use futures_util::{future::join_all, stream, StreamExt};
 use llm_universal_proxy::config::{
     AuthPolicy, Config, HookConfig, HookEndpointConfig, ModelAlias, UpstreamConfig,
 };
@@ -893,6 +901,68 @@ async fn capture_hook_handler(
     (axum::http::StatusCode::OK, Json(json!({"ok": true})))
 }
 
+async fn spawn_slow_openai_completion_mock() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+    let app = Router::new()
+        .route("/v1/chat/completions", post(slow_openai_completion_handler))
+        .route("/chat/completions", post(slow_openai_completion_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn slow_openai_completion_handler(Json(body): Json<Value>) -> Response {
+    let stream_enabled = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if !stream_enabled {
+        return (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "id": "chatcmpl-slow",
+                "object": "chat.completion",
+                "created": 1,
+                "model": body.get("model").unwrap_or(&json!("mock")),
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Hi" }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            })),
+        )
+            .into_response();
+    }
+
+    let pieces = vec![
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            br#"data: {"id":"chatcmpl-slow","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        )),
+        Ok(Bytes::from_static(b"\n\n")),
+        Ok(Bytes::from_static(
+            br#"data: {"id":"chatcmpl-slow","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+        )),
+        Ok(Bytes::from_static(b"\n\n")),
+        Ok(Bytes::from_static(
+            br#"data: {"id":"chatcmpl-slow","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        )),
+        Ok(Bytes::from_static(b"\n\n")),
+        Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+    ];
+    let body_stream = stream::unfold(pieces.into_iter().enumerate(), |mut iter| async move {
+        if let Some((idx, chunk)) = iter.next() {
+            if idx >= 2 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Some((chunk, iter))
+        } else {
+            None
+        }
+    });
+    Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .body(Body::from_stream(body_stream))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn upstream_anthropic_injects_required_version_header() {
     let (mock_base, _mock, captured) = spawn_header_capture_anthropic_mock().await;
@@ -1296,6 +1366,68 @@ async fn hooks_capture_reasoning_for_responses_stream_passthrough() {
     assert_eq!(usage["usage"]["input_tokens"], 1);
     assert_eq!(usage["usage"]["output_tokens"], 2);
     assert_eq!(usage["usage"]["reasoning_tokens"], 1);
+}
+
+#[tokio::test]
+async fn hooks_mark_cancelled_when_stream_is_dropped_early() {
+    let (mock_base, _mock) = spawn_slow_openai_completion_mock().await;
+    let (hook_base, _hook, captured) = spawn_hook_capture_server().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    config.hooks = HookConfig {
+        max_pending_bytes: 100 * 1024 * 1024,
+        timeout: Duration::from_secs(3),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(300),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+        usage: Some(HookEndpointConfig {
+            url: format!("{}/hook", hook_base),
+            authorization: None,
+        }),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+
+    let mut body_stream = res.bytes_stream();
+    let first = body_stream.next().await.unwrap().unwrap();
+    assert!(!first.is_empty());
+    drop(body_stream);
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let payloads = captured.payloads.lock().unwrap();
+    let exchange = payloads
+        .iter()
+        .find(|payload| payload.get("request").is_some())
+        .unwrap();
+    assert_eq!(exchange["completed"], false);
+    assert_eq!(exchange["cancelled_by_client"], true);
+    assert_eq!(exchange["partial"], true);
+    assert_eq!(exchange["termination_reason"], "client_disconnected");
+
+    let usage = payloads
+        .iter()
+        .find(|payload| payload.get("usage").is_some())
+        .unwrap();
+    assert_eq!(usage["status"], "cancelled");
+    assert_eq!(usage["completed"], false);
+    assert_eq!(usage["cancelled_by_client"], true);
+    assert_eq!(usage["partial"], true);
+    assert_eq!(usage["termination_reason"], "client_disconnected");
 }
 
 #[tokio::test]

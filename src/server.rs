@@ -225,17 +225,35 @@ where
             Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
             Poll::Ready(Some(Err(err))) => {
                 if let Some(mut tracker) = this.tracker.take() {
-                    tracker.finish(502);
+                    info!(
+                        "stream terminated with upstream error status={}",
+                        this.status
+                    );
+                    tracker.finish_error(502);
                 }
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
                 if let Some(mut tracker) = this.tracker.take() {
-                    tracker.finish(this.status);
+                    info!("stream completed status={}", this.status);
+                    if (200..400).contains(&this.status) {
+                        tracker.finish_success(this.status);
+                    } else {
+                        tracker.finish_error(this.status);
+                    }
                 }
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for TrackedBodyStream<S> {
+    fn drop(&mut self) {
+        if let Some(mut tracker) = self.tracker.take() {
+            info!("stream cancelled by downstream client");
+            tracker.finish_cancelled();
         }
     }
 }
@@ -409,14 +427,14 @@ async fn handle_request_core(
     let resolved_model = match state.config.resolve_model(&requested_model) {
         Ok(v) => v,
         Err(e) => {
-            tracker.finish(StatusCode::BAD_REQUEST.as_u16());
+            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
             return error_response(client_format, StatusCode::BAD_REQUEST, &e);
         }
     };
     let upstream_state = match state.upstreams.get(&resolved_model.upstream_name) {
         Some(v) => v,
         None => {
-            tracker.finish(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+            tracker.finish_error(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
             return error_response(
                 client_format,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -445,7 +463,7 @@ async fn handle_request_core(
             stream,
         ) {
             error!("Translation failed: {}", e);
-            tracker.finish(StatusCode::BAD_REQUEST.as_u16());
+            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
             return error_response(client_format, StatusCode::BAD_REQUEST, &e);
         }
     }
@@ -509,7 +527,7 @@ async fn handle_request_core(
     {
         Ok(r) => r,
         Err(e) => {
-            tracker.finish(StatusCode::BAD_GATEWAY.as_u16());
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string());
         }
     };
@@ -526,7 +544,7 @@ async fn handle_request_core(
                 "Upstream returned error for streaming request: {} - {}",
                 status, error_body
             );
-            tracker.finish(status.as_u16());
+            tracker.finish_error(status.as_u16());
             return error_response(
                 client_format,
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -567,7 +585,7 @@ async fn handle_request_core(
     let bytes = match res.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            tracker.finish(StatusCode::BAD_GATEWAY.as_u16());
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string());
         }
     };
@@ -577,7 +595,7 @@ async fn handle_request_core(
             "Upstream response body: {}",
             String::from_utf8_lossy(&bytes)
         );
-        tracker.finish(status.as_u16());
+        tracker.finish_error(status.as_u16());
         return error_response(
             client_format,
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -587,7 +605,7 @@ async fn handle_request_core(
     let upstream_body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => {
-            tracker.finish(StatusCode::BAD_GATEWAY.as_u16());
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return error_response(
                 client_format,
                 StatusCode::BAD_GATEWAY,
@@ -598,14 +616,14 @@ async fn handle_request_core(
     let out = match translate_response(upstream_format, client_format, &upstream_body) {
         Ok(v) => v,
         Err(e) => {
-            tracker.finish(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+            tracker.finish_error(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
             return error_response(client_format, StatusCode::INTERNAL_SERVER_ERROR, &e);
         }
     };
     if let (Some(dispatcher), Some(ctx)) = (state.hooks.as_ref(), hook_ctx) {
         dispatcher.emit_non_stream(ctx, 200, json_response_headers(), out.clone());
     }
-    tracker.finish(StatusCode::OK.as_u16());
+    tracker.finish_success(StatusCode::OK.as_u16());
     (StatusCode::OK, Json(out)).into_response()
 }
 

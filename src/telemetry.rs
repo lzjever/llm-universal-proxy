@@ -20,6 +20,7 @@ struct MetricsInner {
     active_stream_requests: u64,
     success_responses: u64,
     error_responses: u64,
+    cancelled_responses: u64,
     per_upstream: BTreeMap<String, UpstreamMetrics>,
     recent_requests: VecDeque<RecentRequest>,
 }
@@ -30,7 +31,15 @@ pub struct UpstreamMetrics {
     pub active_requests: u64,
     pub success_responses: u64,
     pub error_responses: u64,
+    pub cancelled_responses: u64,
     pub stream_requests: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOutcome {
+    Success,
+    Error,
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +50,7 @@ pub struct RecentRequest {
     pub upstream_model: Option<String>,
     pub stream: bool,
     pub status: u16,
+    pub outcome: RequestOutcome,
     pub duration_ms: u128,
 }
 
@@ -53,6 +63,7 @@ pub struct MetricsSnapshot {
     pub active_stream_requests: u64,
     pub success_responses: u64,
     pub error_responses: u64,
+    pub cancelled_responses: u64,
     pub upstreams: Vec<(String, UpstreamMetrics)>,
     pub recent_requests: Vec<RecentRequest>,
     pub configured_aliases: usize,
@@ -118,6 +129,7 @@ impl RuntimeMetrics {
             active_stream_requests: inner.active_stream_requests,
             success_responses: inner.success_responses,
             error_responses: inner.error_responses,
+            cancelled_responses: inner.cancelled_responses,
             upstreams: inner
                 .per_upstream
                 .iter()
@@ -162,7 +174,19 @@ impl RequestTracker {
         self.upstream_model = Some(upstream_model);
     }
 
-    pub fn finish(&mut self, status: u16) {
+    pub fn finish_success(&mut self, status: u16) {
+        self.finish_with(RequestOutcome::Success, status);
+    }
+
+    pub fn finish_error(&mut self, status: u16) {
+        self.finish_with(RequestOutcome::Error, status);
+    }
+
+    pub fn finish_cancelled(&mut self) {
+        self.finish_with(RequestOutcome::Cancelled, 499);
+    }
+
+    fn finish_with(&mut self, outcome: RequestOutcome, status: u16) {
         if self.finished {
             return;
         }
@@ -174,18 +198,30 @@ impl RequestTracker {
         if self.stream {
             inner.active_stream_requests = inner.active_stream_requests.saturating_sub(1);
         }
-        if (200..400).contains(&status) {
-            inner.success_responses = inner.success_responses.saturating_add(1);
-        } else {
-            inner.error_responses = inner.error_responses.saturating_add(1);
+        match outcome {
+            RequestOutcome::Success => {
+                inner.success_responses = inner.success_responses.saturating_add(1);
+            }
+            RequestOutcome::Error => {
+                inner.error_responses = inner.error_responses.saturating_add(1);
+            }
+            RequestOutcome::Cancelled => {
+                inner.cancelled_responses = inner.cancelled_responses.saturating_add(1);
+            }
         }
         if let Some(name) = self.upstream_name.as_deref() {
             if let Some(entry) = inner.per_upstream.get_mut(name) {
                 entry.active_requests = entry.active_requests.saturating_sub(1);
-                if (200..400).contains(&status) {
-                    entry.success_responses = entry.success_responses.saturating_add(1);
-                } else {
-                    entry.error_responses = entry.error_responses.saturating_add(1);
+                match outcome {
+                    RequestOutcome::Success => {
+                        entry.success_responses = entry.success_responses.saturating_add(1);
+                    }
+                    RequestOutcome::Error => {
+                        entry.error_responses = entry.error_responses.saturating_add(1);
+                    }
+                    RequestOutcome::Cancelled => {
+                        entry.cancelled_responses = entry.cancelled_responses.saturating_add(1);
+                    }
                 }
             }
         }
@@ -197,6 +233,7 @@ impl RequestTracker {
             upstream_model: self.upstream_model.clone(),
             stream: self.stream,
             status,
+            outcome,
             duration_ms,
         });
         while inner.recent_requests.len() > MAX_RECENT_REQUESTS {
@@ -208,7 +245,7 @@ impl RequestTracker {
 impl Drop for RequestTracker {
     fn drop(&mut self) {
         if !self.finished {
-            self.finish(500);
+            self.finish_cancelled();
         }
     }
 }
@@ -224,7 +261,7 @@ mod tests {
         let metrics = RuntimeMetrics::new(&config);
         let mut tracker = metrics.start_request("/openai/v1/responses", "sonnet", true);
         tracker.set_upstream("GLM", "GLM-5");
-        tracker.finish(200);
+        tracker.finish_success(200);
 
         let snapshot = metrics.snapshot(&config);
         assert_eq!(snapshot.total_requests, 1);
@@ -232,7 +269,28 @@ mod tests {
         assert_eq!(snapshot.total_stream_requests, 1);
         assert_eq!(snapshot.success_responses, 1);
         assert_eq!(snapshot.error_responses, 0);
+        assert_eq!(snapshot.cancelled_responses, 0);
         assert_eq!(snapshot.upstreams.len(), 1);
         assert_eq!(snapshot.recent_requests.len(), 1);
+    }
+
+    #[test]
+    fn request_tracker_drop_records_cancelled() {
+        let config = Config::default();
+        let metrics = RuntimeMetrics::new(&config);
+        let mut tracker = metrics.start_request("/openai/v1/responses", "sonnet", true);
+        tracker.set_upstream("GLM", "GLM-5");
+        drop(tracker);
+
+        let snapshot = metrics.snapshot(&config);
+        assert_eq!(snapshot.success_responses, 0);
+        assert_eq!(snapshot.error_responses, 0);
+        assert_eq!(snapshot.cancelled_responses, 1);
+        assert_eq!(snapshot.upstreams[0].1.cancelled_responses, 1);
+        assert_eq!(snapshot.recent_requests[0].status, 499);
+        assert_eq!(
+            snapshot.recent_requests[0].outcome,
+            super::RequestOutcome::Cancelled
+        );
     }
 }

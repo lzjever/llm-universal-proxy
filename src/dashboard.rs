@@ -18,7 +18,7 @@ use ratatui::{
 
 use crate::config::{AuthPolicy, Config};
 use crate::hooks::HookSnapshot;
-use crate::telemetry::RuntimeMetrics;
+use crate::telemetry::{RequestOutcome, RuntimeMetrics};
 
 pub async fn run_dashboard(
     config: Arc<Config>,
@@ -156,7 +156,12 @@ fn render_summary(
     let success_rate = if snapshot.total_requests == 0 {
         0.0
     } else {
-        snapshot.success_responses as f64 / snapshot.total_requests as f64
+        let attempts = snapshot.success_responses + snapshot.error_responses;
+        if attempts == 0 {
+            0.0
+        } else {
+            snapshot.success_responses as f64 / attempts as f64
+        }
     };
     let pending_ratio = hooks
         .map(|hook| {
@@ -192,6 +197,7 @@ fn render_summary(
             vec![
                 line_value("Success", snapshot.success_responses.to_string()),
                 line_value("Errors", snapshot.error_responses.to_string()),
+                line_value("Cancelled", snapshot.cancelled_responses.to_string()),
                 line_value("Success Rate", format!("{:.1}%", success_rate * 100.0)),
                 line_value("Aliases", snapshot.configured_aliases.to_string()),
             ],
@@ -334,6 +340,7 @@ fn render_upstreams(
             Cell::from(stats.stream_requests.to_string()),
             Cell::from(stats.success_responses.to_string()),
             Cell::from(stats.error_responses.to_string()),
+            Cell::from(stats.cancelled_responses.to_string()),
         ])
     });
     let table = Table::new(
@@ -345,10 +352,14 @@ fn render_upstreams(
             Constraint::Percentage(14),
             Constraint::Percentage(14),
             Constraint::Percentage(14),
+            Constraint::Percentage(14),
         ],
     )
     .header(
-        Row::new(vec!["Upstream", "Total", "Active", "Streams", "OK", "Err"]).style(
+        Row::new(vec![
+            "Upstream", "Total", "Active", "Streams", "OK", "Err", "Cancel",
+        ])
+        .style(
             Style::default()
                 .fg(Color::Rgb(248, 208, 111))
                 .add_modifier(Modifier::BOLD),
@@ -398,17 +409,26 @@ fn render_recent(
     frame.render_widget(chart, inner[0]);
 
     let rows = snapshot.recent_requests.iter().map(|req| {
-        let status_style = if req.status < 400 {
-            Style::default().fg(Color::Rgb(113, 221, 130))
-        } else {
-            Style::default().fg(Color::Rgb(255, 123, 114))
+        let (status_text, status_style) = match req.outcome {
+            RequestOutcome::Success => (
+                req.status.to_string(),
+                Style::default().fg(Color::Rgb(113, 221, 130)),
+            ),
+            RequestOutcome::Error => (
+                req.status.to_string(),
+                Style::default().fg(Color::Rgb(255, 123, 114)),
+            ),
+            RequestOutcome::Cancelled => (
+                "cancel".to_string(),
+                Style::default().fg(Color::Rgb(255, 184, 108)),
+            ),
         };
         Row::new(vec![
             Cell::from(req.path.clone()),
             Cell::from(req.client_model.clone()),
             Cell::from(req.upstream_name.clone().unwrap_or_else(|| "-".to_string())),
             Cell::from(if req.stream { "yes" } else { "no" }),
-            Cell::from(format!("{}", req.status)).style(status_style),
+            Cell::from(status_text).style(status_style),
             Cell::from(format!("{} ms", req.duration_ms)),
         ])
     });

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.2 - 2026-03-20
+
+- Fixed streaming request telemetry so downstream client disconnects are recorded as `cancelled` instead of being misreported as `500` errors.
+- Added `cancelled` counts to the dashboard and per-upstream traffic panels, and excluded cancelled requests from error-rate accounting.
+- Extended `usage` and `exchange` hook payloads with `cancelled_by_client`, `partial`, and `termination_reason` to make interrupted streaming requests observable without draining upstream generation.
+- Added regression coverage for request tracker cancellation, hook stream-drop finalization, and early client disconnects against a slow SSE mock.
+
 ## v0.2.1 - 2026-03-20
 
 - Added a protocol-namespaced API surface as the formal public interface: `/openai/v1/...`, `/anthropic/v1/...`, and `/google/v1beta/...`.

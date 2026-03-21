@@ -24,6 +24,22 @@ pub enum CredentialSource {
     Server,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminationReason {
+    Completed,
+    ClientDisconnected,
+    StreamError,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FinalizationState {
+    completed: bool,
+    cancelled_by_client: bool,
+    partial: bool,
+    termination_reason: TerminationReason,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HeaderEntry {
     pub name: String,
@@ -369,9 +385,24 @@ impl HookDispatcher {
             status,
             response_headers.clone(),
             response_body.clone(),
-            true,
+            FinalizationState {
+                completed: true,
+                cancelled_by_client: false,
+                partial: false,
+                termination_reason: TerminationReason::Completed,
+            },
         );
-        self.emit_usage(&ctx, status, usage, true);
+        self.emit_usage(
+            &ctx,
+            status,
+            usage,
+            FinalizationState {
+                completed: true,
+                cancelled_by_client: false,
+                partial: false,
+                termination_reason: TerminationReason::Completed,
+            },
+        );
     }
 
     pub fn wrap_stream<S>(
@@ -404,7 +435,7 @@ impl HookDispatcher {
         status: u16,
         response_headers: Vec<HeaderEntry>,
         response_body: Value,
-        completed: bool,
+        state: FinalizationState,
     ) {
         let Some(sender) = self.exchange.clone() else {
             return;
@@ -425,7 +456,10 @@ impl HookDispatcher {
             "upstream_model": ctx.upstream_model,
             "credential_source": ctx.credential_source,
             "credential_fingerprint": ctx.credential_fingerprint,
-            "completed": completed,
+            "completed": state.completed,
+            "cancelled_by_client": state.cancelled_by_client,
+            "partial": state.partial,
+            "termination_reason": state.termination_reason,
             "request": {
                 "headers": ctx.client_request_headers,
                 "body": ctx.client_request_body,
@@ -444,7 +478,7 @@ impl HookDispatcher {
         ctx: &HookRequestContext,
         status: u16,
         usage: NormalizedUsage,
-        completed: bool,
+        state: FinalizationState,
     ) {
         let Some(sender) = self.usage.clone() else {
             return;
@@ -457,8 +491,17 @@ impl HookDispatcher {
             "timestamp_ms": ctx.timestamp_ms,
             "path": ctx.path,
             "stream": ctx.stream,
-            "completed": completed,
-            "status": if (200..300).contains(&status) { "success" } else { "error" },
+            "completed": state.completed,
+            "cancelled_by_client": state.cancelled_by_client,
+            "partial": state.partial,
+            "termination_reason": state.termination_reason,
+            "status": if state.cancelled_by_client {
+                "cancelled"
+            } else if (200..300).contains(&status) {
+                "success"
+            } else {
+                "error"
+            },
             "http_status": status,
             "client_model": ctx.client_model,
             "upstream_name": ctx.upstream_name,
@@ -623,7 +666,7 @@ pub struct HookCaptureStream<S> {
 }
 
 impl<S> HookCaptureStream<S> {
-    fn finalize(&mut self, completed: bool) {
+    fn finalize(&mut self, state: FinalizationState) {
         if self.finalized {
             return;
         }
@@ -636,11 +679,11 @@ impl<S> HookCaptureStream<S> {
                 self.status,
                 self.response_headers.clone(),
                 response_body,
-                completed,
+                state,
             );
         }
         self.dispatcher
-            .emit_usage(&self.ctx, self.status, usage, completed);
+            .emit_usage(&self.ctx, self.status, usage, state);
     }
 }
 
@@ -663,15 +706,36 @@ where
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(err))) => {
-                this.finalize(false);
+                this.finalize(FinalizationState {
+                    completed: false,
+                    cancelled_by_client: false,
+                    partial: true,
+                    termination_reason: TerminationReason::StreamError,
+                });
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
-                this.finalize(true);
+                this.finalize(FinalizationState {
+                    completed: true,
+                    cancelled_by_client: false,
+                    partial: false,
+                    termination_reason: TerminationReason::Completed,
+                });
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl<S> Drop for HookCaptureStream<S> {
+    fn drop(&mut self) {
+        self.finalize(FinalizationState {
+            completed: false,
+            cancelled_by_client: true,
+            partial: true,
+            termination_reason: TerminationReason::ClientDisconnected,
+        });
     }
 }
 
@@ -1037,6 +1101,8 @@ impl AnthropicAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+    use serde_json::json;
 
     fn runtime(
         max_pending_bytes: usize,
@@ -1074,6 +1140,46 @@ mod tests {
         assert!(runtime.can_attempt(HookKind::Usage));
         runtime.record_success(HookKind::Usage);
         assert!(runtime.can_attempt(HookKind::Usage));
+    }
+
+    #[test]
+    fn hook_capture_stream_drop_marks_cancelled_partial() {
+        let runtime = Arc::new(runtime(1024, 3, 100));
+        let dispatcher = HookDispatcher {
+            exchange: None,
+            usage: None,
+            runtime,
+        };
+        let ctx = HookRequestContext {
+            request_id: "req_1".to_string(),
+            timestamp_ms: 1,
+            path: "/openai/v1/responses".to_string(),
+            method: "POST".to_string(),
+            stream: true,
+            client_format: UpstreamFormat::OpenAiCompletion,
+            upstream_format: UpstreamFormat::OpenAiCompletion,
+            client_model: "gpt-4".to_string(),
+            upstream_name: "default".to_string(),
+            upstream_model: "gpt-4".to_string(),
+            credential_source: CredentialSource::Server,
+            credential_fingerprint: Some("abc".to_string()),
+            client_request_headers: vec![],
+            client_request_body: json!({"model":"gpt-4"}),
+        };
+        let stream = HookCaptureStream {
+            inner: stream::pending::<Result<Bytes, std::io::Error>>(),
+            buffer: Vec::new(),
+            accumulator: ClientSseAccumulator::new(UpstreamFormat::OpenAiCompletion),
+            dispatcher,
+            ctx,
+            status: 200,
+            response_headers: json_response_headers(),
+            finalized: false,
+            capture_enabled: true,
+        };
+
+        assert!(!stream.finalized);
+        drop(stream);
     }
 }
 
