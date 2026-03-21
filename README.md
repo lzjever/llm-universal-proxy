@@ -4,6 +4,18 @@
 
 A single-binary HTTP proxy that provides a unified interface for Large Language Model APIs. It accepts requests in multiple LLM API formats, routes models to named upstreams, and automatically handles format conversion when needed.
 
+**Use GLM, Kimi, MiniMax, and other non-native models in Codex CLI, Claude Code, and Gemini CLI through one stable proxy layer.**
+
+This proxy is especially useful when your client only supports one protocol, but the real model you want to use lives behind another one. For example, newer Codex CLI versions only speak the OpenAI Responses API, but `llm-universal-proxy` can still let Codex use Anthropic-compatible or OpenAI-Completions-compatible coding models such as GLM, Kimi, or MiniMax.
+
+![Proxec dashboard](./docs/images/dashboard.png)
+
+The dashboard gives you a direct view into routing, streaming, cancellation, upstream traffic, and hook state while the proxy is running.
+
+![Codex CLI using GLM-5-Turbo through proxec](./docs/images/codex-glm5-turbo.png)
+
+This is a real Codex CLI session using a local alias routed to `GLM-5-Turbo` through the proxy.
+
 ## Features
 
 - **Multi-Format Support**: Accepts requests in 4 different LLM API formats:
