@@ -1307,6 +1307,12 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
         return out;
     }
 
+    let incomplete_reason = match finish_reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
+    };
+
     if finish_reason.is_some() {
         if state.responses_reasoning_added && !state.responses_reasoning_done {
             state.responses_reasoning_done = true;
@@ -1512,9 +1518,9 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             "id": response_id,
             "object": "response",
             "created_at": created,
-            "status": "completed",
+            "status": if incomplete_reason.is_some() { "incomplete" } else { "completed" },
             "error": null,
-            "incomplete_details": null,
+            "incomplete_details": incomplete_reason.map(|reason| serde_json::json!({ "reason": reason })).unwrap_or(serde_json::Value::Null),
             "output": output
         });
         if let Some(ref u) = state.usage {
@@ -1566,12 +1572,17 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             }
             resp["usage"] = usage;
         }
+        let event_type = if incomplete_reason.is_some() {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
         let ev = serde_json::json!({
-            "type": "response.completed",
+            "type": event_type,
             "sequence_number": next_seq(),
             "response": resp
         });
-        out.push(format_sse_event("response.completed", &ev));
+        out.push(format_sse_event(event_type, &ev));
     }
     out
 }
@@ -2280,6 +2291,34 @@ mod tests {
 
         assert!(joined.contains("\"type\":\"response.failed\""));
         assert!(joined.contains("\"code\":\"context_length_exceeded\""));
+        assert!(!joined.contains("\"type\":\"response.completed\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_maps_length_finish_to_incomplete() {
+        let mut state = StreamState::default();
+        let text_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": { "content": "Hi" }, "finish_reason": null }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "length" }]
+        });
+
+        let out1 = openai_chunk_to_responses_sse(&text_chunk, &mut state);
+        let out2 = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out1
+            .into_iter()
+            .chain(out2)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"type\":\"response.incomplete\""));
+        assert!(joined.contains("\"reason\":\"max_output_tokens\""));
         assert!(!joined.contains("\"type\":\"response.completed\""));
     }
 }
