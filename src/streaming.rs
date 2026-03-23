@@ -1162,7 +1162,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                     "output_index": idx,
                     "content_index": 0,
                     "item_id": item_id,
-                    "part": { "type": "output_text", "text": "" }
+                    "part": { "type": "output_text", "text": "", "annotations": [] }
                 });
                 out.push(format_sse_event(
                     "response.content_part.added",
@@ -1385,7 +1385,11 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 "output_index": idx,
                 "content_index": 0,
                 "item_id": item_id,
-                "part": { "type": "output_text", "text": state.responses_output_text }
+                "part": {
+                    "type": "output_text",
+                    "text": state.responses_output_text,
+                    "annotations": []
+                }
             });
             out.push(format_sse_event(
                 "response.content_part.done",
@@ -1409,7 +1413,11 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [{ "type": "output_text", "text": state.responses_output_text }]
+                    "content": [{
+                        "type": "output_text",
+                        "text": state.responses_output_text,
+                        "annotations": []
+                    }]
                 }
             });
             out.push(format_sse_event(
@@ -1435,7 +1443,8 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 "role": "assistant",
                 "content": [{
                     "type": "output_text",
-                    "text": state.responses_output_text
+                    "text": state.responses_output_text,
+                    "annotations": []
                 }]
             }));
         }
@@ -2107,5 +2116,33 @@ mod tests {
         assert!(joined.contains("\"type\":\"response.function_call_arguments.done\""));
         assert!(joined.contains("\"call_id\":\"call_1\""));
         assert!(joined.contains("\"name\":\"lookup\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_adds_empty_annotations_to_text_parts() {
+        let mut state = StreamState::default();
+        let text_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": { "content": "Hi" }, "finish_reason": null }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+
+        let out1 = openai_chunk_to_responses_sse(&text_chunk, &mut state);
+        let out2 = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out1
+            .into_iter()
+            .chain(out2)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"type\":\"response.content_part.added\""));
+        assert!(joined.contains("\"type\":\"response.content_part.done\""));
+        assert!(joined.contains("\"annotations\":[]"));
     }
 }
