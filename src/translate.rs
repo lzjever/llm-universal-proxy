@@ -305,6 +305,12 @@ fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
         .to_string();
     if finish == "tool_calls" {
         finish = "tool_use".to_string();
+    } else if finish == "length" {
+        finish = "max_tokens".to_string();
+    } else if finish == "content_filter" {
+        finish = "refusal".to_string();
+    } else if finish == "context_length_exceeded" {
+        finish = "model_context_window_exceeded".to_string();
     }
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or(serde_json::Value::Null),
@@ -1048,6 +1054,23 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
     if let Some(t) = body.get("temperature") {
         result["temperature"] = t.clone();
     }
+    if let Some(tp) = body.get("top_p") {
+        result["top_p"] = tp.clone();
+    }
+    if let Some(stop_sequences) = body.get("stop_sequences") {
+        result["stop"] = if stop_sequences
+            .as_array()
+            .map(|arr| arr.len() == 1)
+            .unwrap_or(false)
+        {
+            stop_sequences[0].clone()
+        } else {
+            stop_sequences.clone()
+        };
+    }
+    if let Some(metadata) = body.get("metadata") {
+        result["metadata"] = metadata.clone();
+    }
     // System: strip cache_control from blocks
     // Reference: 9router claudeHelper.js - remove all cache_control, add only to last block
     if let Some(system) = body.get("system") {
@@ -1227,6 +1250,19 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
     });
     if let Some(t) = body.get("temperature") {
         result["temperature"] = t.clone();
+    }
+    if let Some(tp) = body.get("top_p") {
+        result["top_p"] = tp.clone();
+    }
+    if let Some(stop) = body.get("stop") {
+        result["stop_sequences"] = if stop.is_array() {
+            stop.clone()
+        } else {
+            Value::Array(vec![stop.clone()])
+        };
+    }
+    if let Some(metadata) = body.get("metadata") {
+        result["metadata"] = metadata.clone();
     }
     if let Some(tool_choice) = body.get("tool_choice") {
         if let Some(mapped_tool_choice) =
@@ -1955,6 +1991,28 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_openai_to_claude_preserves_top_p_stop_and_metadata() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "top_p": 0.7,
+            "stop": ["END"],
+            "metadata": { "trace_id": "abc" }
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["top_p"], 0.7);
+        assert_eq!(body["stop_sequences"][0], "END");
+        assert_eq!(body["metadata"]["trace_id"], "abc");
+    }
+
+    #[test]
     fn translate_request_openai_to_gemini_has_contents() {
         let mut body = json!({
             "model": "gemini-1.5",
@@ -2154,6 +2212,21 @@ mod tests {
             .unwrap()
             .iter()
             .any(|b| b.get("type").and_then(Value::as_str) == Some("text")));
+    }
+
+    #[test]
+    fn translate_response_openai_error_finishes_to_claude_stop_reasons() {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "choices": [{ "message": { "role": "assistant", "content": "" }, "finish_reason": "context_length_exceeded" }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["stop_reason"], "model_context_window_exceeded");
     }
 
     #[test]

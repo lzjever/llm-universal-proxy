@@ -806,6 +806,8 @@ fn convert_openai_finish_to_claude(reason: &str) -> &'static str {
         "stop" => "end_turn",
         "length" => "max_tokens",
         "tool_calls" => "tool_use",
+        "content_filter" => "refusal",
+        "context_length_exceeded" => "model_context_window_exceeded",
         _ => "end_turn",
     }
 }
@@ -1966,6 +1968,22 @@ mod tests {
             .iter()
             .any(|b| String::from_utf8_lossy(b).contains("content_block"));
         assert!(has_content_block);
+    }
+
+    #[test]
+    fn openai_chunk_to_claude_sse_maps_context_window_finish_reason() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "context_length_exceeded" }]
+        });
+        let mut state = StreamState::default();
+        let out = openai_chunk_to_claude_sse(&chunk, &mut state);
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"stop_reason\":\"model_context_window_exceeded\""));
     }
 
     #[test]
