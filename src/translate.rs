@@ -513,17 +513,52 @@ pub fn translate_request(
     _stream: bool,
 ) -> Result<(), String> {
     if client_format == upstream_format {
+        normalize_openai_roles_for_compatibility(upstream_format, body);
         return Ok(());
     }
     // Step 1: client → openai (if client is not openai)
     if client_format != UpstreamFormat::OpenAiCompletion {
         client_to_openai_completion(client_format, body)?;
     }
+    normalize_openai_message_roles(body);
     // Step 2: openai → upstream (if upstream is not openai)
     if upstream_format != UpstreamFormat::OpenAiCompletion {
         openai_completion_to_upstream(upstream_format, body)?;
     }
+    normalize_openai_roles_for_compatibility(upstream_format, body);
     Ok(())
+}
+
+fn normalize_openai_roles_for_compatibility(format: UpstreamFormat, body: &mut Value) {
+    match format {
+        UpstreamFormat::OpenAiCompletion => normalize_openai_message_roles(body),
+        UpstreamFormat::OpenAiResponses => normalize_openai_responses_roles(body),
+        _ => {}
+    }
+}
+
+fn normalize_openai_message_roles(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages.iter_mut() {
+        let role = message.get("role").and_then(Value::as_str);
+        if role == Some("developer") {
+            message["role"] = Value::String("system".to_string());
+        }
+    }
+}
+
+fn normalize_openai_responses_roles(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items.iter_mut() {
+        let role = item.get("role").and_then(Value::as_str);
+        if role == Some("developer") {
+            item["role"] = Value::String("system".to_string());
+        }
+    }
 }
 
 fn client_to_openai_completion(from: UpstreamFormat, body: &mut Value) -> Result<(), String> {
@@ -589,9 +624,10 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
         match ty {
             "message" => {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                let normalized_role = if role == "developer" { "system" } else { role };
                 let content = item.get("content").cloned();
                 let content = map_responses_content_to_openai(content);
-                if role == "assistant" {
+                if normalized_role == "assistant" {
                     let assistant = current_assistant.get_or_insert_with(|| {
                         serde_json::json!({
                             "role": "assistant",
@@ -602,7 +638,7 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                     assistant["content"] = content;
                 } else {
                     flush_assistant(&mut messages, &mut current_assistant);
-                    messages.push(serde_json::json!({ "role": role, "content": content }));
+                    messages.push(serde_json::json!({ "role": normalized_role, "content": content }));
                 }
             }
             "function_call" => {
@@ -2071,6 +2107,50 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_openai_same_format_normalizes_developer_role() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                { "role": "developer", "content": "Follow repo rules." },
+                { "role": "user", "content": "Hi" }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn translate_request_responses_same_format_normalizes_developer_role() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "input": [
+                { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "Follow repo rules." }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Hi" }] }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[1]["role"], "user");
+    }
+
+    #[test]
     fn translate_request_responses_to_openai() {
         let mut body = json!({
             "model": "gpt-4o",
@@ -2086,6 +2166,28 @@ mod tests {
         .unwrap();
         assert!(body.get("messages").is_some());
         assert!(body.get("input").is_none());
+    }
+
+    #[test]
+    fn translate_request_responses_to_openai_maps_developer_role_to_system() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "input": [
+                { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "Follow repo rules." }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Hello" }] }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
     }
 
     #[test]
