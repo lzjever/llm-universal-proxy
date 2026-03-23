@@ -531,10 +531,15 @@ pub fn translate_request(
 
 fn normalize_openai_roles_for_compatibility(format: UpstreamFormat, body: &mut Value) {
     match format {
-        UpstreamFormat::OpenAiCompletion => normalize_openai_message_roles(body),
+        UpstreamFormat::OpenAiCompletion => normalize_openai_messages_for_compatibility(body),
         UpstreamFormat::OpenAiResponses => normalize_openai_responses_roles(body),
         _ => {}
     }
+}
+
+fn normalize_openai_messages_for_compatibility(body: &mut Value) {
+    normalize_openai_message_roles(body);
+    coalesce_openai_string_messages(body);
 }
 
 fn normalize_openai_message_roles(body: &mut Value) {
@@ -547,6 +552,78 @@ fn normalize_openai_message_roles(body: &mut Value) {
             message["role"] = Value::String("system".to_string());
         }
     }
+}
+
+fn coalesce_openai_string_messages(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for message in messages.iter() {
+        let role = message.get("role").and_then(Value::as_str);
+        let content = message.get("content").and_then(Value::as_str);
+        let has_tools = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(|items| !items.is_empty())
+            .unwrap_or(false);
+        let has_tool_result = message.get("tool_call_id").is_some();
+        let has_reasoning = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .map(|text| !text.is_empty())
+            .unwrap_or(false);
+
+        let mergeable = role.is_some()
+            && content.is_some()
+            && !has_tools
+            && !has_tool_result
+            && !has_reasoning;
+
+        if mergeable {
+            if let Some(previous) = merged.last_mut() {
+                let prev_role = previous.get("role").and_then(Value::as_str);
+                let prev_has_tools = previous
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .map(|items| !items.is_empty())
+                    .unwrap_or(false);
+                let prev_has_tool_result = previous.get("tool_call_id").is_some();
+                let prev_has_reasoning = previous
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .map(|text| !text.is_empty())
+                    .unwrap_or(false);
+
+                if prev_role == role
+                    && !prev_has_tools
+                    && !prev_has_tool_result
+                    && !prev_has_reasoning
+                    && previous.get("content").and_then(Value::as_str).is_some()
+                {
+                    let prior = previous
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let next = content.unwrap_or("");
+                    previous["content"] = Value::String(if prior.is_empty() {
+                        next.to_string()
+                    } else if next.is_empty() {
+                        prior
+                    } else {
+                        format!("{prior}\n\n{next}")
+                    });
+                    continue;
+                }
+            }
+        }
+
+        merged.push(message.clone());
+    }
+
+    *messages = merged;
 }
 
 fn normalize_openai_responses_roles(body: &mut Value) {
@@ -800,6 +877,8 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
         Some(Value::Array(a)) => a,
         Some(v) => return v,
     };
+    let mut plain_text_parts: Vec<String> = Vec::new();
+    let mut has_non_text_part = false;
     let out: Vec<Value> = arr
         .into_iter()
         .map(|c| {
@@ -807,13 +886,19 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
             if ty == Some("input_text") || ty == Some("output_text") {
                 let text = c
                     .get("text")
-                    .cloned()
-                    .unwrap_or(Value::String(String::new()));
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                plain_text_parts.push(text.clone());
                 return serde_json::json!({ "type": "text", "text": text });
             }
+            has_non_text_part = true;
             c
         })
         .collect();
+    if !has_non_text_part {
+        return Value::String(plain_text_parts.join(""));
+    }
     Value::Array(out)
 }
 
@@ -2129,6 +2214,33 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_openai_same_format_coalesces_adjacent_string_messages() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                { "role": "system", "content": "System A" },
+                { "role": "developer", "content": "System B" },
+                { "role": "user", "content": "User A" },
+                { "role": "user", "content": "User B" }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "System A\n\nSystem B");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "User A\n\nUser B");
+    }
+
+    #[test]
     fn translate_request_responses_same_format_normalizes_developer_role() {
         let mut body = json!({
             "model": "gpt-4o",
@@ -2166,6 +2278,62 @@ mod tests {
         .unwrap();
         assert!(body.get("messages").is_some());
         assert!(body.get("input").is_none());
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"], "Hello");
+    }
+
+    #[test]
+    fn translate_request_responses_to_openai_coalesces_adjacent_string_messages() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "instructions": "System A",
+            "input": [
+                { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "System B" }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "User A" }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "User B" }] }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "System A\n\nSystem B");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "User A\n\nUser B");
+    }
+
+    #[test]
+    fn translate_request_responses_to_openai_flattens_text_only_content_arrays() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Hello " },
+                        { "type": "input_text", "text": "world" }
+                    ]
+                }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"], "Hello world");
     }
 
     #[test]
@@ -2210,8 +2378,7 @@ mod tests {
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[0]["reasoning_content"], "thinking");
-        assert_eq!(messages[0]["content"][0]["type"], "text");
-        assert_eq!(messages[0]["content"][0]["text"], "Hi");
+        assert_eq!(messages[0]["content"], "Hi");
     }
 
     #[test]
