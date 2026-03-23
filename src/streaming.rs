@@ -1447,11 +1447,43 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 .and_then(Value::as_u64)
                 .or(u.get("completion_tokens").and_then(Value::as_u64))
                 .unwrap_or(0);
-            resp["usage"] = serde_json::json!({
+            let total_tokens = u
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(input_tokens + output_tokens);
+            let cached_tokens = u
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    u.get("prompt_tokens_details")
+                        .and_then(|details| details.get("cached_tokens"))
+                        .and_then(Value::as_u64)
+                });
+            let reasoning_tokens = u
+                .get("output_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    u.get("completion_tokens_details")
+                        .and_then(|details| details.get("reasoning_tokens"))
+                        .and_then(Value::as_u64)
+                });
+
+            let mut usage = serde_json::json!({
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens
+                "total_tokens": total_tokens
             });
+            if let Some(cached_tokens) = cached_tokens {
+                usage["input_tokens_details"] =
+                    serde_json::json!({ "cached_tokens": cached_tokens });
+            }
+            if let Some(reasoning_tokens) = reasoning_tokens {
+                usage["output_tokens_details"] =
+                    serde_json::json!({ "reasoning_tokens": reasoning_tokens });
+            }
+            resp["usage"] = usage;
         }
         let ev = serde_json::json!({
             "type": "response.completed",
@@ -1954,5 +1986,33 @@ mod tests {
         assert!(joined.contains("response.reasoning_summary_text.delta"));
         assert!(joined.contains("response.reasoning_summary_text.done"));
         assert!(joined.contains("\"type\":\"reasoning\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_preserves_usage_details_and_total_tokens() {
+        let mut state = StreamState::default();
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 25,
+                "prompt_tokens_details": { "cached_tokens": 3 },
+                "completion_tokens_details": { "reasoning_tokens": 2 }
+            },
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+
+        let out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"total_tokens\":25"));
+        assert!(joined.contains("\"input_tokens_details\":{\"cached_tokens\":3}"));
+        assert!(joined.contains("\"output_tokens_details\":{\"reasoning_tokens\":2}"));
     }
 }
