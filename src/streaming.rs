@@ -1239,6 +1239,8 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                         "type": "response.function_call_arguments.delta",
                         "sequence_number": next_seq(),
                         "response_id": response_id,
+                        "call_id": entry.id.as_ref().and_then(Value::as_str),
+                        "name": entry.name,
                         "item_id": entry
                             .id
                             .as_ref()
@@ -1327,6 +1329,8 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                     "type": "response.function_call_arguments.done",
                     "sequence_number": next_seq(),
                     "response_id": response_id,
+                    "call_id": call_id,
+                    "name": tool_call.name,
                     "item_id": format!("fc_{}", call_id),
                     "output_index": output_index,
                     "arguments": arguments
@@ -2064,5 +2068,44 @@ mod tests {
         assert!(joined.contains("\"type\":\"response.output_text.delta\""));
         assert!(joined.contains("\"type\":\"response.output_text.done\""));
         assert!(joined.contains("\"response_id\":\"chatcmpl-msg123\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_includes_call_metadata_on_function_events() {
+        let mut state = StreamState::default();
+        let tool_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": { "name": "lookup", "arguments": "{\"x\":1}" }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+        });
+
+        let out1 = openai_chunk_to_responses_sse(&tool_chunk, &mut state);
+        let out2 = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out1
+            .into_iter()
+            .chain(out2)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"type\":\"response.function_call_arguments.delta\""));
+        assert!(joined.contains("\"type\":\"response.function_call_arguments.done\""));
+        assert!(joined.contains("\"call_id\":\"call_1\""));
+        assert!(joined.contains("\"name\":\"lookup\""));
     }
 }
