@@ -860,7 +860,7 @@ async fn handle_request_core(
         upstream_format,
     });
     if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref()) {
-        recorder.record_request(ctx, &original_body);
+        recorder.record_request_with_upstream(ctx, &original_body, &body);
     }
 
     let url = upstream::upstream_url(

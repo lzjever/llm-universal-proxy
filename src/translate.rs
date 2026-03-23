@@ -29,7 +29,7 @@ fn upstream_response_to_openai(
     body: &Value,
 ) -> Result<Value, String> {
     match upstream_format {
-        UpstreamFormat::OpenAiCompletion => Ok(body.clone()),
+        UpstreamFormat::OpenAiCompletion => Ok(normalize_openai_completion_response(body)),
         UpstreamFormat::Anthropic => claude_response_to_openai(body),
         UpstreamFormat::Google => gemini_response_to_openai(body),
         UpstreamFormat::OpenAiResponses => responses_response_to_openai(body),
@@ -263,6 +263,59 @@ fn gemini_response_to_openai(body: &Value) -> Result<Value, String> {
     Ok(result)
 }
 
+fn is_minimax_model(model: &str) -> bool {
+    model.starts_with("MiniMax-")
+}
+
+fn reasoning_details_to_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Array(items) => {
+            let joined = items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
+fn openai_message_reasoning_text(message: &Value) -> Option<String> {
+    if let Some(text) = message.get("reasoning_content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    reasoning_details_to_text(message.get("reasoning_details"))
+}
+
+fn normalize_openai_completion_response(body: &Value) -> Value {
+    let mut out = body.clone();
+    let Some(choices) = out.get_mut("choices").and_then(Value::as_array_mut) else {
+        return out;
+    };
+    for choice in choices.iter_mut() {
+        let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let reasoning_details = message.get("reasoning_details").cloned();
+        let has_reasoning_content = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !has_reasoning_content {
+            if let Some(reasoning) = reasoning_details_to_text(reasoning_details.as_ref()) {
+                message.insert("reasoning_content".to_string(), Value::String(reasoning));
+            }
+        }
+    }
+    out
+}
+
 fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
     let choices = body
         .get("choices")
@@ -271,7 +324,7 @@ fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
     let choice = choices.first().ok_or("empty choices")?;
     let message = choice.get("message").ok_or("missing message")?;
     let mut content: Vec<Value> = vec![];
-    if let Some(rc) = message.get("reasoning_content").and_then(Value::as_str) {
+    if let Some(rc) = openai_message_reasoning_text(message) {
         if !rc.is_empty() {
             content.push(serde_json::json!({ "type": "thinking", "thinking": rc }));
         }
@@ -342,7 +395,7 @@ fn openai_response_to_gemini(body: &Value) -> Result<Value, String> {
     let choice = choices.first().ok_or("empty choices")?;
     let message = choice.get("message").ok_or("missing message")?;
     let mut parts: Vec<Value> = vec![];
-    if let Some(rc) = message.get("reasoning_content").and_then(Value::as_str) {
+    if let Some(rc) = openai_message_reasoning_text(message) {
         if !rc.is_empty() {
             parts.push(serde_json::json!({ "thought": true, "text": rc }));
         }
@@ -448,7 +501,7 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
     let choice = choices.first().ok_or("empty choices")?;
     let message = choice.get("message").ok_or("missing message")?;
     let mut output: Vec<Value> = vec![];
-    if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+    if let Some(reasoning) = openai_message_reasoning_text(message) {
         if !reasoning.is_empty() {
             output.push(serde_json::json!({
                 "type": "reasoning",
@@ -508,7 +561,7 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
 pub fn translate_request(
     client_format: UpstreamFormat,
     upstream_format: UpstreamFormat,
-    _model: &str,
+    model: &str,
     body: &mut Value,
     _stream: bool,
 ) -> Result<(), String> {
@@ -524,9 +577,44 @@ pub fn translate_request(
     // Step 2: openai → upstream (if upstream is not openai)
     if upstream_format != UpstreamFormat::OpenAiCompletion {
         openai_completion_to_upstream(upstream_format, body)?;
+    } else {
+        apply_openai_completion_compat_overrides(model, body);
     }
     normalize_openai_roles_for_compatibility(upstream_format, body);
     Ok(())
+}
+
+fn apply_openai_completion_compat_overrides(model: &str, body: &mut Value) {
+    if !is_minimax_model(model) {
+        return;
+    }
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("reasoning_split".to_string(), serde_json::json!(true));
+        let stream_options = obj
+            .entry("stream_options".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(stream_options_obj) = stream_options.as_object_mut() {
+            stream_options_obj.insert("include_usage".to_string(), serde_json::json!(true));
+        }
+    }
+
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages.iter_mut() {
+        let is_assistant = message.get("role").and_then(Value::as_str) == Some("assistant");
+        if !is_assistant || message.get("reasoning_details").is_some() {
+            continue;
+        }
+        let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) else {
+            continue;
+        };
+        if reasoning.is_empty() {
+            continue;
+        }
+        message["reasoning_details"] = serde_json::json!([{ "text": reasoning }]);
+    }
 }
 
 fn normalize_openai_roles_for_compatibility(format: UpstreamFormat, body: &mut Value) {
@@ -829,16 +917,42 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
         messages.push(deferred);
     }
     flush_assistant(&mut messages, &mut current_assistant);
-    body["messages"] = Value::Array(messages);
+    let max_tokens = body.get("max_output_tokens").cloned();
+    let temperature = body.get("temperature").cloned();
+    let top_p = body.get("top_p").cloned();
+    let stop = body.get("stop").cloned();
+    let tools = body.get("tools").cloned();
+    let parallel_tool_calls = body.get("parallel_tool_calls").cloned();
+    let stream = body.get("stream").cloned();
+    let model = body.get("model").cloned();
+
+    let mut out = serde_json::Map::new();
+    if let Some(model) = model {
+        out.insert("model".to_string(), model);
+    }
+    out.insert("messages".to_string(), Value::Array(messages));
+    if let Some(stream) = stream {
+        out.insert("stream".to_string(), stream);
+    }
+    if let Some(max_tokens) = max_tokens {
+        out.insert("max_tokens".to_string(), max_tokens);
+    }
+    if let Some(temperature) = temperature {
+        out.insert("temperature".to_string(), temperature);
+    }
+    if let Some(top_p) = top_p {
+        out.insert("top_p".to_string(), top_p);
+    }
+    if let Some(stop) = stop {
+        out.insert("stop".to_string(), stop);
+    }
     if let Some(tool_choice) = body.get("tool_choice").cloned() {
         if let Some(mapped_tool_choice) = responses_tool_choice_to_openai_tool_choice(&tool_choice) {
-            body["tool_choice"] = mapped_tool_choice;
-        } else if let Some(obj) = body.as_object_mut() {
-            obj.remove("tool_choice");
+            out.insert("tool_choice".to_string(), mapped_tool_choice);
         }
     }
-    if let Some(parallel_tool_calls) = body.get("parallel_tool_calls").cloned() {
-        body["parallel_tool_calls"] = parallel_tool_calls;
+    if let Some(parallel_tool_calls) = parallel_tool_calls {
+        out.insert("parallel_tool_calls".to_string(), parallel_tool_calls);
     }
 
     // Convert tools from Responses API format to Chat Completions format
@@ -846,7 +960,7 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
     // Chat: { "type": "function", "function": { "name": "...", "description": "...", "parameters": {...} } }
     // Note: Responses API may include non-function tools like web_search which don't have names.
     // We only convert tools that have a "name" field (function tools).
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+    if let Some(tools) = tools.as_ref().and_then(Value::as_array) {
         let converted_tools: Vec<Value> = tools
             .iter()
             .filter_map(|t| {
@@ -871,24 +985,11 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                 }))
             })
             .collect();
-        if converted_tools.is_empty() {
-            // Remove tools array if all tools were filtered out
-            if let Some(obj) = body.as_object_mut() {
-                obj.remove("tools");
-            }
-        } else {
-            body["tools"] = Value::Array(converted_tools);
+        if !converted_tools.is_empty() {
+            out.insert("tools".to_string(), Value::Array(converted_tools));
         }
     }
-
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("input");
-        obj.remove("instructions");
-        obj.remove("include");
-        obj.remove("prompt_cache_key");
-        obj.remove("store");
-        obj.remove("reasoning");
-    }
+    *body = Value::Object(out);
     Ok(())
 }
 
@@ -2310,6 +2411,36 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_responses_to_minimax_openai_enables_reasoning_split() {
+        let mut body = json!({
+            "model": "claude-openai",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": "internal thinking" }]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Hello" }]
+                }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "MiniMax-M2.7-highspeed",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["reasoning_split"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["reasoning_details"][0]["text"], "internal thinking");
+    }
+
+    #[test]
     fn translate_request_responses_to_openai_coalesces_adjacent_string_messages() {
         let mut body = json!({
             "model": "gpt-4o",
@@ -2427,6 +2558,67 @@ mod tests {
         assert_eq!(body["tool_choice"]["type"], "function");
         assert_eq!(body["tool_choice"]["function"]["name"], "lookup");
         assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn translate_request_responses_to_openai_drops_responses_only_fields() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "stream": true,
+            "max_output_tokens": 123,
+            "include": ["reasoning.encrypted_content"],
+            "text": { "format": { "type": "text" } },
+            "reasoning": { "effort": "medium" },
+            "store": true,
+            "prompt_cache_key": "cache-key",
+            "previous_response_id": "resp_123",
+            "truncation": "auto"
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["max_tokens"], 123);
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("include").is_none());
+        assert!(body.get("text").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("store").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("truncation").is_none());
+    }
+
+    #[test]
+    fn translate_response_openai_reasoning_details_maps_to_responses_reasoning() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "model": "MiniMax-M2.7-highspeed",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello",
+                    "reasoning_details": [{ "text": "internal thinking" }]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        let output = out["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "internal thinking");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "Hello");
     }
 
     #[test]

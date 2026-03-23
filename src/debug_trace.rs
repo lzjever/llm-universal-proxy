@@ -105,6 +105,31 @@ impl DebugTraceRecorder {
         }));
     }
 
+    pub fn record_request_with_upstream(
+        &self,
+        ctx: &DebugTraceContext,
+        original_body: &Value,
+        upstream_body: &Value,
+    ) {
+        self.write_entry(json!({
+            "timestamp_ms": ctx.timestamp_ms,
+            "request_id": ctx.request_id,
+            "phase": TracePhase::Request,
+            "path": ctx.path,
+            "stream": ctx.stream,
+            "client_format": ctx.client_format,
+            "upstream_format": ctx.upstream_format,
+            "client_model": ctx.client_model,
+            "upstream_name": ctx.upstream_name,
+            "upstream_model": ctx.upstream_model,
+            "request": {
+                "new_items": extract_request_delta(ctx.client_format, original_body, self.max_text_chars),
+                "client_summary": summarize_request_body(ctx.client_format, original_body, self.max_text_chars),
+                "upstream_summary": summarize_request_body(ctx.upstream_format, upstream_body, self.max_text_chars)
+            }
+        }));
+    }
+
     pub fn record_non_stream_response(&self, ctx: &DebugTraceContext, status: u16, body: &Value) {
         self.write_entry(json!({
             "timestamp_ms": ctx.timestamp_ms,
@@ -310,6 +335,81 @@ fn extract_request_delta(format: UpstreamFormat, body: &Value, max_text_chars: u
         }
         UpstreamFormat::Google => body.clone(),
     }
+}
+
+fn summarize_request_body(format: UpstreamFormat, body: &Value, max_text_chars: usize) -> Value {
+    match format {
+        UpstreamFormat::OpenAiResponses => json!({
+            "model": body.get("model"),
+            "stream": body.get("stream"),
+            "max_output_tokens": body.get("max_output_tokens"),
+            "tool_choice": body.get("tool_choice"),
+            "parallel_tool_calls": body.get("parallel_tool_calls"),
+            "text": body.get("text"),
+            "include": body.get("include"),
+            "reasoning": body.get("reasoning"),
+            "tool_names": body.get("tools").and_then(Value::as_array).map(tool_names_from_responses),
+            "input_tail": extract_request_delta(format, body, max_text_chars),
+        }),
+        UpstreamFormat::OpenAiCompletion => json!({
+            "model": body.get("model"),
+            "stream": body.get("stream"),
+            "max_tokens": body.get("max_tokens"),
+            "temperature": body.get("temperature"),
+            "top_p": body.get("top_p"),
+            "stop": body.get("stop"),
+            "tool_choice": body.get("tool_choice"),
+            "parallel_tool_calls": body.get("parallel_tool_calls"),
+            "tool_names": body.get("tools").and_then(Value::as_array).map(tool_names_from_chat_tools),
+            "message_roles": body.get("messages").and_then(Value::as_array).map(message_roles),
+            "messages_tail": extract_request_delta(format, body, max_text_chars),
+        }),
+        UpstreamFormat::Anthropic => json!({
+            "model": body.get("model"),
+            "stream": body.get("stream"),
+            "max_tokens": body.get("max_tokens"),
+            "temperature": body.get("temperature"),
+            "top_p": body.get("top_p"),
+            "tool_choice": body.get("tool_choice"),
+            "tool_names": body.get("tools").and_then(Value::as_array).map(tool_names_from_claude_tools),
+            "message_roles": body.get("messages").and_then(Value::as_array).map(message_roles),
+            "messages_tail": extract_request_delta(format, body, max_text_chars),
+        }),
+        UpstreamFormat::Google => json!({
+            "model": body.get("model"),
+            "contents_count": body.get("contents").and_then(Value::as_array).map(|a| a.len()),
+        }),
+    }
+}
+
+fn tool_names_from_responses(tools: &Vec<Value>) -> Vec<String> {
+    tools.iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
+fn tool_names_from_chat_tools(tools: &Vec<Value>) -> Vec<String> {
+    tools.iter()
+        .filter_map(|tool| {
+            tool.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn tool_names_from_claude_tools(tools: &Vec<Value>) -> Vec<String> {
+    tools.iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
+fn message_roles(messages: &Vec<Value>) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|msg| msg.get("role").and_then(Value::as_str).map(str::to_string))
+        .collect()
 }
 
 fn trailing_client_messages<F>(items: &[Value], is_model_boundary: F) -> Vec<Value>
