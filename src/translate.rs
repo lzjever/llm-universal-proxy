@@ -671,6 +671,16 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
     }
     flush_assistant(&mut messages, &mut current_assistant);
     body["messages"] = Value::Array(messages);
+    if let Some(tool_choice) = body.get("tool_choice").cloned() {
+        if let Some(mapped_tool_choice) = responses_tool_choice_to_openai_tool_choice(&tool_choice) {
+            body["tool_choice"] = mapped_tool_choice;
+        } else if let Some(obj) = body.as_object_mut() {
+            obj.remove("tool_choice");
+        }
+    }
+    if let Some(parallel_tool_calls) = body.get("parallel_tool_calls").cloned() {
+        body["parallel_tool_calls"] = parallel_tool_calls;
+    }
 
     // Convert tools from Responses API format to Chat Completions format
     // Responses: { "name": "...", "description": "...", "parameters": {...} }
@@ -815,10 +825,61 @@ fn messages_to_responses(body: &mut Value) -> Result<(), String> {
     }
     body["input"] = Value::Array(input);
     body["instructions"] = Value::String(instructions);
+    if let Some(tool_choice) = body.get("tool_choice").cloned() {
+        if let Some(mapped_tool_choice) = openai_tool_choice_to_responses_tool_choice(&tool_choice)
+        {
+            body["tool_choice"] = mapped_tool_choice;
+        } else if let Some(obj) = body.as_object_mut() {
+            obj.remove("tool_choice");
+        }
+    }
+    if let Some(parallel_tool_calls) = body.get("parallel_tool_calls").cloned() {
+        body["parallel_tool_calls"] = parallel_tool_calls;
+    }
     if let Some(obj) = body.as_object_mut() {
         obj.remove("messages");
     }
     Ok(())
+}
+
+fn responses_tool_choice_to_openai_tool_choice(choice: &Value) -> Option<Value> {
+    if choice.is_string() {
+        return Some(choice.clone());
+    }
+    let obj = choice.as_object()?;
+    let ty = obj.get("type").and_then(Value::as_str)?;
+    match ty {
+        "function" => {
+            let name = obj
+                .get("name")
+                .or_else(|| obj.get("function").and_then(|f| f.get("name")))?;
+            Some(serde_json::json!({
+                "type": "function",
+                "function": { "name": name }
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn openai_tool_choice_to_responses_tool_choice(choice: &Value) -> Option<Value> {
+    if choice.is_string() {
+        return Some(choice.clone());
+    }
+    let obj = choice.as_object()?;
+    let ty = obj.get("type").and_then(Value::as_str)?;
+    match ty {
+        "function" => {
+            let name = obj
+                .get("name")
+                .or_else(|| obj.get("function").and_then(|f| f.get("name")))?;
+            Some(serde_json::json!({
+                "type": "function",
+                "name": name
+            }))
+        }
+        _ => None,
+    }
 }
 
 fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -> Vec<Value> {
@@ -1167,6 +1228,13 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
     if let Some(t) = body.get("temperature") {
         result["temperature"] = t.clone();
     }
+    if let Some(tool_choice) = body.get("tool_choice") {
+        if let Some(mapped_tool_choice) =
+            openai_tool_choice_to_claude_tool_choice(tool_choice, body.get("parallel_tool_calls"))
+        {
+            result["tool_choice"] = mapped_tool_choice;
+        }
+    }
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
@@ -1250,6 +1318,38 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
     }
     *body = result;
     Ok(())
+}
+
+fn openai_tool_choice_to_claude_tool_choice(
+    choice: &Value,
+    parallel_tool_calls: Option<&Value>,
+) -> Option<Value> {
+    let disable_parallel_tool_use = parallel_tool_calls.and_then(Value::as_bool) == Some(false);
+    let mut mapped = if let Some(choice_str) = choice.as_str() {
+        match choice_str {
+            "none" => serde_json::json!({ "type": "none" }),
+            "auto" => serde_json::json!({ "type": "auto" }),
+            "required" => serde_json::json!({ "type": "any" }),
+            _ => return None,
+        }
+    } else {
+        let obj = choice.as_object()?;
+        let ty = obj.get("type").and_then(Value::as_str)?;
+        match ty {
+            "function" => {
+                let name = obj
+                    .get("name")
+                    .or_else(|| obj.get("function").and_then(|f| f.get("name")))?;
+                serde_json::json!({ "type": "tool", "name": name })
+            }
+            _ => return None,
+        }
+    };
+
+    if disable_parallel_tool_use && mapped.get("type").and_then(Value::as_str) != Some("none") {
+        mapped["disable_parallel_tool_use"] = Value::Bool(true);
+    }
+    Some(mapped)
 }
 
 fn extract_text_content(content: Option<&Value>) -> String {
@@ -1783,6 +1883,27 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_responses_to_openai_maps_tool_choice_and_parallel_calls() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "tool_choice": { "type": "function", "name": "lookup" },
+            "parallel_tool_calls": false
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["function"]["name"], "lookup");
+        assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
     fn translate_request_openai_to_claude_has_system_and_messages() {
         let mut body = json!({
             "model": "claude-3",
@@ -1810,6 +1931,27 @@ mod tests {
         assert_eq!(system[0]["cache_control"]["ttl"], "1h");
         assert!(body.get("messages").is_some());
         assert!(!body["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn translate_request_openai_to_claude_maps_tool_choice_and_parallel_calls() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tool_choice": { "type": "function", "function": { "name": "lookup" } },
+            "parallel_tool_calls": false
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "lookup");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
     }
 
     #[test]
@@ -1848,6 +1990,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn translate_request_openai_to_responses_maps_tool_choice() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tool_choice": { "type": "function", "function": { "name": "lookup" } },
+            "parallel_tool_calls": false
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["name"], "lookup");
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]

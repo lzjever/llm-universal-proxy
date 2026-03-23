@@ -673,7 +673,7 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
         return out;
     }
 
-    if ty == "response.completed" {
+    if ty == "response.completed" || ty == "response.incomplete" || ty == "response.failed" {
         if let Some(resp) = event.get("response") {
             if let Some(u) = resp.get("usage") {
                 state.usage = Some(serde_json::json!({
@@ -683,7 +683,32 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
             }
         }
         if !state.finish_reason_sent {
-            let mut chunk = openai_chunk(state, serde_json::json!({}), Some("stop"));
+            let finish_reason = match ty {
+                "response.incomplete" => event
+                    .get("response")
+                    .and_then(|resp| resp.get("incomplete_details"))
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(|reason| match reason {
+                        "max_output_tokens" => "length",
+                        "content_filter" => "content_filter",
+                        _ => "stop",
+                    })
+                    .unwrap_or("stop"),
+                "response.failed" => event
+                    .get("response")
+                    .and_then(|resp| resp.get("error"))
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str)
+                    .map(|code| match code {
+                        "context_length_exceeded" => "context_length_exceeded",
+                        "content_filter" | "invalid_prompt" => "content_filter",
+                        _ => "stop",
+                    })
+                    .unwrap_or("stop"),
+                _ => "stop",
+            };
+            let mut chunk = openai_chunk(state, serde_json::json!({}), Some(finish_reason));
             if let Some(ref u) = state.usage {
                 chunk["usage"] = u.clone();
             }
@@ -1869,6 +1894,41 @@ mod tests {
         assert_eq!(
             chunks[0]["choices"][0]["delta"]["reasoning_content"],
             "think"
+        );
+    }
+
+    #[test]
+    fn responses_incomplete_event_produces_openai_length_finish() {
+        let event = serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1",
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "usage": { "input_tokens": 1, "output_tokens": 2 }
+            }
+        });
+        let mut state = StreamState::default();
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "length");
+        assert_eq!(chunks[0]["usage"]["prompt_tokens"], 1);
+    }
+
+    #[test]
+    fn responses_failed_context_window_event_produces_openai_error_finish() {
+        let event = serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_1",
+                "error": { "code": "context_length_exceeded" }
+            }
+        });
+        let mut state = StreamState::default();
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0]["choices"][0]["finish_reason"],
+            "context_length_exceeded"
         );
     }
 
