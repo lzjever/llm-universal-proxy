@@ -1399,29 +1399,26 @@ fn upsert_header(headers: &mut Vec<(String, String)>, name: String, value: Strin
     headers.push((name, value));
 }
 
-/// Extract all headers that should be forwarded to upstream.
-/// This forwards all headers except hop-by-hop headers and content-related ones.
+/// Extract only protocol-relevant headers that are safe to forward to upstream.
+/// Avoid forwarding generic browser/runtime headers from the client request.
 fn extract_forwardable_headers(headers: &HeaderMap) -> Vec<(String, String)> {
-    // Headers that should NOT be forwarded
-    const HOP_BY_HOP: &[&str] = &[
-        "host",
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-        "content-type",
+    const FORWARDABLE: &[&str] = &[
+        "authorization",
+        "x-api-key",
+        "api-key",
+        "openai-api-key",
+        "x-goog-api-key",
+        "anthropic-api-key",
+        "anthropic-version",
+        "anthropic-beta",
+        "x-stainless-helper-method",
     ];
 
     let mut result = Vec::new();
     debug!("Extracting headers from request:");
     for (name, value) in headers.iter() {
         let name_str = name.as_str().to_lowercase();
-        if !HOP_BY_HOP.contains(&name_str.as_str()) {
+        if FORWARDABLE.contains(&name_str.as_str()) {
             if let Ok(v) = value.to_str() {
                 let display_value = if name_str.contains("key")
                     || name_str.contains("auth")
@@ -1435,11 +1432,34 @@ fn extract_forwardable_headers(headers: &HeaderMap) -> Vec<(String, String)> {
                 result.push((name_str, v.to_string()));
             }
         } else {
-            debug!("Skipping hop-by-hop header: {}", name_str);
+            debug!("Skipping non-forwardable header: {}", name_str);
         }
     }
     debug!("Total headers to forward: {}", result.len());
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_forwardable_headers;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn extract_forwardable_headers_keeps_only_protocol_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer test"));
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("accept-language", HeaderValue::from_static("*"));
+        headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
+
+        let forwarded = extract_forwardable_headers(&headers);
+        assert!(forwarded.iter().any(|(k, v)| k == "authorization" && v == "Bearer test"));
+        assert!(forwarded.iter().any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
+        assert!(!forwarded.iter().any(|(k, _)| k == "content-type"));
+        assert!(!forwarded.iter().any(|(k, _)| k == "accept-language"));
+        assert!(!forwarded.iter().any(|(k, _)| k == "sec-fetch-mode"));
+    }
 }
 
 /// Generate auth header for the given upstream format.
