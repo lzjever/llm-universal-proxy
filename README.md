@@ -31,6 +31,7 @@ This is a real Codex CLI session using a local alias routed to `GLM-5-Turbo` thr
 - **Named Upstreams**: Route requests to multiple upstream providers from one proxy instance
 - **Local Model Aliases**: Expose one unique local model name for any upstream model
 - **Audit Hooks**: Optional async `exchange` / `usage` HTTP hooks for request-response capture and metering
+- **Local Debug Trace**: Optional JSONL trace for per-turn debugging without shipping traffic to external hooks
 - **Credential Policy**: Supports fallback credentials, direct configured credentials, and force-server auth
 - **Codex CLI Friendly**: Works as a Responses-compatible endpoint in front of Anthropic-compatible upstreams
 - **Model Unification Layer**: Map models from different providers to one stable local naming scheme, such as `opus`, `sonnet`, `haiku`, or team-specific coding aliases
@@ -139,6 +140,10 @@ hooks:
     url: https://example.com/hooks/usage
   exchange:
     url: https://example.com/hooks/exchange
+
+debug_trace:
+  path: /tmp/llm-proxy-debug.jsonl
+  max_text_chars: 16384
 ```
 
 Notes:
@@ -150,6 +155,9 @@ Notes:
 - `credential_actual` can be used instead of `credential_env` when you want to place a fallback credential directly in YAML. `credential_env` and `credential_actual` are mutually exclusive.
 - `auth_policy` supports `client_or_fallback` and `force_server`.
 - Hooks are best-effort and asynchronous. `usage` is usually enough; `exchange` captures the full client-facing request/response pair after the request completes.
+- `debug_trace` writes a local JSONL file for debugging protocol issues. It is designed for interactive troubleshooting, not long-term traffic archival.
+- `debug_trace` records only the tail "new input" portion of each client request rather than rewriting the full accumulated conversation each turn.
+- For streaming responses, `debug_trace` records the processed client-visible result: aggregated text, reasoning text, tool-call deltas, terminal event, finish reason, and any normalized error. It does not dump raw SSE JSON lines.
 
 ### Full YAML Reference
 
@@ -181,6 +189,10 @@ hooks:
   exchange:
     url: https://example.com/hooks/exchange
     authorization: Bearer exchange-hook-token
+
+debug_trace:
+  path: /tmp/llm-proxy-debug.jsonl
+  max_text_chars: 16384
 ```
 
 ### Top-Level Fields
@@ -192,6 +204,24 @@ hooks:
 | `upstreams` | map | Yes | none | Named upstream definitions |
 | `model_aliases` | map | No | empty | Maps local model names to `upstream:model` |
 | `hooks` | object | No | disabled | Optional async audit and usage export hooks |
+| `debug_trace` | object | No | disabled | Optional local JSONL debug trace for per-turn request/response summaries |
+
+### `debug_trace`
+
+Use `debug_trace` when you need to troubleshoot client or proxy behavior locally and want something lighter than full exchange capture.
+
+```yaml
+debug_trace:
+  path: /tmp/llm-proxy-debug.jsonl
+  max_text_chars: 16384
+```
+
+Design notes:
+- The request entry records only the new tail input for the current turn, not the full accumulated transcript.
+- The response entry records a normalized summary.
+  - Non-streaming: summarized final body.
+  - Streaming: aggregated text, aggregated reasoning text, tool-call deltas, terminal event such as `response.completed` or `response.failed`, and normalized error details when present.
+- This format is meant to answer "what did the client add this turn?" and "what did the model actually send back?" without forcing you to reconstruct long raw SSE logs.
 
 ### `upstreams`
 

@@ -692,12 +692,18 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
             .to_vec()
     };
     let mut current_assistant: Option<Value> = None;
-    for item in items {
+    let mut deferred_user_after_tool_results: Option<Value> = None;
+    let mut idx = 0;
+    while idx < items.len() {
+        let item = items[idx].clone();
         let item_type = item
             .get("type")
             .and_then(Value::as_str)
             .or_else(|| item.get("role").and_then(Value::as_str).map(|_| "message"));
-        let Some(ty) = item_type else { continue };
+        let Some(ty) = item_type else {
+            idx += 1;
+            continue;
+        };
         match ty {
             "message" => {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -713,6 +719,14 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                     });
                     assistant["role"] = Value::String("assistant".to_string());
                     assistant["content"] = content;
+                } else if normalized_role == "user"
+                    && items
+                        .get(idx + 1)
+                        .and_then(|next| next.get("type").and_then(Value::as_str))
+                        == Some("function_call_output")
+                {
+                    deferred_user_after_tool_results =
+                        Some(serde_json::json!({ "role": "user", "content": content }));
                 } else {
                     flush_assistant(&mut messages, &mut current_assistant);
                     messages.push(serde_json::json!({ "role": normalized_role, "content": content }));
@@ -764,6 +778,15 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                     "tool_call_id": call_id,
                     "content": content
                 }));
+                let next_is_function_output = items
+                    .get(idx + 1)
+                    .and_then(|next| next.get("type").and_then(Value::as_str))
+                    == Some("function_call_output");
+                if !next_is_function_output {
+                    if let Some(deferred) = deferred_user_after_tool_results.take() {
+                        messages.push(deferred);
+                    }
+                }
             }
             "reasoning" => {
                 let summary = item
@@ -800,6 +823,10 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
             }
             _ => {}
         }
+        idx += 1;
+    }
+    if let Some(deferred) = deferred_user_after_tool_results.take() {
+        messages.push(deferred);
     }
     flush_assistant(&mut messages, &mut current_assistant);
     body["messages"] = Value::Array(messages);
@@ -2633,6 +2660,54 @@ mod tests {
         let user_blocks = messages[2]["content"].as_array().expect("user content");
         assert_eq!(user_blocks[0]["type"], "tool_result");
         assert_eq!(user_blocks[0]["tool_use_id"], "call_1");
+    }
+
+    #[test]
+    fn translate_request_responses_to_claude_moves_user_warning_after_tool_result() {
+        let mut body = json!({
+            "model": "codex-anthropic",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Running test..." }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"python test.py\"}"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "Warning: process limit reached" }]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Done"
+                }
+            ],
+            "stream": true
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Anthropic,
+            "codex-anthropic",
+            &mut body,
+            true,
+        )
+        .unwrap();
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "user");
+        let user_blocks = messages[1]["content"].as_array().expect("user content");
+        assert_eq!(user_blocks[0]["type"], "tool_result");
+        assert_eq!(user_blocks[0]["tool_use_id"], "call_1");
+        assert_eq!(user_blocks[1]["type"], "text");
+        assert_eq!(user_blocks[1]["text"], "Warning: process limit reached");
     }
 
     #[test]

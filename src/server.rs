@@ -22,6 +22,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AuthPolicy, Config, RuntimeConfigPayload, UpstreamConfig};
+use crate::debug_trace::{DebugTraceContext, DebugTraceRecorder};
 use crate::dashboard::run_dashboard;
 use crate::discovery::UpstreamCapability;
 use crate::hooks::{
@@ -243,6 +244,7 @@ struct RuntimeNamespaceState {
     upstreams: BTreeMap<String, UpstreamState>,
     client: Client,
     hooks: Option<HookDispatcher>,
+    debug_trace: Option<DebugTraceRecorder>,
 }
 
 #[derive(Default)]
@@ -302,12 +304,14 @@ async fn build_runtime_namespace_state(
     let upstreams = resolve_upstreams(&config).await;
     let client = upstream::build_client(&config);
     let hooks = HookDispatcher::new(&config.hooks);
+    let debug_trace = DebugTraceRecorder::new(&config.debug_trace);
     Ok(RuntimeNamespaceState {
         revision,
         config,
         upstreams,
         client,
         hooks,
+        debug_trace,
     })
 }
 
@@ -829,7 +833,7 @@ async fn handle_request_core(
         upstream_format,
     );
     let hook_ctx = namespace_state.hooks.as_ref().map(|_| HookRequestContext {
-        request_id,
+        request_id: request_id.clone(),
         timestamp_ms: request_timestamp,
         path: path.clone(),
         method: "POST".to_string(),
@@ -842,8 +846,22 @@ async fn handle_request_core(
         credential_source: effective_credential.source,
         credential_fingerprint: effective_credential.fingerprint.clone(),
         client_request_headers: original_headers,
-        client_request_body: original_body,
+        client_request_body: original_body.clone(),
     });
+    let debug_ctx = namespace_state.debug_trace.as_ref().map(|_| DebugTraceContext {
+        request_id: request_id.clone(),
+        timestamp_ms: request_timestamp,
+        path: path.clone(),
+        stream,
+        client_model: requested_model.clone(),
+        upstream_name: resolved_model.upstream_name.clone(),
+        upstream_model: resolved_model.upstream_model.clone(),
+        client_format,
+        upstream_format,
+    });
+    if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref()) {
+        recorder.record_request(ctx, &original_body);
+    }
 
     let url = upstream::upstream_url(
         &namespace_state.config,
@@ -890,7 +908,7 @@ async fn handle_request_core(
             );
         }
         let upstream_stream = res.bytes_stream();
-        let body_stream: Pin<
+        let mut body_stream: Pin<
             Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
         > = if needs_stream_translation(upstream_format, client_format) {
             let translated =
@@ -899,17 +917,22 @@ async fn handle_request_core(
         } else {
             Box::pin(upstream_stream.map(|r| r.map_err(std::io::Error::other)))
         };
-        let body = if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.clone(), hook_ctx.clone()) {
-            let captured =
-                dispatcher.wrap_stream(body_stream, ctx, status.as_u16(), sse_response_headers());
-            Body::from_stream(TrackedBodyStream::new(captured, tracker, status.as_u16()))
-        } else {
-            Body::from_stream(TrackedBodyStream::new(
+        if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.clone(), hook_ctx.clone()) {
+            body_stream = Box::pin(dispatcher.wrap_stream(
                 body_stream,
-                tracker,
+                ctx,
                 status.as_u16(),
-            ))
-        };
+                sse_response_headers(),
+            ));
+        }
+        if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.clone()) {
+            body_stream = Box::pin(recorder.wrap_stream(body_stream, ctx, status.as_u16()));
+        }
+        let body = Body::from_stream(TrackedBodyStream::new(
+            body_stream,
+            tracker,
+            status.as_u16(),
+        ));
         let mut response = Response::builder()
             .status(status)
             .header("Content-Type", "text/event-stream")
@@ -972,6 +995,9 @@ async fn handle_request_core(
     };
     if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.as_ref(), hook_ctx) {
         dispatcher.emit_non_stream(ctx, 200, json_response_headers(), out.clone());
+    }
+    if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref()) {
+        recorder.record_non_stream_response(ctx, StatusCode::OK.as_u16(), &out);
     }
     tracker.finish_success(StatusCode::OK.as_u16());
     let mut response = Response::builder()

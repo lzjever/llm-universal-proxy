@@ -15,7 +15,7 @@ use bytes::Bytes;
 use common::*;
 use futures_util::{future::join_all, stream, StreamExt};
 use llm_universal_proxy::config::{
-    AuthPolicy, Config, HookConfig, HookEndpointConfig, ModelAlias, RuntimeConfigPayload,
+    AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ModelAlias, RuntimeConfigPayload,
     RuntimeHookConfig, RuntimeConfigSnapshot, RuntimeUpstreamConfig, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
@@ -43,6 +43,7 @@ fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
     }
 }
 
@@ -147,6 +148,7 @@ async fn runtime_namespace_config_can_be_pushed_after_empty_start() {
                 }],
                 model_aliases: std::collections::BTreeMap::new(),
                 hooks: RuntimeHookConfig::default(),
+                debug_trace: DebugTraceConfig::default(),
             },
         })
         .send()
@@ -205,6 +207,7 @@ async fn runtime_namespace_config_rejects_stale_or_duplicate_revision() {
             }],
             model_aliases: std::collections::BTreeMap::new(),
             hooks: RuntimeHookConfig::default(),
+            debug_trace: DebugTraceConfig::default(),
         },
     };
 
@@ -1258,6 +1261,7 @@ async fn multi_upstream_supports_explicit_upstream_model_selector() {
         ],
         model_aliases: Default::default(),
         hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -1304,6 +1308,7 @@ async fn multi_upstream_supports_local_model_alias() {
         ],
         model_aliases,
         hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -1342,6 +1347,7 @@ async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
         ],
         model_aliases: Default::default(),
         hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -1373,6 +1379,7 @@ async fn multi_upstream_uses_per_upstream_fallback_credential() {
         )],
         model_aliases: Default::default(),
         hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -1417,6 +1424,7 @@ async fn force_server_auth_policy_ignores_client_key() {
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -1970,6 +1978,46 @@ async fn responses_endpoint_streaming_preserves_anthropic_reasoning() {
 }
 
 #[tokio::test]
+async fn debug_trace_records_request_delta_and_stream_summary() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let trace_path = std::env::temp_dir().join(format!(
+        "llm-proxy-debug-trace-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    config.debug_trace = DebugTraceConfig {
+        path: Some(trace_path.display().to_string()),
+        max_text_chars: 256,
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "Hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("response.completed"), "body = {body}");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let log = std::fs::read_to_string(&trace_path).unwrap();
+    assert!(log.contains("\"phase\":\"request\""), "log = {log}");
+    assert!(log.contains("\"phase\":\"response\""), "log = {log}");
+    assert!(log.contains("\"new_items\":[{\"role\":\"user\",\"text\":\"Hi\",\"type\":\"message\"}]"), "log = {log}");
+    assert!(log.contains("\"terminal_event\":\"response.completed\""), "log = {log}");
+    assert!(log.contains("\"text\":\"Hi\""), "log = {log}");
+
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[tokio::test]
 async fn chat_completions_endpoint_preserves_responses_reasoning_stream() {
     let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
@@ -2175,6 +2223,7 @@ async fn upstream_unreachable_returns_502() {
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 

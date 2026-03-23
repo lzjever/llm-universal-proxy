@@ -797,6 +797,11 @@ pub fn translate_sse_event(
         }
         return vec![format_sse_data(event)];
     }
+    if upstream_format == UpstreamFormat::Anthropic
+        && event.get("type").and_then(Value::as_str) == Some("error")
+    {
+        return anthropic_error_event_to_client_sse(event, client_format, state);
+    }
     let openai_chunks: Vec<Value> = match upstream_format {
         UpstreamFormat::OpenAiCompletion => openai_event_as_chunk(event).into_iter().collect(),
         UpstreamFormat::Anthropic => claude_event_to_openai_chunks(event, state),
@@ -1698,6 +1703,102 @@ pub fn translate_response_chunk(
         &event,
         state,
     ))
+}
+
+fn anthropic_error_event_to_client_sse(
+    event: &Value,
+    client_format: UpstreamFormat,
+    state: &mut StreamState,
+) -> Vec<Vec<u8>> {
+    let error = event.get("error").unwrap_or(&Value::Null);
+    let error_type = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("api_error");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Anthropic streaming error");
+
+    let (normalized_type, normalized_code, finish_reason) =
+        normalize_anthropic_stream_error(error_type, message);
+
+    match client_format {
+        UpstreamFormat::OpenAiResponses => {
+            state.responses_seq += 1;
+            let response_id = state
+                .message_id
+                .clone()
+                .unwrap_or_else(|| format!("resp_error_{}", uuid::Uuid::new_v4().simple()));
+            let failed = serde_json::json!({
+                "type": "response.failed",
+                "sequence_number": state.responses_seq,
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": 0,
+                    "status": "failed",
+                    "background": false,
+                    "error": {
+                        "type": normalized_type,
+                        "code": normalized_code,
+                        "message": message
+                    },
+                    "incomplete_details": null,
+                    "usage": null,
+                    "metadata": {}
+                }
+            });
+            vec![format_sse_event("response.failed", &failed)]
+        }
+        UpstreamFormat::OpenAiCompletion => {
+            let mut chunk = openai_chunk(state, serde_json::json!({}), Some(finish_reason));
+            chunk["error"] = serde_json::json!({
+                "type": normalized_type,
+                "code": normalized_code,
+                "message": message
+            });
+            vec![format_sse_data(&chunk), b"data: [DONE]\n\n".to_vec()]
+        }
+        UpstreamFormat::Anthropic => vec![format_sse_data(event)],
+        UpstreamFormat::Google => vec![],
+    }
+}
+
+fn normalize_anthropic_stream_error(
+    error_type: &str,
+    message: &str,
+) -> (&'static str, Option<&'static str>, &'static str) {
+    let lower_type = error_type.to_ascii_lowercase();
+    let lower_message = message.to_ascii_lowercase();
+    if lower_type.contains("overloaded") || lower_type.contains("api_error") {
+        return ("server_error", Some("server_is_overloaded"), "stop");
+    }
+    if lower_type.contains("rate_limit") {
+        return ("rate_limit_error", Some("rate_limit_exceeded"), "stop");
+    }
+    if lower_type.contains("invalid_request")
+        && (lower_message.contains("context window")
+            || lower_message.contains("context_length_exceeded")
+            || lower_message.contains("too many tokens")
+            || lower_message.contains("maximum context length"))
+    {
+        return (
+            "invalid_request_error",
+            Some("context_length_exceeded"),
+            "context_length_exceeded",
+        );
+    }
+    if lower_type.contains("invalid_request")
+        && (lower_message.contains("refusal") || lower_message.contains("content filter"))
+    {
+        return (
+            "invalid_request_error",
+            Some("content_filter"),
+            "content_filter",
+        );
+    }
+    ("server_error", Some("server_is_overloaded"), "stop")
 }
 
 /// Stream that buffers upstream bytes, parses SSE events, and yields translated SSE bytes.
@@ -2645,5 +2746,57 @@ mod tests {
         assert!(joined.contains("\"type\":\"response.incomplete\""));
         assert!(joined.contains("\"reason\":\"max_output_tokens\""));
         assert!(!joined.contains("\"type\":\"response.completed\""));
+    }
+
+    #[test]
+    fn anthropic_error_event_maps_to_responses_failed() {
+        let mut state = StreamState::default();
+        let out = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Overloaded"
+                }
+            }),
+            &mut state,
+        );
+
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"type\":\"response.failed\""));
+        assert!(joined.contains("\"type\":\"server_error\""));
+        assert!(joined.contains("\"code\":\"server_is_overloaded\""));
+    }
+
+    #[test]
+    fn anthropic_error_event_maps_context_to_openai_context_finish() {
+        let mut state = StreamState::default();
+        let out = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "maximum context length exceeded"
+                }
+            }),
+            &mut state,
+        );
+
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"finish_reason\":\"context_length_exceeded\""));
+        assert!(joined.contains("\"code\":\"context_length_exceeded\""));
+        assert!(joined.contains("[DONE]"));
     }
 }
