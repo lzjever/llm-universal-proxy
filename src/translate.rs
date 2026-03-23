@@ -1074,9 +1074,6 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
             stop_sequences.clone()
         };
     }
-    if let Some(metadata) = body.get("metadata") {
-        result["metadata"] = metadata.clone();
-    }
     // System: strip cache_control from blocks
     // Reference: 9router claudeHelper.js - remove all cache_control, add only to last block
     if let Some(system) = body.get("system") {
@@ -1198,16 +1195,7 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
     if !tool_results.is_empty() {
         let mut out: Vec<Value> = tool_results;
         if !parts.is_empty() {
-            let content = if parts.len() == 1
-                && parts[0].get("type").and_then(Value::as_str) == Some("text")
-            {
-                parts[0]
-                    .get("text")
-                    .cloned()
-                    .unwrap_or(Value::String(String::new()))
-            } else {
-                Value::Array(parts)
-            };
+            let content = collapse_claude_text_parts_for_openai(&parts);
             out.push(serde_json::json!({ "role": "user", "content": content }));
         }
         return Some(out);
@@ -1215,16 +1203,7 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
     if !tool_calls.is_empty() {
         let mut m = serde_json::json!({ "role": "assistant", "tool_calls": tool_calls });
         if !parts.is_empty() {
-            m["content"] = if parts.len() == 1
-                && parts[0].get("type").and_then(Value::as_str) == Some("text")
-            {
-                parts[0]
-                    .get("text")
-                    .cloned()
-                    .unwrap_or(Value::String(String::new()))
-            } else {
-                Value::Array(parts)
-            };
+            m["content"] = collapse_claude_text_parts_for_openai(&parts);
         }
         return Some(vec![m]);
     }
@@ -1233,18 +1212,25 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
             serde_json::json!({ "role": openai_role, "content": "" }),
         ]);
     }
-    let content =
-        if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text") {
-            parts[0]
-                .get("text")
-                .cloned()
-                .unwrap_or(Value::String(String::new()))
-        } else {
-            Value::Array(parts)
-        };
+    let content = collapse_claude_text_parts_for_openai(&parts);
     Some(vec![
         serde_json::json!({ "role": openai_role, "content": content }),
     ])
+}
+
+fn collapse_claude_text_parts_for_openai(parts: &[Value]) -> Value {
+    let all_text = parts
+        .iter()
+        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"));
+    if all_text {
+        return Value::String(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<String>(),
+        );
+    }
+    Value::Array(parts.to_vec())
 }
 
 fn openai_to_claude(body: &mut Value) -> Result<(), String> {
@@ -2097,6 +2083,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn translate_request_claude_to_openai_collapses_text_blocks_to_string() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "alpha\n" },
+                    { "type": "text", "text": "beta" }
+                ]
+            }]
+        });
+        translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["messages"][0]["content"], "alpha\nbeta");
+    }
+
+    #[test]
+    fn translate_request_claude_to_openai_drops_metadata_for_compatibility() {
+        let mut body = json!({
+            "model": "claude-3",
+            "metadata": { "user_id": "abc" },
+            "messages": [{ "role": "user", "content": "Hi" }]
+        });
+        translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        assert!(body.get("metadata").is_none());
     }
 
     #[test]

@@ -620,6 +620,10 @@ async fn handle_request_core(
     let upstream_body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => {
+            error!(
+                "Upstream returned invalid JSON body: {}",
+                String::from_utf8_lossy(&bytes)
+            );
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return error_response(
                 client_format,
@@ -1072,6 +1076,18 @@ fn collect_request_compatibility_warnings(
     {
         warnings.push(
             "Anthropic does not support `parallel_tool_calls`; proxy approximates this with `disable_parallel_tool_use`".to_string(),
+        );
+    }
+    if client_format == crate::formats::UpstreamFormat::Anthropic
+        && matches!(
+            upstream_format,
+            crate::formats::UpstreamFormat::OpenAiCompletion
+                | crate::formats::UpstreamFormat::OpenAiResponses
+        )
+        && body.get("metadata").is_some()
+    {
+        warnings.push(
+            "Anthropic `metadata` is not universally supported by OpenAI-style upstreams; proxy may drop it for compatibility".to_string(),
         );
     }
     warnings
