@@ -31,8 +31,8 @@
 | `parallel_tool_calls` | Supported | Partially supported in Chat ecosystems | Anthropic uses `disable_parallel_tool_use` | `false` maps to Anthropic `disable_parallel_tool_use: true` when tool choice is present | Approx | Only the "disable parallel calls" intent is preserved. |
 | `max_output_tokens` / `max_tokens` | `max_output_tokens` | `max_tokens` | `max_tokens` | Mapped | Exact | |
 | `previous_response_id` | Supported | Not supported | Not supported | Dropped when leaving Responses | Unsupported | Cannot be reconstructed from stateless Chat or Anthropic requests. |
-| `store` | Supported | Different / not portable | Not portable | Dropped when leaving Responses | Unsupported | Storage semantics are provider-specific. |
-| `metadata` | Supported | Provider-specific | Provider-specific | Not translated today | Unsupported | Safer to drop than emit unsupported payloads. |
+| `store` | Supported | Chat-compatible OpenAI implementations may support it | Not portable | Preserved inside OpenAI-style translations; dropped when leaving the OpenAI family | Approx | Anthropic and Gemini have no equivalent storage semantics. |
+| `metadata` | Supported | Supported by many OpenAI-style implementations | Anthropic request metadata exists | Preserved where a target protocol has a compatible metadata object | Approx | There is still no universal cross-provider metadata contract. |
 | `truncation` | Supported | No exact equivalent | No exact equivalent | Dropped when leaving Responses | Unsupported | The runtime truncation policy cannot be reproduced in other protocols. |
 | `reasoning` request config | Supported | Provider-specific | Provider-specific extended thinking knobs | Dropped when crossing protocols | Unsupported | Only reasoning output usage is mapped today, not request policy. |
 | `include` | Supported | Not equivalent | Not equivalent | Dropped when leaving Responses | Unsupported | Some included fields have no Chat or Anthropic representation. |
@@ -55,7 +55,7 @@
 | Provider startup error before SSE body | `response.failed` | HTTP error | HTTP error | Proxy synthesizes Responses `response.failed` for Responses clients | Approx | Improves downstream compatibility for Codex. |
 | `response.failed` from Responses upstream | Explicit failed event | No exact streaming error event | No exact equivalent | Proxy converts to a final OpenAI completion chunk with best-effort finish reason | Approx | Best effort for non-Responses clients. |
 | `response.incomplete` from Responses upstream | Explicit incomplete event | Final chunk with `finish_reason=length/content_filter` | Final Claude stop reason | Proxy maps to best-effort finish reason | Approx | Preserves truncation/filter behavior for downstream consumers. |
-| `pause_turn` | Not a Responses concept | No exact equivalent | Anthropic successful stop reason for server-tool loops | Not fully mapped today | Unsupported | Requires a higher-level resume protocol, not just field translation. |
+| `pause_turn` | Not a Responses concept | No exact equivalent | Anthropic successful stop reason for server-tool loops | Not fully mapped today | Unsupported | Requires a higher-level resume protocol, not just field translation. Proxy documents this instead of inventing a misleading completion state. |
 
 ## Streaming event lifecycle
 
@@ -73,11 +73,19 @@
 | Source feature | Why no exact mapping exists | Proxy fallback |
 |---------------|-----------------------------|----------------|
 | `previous_response_id` | Responses supports stateful response chaining; Chat and Anthropic are stateless request formats | Drop field when leaving Responses; caller must inline prior context explicitly. |
-| `store` | Persistence model is provider-specific | Drop field when leaving Responses. |
+| `store` | Persistence model is provider-specific outside the OpenAI family | Preserve within OpenAI-style translations; drop for Anthropic and Gemini. |
 | Responses built-in tools | Chat Completions and Anthropic tool schemas are not the same API surface | Keep function tools only; drop built-ins on cross-protocol translation. |
 | `truncation` | Provider-side context management policy cannot be reproduced in another protocol | Drop field and rely on downstream model/provider defaults. |
 | Anthropic `pause_turn` | It is a workflow control signal, not a normal completion state | Currently documented as unsupported. |
 | Anthropic `refusal` | Closest OpenAI equivalent is `content_filter`, but semantics are not identical | Map to `content_filter` because downstream safety handling is closer. |
+
+## Current pragmatic mappings
+
+- `Responses parallel_tool_calls=false` -> `Anthropic tool_choice.disable_parallel_tool_use=true` when a Claude tool choice object is emitted.
+- `Anthropic model_context_window_exceeded` -> OpenAI / Responses context-window error semantics, because downstream tools like Codex need an explicit overflow signal instead of a superficially successful completion.
+- `Anthropic refusal` -> OpenAI `content_filter` / Responses `incomplete.reason=content_filter`, because downstream safety handling is closer to filtering than to natural completion.
+- `OpenAI content_filter` -> Anthropic `refusal`.
+- `OpenAI context_length_exceeded` -> Anthropic `model_context_window_exceeded`.
 
 ## Operational guidance
 
