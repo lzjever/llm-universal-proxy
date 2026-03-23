@@ -31,6 +31,7 @@ use crate::telemetry::RuntimeMetrics;
 use crate::translate::{translate_request, translate_response};
 use crate::upstream;
 use futures_util::StreamExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub async fn run_with_config_path(
     path: impl AsRef<std::path::Path>,
@@ -528,7 +529,11 @@ async fn handle_request_core(
         Ok(r) => r,
         Err(e) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string());
+            return streaming_error_response(
+                client_format,
+                StatusCode::BAD_GATEWAY,
+                &e.to_string(),
+            );
         }
     };
 
@@ -545,7 +550,7 @@ async fn handle_request_core(
                 status, error_body
             );
             tracker.finish_error(status.as_u16());
-            return error_response(
+            return streaming_error_response(
                 client_format,
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 &error_body,
@@ -794,11 +799,16 @@ fn error_response(
     status: StatusCode,
     message: &str,
 ) -> Response<Body> {
+    let normalized_error = normalize_upstream_error(status, message);
     match format {
-        crate::formats::UpstreamFormat::OpenAiCompletion
-        | crate::formats::UpstreamFormat::OpenAiResponses => (
+        crate::formats::UpstreamFormat::OpenAiCompletion => (
             status,
-            Json(serde_json::json!({ "error": { "message": message } })),
+            Json(openai_error_body(&normalized_error)),
+        )
+            .into_response(),
+        crate::formats::UpstreamFormat::OpenAiResponses => (
+            status,
+            Json(openai_error_body(&normalized_error)),
         )
             .into_response(),
         crate::formats::UpstreamFormat::Anthropic => (
@@ -824,6 +834,170 @@ fn error_response(
         )
             .into_response(),
     }
+}
+
+fn streaming_error_response(
+    format: crate::formats::UpstreamFormat,
+    status: StatusCode,
+    message: &str,
+) -> Response<Body> {
+    if format != crate::formats::UpstreamFormat::OpenAiResponses {
+        return error_response(format, status, message);
+    }
+
+    let normalized_error = normalize_upstream_error(status, message);
+    let response_id = format!(
+        "resp_error_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "type": "response.failed",
+        "sequence_number": 0,
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "failed",
+            "background": false,
+            "error": {
+                "type": normalized_error.error_type,
+                "code": normalized_error.code,
+                "message": normalized_error.message,
+            },
+            "incomplete_details": null,
+            "usage": null,
+            "metadata": {}
+        }
+    });
+    let body = format!(
+        "event: response.failed\ndata: {payload}\n\n"
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedUpstreamError {
+    message: String,
+    error_type: &'static str,
+    code: Option<&'static str>,
+}
+
+fn normalize_upstream_error(status: StatusCode, raw_message: &str) -> NormalizedUpstreamError {
+    let parsed = serde_json::from_str::<Value>(raw_message).ok();
+    let extracted_message = parsed
+        .as_ref()
+        .and_then(extract_error_message)
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| raw_message.to_string());
+    let signal = parsed
+        .as_ref()
+        .map(extract_error_signal)
+        .unwrap_or_default();
+    let signal = signal.to_ascii_lowercase();
+    let message_lc = extracted_message.to_ascii_lowercase();
+    let combined = format!("{signal} {message_lc}");
+
+    let (error_type, code) = if status == StatusCode::TOO_MANY_REQUESTS
+        || combined.contains("rate limit")
+        || combined.contains("rate_limit")
+    {
+        ("rate_limit_error", Some("rate_limit_exceeded"))
+    } else if combined.contains("quota")
+        || combined.contains("insufficient_quota")
+        || combined.contains("credit balance")
+    {
+        ("insufficient_quota", Some("insufficient_quota"))
+    } else if status.is_server_error()
+        || combined.contains("overloaded")
+        || combined.contains("slow down")
+        || combined.contains("server_is_overloaded")
+        || combined.contains("temporarily unavailable")
+        || combined.contains("service unavailable")
+    {
+        ("server_error", Some("server_is_overloaded"))
+    } else if combined.contains("context_length_exceeded")
+        || combined.contains("context window")
+        || combined.contains("maximum context length")
+        || combined.contains("prompt is too long")
+        || combined.contains("prompt too long")
+        || combined.contains("too many tokens")
+        || combined.contains("token limit exceeded")
+    {
+        ("invalid_request_error", Some("context_length_exceeded"))
+    } else if combined.contains("invalid_prompt")
+        || combined.contains("safety reasons")
+        || combined.contains("prompt blocked")
+    {
+        ("invalid_request_error", Some("invalid_prompt"))
+    } else if status.is_client_error() {
+        ("invalid_request_error", Some("invalid_request_error"))
+    } else {
+        ("server_error", None)
+    };
+
+    NormalizedUpstreamError {
+        message: extracted_message,
+        error_type,
+        code,
+    }
+}
+
+fn extract_error_message(body: &Value) -> Option<String> {
+    body.get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            body.get("error")
+                .and_then(|error| error.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| body.get("message").and_then(Value::as_str))
+        .map(ToString::to_string)
+}
+
+fn extract_error_signal(body: &Value) -> String {
+    let candidates = [
+        body.get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        body.get("error")
+            .and_then(|error| error.get("type"))
+            .and_then(Value::as_str),
+        body.get("error")
+            .and_then(|error| error.get("status"))
+            .and_then(Value::as_str),
+        body.get("code").and_then(Value::as_str),
+        body.get("type").and_then(Value::as_str),
+        body.get("status").and_then(Value::as_str),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn openai_error_body(error: &NormalizedUpstreamError) -> Value {
+    serde_json::json!({
+        "error": {
+            "message": error.message,
+            "type": error.error_type,
+            "code": error.code,
+        }
+    })
 }
 
 fn google_status_text(status: StatusCode) -> &'static str {
@@ -1068,4 +1242,70 @@ fn extract_api_key_from_headers(headers: &[(String, String)]) -> Option<String> 
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_upstream_error_maps_context_window_messages() {
+        let error = normalize_upstream_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215000 tokens > 200000 limit"}}"#,
+        );
+
+        assert_eq!(
+            error,
+            NormalizedUpstreamError {
+                message: "prompt is too long: 215000 tokens > 200000 limit".to_string(),
+                error_type: "invalid_request_error",
+                code: Some("context_length_exceeded"),
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_upstream_error_preserves_rate_limit_signal() {
+        let error = normalize_upstream_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"Please slow down.","type":"rate_limit_error"}}"#,
+        );
+
+        assert_eq!(
+            error,
+            NormalizedUpstreamError {
+                message: "Please slow down.".to_string(),
+                error_type: "rate_limit_error",
+                code: Some("rate_limit_exceeded"),
+            }
+        );
+    }
+
+    #[test]
+    fn streaming_error_response_returns_responses_failed_event() {
+        let response = streaming_error_response(
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            StatusCode::BAD_REQUEST,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let body = runtime.block_on(async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body bytes");
+            String::from_utf8(bytes.to_vec()).expect("utf8 body")
+        });
+
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("\"code\":\"context_length_exceeded\""));
+        assert!(body.contains("\"message\":\"prompt is too long\""));
+    }
 }
