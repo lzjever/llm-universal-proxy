@@ -692,6 +692,7 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                     .map(|reason| match reason {
                         "max_output_tokens" => "length",
                         "content_filter" => "content_filter",
+                        "pause_turn" => "pause_turn",
                         _ => "stop",
                     })
                     .unwrap_or("stop"),
@@ -806,6 +807,7 @@ fn convert_openai_finish_to_claude(reason: &str) -> &'static str {
         "stop" => "end_turn",
         "length" => "max_tokens",
         "tool_calls" => "tool_use",
+        "pause_turn" => "pause_turn",
         "content_filter" => "refusal",
         "context_length_exceeded" => "model_context_window_exceeded",
         _ => "end_turn",
@@ -1337,6 +1339,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
     let incomplete_reason = match finish_reason {
         Some("length") => Some("max_output_tokens"),
         Some("content_filter") => Some("content_filter"),
+        Some("pause_turn") => Some("pause_turn"),
         _ => None,
     };
 
@@ -1917,6 +1920,21 @@ mod tests {
     }
 
     #[test]
+    fn responses_incomplete_pause_turn_event_produces_openai_pause_turn_finish() {
+        let event = serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1",
+                "incomplete_details": { "reason": "pause_turn" }
+            }
+        });
+        let mut state = StreamState::default();
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "pause_turn");
+    }
+
+    #[test]
     fn responses_failed_context_window_event_produces_openai_error_finish() {
         let event = serde_json::json!({
             "type": "response.failed",
@@ -1984,6 +2002,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("\"stop_reason\":\"model_context_window_exceeded\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_maps_pause_turn_to_incomplete() {
+        let mut state = StreamState::default();
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "pause_turn" }]
+        });
+        let out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"type\":\"response.incomplete\""));
+        assert!(joined.contains("\"reason\":\"pause_turn\""));
     }
 
     #[test]

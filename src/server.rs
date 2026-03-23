@@ -17,7 +17,7 @@ use bytes::Bytes;
 use reqwest::Client;
 use serde_json::Value;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{AuthPolicy, Config, UpstreamConfig};
 use crate::dashboard::run_dashboard;
@@ -454,6 +454,14 @@ async fn handle_request_core(
     let upstream_format = upstream_state
         .capability
         .upstream_format_for_request(client_format);
+    let compatibility_warnings =
+        collect_request_compatibility_warnings(client_format, upstream_format, &original_body);
+    for warning in &compatibility_warnings {
+        warn!(
+            "compatibility downgrade: client_format={} upstream_format={} warning={}",
+            client_format, upstream_format, warning
+        );
+    }
 
     if client_format != upstream_format {
         if let Err(e) = translate_request(
@@ -577,13 +585,15 @@ async fn handle_request_core(
                 status.as_u16(),
             ))
         };
-        return Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header("Content-Type", "text/event-stream")
             .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive")
             .body(body)
             .unwrap();
+        append_compatibility_warning_headers(&mut response, &compatibility_warnings);
+        return response;
     }
 
     let status = res.status();
@@ -635,7 +645,15 @@ async fn handle_request_core(
         dispatcher.emit_non_stream(ctx, 200, json_response_headers(), out.clone());
     }
     tracker.finish_success(StatusCode::OK.as_u16());
-    (StatusCode::OK, Json(out)).into_response()
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&out).unwrap_or_else(|_| b"{}".to_vec()),
+        ))
+        .unwrap();
+    append_compatibility_warning_headers(&mut response, &compatibility_warnings);
+    response
 }
 
 async fn handle_openai_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1006,6 +1024,70 @@ fn openai_error_body(error: &NormalizedUpstreamError) -> Value {
     })
 }
 
+fn collect_request_compatibility_warnings(
+    client_format: crate::formats::UpstreamFormat,
+    upstream_format: crate::formats::UpstreamFormat,
+    body: &Value,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if client_format == crate::formats::UpstreamFormat::OpenAiResponses
+        && upstream_format != crate::formats::UpstreamFormat::OpenAiResponses
+    {
+        for field in [
+            "previous_response_id",
+            "truncation",
+            "max_tool_calls",
+            "include",
+            "reasoning",
+            "prompt_cache_key",
+        ] {
+            if body.get(field).is_some() {
+                warnings.push(format!(
+                    "field `{field}` is not portable from Responses to {upstream_format} and may be dropped or degraded"
+                ));
+            }
+        }
+        if upstream_format != crate::formats::UpstreamFormat::OpenAiCompletion
+            && body.get("store").is_some()
+        {
+            warnings.push(format!(
+                "field `store` is not portable from Responses to {upstream_format} and will be dropped"
+            ));
+        }
+        if upstream_format != crate::formats::UpstreamFormat::OpenAiResponses {
+            if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+                if tools
+                    .iter()
+                    .any(|tool| tool.get("name").is_none() && tool.get("function").is_none())
+                {
+                    warnings.push(format!(
+                        "non-function Responses tools are not portable to {upstream_format} and will be dropped"
+                    ));
+                }
+            }
+        }
+    }
+    if upstream_format == crate::formats::UpstreamFormat::Anthropic
+        && body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+    {
+        warnings.push(
+            "Anthropic does not support `parallel_tool_calls`; proxy approximates this with `disable_parallel_tool_use`".to_string(),
+        );
+    }
+    warnings
+}
+
+fn append_compatibility_warning_headers(response: &mut Response<Body>, warnings: &[String]) {
+    for warning in warnings {
+        let sanitized = warning.replace(['\r', '\n'], " ");
+        if let Ok(value) = axum::http::HeaderValue::from_str(&sanitized) {
+            response
+                .headers_mut()
+                .append("x-proxy-compat-warning", value);
+        }
+    }
+}
+
 fn normalized_non_stream_upstream_error(
     upstream_format: crate::formats::UpstreamFormat,
     client_format: crate::formats::UpstreamFormat,
@@ -1363,5 +1445,48 @@ mod tests {
                 "Your input exceeds the context window of this model. Please adjust your input and try again.".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn collect_request_compatibility_warnings_flags_non_portable_responses_fields() {
+        let body = serde_json::json!({
+            "previous_response_id": "resp_1",
+            "truncation": "auto",
+            "store": true,
+            "tools": [{ "type": "web_search" }]
+        });
+        let warnings = collect_request_compatibility_warnings(
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            crate::formats::UpstreamFormat::Anthropic,
+            &body,
+        );
+        assert!(warnings.iter().any(|w| w.contains("previous_response_id")));
+        assert!(warnings.iter().any(|w| w.contains("truncation")));
+        assert!(warnings.iter().any(|w| w.contains("store")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("non-function Responses tools")));
+    }
+
+    #[test]
+    fn append_compatibility_warning_headers_exposes_each_warning() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .expect("response");
+        let warnings = vec![
+            "first warning".to_string(),
+            "second warning with\nnewline".to_string(),
+        ];
+
+        append_compatibility_warning_headers(&mut response, &warnings);
+
+        let values: Vec<_> = response
+            .headers()
+            .get_all("x-proxy-compat-warning")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(values, vec!["first warning", "second warning with newline"]);
     }
 }

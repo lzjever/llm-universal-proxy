@@ -98,6 +98,9 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
     if finish_reason == "model_context_window_exceeded" {
         finish_reason = "context_length_exceeded".to_string();
     }
+    if finish_reason == "pause_turn" {
+        finish_reason = "pause_turn".to_string();
+    }
     if finish_reason == "refusal" {
         finish_reason = "content_filter".to_string();
     }
@@ -311,6 +314,8 @@ fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
         finish = "refusal".to_string();
     } else if finish == "context_length_exceeded" {
         finish = "model_context_window_exceeded".to_string();
+    } else if finish == "pause_turn" {
+        finish = "pause_turn".to_string();
     }
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or(serde_json::Value::Null),
@@ -480,6 +485,7 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
     let incomplete_reason = match finish_reason {
         "length" => Some("max_output_tokens"),
         "content_filter" => Some("content_filter"),
+        "pause_turn" => Some("pause_turn"),
         _ => None,
     };
     let mut result = serde_json::json!({
@@ -1270,6 +1276,11 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
         {
             result["tool_choice"] = mapped_tool_choice;
         }
+    } else if body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+        && body.get("tools").and_then(Value::as_array).map(|t| !t.is_empty()).unwrap_or(false)
+    {
+        result["tool_choice"] =
+            serde_json::json!({ "type": "auto", "disable_parallel_tool_use": true });
     }
     let messages = body
         .get("messages")
@@ -2194,6 +2205,23 @@ mod tests {
     }
 
     #[test]
+    fn translate_response_claude_pause_turn_maps_to_pause_turn_finish() {
+        let body = json!({
+            "id": "msg_1",
+            "content": [{ "type": "text", "text": "" }],
+            "stop_reason": "pause_turn",
+            "model": "claude-3"
+        });
+        let out = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["choices"][0]["finish_reason"], "pause_turn");
+    }
+
+    #[test]
     fn translate_response_openai_to_claude_has_content_array() {
         let body = json!({
             "id": "chatcmpl-1",
@@ -2227,6 +2255,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["stop_reason"], "model_context_window_exceeded");
+    }
+
+    #[test]
+    fn translate_response_openai_pause_turn_to_claude_stop_reason() {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "choices": [{ "message": { "role": "assistant", "content": "" }, "finish_reason": "pause_turn" }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["stop_reason"], "pause_turn");
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_maps_pause_turn_to_incomplete() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "" },
+                "finish_reason": "pause_turn"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "pause_turn");
     }
 
     #[test]
