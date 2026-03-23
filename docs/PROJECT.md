@@ -29,7 +29,8 @@ llm-universal-proxy/
 └── docs/
     ├── DESIGN.md
     ├── PROJECT.md (this file)
-    └── protocol-baselines/     # Official protocol reference baselines (source + date in each file)
+    ├── protocol-baselines/     # Official protocol reference baselines (source + date in each file)
+    └── protocol-compatibility-matrix.md  # Field-level mapping, degradations, and unsupported cases
         ├── README.md           # Index, source URLs, capture date
         ├── openai-chat-completions.md
         ├── openai-responses.md
