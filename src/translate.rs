@@ -627,6 +627,7 @@ fn normalize_openai_roles_for_compatibility(format: UpstreamFormat, body: &mut V
 
 fn normalize_openai_messages_for_compatibility(body: &mut Value) {
     normalize_openai_message_roles(body);
+    hoist_and_merge_system_messages(body);
     coalesce_openai_string_messages(body);
 }
 
@@ -712,6 +713,54 @@ fn coalesce_openai_string_messages(body: &mut Value) {
     }
 
     *messages = merged;
+}
+
+fn hoist_and_merge_system_messages(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    let mut system_chunks: Vec<String> = Vec::new();
+    let mut non_system: Vec<Value> = Vec::with_capacity(messages.len());
+
+    for message in messages.iter() {
+        let role = message.get("role").and_then(Value::as_str);
+        if role == Some("system") {
+            let content = message.get("content");
+            let text = match content {
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(Value::Array(arr)) => {
+                    let joined = arr
+                        .iter()
+                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    (!joined.is_empty()).then_some(joined)
+                }
+                _ => None,
+            };
+            if let Some(text) = text {
+                if !text.is_empty() {
+                    system_chunks.push(text);
+                }
+            }
+            continue;
+        }
+        non_system.push(message.clone());
+    }
+
+    if !system_chunks.is_empty() {
+        let merged = system_chunks.join("\n\n");
+        non_system.insert(
+            0,
+            serde_json::json!({
+                "role": "system",
+                "content": merged
+            }),
+        );
+    }
+
+    *messages = non_system;
 }
 
 fn normalize_openai_responses_roles(body: &mut Value) {
@@ -2592,6 +2641,31 @@ mod tests {
         assert!(body.get("prompt_cache_key").is_none());
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("truncation").is_none());
+    }
+
+    #[test]
+    fn translate_request_responses_to_openai_moves_mid_thread_system_to_front() {
+        let mut body = json!({
+            "model": "MiniMax-M2.7-highspeed",
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Earlier user message" }] },
+                { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "Compacted thread summary" }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Continue" }] }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "MiniMax-M2.7-highspeed",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "Compacted thread summary");
+        assert!(messages.iter().skip(1).all(|msg| msg["role"] != "system"));
+        assert_eq!(messages[1]["role"], "user");
     }
 
     #[test]

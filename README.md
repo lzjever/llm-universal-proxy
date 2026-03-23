@@ -79,6 +79,35 @@ Recommended thresholds for `GLM-5-Turbo`:
 - More aggressive: `184000`
 
 Set `model_context_window` to the real upstream limit and tune only `model_auto_compact_token_limit` if you want compaction earlier or later.
+
+### How Codex Compact Actually Works With A Proxy
+
+When Codex talks to a custom proxy-backed provider, compaction does not behave exactly like official OpenAI-hosted Codex.
+
+- Codex has two compaction paths:
+  - official OpenAI provider: remote `/responses/compact`
+  - custom providers: local inline compaction using the current model
+- The remote compact path is only used when Codex recognizes the provider as built-in OpenAI. A custom provider such as `glm-proxy` does not qualify, even if it serves a Responses-compatible API.
+- That means proxy-backed Codex sessions use model-generated summarization, not the official OpenAI compact service.
+
+Practical consequences:
+
+- Compact quality depends on the routed upstream model, because that model is the one producing the summary.
+- Compact timing depends on token accounting coming back through the proxy. If usage mapping is wrong, Codex may compact too late or not at all.
+- Compact replacement history is still reconstructed by Codex locally, so protocol normalization after compaction matters. If translated history contains roles or message layouts that the upstream rejects, the next turn after compaction can fail even though compaction itself succeeded.
+
+Important boundary:
+
+- The proxy does not persist or grow system prompts on its own.
+- Codex may inject new compacted thread summaries into later requests.
+- The proxy only normalizes those messages so they remain valid for the upstream protocol.
+
+Best practice for proxy-backed Codex sessions:
+
+- Set both `model_context_window` and `model_auto_compact_token_limit`.
+- Prefer shorter threads and start a new thread after multiple compactions.
+- Treat proxy-backed compact as "local summary compaction" rather than "official OpenAI remote compaction".
+
 ## Installation
 
 ### Download Binary
