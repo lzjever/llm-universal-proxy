@@ -1,0 +1,9 @@
+.git
+.github
+target
+artifacts
+.tmp
+tmp
+coverage
+node_modules
+*.log
