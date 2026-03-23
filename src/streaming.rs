@@ -55,6 +55,9 @@ pub struct StreamState {
     pub responses_reasoning_added: bool,
     pub responses_reasoning_done: bool,
     pub responses_reasoning_text: String,
+    pub openai_seen_content: String,
+    pub openai_seen_reasoning: String,
+    pub responses_terminal_sent: bool,
 }
 
 #[derive(Debug, Default)]
@@ -422,6 +425,9 @@ fn convert_claude_stop_reason(r: &str) -> String {
 pub fn openai_event_as_chunk(event: &Value) -> Option<Value> {
     if event.get("_done").and_then(Value::as_bool) == Some(true) {
         return None;
+    }
+    if event.get("usage").is_some() {
+        return Some(event.clone());
     }
     if event
         .get("choices")
@@ -791,11 +797,29 @@ pub fn translate_sse_event(
     event: &Value,
     state: &mut StreamState,
 ) -> Vec<Vec<u8>> {
+    if upstream_format == UpstreamFormat::OpenAiCompletion
+        && client_format == UpstreamFormat::OpenAiResponses
+        && event.get("_done").and_then(Value::as_bool) == Some(true)
+    {
+        if !state.responses_terminal_sent {
+            let response_id = state
+                .message_id
+                .clone()
+                .unwrap_or_else(|| "resp_0".to_string());
+            return emit_openai_responses_terminal(state, &response_id, 0, 0);
+        }
+        return Vec::new();
+    }
     if upstream_format == client_format {
         if event.get("_done").and_then(Value::as_bool) == Some(true) {
             return vec![b"data: [DONE]\n\n".to_vec()];
         }
         return vec![format_sse_data(event)];
+    }
+    if upstream_format == UpstreamFormat::Anthropic
+        && event.get("type").and_then(Value::as_str) == Some("error")
+    {
+        return anthropic_error_event_to_client_sse(event, client_format, state);
     }
     let openai_chunks: Vec<Value> = match upstream_format {
         UpstreamFormat::OpenAiCompletion => openai_event_as_chunk(event).into_iter().collect(),
@@ -832,9 +856,7 @@ pub fn translate_sse_event(
         for c in &openai_chunks {
             out.extend(openai_chunk_to_responses_sse(c, state));
         }
-        if !out.is_empty() {
-            return out;
-        }
+        return out;
     }
     openai_chunks
         .into_iter()
@@ -862,6 +884,373 @@ fn stop_text_block_claude(state: &mut StreamState, out: &mut Vec<Vec<u8>>) {
         "content_block_stop",
         &serde_json::json!({ "type": "content_block_stop", "index": state.text_block_index }),
     ));
+}
+
+fn minimax_reasoning_details_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Array(items) => {
+            let joined = items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
+fn is_minimax_chunk(chunk: &Value, state: &StreamState) -> bool {
+    chunk.get("model")
+        .and_then(Value::as_str)
+        .or(state.model.as_deref())
+        .map(|model| model.starts_with("MiniMax-"))
+        .unwrap_or(false)
+}
+
+fn normalize_openai_stream_text(incoming: &str, seen: &mut String) -> Option<String> {
+    if incoming.is_empty() {
+        return None;
+    }
+    if incoming == seen {
+        return None;
+    }
+
+    let delta = if incoming.starts_with(seen.as_str()) {
+        incoming[seen.len()..].to_string()
+    } else {
+        incoming.to_string()
+    };
+
+    if incoming.starts_with(seen.as_str()) {
+        *seen = incoming.to_string();
+    } else {
+        seen.push_str(incoming);
+    }
+
+    (!delta.is_empty()).then_some(delta)
+}
+
+fn openai_chunk_reasoning_delta(delta: &Value, state: &mut StreamState) -> Option<String> {
+    if let Some(reasoning) = delta
+        .get("reasoning_content")
+        .or(delta.get("reasoning"))
+        .and_then(Value::as_str)
+    {
+        return normalize_openai_stream_text(reasoning, &mut state.openai_seen_reasoning);
+    }
+    let reasoning = minimax_reasoning_details_text(delta.get("reasoning_details"))?;
+    normalize_openai_stream_text(&reasoning, &mut state.openai_seen_reasoning)
+}
+
+fn openai_chunk_content_delta(delta: &Value, state: &mut StreamState) -> Option<String> {
+    let content = delta.get("content").and_then(Value::as_str)?;
+    normalize_openai_stream_text(content, &mut state.openai_seen_content)
+}
+
+fn next_responses_seq(state: &mut StreamState) -> u64 {
+    state.responses_seq += 1;
+    state.responses_seq
+}
+
+fn emit_openai_responses_terminal(
+    state: &mut StreamState,
+    response_id: &str,
+    created: u64,
+    idx: u64,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let finish_reason = state.finish_reason.clone();
+    let Some(finish_reason) = finish_reason.as_deref() else {
+        return out;
+    };
+
+    let incomplete_reason = match finish_reason {
+        "length" => Some("max_output_tokens"),
+        "content_filter" => Some("content_filter"),
+        "pause_turn" => Some("pause_turn"),
+        _ => None,
+    };
+
+    if state.responses_reasoning_added && !state.responses_reasoning_done {
+        state.responses_reasoning_done = true;
+        let item_id = state
+            .responses_reasoning_id
+            .clone()
+            .unwrap_or_else(|| "rs_0".to_string());
+        let text = state.responses_reasoning_text.clone();
+        let text_done_ev = serde_json::json!({
+            "type": "response.reasoning_summary_text.done",
+            "sequence_number": next_responses_seq(state),
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": idx,
+            "summary_index": 0,
+            "text": text
+        });
+        out.push(format_sse_event(
+            "response.reasoning_summary_text.done",
+            &text_done_ev,
+        ));
+
+        let part_done_ev = serde_json::json!({
+            "type": "response.reasoning_summary_part.done",
+            "sequence_number": next_responses_seq(state),
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": idx,
+            "summary_index": 0,
+            "part": { "type": "summary_text", "text": state.responses_reasoning_text }
+        });
+        out.push(format_sse_event(
+            "response.reasoning_summary_part.done",
+            &part_done_ev,
+        ));
+
+        let output_item_done_ev = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": next_responses_seq(state),
+            "response_id": response_id,
+            "output_index": idx,
+            "item": {
+                "id": state.responses_reasoning_id,
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": state.responses_reasoning_text }]
+            }
+        });
+        out.push(format_sse_event(
+            "response.output_item.done",
+            &output_item_done_ev,
+        ));
+    }
+
+    let mut tool_call_keys = state.openai_tool_calls.keys().cloned().collect::<Vec<_>>();
+    tool_call_keys.sort_unstable();
+    let mut completed_tool_calls = Vec::new();
+    for key in tool_call_keys {
+        let Some(tool_call) = state.openai_tool_calls.get_mut(&key) else {
+            continue;
+        };
+        if tool_call.responses_item_added && !tool_call.responses_done {
+            tool_call.responses_done = true;
+            let Some(call_id) = tool_call.id.as_ref().and_then(Value::as_str) else {
+                continue;
+            };
+            completed_tool_calls.push((
+                call_id.to_string(),
+                tool_call.name.clone(),
+                tool_call.arguments.clone(),
+                tool_call.index,
+            ));
+        }
+    }
+    for (call_id, name, arguments, output_index) in completed_tool_calls {
+        let args_done_ev = serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "sequence_number": next_responses_seq(state),
+            "response_id": response_id,
+            "call_id": call_id,
+            "name": name,
+            "item_id": format!("fc_{}", call_id),
+            "output_index": output_index,
+            "arguments": arguments
+        });
+        out.push(format_sse_event(
+            "response.function_call_arguments.done",
+            &args_done_ev,
+        ));
+
+        let output_item_done_ev = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": next_responses_seq(state),
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": {
+                "id": format!("fc_{}", call_id),
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments
+            }
+        });
+        out.push(format_sse_event(
+            "response.output_item.done",
+            &output_item_done_ev,
+        ));
+    }
+
+    if state.responses_content_part_added {
+        let item_id = state
+            .output_item_id
+            .clone()
+            .unwrap_or_else(|| "msg_0".to_string());
+        let text = state.responses_output_text.clone();
+        let text_done_ev = serde_json::json!({
+            "type": "response.output_text.done",
+            "sequence_number": next_responses_seq(state),
+            "response_id": response_id,
+            "output_index": idx,
+            "content_index": 0,
+            "item_id": item_id,
+            "text": text
+        });
+        out.push(format_sse_event("response.output_text.done", &text_done_ev));
+
+        let part_done_ev = serde_json::json!({
+            "type": "response.content_part.done",
+            "sequence_number": next_responses_seq(state),
+            "response_id": response_id,
+            "output_index": idx,
+            "content_index": 0,
+            "item_id": item_id,
+            "part": {
+                "type": "output_text",
+                "text": state.responses_output_text,
+                "annotations": []
+            }
+        });
+        out.push(format_sse_event(
+            "response.content_part.done",
+            &part_done_ev,
+        ));
+    }
+
+    if state.output_item_added {
+        let item_id = state
+            .output_item_id
+            .clone()
+            .unwrap_or_else(|| "msg_0".to_string());
+        let output_item_done_ev = serde_json::json!({
+            "type": "response.output_item.done",
+            "sequence_number": next_responses_seq(state),
+            "response_id": response_id,
+            "output_index": idx,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": state.responses_output_text,
+                    "annotations": []
+                }]
+            }
+        });
+        out.push(format_sse_event(
+            "response.output_item.done",
+            &output_item_done_ev,
+        ));
+    }
+
+    let mut output = Vec::new();
+    if state.responses_reasoning_added {
+        output.push(serde_json::json!({
+            "id": state.responses_reasoning_id,
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": state.responses_reasoning_text }]
+        }));
+    }
+    if state.output_item_added {
+        output.push(serde_json::json!({
+            "id": state.output_item_id.clone().unwrap_or_else(|| "msg_0".to_string()),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": state.responses_output_text,
+                "annotations": []
+            }]
+        }));
+    }
+    let mut tool_call_output = state.openai_tool_calls.values().collect::<Vec<_>>();
+    tool_call_output.sort_by_key(|tc| tc.index);
+    for tool_call in tool_call_output {
+        if let Some(call_id) = tool_call.id.as_ref().and_then(Value::as_str) {
+            output.push(serde_json::json!({
+                "id": format!("fc_{}", call_id),
+                "type": "function_call",
+                "call_id": call_id,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments
+            }));
+        }
+    }
+
+    let mut resp = serde_json::json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created,
+        "status": if incomplete_reason.is_some() { "incomplete" } else { "completed" },
+        "error": null,
+        "incomplete_details": incomplete_reason.map(|reason| serde_json::json!({ "reason": reason })).unwrap_or(serde_json::Value::Null),
+        "output": output
+    });
+    if let Some(ref u) = state.usage {
+        let input_tokens = u
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .or(u.get("prompt_tokens").and_then(Value::as_u64))
+            .unwrap_or(0);
+        let output_tokens = u
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .or(u.get("completion_tokens").and_then(Value::as_u64))
+            .unwrap_or(0);
+        let total_tokens = u
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(input_tokens + output_tokens);
+        let cached_tokens = u
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                u.get("prompt_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(Value::as_u64)
+            });
+        let reasoning_tokens = u
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                u.get("completion_tokens_details")
+                    .and_then(|details| details.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            });
+
+        let mut usage = serde_json::json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens
+        });
+        if let Some(cached_tokens) = cached_tokens {
+            usage["input_tokens_details"] =
+                serde_json::json!({ "cached_tokens": cached_tokens });
+        }
+        if let Some(reasoning_tokens) = reasoning_tokens {
+            usage["output_tokens_details"] =
+                serde_json::json!({ "reasoning_tokens": reasoning_tokens });
+        }
+        resp["usage"] = usage;
+    }
+    let event_type = if incomplete_reason.is_some() {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    let ev = serde_json::json!({
+        "type": event_type,
+        "sequence_number": next_responses_seq(state),
+        "response": resp
+    });
+    out.push(format_sse_event(event_type, &ev));
+    state.responses_terminal_sent = true;
+    out
 }
 
 fn convert_openai_finish_to_claude(reason: &str) -> &'static str {
@@ -916,11 +1305,7 @@ fn openai_chunk_to_claude_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
         out.push(format_sse_event("message_start", &msg));
     }
 
-    if let Some(reasoning) = delta
-        .get("reasoning_content")
-        .or(delta.get("reasoning"))
-        .and_then(Value::as_str)
-    {
+    if let Some(reasoning) = openai_chunk_reasoning_delta(delta, state) {
         if !reasoning.is_empty() {
             stop_text_block_claude(state, &mut out);
             if !state.thinking_block_started {
@@ -943,7 +1328,7 @@ fn openai_chunk_to_claude_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
         }
     }
 
-    if let Some(content) = delta.get("content").and_then(Value::as_str) {
+    if let Some(content) = openai_chunk_content_delta(delta, state) {
         if !content.is_empty() {
             stop_thinking_block_claude(state, &mut out);
             if !state.text_block_started {
@@ -1053,15 +1438,18 @@ fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
         state.model = chunk.get("model").and_then(Value::as_str).map(String::from);
     }
 
-    let model = state.model.as_deref().unwrap_or("gemini");
+    let model = state
+        .model
+        .clone()
+        .unwrap_or_else(|| "gemini".to_string());
     let mut parts: Vec<Value> = vec![];
 
-    if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str) {
+    if let Some(r) = openai_chunk_reasoning_delta(delta, state) {
         if !r.is_empty() {
             parts.push(serde_json::json!({ "text": r, "thought": true }));
         }
     }
-    if let Some(c) = delta.get("content").and_then(Value::as_str) {
+    if let Some(c) = openai_chunk_content_delta(delta, state) {
         if !c.is_empty() {
             parts.push(serde_json::json!({ "text": c }));
         }
@@ -1106,19 +1494,19 @@ fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
 
 fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    let choices = match chunk.get("choices").and_then(Value::as_array) {
-        Some(c) if !c.is_empty() => c,
-        _ => return out,
-    };
-    let choice = &choices[0];
-    let delta = choice.get("delta").unwrap_or(&serde_json::Value::Null);
-    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
-    let idx = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+    let choices = chunk.get("choices").and_then(Value::as_array);
+    let choice = choices.and_then(|c| c.first());
+    let delta = choice
+        .and_then(|choice| choice.get("delta"))
+        .unwrap_or(&serde_json::Value::Null);
+    let finish_reason = choice
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str);
+    let idx = choice
+        .and_then(|choice| choice.get("index"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
 
-    let mut next_seq = || {
-        state.responses_seq += 1;
-        state.responses_seq
-    };
     let response_id = chunk
         .get("id")
         .and_then(Value::as_str)
@@ -1135,7 +1523,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
         let created = chunk.get("created").and_then(Value::as_u64).unwrap_or(0);
         let ev = serde_json::json!({
             "type": "response.created",
-            "sequence_number": next_seq(),
+            "sequence_number": next_responses_seq(state),
             "response": {
                 "id": response_id,
                 "object": "response",
@@ -1151,7 +1539,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
         out.push(format_sse_event("response.created", &ev));
         let ev2 = serde_json::json!({
             "type": "response.in_progress",
-            "sequence_number": next_seq(),
+            "sequence_number": next_responses_seq(state),
             "response": {
                 "id": response_id,
                 "object": "response",
@@ -1165,13 +1553,9 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
         out.push(format_sse_event("response.in_progress", &ev2));
     }
 
-    if let Some(r) = delta
-        .get("reasoning_content")
-        .or(delta.get("reasoning"))
-        .and_then(Value::as_str)
-    {
+    if let Some(r) = openai_chunk_reasoning_delta(delta, state) {
         if !r.is_empty() {
-            state.responses_reasoning_text.push_str(r);
+            state.responses_reasoning_text.push_str(&r);
             if !state.responses_reasoning_added {
                 state.responses_reasoning_added = true;
                 let item_id = state
@@ -1182,7 +1566,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
 
                 let added_ev = serde_json::json!({
                     "type": "response.output_item.added",
-                    "sequence_number": next_seq(),
+                    "sequence_number": next_responses_seq(state),
                     "response_id": response_id,
                     "output_index": idx,
                     "item": {
@@ -1195,7 +1579,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
 
                 let part_added_ev = serde_json::json!({
                     "type": "response.reasoning_summary_part.added",
-                    "sequence_number": next_seq(),
+                    "sequence_number": next_responses_seq(state),
                     "response_id": response_id,
                     "item_id": state.responses_reasoning_id,
                     "output_index": idx,
@@ -1209,7 +1593,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             }
             let ev = serde_json::json!({
                 "type": "response.reasoning_summary_text.delta",
-                "sequence_number": next_seq(),
+                "sequence_number": next_responses_seq(state),
                 "response_id": response_id,
                 "item_id": state.responses_reasoning_id,
                 "output_index": idx,
@@ -1222,7 +1606,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             ));
         }
     }
-    if let Some(c) = delta.get("content").and_then(Value::as_str) {
+    if let Some(c) = openai_chunk_content_delta(delta, state) {
         if !c.is_empty() {
             // Send response.output_item.added before the first content if not sent yet
             if !state.output_item_added {
@@ -1242,7 +1626,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
 
                 let output_item_ev = serde_json::json!({
                     "type": "response.output_item.added",
-                    "sequence_number": next_seq(),
+                    "sequence_number": next_responses_seq(state),
                     "response_id": response_id,
                     "output_index": idx,
                     "item": {
@@ -1259,7 +1643,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 ));
             }
             // Track the full text so terminal events can include a complete message body.
-            state.responses_output_text.push_str(c);
+            state.responses_output_text.push_str(&c);
 
             // Send response.content_part.added before the first content delta if not sent yet.
             if !state.responses_content_part_added {
@@ -1270,7 +1654,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                     .unwrap_or_else(|| "msg_0".to_string());
                 let content_part_ev = serde_json::json!({
                     "type": "response.content_part.added",
-                    "sequence_number": next_seq(),
+                    "sequence_number": next_responses_seq(state),
                     "response_id": response_id,
                     "output_index": idx,
                     "content_index": 0,
@@ -1288,7 +1672,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 .unwrap_or_else(|| "msg_0".to_string());
             let ev = serde_json::json!({
                 "type": "response.output_text.delta",
-                "sequence_number": next_seq(),
+                "sequence_number": next_responses_seq(state),
                 "response_id": response_id,
                 "output_index": idx,
                 "content_index": 0,
@@ -1302,34 +1686,57 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
         for tc in tcs {
             let tc_idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             dedupe_tool_call_state_by_call_id(&mut state.openai_tool_calls, tc_idx, tc.get("id"));
-            let entry = state
-                .openai_tool_calls
-                .entry(tc_idx)
-                .or_insert_with(|| ToolCallState {
-                    index: tc_idx,
-                    ..Default::default()
-                });
-            if let Some(id) = tc.get("id").cloned() {
-                entry.id = Some(id);
-            }
-            if let Some(name) = tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)
+            let mut item_added: Option<(String, String)> = None;
+            let mut args_delta: Option<(String, String, String)> = None;
             {
-                entry.name = name.to_string();
-            }
-            if !entry.responses_item_added && entry.id.is_some() {
-                entry.responses_item_added = true;
-                let call_id = entry.id.as_ref().and_then(Value::as_str).unwrap_or("");
-                let name = tc
+                let entry = state
+                    .openai_tool_calls
+                    .entry(tc_idx)
+                    .or_insert_with(|| ToolCallState {
+                        index: tc_idx,
+                        ..Default::default()
+                    });
+                if let Some(id) = tc.get("id").cloned() {
+                    entry.id = Some(id);
+                }
+                if let Some(name) = tc
                     .get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(Value::as_str)
-                    .unwrap_or("");
+                {
+                    entry.name = name.to_string();
+                }
+                if !entry.responses_item_added && entry.id.is_some() {
+                    entry.responses_item_added = true;
+                    let call_id = entry
+                        .id
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    item_added = Some((call_id, entry.name.clone()));
+                }
+                if let Some(args) = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(Value::as_str)
+                {
+                    if !args.is_empty() {
+                        entry.arguments.push_str(args);
+                        let call_id = entry
+                            .id
+                            .as_ref()
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        args_delta = Some((call_id, entry.name.clone(), args.to_string()));
+                    }
+                }
+            }
+            if let Some((call_id, name)) = item_added {
                 let ev = serde_json::json!({
                     "type": "response.output_item.added",
-                    "sequence_number": next_seq(),
+                    "sequence_number": next_responses_seq(state),
                     "response_id": response_id,
                     "output_index": tc_idx,
                     "item": {
@@ -1342,32 +1749,21 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 });
                 out.push(format_sse_event("response.output_item.added", &ev));
             }
-            if let Some(args) = tc
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(Value::as_str)
-            {
-                if !args.is_empty() {
-                    entry.arguments.push_str(args);
-                    let ev = serde_json::json!({
-                        "type": "response.function_call_arguments.delta",
-                        "sequence_number": next_seq(),
-                        "response_id": response_id,
-                        "call_id": entry.id.as_ref().and_then(Value::as_str),
-                        "name": entry.name,
-                        "item_id": entry
-                            .id
-                            .as_ref()
-                            .and_then(Value::as_str)
-                            .map(|call_id| format!("fc_{}", call_id)),
-                        "output_index": tc_idx,
-                        "delta": args
-                    });
-                    out.push(format_sse_event(
-                        "response.function_call_arguments.delta",
-                        &ev,
-                    ));
-                }
+            if let Some((call_id, name, args)) = args_delta {
+                let ev = serde_json::json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": next_responses_seq(state),
+                    "response_id": response_id,
+                    "call_id": call_id,
+                    "name": name,
+                    "item_id": format!("fc_{}", call_id),
+                    "output_index": tc_idx,
+                    "delta": args
+                });
+                out.push(format_sse_event(
+                    "response.function_call_arguments.delta",
+                    &ev,
+                ));
             }
         }
     }
@@ -1378,7 +1774,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
     if finish_reason == Some("context_length_exceeded") {
         let failed = serde_json::json!({
             "type": "response.failed",
-            "sequence_number": next_seq(),
+            "sequence_number": next_responses_seq(state),
             "response": {
                 "id": response_id,
                 "object": "response",
@@ -1398,284 +1794,26 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
         out.push(format_sse_event("response.failed", &failed));
         return out;
     }
-
-    let incomplete_reason = match finish_reason {
-        Some("length") => Some("max_output_tokens"),
-        Some("content_filter") => Some("content_filter"),
-        Some("pause_turn") => Some("pause_turn"),
-        _ => None,
+    if let Some(fr) = finish_reason {
+        state.finish_reason = Some(fr.to_string());
+    }
+    let has_real_usage = chunk
+        .get("usage")
+        .map(|usage| !usage.is_null())
+        .unwrap_or(false);
+    let should_finalize_now = if state.finish_reason.is_some() && !state.responses_terminal_sent {
+        has_real_usage || !is_minimax_chunk(chunk, state)
+    } else {
+        false
     };
-
-    if finish_reason.is_some() {
-        if state.responses_reasoning_added && !state.responses_reasoning_done {
-            state.responses_reasoning_done = true;
-            let item_id = state
-                .responses_reasoning_id
-                .clone()
-                .unwrap_or_else(|| "rs_0".to_string());
-            let text = state.responses_reasoning_text.clone();
-            let text_done_ev = serde_json::json!({
-                "type": "response.reasoning_summary_text.done",
-                "sequence_number": next_seq(),
-                "response_id": response_id,
-                "item_id": item_id,
-                "output_index": idx,
-                "summary_index": 0,
-                "text": text
-            });
-            out.push(format_sse_event(
-                "response.reasoning_summary_text.done",
-                &text_done_ev,
-            ));
-
-            let part_done_ev = serde_json::json!({
-                "type": "response.reasoning_summary_part.done",
-                "sequence_number": next_seq(),
-                "response_id": response_id,
-                "item_id": item_id,
-                "output_index": idx,
-                "summary_index": 0,
-                "part": { "type": "summary_text", "text": state.responses_reasoning_text }
-            });
-            out.push(format_sse_event(
-                "response.reasoning_summary_part.done",
-                &part_done_ev,
-            ));
-
-            let output_item_done_ev = serde_json::json!({
-                "type": "response.output_item.done",
-                "sequence_number": next_seq(),
-                "response_id": response_id,
-                "output_index": idx,
-                "item": {
-                    "id": state.responses_reasoning_id,
-                    "type": "reasoning",
-                    "summary": [{ "type": "summary_text", "text": state.responses_reasoning_text }]
-                }
-            });
-            out.push(format_sse_event(
-                "response.output_item.done",
-                &output_item_done_ev,
-            ));
-        }
-
-        let mut tool_calls = state.openai_tool_calls.values_mut().collect::<Vec<_>>();
-        tool_calls.sort_by_key(|tc| tc.index);
-        for tool_call in tool_calls {
-            if tool_call.responses_item_added && !tool_call.responses_done {
-                tool_call.responses_done = true;
-                let Some(call_id) = tool_call.id.as_ref().and_then(Value::as_str) else {
-                    continue;
-                };
-                let arguments = tool_call.arguments.clone();
-                let output_index = tool_call.index;
-
-                let args_done_ev = serde_json::json!({
-                    "type": "response.function_call_arguments.done",
-                    "sequence_number": next_seq(),
-                    "response_id": response_id,
-                    "call_id": call_id,
-                    "name": tool_call.name,
-                    "item_id": format!("fc_{}", call_id),
-                    "output_index": output_index,
-                    "arguments": arguments
-                });
-                out.push(format_sse_event(
-                    "response.function_call_arguments.done",
-                    &args_done_ev,
-                ));
-
-                let output_item_done_ev = serde_json::json!({
-                    "type": "response.output_item.done",
-                    "sequence_number": next_seq(),
-                    "response_id": response_id,
-                    "output_index": output_index,
-                    "item": {
-                        "id": format!("fc_{}", call_id),
-                        "type": "function_call",
-                        "call_id": call_id,
-                        "name": tool_call.name,
-                        "arguments": tool_call.arguments
-                    }
-                });
-                out.push(format_sse_event(
-                    "response.output_item.done",
-                    &output_item_done_ev,
-                ));
-            }
-        }
-
-        // Send content_part.done before completed if we had text content
-        if state.responses_content_part_added {
-            let item_id = state
-                .output_item_id
-                .clone()
-                .unwrap_or_else(|| "msg_0".to_string());
-            let text = state.responses_output_text.clone();
-            let text_done_ev = serde_json::json!({
-                "type": "response.output_text.done",
-                "sequence_number": next_seq(),
-                "response_id": response_id,
-                "output_index": idx,
-                "content_index": 0,
-                "item_id": item_id,
-                "text": text
-            });
-            out.push(format_sse_event("response.output_text.done", &text_done_ev));
-
-            let part_done_ev = serde_json::json!({
-                "type": "response.content_part.done",
-                "sequence_number": next_seq(),
-                "response_id": response_id,
-                "output_index": idx,
-                "content_index": 0,
-                "item_id": item_id,
-                "part": {
-                    "type": "output_text",
-                    "text": state.responses_output_text,
-                    "annotations": []
-                }
-            });
-            out.push(format_sse_event(
-                "response.content_part.done",
-                &part_done_ev,
-            ));
-        }
-
-        // Send response.output_item.done if we added an output item
-        if state.output_item_added {
-            let item_id = state
-                .output_item_id
-                .clone()
-                .unwrap_or_else(|| "msg_0".to_string());
-            let output_item_done_ev = serde_json::json!({
-                "type": "response.output_item.done",
-                "sequence_number": next_seq(),
-                "response_id": response_id,
-                "output_index": idx,
-                "item": {
-                    "id": item_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": state.responses_output_text,
-                        "annotations": []
-                    }]
-                }
-            });
-            out.push(format_sse_event(
-                "response.output_item.done",
-                &output_item_done_ev,
-            ));
-        }
-
+    if should_finalize_now {
         let created = chunk.get("created").and_then(Value::as_u64).unwrap_or(0);
-        let mut output = Vec::new();
-        if state.responses_reasoning_added {
-            output.push(serde_json::json!({
-                "id": state.responses_reasoning_id,
-                "type": "reasoning",
-                "summary": [{ "type": "summary_text", "text": state.responses_reasoning_text }]
-            }));
-        }
-        if state.output_item_added {
-            output.push(serde_json::json!({
-                "id": state.output_item_id.clone().unwrap_or_else(|| "msg_0".to_string()),
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": state.responses_output_text,
-                    "annotations": []
-                }]
-            }));
-        }
-        let mut tool_call_output = state.openai_tool_calls.values().collect::<Vec<_>>();
-        tool_call_output.sort_by_key(|tc| tc.index);
-        for tool_call in tool_call_output {
-            if let Some(call_id) = tool_call.id.as_ref().and_then(Value::as_str) {
-                output.push(serde_json::json!({
-                    "id": format!("fc_{}", call_id),
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": tool_call.name,
-                    "arguments": tool_call.arguments
-                }));
-            }
-        }
-
-        let mut resp = serde_json::json!({
-            "id": response_id,
-            "object": "response",
-            "created_at": created,
-            "status": if incomplete_reason.is_some() { "incomplete" } else { "completed" },
-            "error": null,
-            "incomplete_details": incomplete_reason.map(|reason| serde_json::json!({ "reason": reason })).unwrap_or(serde_json::Value::Null),
-            "output": output
-        });
-        if let Some(ref u) = state.usage {
-            let input_tokens = u
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .or(u.get("prompt_tokens").and_then(Value::as_u64))
-                .unwrap_or(0);
-            let output_tokens = u
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .or(u.get("completion_tokens").and_then(Value::as_u64))
-                .unwrap_or(0);
-            let total_tokens = u
-                .get("total_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(input_tokens + output_tokens);
-            let cached_tokens = u
-                .get("input_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64)
-                .or_else(|| {
-                    u.get("prompt_tokens_details")
-                        .and_then(|details| details.get("cached_tokens"))
-                        .and_then(Value::as_u64)
-                });
-            let reasoning_tokens = u
-                .get("output_tokens_details")
-                .and_then(|details| details.get("reasoning_tokens"))
-                .and_then(Value::as_u64)
-                .or_else(|| {
-                    u.get("completion_tokens_details")
-                        .and_then(|details| details.get("reasoning_tokens"))
-                        .and_then(Value::as_u64)
-                });
-
-            let mut usage = serde_json::json!({
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": total_tokens
-            });
-            if let Some(cached_tokens) = cached_tokens {
-                usage["input_tokens_details"] =
-                    serde_json::json!({ "cached_tokens": cached_tokens });
-            }
-            if let Some(reasoning_tokens) = reasoning_tokens {
-                usage["output_tokens_details"] =
-                    serde_json::json!({ "reasoning_tokens": reasoning_tokens });
-            }
-            resp["usage"] = usage;
-        }
-        let event_type = if incomplete_reason.is_some() {
-            "response.incomplete"
-        } else {
-            "response.completed"
-        };
-        let ev = serde_json::json!({
-            "type": event_type,
-            "sequence_number": next_seq(),
-            "response": resp
-        });
-        out.push(format_sse_event(event_type, &ev));
+        out.extend(emit_openai_responses_terminal(
+            state,
+            &response_id,
+            created,
+            idx,
+        ));
     }
     out
 }
@@ -1698,6 +1836,102 @@ pub fn translate_response_chunk(
         &event,
         state,
     ))
+}
+
+fn anthropic_error_event_to_client_sse(
+    event: &Value,
+    client_format: UpstreamFormat,
+    state: &mut StreamState,
+) -> Vec<Vec<u8>> {
+    let error = event.get("error").unwrap_or(&Value::Null);
+    let error_type = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("api_error");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Anthropic streaming error");
+
+    let (normalized_type, normalized_code, finish_reason) =
+        normalize_anthropic_stream_error(error_type, message);
+
+    match client_format {
+        UpstreamFormat::OpenAiResponses => {
+            state.responses_seq += 1;
+            let response_id = state
+                .message_id
+                .clone()
+                .unwrap_or_else(|| format!("resp_error_{}", uuid::Uuid::new_v4().simple()));
+            let failed = serde_json::json!({
+                "type": "response.failed",
+                "sequence_number": state.responses_seq,
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": 0,
+                    "status": "failed",
+                    "background": false,
+                    "error": {
+                        "type": normalized_type,
+                        "code": normalized_code,
+                        "message": message
+                    },
+                    "incomplete_details": null,
+                    "usage": null,
+                    "metadata": {}
+                }
+            });
+            vec![format_sse_event("response.failed", &failed)]
+        }
+        UpstreamFormat::OpenAiCompletion => {
+            let mut chunk = openai_chunk(state, serde_json::json!({}), Some(finish_reason));
+            chunk["error"] = serde_json::json!({
+                "type": normalized_type,
+                "code": normalized_code,
+                "message": message
+            });
+            vec![format_sse_data(&chunk), b"data: [DONE]\n\n".to_vec()]
+        }
+        UpstreamFormat::Anthropic => vec![format_sse_data(event)],
+        UpstreamFormat::Google => vec![],
+    }
+}
+
+fn normalize_anthropic_stream_error(
+    error_type: &str,
+    message: &str,
+) -> (&'static str, Option<&'static str>, &'static str) {
+    let lower_type = error_type.to_ascii_lowercase();
+    let lower_message = message.to_ascii_lowercase();
+    if lower_type.contains("overloaded") || lower_type.contains("api_error") {
+        return ("server_error", Some("server_is_overloaded"), "stop");
+    }
+    if lower_type.contains("rate_limit") {
+        return ("rate_limit_error", Some("rate_limit_exceeded"), "stop");
+    }
+    if lower_type.contains("invalid_request")
+        && (lower_message.contains("context window")
+            || lower_message.contains("context_length_exceeded")
+            || lower_message.contains("too many tokens")
+            || lower_message.contains("maximum context length"))
+    {
+        return (
+            "invalid_request_error",
+            Some("context_length_exceeded"),
+            "context_length_exceeded",
+        );
+    }
+    if lower_type.contains("invalid_request")
+        && (lower_message.contains("refusal") || lower_message.contains("content filter"))
+    {
+        return (
+            "invalid_request_error",
+            Some("content_filter"),
+            "content_filter",
+        );
+    }
+    ("server_error", Some("server_is_overloaded"), "stop")
 }
 
 /// Stream that buffers upstream bytes, parses SSE events, and yields translated SSE bytes.
@@ -2406,6 +2640,134 @@ mod tests {
     }
 
     #[test]
+    fn openai_chunk_to_responses_sse_maps_minimax_reasoning_details() {
+        let mut state = StreamState::default();
+        let reasoning_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "MiniMax-M2.7-highspeed",
+            "created": 123,
+            "choices": [{
+                "index": 0,
+                "delta": { "reasoning_details": [{ "text": "internal thinking" }] },
+                "finish_reason": null
+            }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "MiniMax-M2.7-highspeed",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+
+        let out1 = openai_chunk_to_responses_sse(&reasoning_chunk, &mut state);
+        let out2 = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out1
+            .into_iter()
+            .chain(out2)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"type\":\"response.reasoning_summary_text.delta\""));
+        assert!(joined.contains("\"delta\":\"internal thinking\""));
+        assert!(!joined.contains("\"type\":\"response.output_text.delta\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_dedupes_minimax_cumulative_text() {
+        let mut state = StreamState::default();
+        let chunk1 = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "MiniMax-M2.7-highspeed",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": { "content": "Hello" }, "finish_reason": null }]
+        });
+        let chunk2 = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "MiniMax-M2.7-highspeed",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": { "content": "Hello world" }, "finish_reason": null }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "MiniMax-M2.7-highspeed",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+        let usage_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "MiniMax-M2.7-highspeed",
+            "created": 123,
+            "choices": [],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+        });
+
+        let out1 = openai_chunk_to_responses_sse(&chunk1, &mut state);
+        let out2 = openai_chunk_to_responses_sse(&chunk2, &mut state);
+        let _ = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let out3 = openai_chunk_to_responses_sse(&usage_chunk, &mut state);
+        let joined = out1
+            .into_iter()
+            .chain(out2)
+            .chain(out3)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"delta\":\"Hello\""));
+        assert!(joined.contains("\"delta\":\" world\""));
+        assert!(joined.contains("\"text\":\"Hello world\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_waits_for_usage_only_chunk_before_completed() {
+        let mut state = StreamState::default();
+        let text_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "MiniMax-M2.7-highspeed",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": { "content": "Hello" }, "finish_reason": null }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "MiniMax-M2.7-highspeed",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+        let usage_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "MiniMax-M2.7-highspeed",
+            "created": 123,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 42,
+                "completion_tokens": 172,
+                "total_tokens": 214,
+                "completion_tokens_details": { "reasoning_tokens": 162 }
+            }
+        });
+
+        let _ = openai_chunk_to_responses_sse(&text_chunk, &mut state);
+        let finish_out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let usage_out = openai_chunk_to_responses_sse(&usage_chunk, &mut state);
+        let finish_joined = finish_out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let usage_joined = usage_out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!finish_joined.contains("\"type\":\"response.completed\""));
+        assert!(usage_joined.contains("\"type\":\"response.completed\""));
+        assert!(usage_joined.contains("\"total_tokens\":214"));
+        assert!(usage_joined.contains("\"output_tokens_details\":{\"reasoning_tokens\":162}"));
+    }
+
+    #[test]
     fn openai_chunk_to_responses_sse_preserves_usage_details_and_total_tokens() {
         let mut state = StreamState::default();
         let finish_chunk = serde_json::json!({
@@ -2645,5 +3007,57 @@ mod tests {
         assert!(joined.contains("\"type\":\"response.incomplete\""));
         assert!(joined.contains("\"reason\":\"max_output_tokens\""));
         assert!(!joined.contains("\"type\":\"response.completed\""));
+    }
+
+    #[test]
+    fn anthropic_error_event_maps_to_responses_failed() {
+        let mut state = StreamState::default();
+        let out = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Overloaded"
+                }
+            }),
+            &mut state,
+        );
+
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"type\":\"response.failed\""));
+        assert!(joined.contains("\"type\":\"server_error\""));
+        assert!(joined.contains("\"code\":\"server_is_overloaded\""));
+    }
+
+    #[test]
+    fn anthropic_error_event_maps_context_to_openai_context_finish() {
+        let mut state = StreamState::default();
+        let out = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "maximum context length exceeded"
+                }
+            }),
+            &mut state,
+        );
+
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"finish_reason\":\"context_length_exceeded\""));
+        assert!(joined.contains("\"code\":\"context_length_exceeded\""));
+        assert!(joined.contains("[DONE]"));
     }
 }

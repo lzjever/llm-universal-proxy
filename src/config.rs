@@ -47,6 +47,30 @@ impl Default for HookConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugTraceConfig {
+    pub path: Option<String>,
+    pub max_text_chars: usize,
+}
+
+impl DebugTraceConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.path
+            .as_deref()
+            .map(|path| !path.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+impl Default for DebugTraceConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            max_text_chars: default_debug_trace_max_text_chars(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookEndpointConfig {
     pub url: String,
     pub authorization: Option<String>,
@@ -100,6 +124,8 @@ pub struct Config {
     pub model_aliases: BTreeMap<String, ModelAlias>,
     /// Optional audit and metering hooks.
     pub hooks: HookConfig,
+    /// Optional local debug trace sink.
+    pub debug_trace: DebugTraceConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,6 +192,8 @@ pub struct RuntimeConfigPayload {
     pub model_aliases: BTreeMap<String, ModelAlias>,
     #[serde(default)]
     pub hooks: RuntimeHookConfig,
+    #[serde(default)]
+    pub debug_trace: DebugTraceConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,6 +214,8 @@ struct FileConfig {
     model_aliases: BTreeMap<String, String>,
     #[serde(default)]
     hooks: HooksFileConfig,
+    #[serde(default)]
+    debug_trace: DebugTraceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -246,6 +276,7 @@ impl Default for Config {
             upstreams: Vec::new(),
             model_aliases: BTreeMap::new(),
             hooks: HookConfig::default(),
+            debug_trace: DebugTraceConfig::default(),
         }
     }
 }
@@ -320,6 +351,7 @@ impl Config {
                     authorization: hook.authorization,
                 }),
             },
+            debug_trace: parsed.debug_trace,
         })
     }
 
@@ -540,6 +572,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
                     authorization: hook.authorization,
                 }),
             },
+            debug_trace: value.debug_trace,
         };
         config.validate()?;
         Ok(config)
@@ -579,6 +612,7 @@ impl From<&Config> for RuntimeConfigPayload {
                     authorization: hook.authorization.clone(),
                 }),
             },
+            debug_trace: value.debug_trace.clone(),
         }
     }
 }
@@ -605,6 +639,10 @@ fn default_hook_failure_threshold() -> usize {
 
 fn default_hook_cooldown_secs() -> u64 {
     300
+}
+
+fn default_debug_trace_max_text_chars() -> usize {
+    16384
 }
 
 /// Build full upstream POST URL for a format.

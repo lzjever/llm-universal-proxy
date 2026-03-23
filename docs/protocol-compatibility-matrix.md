@@ -101,3 +101,20 @@
   - `model_context_window` tells Codex how large the model window is.
   - `model_auto_compact_token_limit` is the absolute total-token threshold that actually triggers automatic compaction.
 - For proxy-backed custom models, set `model_auto_compact_token_limit` to roughly `85%` to `92%` of the real upstream window unless you have provider-specific evidence that a tighter or looser threshold is safe.
+
+## Codex compaction semantics with custom providers
+
+- Codex has two distinct compaction implementations:
+  - remote compaction through the official OpenAI `/responses/compact` endpoint
+  - local inline compaction that asks the current model to summarize history
+- The remote path is only selected when Codex believes the provider is the built-in OpenAI provider.
+- A custom provider that exposes a Responses-compatible endpoint through this proxy still uses Codex's local inline compaction path.
+
+Implications for this proxy:
+
+- Compaction quality is model-dependent because the routed upstream model generates the summary.
+- Auto-compaction timing is sensitive to `usage` translation quality. Incorrect token mapping can delay or suppress compaction.
+- Post-compaction turns are especially sensitive to protocol normalization. Codex may inject compacted summaries back into the transcript as `developer/system` or user-summary content, and the proxy must keep those messages valid for the target upstream protocol.
+- The proxy does not own or persist Codex's compaction state. It only translates the client-visible transcript produced by Codex.
+
+Operationally, this means proxy-backed Codex compaction is best treated as "local summary compaction over a translated protocol bridge", not as an exact replica of official OpenAI-hosted Codex compaction behavior.

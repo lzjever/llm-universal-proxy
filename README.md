@@ -31,6 +31,7 @@ This is a real Codex CLI session using a local alias routed to `GLM-5-Turbo` thr
 - **Named Upstreams**: Route requests to multiple upstream providers from one proxy instance
 - **Local Model Aliases**: Expose one unique local model name for any upstream model
 - **Audit Hooks**: Optional async `exchange` / `usage` HTTP hooks for request-response capture and metering
+- **Local Debug Trace**: Optional JSONL trace for per-turn debugging without shipping traffic to external hooks
 - **Credential Policy**: Supports fallback credentials, direct configured credentials, and force-server auth
 - **Codex CLI Friendly**: Works as a Responses-compatible endpoint in front of Anthropic-compatible upstreams
 - **Model Unification Layer**: Map models from different providers to one stable local naming scheme, such as `opus`, `sonnet`, `haiku`, or team-specific coding aliases
@@ -78,6 +79,35 @@ Recommended thresholds for `GLM-5-Turbo`:
 - More aggressive: `184000`
 
 Set `model_context_window` to the real upstream limit and tune only `model_auto_compact_token_limit` if you want compaction earlier or later.
+
+### How Codex Compact Actually Works With A Proxy
+
+When Codex talks to a custom proxy-backed provider, compaction does not behave exactly like official OpenAI-hosted Codex.
+
+- Codex has two compaction paths:
+  - official OpenAI provider: remote `/responses/compact`
+  - custom providers: local inline compaction using the current model
+- The remote compact path is only used when Codex recognizes the provider as built-in OpenAI. A custom provider such as `glm-proxy` does not qualify, even if it serves a Responses-compatible API.
+- That means proxy-backed Codex sessions use model-generated summarization, not the official OpenAI compact service.
+
+Practical consequences:
+
+- Compact quality depends on the routed upstream model, because that model is the one producing the summary.
+- Compact timing depends on token accounting coming back through the proxy. If usage mapping is wrong, Codex may compact too late or not at all.
+- Compact replacement history is still reconstructed by Codex locally, so protocol normalization after compaction matters. If translated history contains roles or message layouts that the upstream rejects, the next turn after compaction can fail even though compaction itself succeeded.
+
+Important boundary:
+
+- The proxy does not persist or grow system prompts on its own.
+- Codex may inject new compacted thread summaries into later requests.
+- The proxy only normalizes those messages so they remain valid for the upstream protocol.
+
+Best practice for proxy-backed Codex sessions:
+
+- Set both `model_context_window` and `model_auto_compact_token_limit`.
+- Prefer shorter threads and start a new thread after multiple compactions.
+- Treat proxy-backed compact as "local summary compaction" rather than "official OpenAI remote compaction".
+
 ## Installation
 
 ### Download Binary
@@ -139,6 +169,10 @@ hooks:
     url: https://example.com/hooks/usage
   exchange:
     url: https://example.com/hooks/exchange
+
+debug_trace:
+  path: /tmp/llm-proxy-debug.jsonl
+  max_text_chars: 16384
 ```
 
 Notes:
@@ -150,6 +184,9 @@ Notes:
 - `credential_actual` can be used instead of `credential_env` when you want to place a fallback credential directly in YAML. `credential_env` and `credential_actual` are mutually exclusive.
 - `auth_policy` supports `client_or_fallback` and `force_server`.
 - Hooks are best-effort and asynchronous. `usage` is usually enough; `exchange` captures the full client-facing request/response pair after the request completes.
+- `debug_trace` writes a local JSONL file for debugging protocol issues. It is designed for interactive troubleshooting, not long-term traffic archival.
+- `debug_trace` records only the tail "new input" portion of each client request rather than rewriting the full accumulated conversation each turn.
+- For streaming responses, `debug_trace` records the processed client-visible result: aggregated text, reasoning text, tool-call deltas, terminal event, finish reason, and any normalized error. It does not dump raw SSE JSON lines.
 
 ### Full YAML Reference
 
@@ -181,6 +218,10 @@ hooks:
   exchange:
     url: https://example.com/hooks/exchange
     authorization: Bearer exchange-hook-token
+
+debug_trace:
+  path: /tmp/llm-proxy-debug.jsonl
+  max_text_chars: 16384
 ```
 
 ### Top-Level Fields
@@ -192,6 +233,24 @@ hooks:
 | `upstreams` | map | Yes | none | Named upstream definitions |
 | `model_aliases` | map | No | empty | Maps local model names to `upstream:model` |
 | `hooks` | object | No | disabled | Optional async audit and usage export hooks |
+| `debug_trace` | object | No | disabled | Optional local JSONL debug trace for per-turn request/response summaries |
+
+### `debug_trace`
+
+Use `debug_trace` when you need to troubleshoot client or proxy behavior locally and want something lighter than full exchange capture.
+
+```yaml
+debug_trace:
+  path: /tmp/llm-proxy-debug.jsonl
+  max_text_chars: 16384
+```
+
+Design notes:
+- The request entry records only the new tail input for the current turn, not the full accumulated transcript.
+- The response entry records a normalized summary.
+  - Non-streaming: summarized final body.
+  - Streaming: aggregated text, aggregated reasoning text, tool-call deltas, terminal event such as `response.completed` or `response.failed`, and normalized error details when present.
+- This format is meant to answer "what did the client add this turn?" and "what did the model actually send back?" without forcing you to reconstruct long raw SSE logs.
 
 ### `upstreams`
 
