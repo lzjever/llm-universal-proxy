@@ -350,6 +350,7 @@ fn convert_claude_stop_reason(r: &str) -> String {
         "max_tokens" => "length",
         "tool_use" => "tool_calls",
         "stop_sequence" => "stop",
+        "model_context_window_exceeded" => "context_length_exceeded",
         _ => "stop",
     }
     .to_string()
@@ -1282,6 +1283,30 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
     if let Some(u) = chunk.get("usage") {
         state.usage = Some(u.clone());
     }
+    if finish_reason == Some("context_length_exceeded") {
+        let failed = serde_json::json!({
+            "type": "response.failed",
+            "sequence_number": next_seq(),
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": chunk.get("created").and_then(Value::as_u64).unwrap_or(0),
+                "status": "failed",
+                "background": false,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window of this model. Please adjust your input and try again."
+                },
+                "incomplete_details": null,
+                "usage": null,
+                "metadata": {}
+            }
+        });
+        out.push(format_sse_event("response.failed", &failed));
+        return out;
+    }
+
     if finish_reason.is_some() {
         if state.responses_reasoning_added && !state.responses_reasoning_done {
             state.responses_reasoning_done = true;
@@ -2207,5 +2232,54 @@ mod tests {
         };
         let chunk = openai_chunk(&state, serde_json::json!({"content":"Hi"}), None);
         assert_eq!(chunk["id"], "chatcmpl-msg123");
+    }
+
+    #[test]
+    fn claude_context_window_exceeded_maps_to_responses_failed_event() {
+        let mut state = StreamState::default();
+        let start = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "model": "glm-5"
+            }
+        });
+        let delta = serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "model_context_window_exceeded" },
+            "usage": { "input_tokens": 0, "output_tokens": 0 }
+        });
+        let stop = serde_json::json!({
+            "type": "message_stop"
+        });
+
+        let mut out = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &start,
+            &mut state,
+        );
+        out.extend(translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &delta,
+            &mut state,
+        ));
+        out.extend(translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &stop,
+            &mut state,
+        ));
+
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"type\":\"response.failed\""));
+        assert!(joined.contains("\"code\":\"context_length_exceeded\""));
+        assert!(!joined.contains("\"type\":\"response.completed\""));
     }
 }
