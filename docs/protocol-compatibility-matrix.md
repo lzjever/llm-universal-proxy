@@ -55,7 +55,7 @@
 | Provider startup error before SSE body | `response.failed` | HTTP error | HTTP error | Proxy synthesizes Responses `response.failed` for Responses clients | Approx | Improves downstream compatibility for Codex. |
 | `response.failed` from Responses upstream | Explicit failed event | No exact streaming error event | No exact equivalent | Proxy converts to a final OpenAI completion chunk with best-effort finish reason | Approx | Best effort for non-Responses clients. |
 | `response.incomplete` from Responses upstream | Explicit incomplete event | Final chunk with `finish_reason=length/content_filter` | Final Claude stop reason | Proxy maps to best-effort finish reason | Approx | Preserves truncation/filter behavior for downstream consumers. |
-| `pause_turn` | Not a Responses concept | No exact equivalent | Anthropic successful stop reason for server-tool loops | Not fully mapped today | Unsupported | Requires a higher-level resume protocol, not just field translation. Proxy documents this instead of inventing a misleading completion state. |
+| `pause_turn` | Not a native Responses completion state | Chat `finish_reason` can carry a custom terminal reason | Anthropic successful stop reason for server-tool loops | Preserved as `finish_reason: "pause_turn"` in Chat and downgraded to Responses `status: incomplete`, `reason: "pause_turn"` | Approx | This keeps downstream loops from treating the turn as fully completed, but it still is not a full resume protocol. |
 
 ## Streaming event lifecycle
 
@@ -65,8 +65,9 @@
 | Function call event metadata | `call_id` and `name` preserved on delta/done events | Exact | |
 | Text part annotations | Empty `annotations: []` emitted on text parts | Approx | Matches common OpenAI Responses examples. |
 | `response.completed` usage details | `total_tokens`, cached tokens, reasoning tokens preserved | Exact | |
-| `response.incomplete` emission | Emitted for `length` and `content_filter` finishes | Exact | |
+| `response.incomplete` emission | Emitted for `length`, `content_filter`, and `pause_turn` finishes | Approx | `pause_turn` is represented as incomplete to avoid a false `completed` terminal state. |
 | `response.failed` emission for Anthropic context overflows | Emitted | Approx | Upstream Anthropic stop reason is upgraded into an error event. |
+| Compatibility downgrade visibility | `x-proxy-compat-warning` response headers and server logs | Approx | Emitted when the proxy drops or approximates request fields such as `previous_response_id`, `truncation`, or non-function Responses tools. |
 
 ## Important non-1:1 differences
 
@@ -76,7 +77,7 @@
 | `store` | Persistence model is provider-specific outside the OpenAI family | Preserve within OpenAI-style translations; drop for Anthropic and Gemini. |
 | Responses built-in tools | Chat Completions and Anthropic tool schemas are not the same API surface | Keep function tools only; drop built-ins on cross-protocol translation. |
 | `truncation` | Provider-side context management policy cannot be reproduced in another protocol | Drop field and rely on downstream model/provider defaults. |
-| Anthropic `pause_turn` | It is a workflow control signal, not a normal completion state | Currently documented as unsupported. |
+| Anthropic `pause_turn` | It is a workflow control signal, not a normal completion state | Preserve `finish_reason: "pause_turn"` in the Chat pivot and emit Responses `incomplete.reason="pause_turn"` so downstream clients do not confuse it with a normal completion. |
 | Anthropic `refusal` | Closest OpenAI equivalent is `content_filter`, but semantics are not identical | Map to `content_filter` because downstream safety handling is closer. |
 
 ## Current pragmatic mappings
@@ -84,6 +85,7 @@
 - `Responses parallel_tool_calls=false` -> `Anthropic tool_choice.disable_parallel_tool_use=true` when a Claude tool choice object is emitted.
 - `Anthropic model_context_window_exceeded` -> OpenAI / Responses context-window error semantics, because downstream tools like Codex need an explicit overflow signal instead of a superficially successful completion.
 - `Anthropic refusal` -> OpenAI `content_filter` / Responses `incomplete.reason=content_filter`, because downstream safety handling is closer to filtering than to natural completion.
+- `Anthropic pause_turn` -> OpenAI Chat `finish_reason=pause_turn` -> Responses `status=incomplete`, `reason=pause_turn`, because that preserves the "not actually done yet" behavior without inventing an unsupported Responses success state.
 - `OpenAI content_filter` -> Anthropic `refusal`.
 - `OpenAI context_length_exceeded` -> Anthropic `model_context_window_exceeded`.
 
@@ -92,3 +94,4 @@
 - Prefer passthrough whenever the client and upstream both speak the same protocol.
 - For Codex and other Responses-native clients, normalize hard failures into `response.failed` and truncations into `response.incomplete`; downstream behavior is better than returning a superficially successful `response.completed`.
 - When a field is dropped intentionally, prefer documenting it over inventing unsupported wire shapes.
+- When a request requires degradation, inspect `x-proxy-compat-warning` response headers or server logs; the proxy emits one warning per dropped or approximated feature.

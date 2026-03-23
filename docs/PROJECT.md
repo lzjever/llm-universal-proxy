@@ -65,6 +65,12 @@ We write or extend tests first, then implement to pass.
   - **JSON report:** `test-reports/report-<timestamp>.json` and `test-reports/report-latest.json` (timestamp, success, passed, failed, total, failed_tests).
 - **Make target:** `make test-report` runs the script. Use for CI or local verification with a single report artifact.
 
+## Compatibility policy
+
+- Cross-protocol translation is intentionally conservative: preserve downstream behavior first, even when the exact upstream wire shape cannot be reproduced.
+- When the proxy must drop or approximate request semantics, it should emit `x-proxy-compat-warning` response headers and matching server log warnings instead of silently pretending to provide 1:1 fidelity.
+- Field-level degradations and unsupported cases are tracked in [protocol-compatibility-matrix.md](/home/percy/works/llm-universal-proxy/docs/protocol-compatibility-matrix.md).
+
 ## Rust version
 
 - **Edition**: 2021 (works on stable without 2024).
