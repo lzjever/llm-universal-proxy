@@ -1040,6 +1040,8 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 "status": "in_progress",
                 "background": false,
                 "error": null,
+                "incomplete_details": null,
+                "usage": null,
                 "output": []
             }
         });
@@ -1047,7 +1049,15 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
         let ev2 = serde_json::json!({
             "type": "response.in_progress",
             "sequence_number": next_seq(),
-            "response": { "id": response_id, "object": "response", "created_at": created, "status": "in_progress" }
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": created,
+                "status": "in_progress",
+                "error": null,
+                "incomplete_details": null,
+                "usage": null
+            }
         });
         out.push(format_sse_event("response.in_progress", &ev2));
     }
@@ -1467,6 +1477,8 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             "object": "response",
             "created_at": created,
             "status": "completed",
+            "error": null,
+            "incomplete_details": null,
             "output": output
         });
         if let Some(ref u) = state.usage {
@@ -2144,5 +2156,35 @@ mod tests {
         assert!(joined.contains("\"type\":\"response.content_part.added\""));
         assert!(joined.contains("\"type\":\"response.content_part.done\""));
         assert!(joined.contains("\"annotations\":[]"));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_includes_null_error_fields_on_response_events() {
+        let mut state = StreamState::default();
+        let text_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": { "content": "Hi" }, "finish_reason": null }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+
+        let out1 = openai_chunk_to_responses_sse(&text_chunk, &mut state);
+        let out2 = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out1
+            .into_iter()
+            .chain(out2)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"type\":\"response.created\""));
+        assert!(joined.contains("\"type\":\"response.in_progress\""));
+        assert!(joined.contains("\"type\":\"response.completed\""));
+        assert!(joined.contains("\"error\":null"));
+        assert!(joined.contains("\"incomplete_details\":null"));
     }
 }
