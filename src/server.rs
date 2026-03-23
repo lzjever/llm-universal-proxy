@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{AuthPolicy, Config, RuntimeConfigPayload, UpstreamConfig};
 use crate::dashboard::run_dashboard;
@@ -33,6 +33,7 @@ use crate::telemetry::RuntimeMetrics;
 use crate::translate::{translate_request, translate_response};
 use crate::upstream;
 use futures_util::StreamExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_NAMESPACE: &str = "default";
 
@@ -778,6 +779,14 @@ async fn handle_request_core(
     let upstream_format = upstream_state
         .capability
         .upstream_format_for_request(client_format);
+    let compatibility_warnings =
+        collect_request_compatibility_warnings(client_format, upstream_format, &original_body);
+    for warning in &compatibility_warnings {
+        warn!(
+            "compatibility downgrade: client_format={} upstream_format={} warning={}",
+            client_format, upstream_format, warning
+        );
+    }
 
     if client_format != upstream_format {
         if let Err(e) = translate_request(
@@ -853,7 +862,11 @@ async fn handle_request_core(
         Ok(r) => r,
         Err(e) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string());
+            return streaming_error_response(
+                client_format,
+                StatusCode::BAD_GATEWAY,
+                &e.to_string(),
+            );
         }
     };
 
@@ -870,7 +883,7 @@ async fn handle_request_core(
                 status, error_body
             );
             tracker.finish_error(status.as_u16());
-            return error_response(
+            return streaming_error_response(
                 client_format,
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 &error_body,
@@ -897,13 +910,15 @@ async fn handle_request_core(
                 status.as_u16(),
             ))
         };
-        return Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header("Content-Type", "text/event-stream")
             .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive")
             .body(body)
             .unwrap();
+        append_compatibility_warning_headers(&mut response, &compatibility_warnings);
+        return response;
     }
 
     let status = res.status();
@@ -930,6 +945,10 @@ async fn handle_request_core(
     let upstream_body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => {
+            error!(
+                "Upstream returned invalid JSON body: {}",
+                String::from_utf8_lossy(&bytes)
+            );
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return error_response(
                 client_format,
@@ -938,6 +957,12 @@ async fn handle_request_core(
             );
         }
     };
+    if let Some((status, message)) =
+        normalized_non_stream_upstream_error(upstream_format, client_format, &upstream_body)
+    {
+        tracker.finish_error(status.as_u16());
+        return error_response(client_format, status, &message);
+    }
     let out = match translate_response(upstream_format, client_format, &upstream_body) {
         Ok(v) => v,
         Err(e) => {
@@ -949,7 +974,15 @@ async fn handle_request_core(
         dispatcher.emit_non_stream(ctx, 200, json_response_headers(), out.clone());
     }
     tracker.finish_success(StatusCode::OK.as_u16());
-    (StatusCode::OK, Json(out)).into_response()
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&out).unwrap_or_else(|_| b"{}".to_vec()),
+        ))
+        .unwrap();
+    append_compatibility_warning_headers(&mut response, &compatibility_warnings);
+    response
 }
 
 async fn handle_openai_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1247,11 +1280,16 @@ fn error_response(
     status: StatusCode,
     message: &str,
 ) -> Response<Body> {
+    let normalized_error = normalize_upstream_error(status, message);
     match format {
-        crate::formats::UpstreamFormat::OpenAiCompletion
-        | crate::formats::UpstreamFormat::OpenAiResponses => (
+        crate::formats::UpstreamFormat::OpenAiCompletion => (
             status,
-            Json(serde_json::json!({ "error": { "message": message } })),
+            Json(openai_error_body(&normalized_error)),
+        )
+            .into_response(),
+        crate::formats::UpstreamFormat::OpenAiResponses => (
+            status,
+            Json(openai_error_body(&normalized_error)),
         )
             .into_response(),
         crate::formats::UpstreamFormat::Anthropic => (
@@ -1276,6 +1314,274 @@ fn error_response(
             })),
         )
             .into_response(),
+    }
+}
+
+fn streaming_error_response(
+    format: crate::formats::UpstreamFormat,
+    status: StatusCode,
+    message: &str,
+) -> Response<Body> {
+    if format != crate::formats::UpstreamFormat::OpenAiResponses {
+        return error_response(format, status, message);
+    }
+
+    let normalized_error = normalize_upstream_error(status, message);
+    let response_id = format!(
+        "resp_error_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "type": "response.failed",
+        "sequence_number": 0,
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "failed",
+            "background": false,
+            "error": {
+                "type": normalized_error.error_type,
+                "code": normalized_error.code,
+                "message": normalized_error.message,
+            },
+            "incomplete_details": null,
+            "usage": null,
+            "metadata": {}
+        }
+    });
+    let body = format!(
+        "event: response.failed\ndata: {payload}\n\n"
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedUpstreamError {
+    message: String,
+    error_type: &'static str,
+    code: Option<&'static str>,
+}
+
+fn normalize_upstream_error(status: StatusCode, raw_message: &str) -> NormalizedUpstreamError {
+    let parsed = serde_json::from_str::<Value>(raw_message).ok();
+    let extracted_message = parsed
+        .as_ref()
+        .and_then(extract_error_message)
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| raw_message.to_string());
+    let signal = parsed
+        .as_ref()
+        .map(extract_error_signal)
+        .unwrap_or_default();
+    let signal = signal.to_ascii_lowercase();
+    let message_lc = extracted_message.to_ascii_lowercase();
+    let combined = format!("{signal} {message_lc}");
+
+    let (error_type, code) = if status == StatusCode::TOO_MANY_REQUESTS
+        || combined.contains("rate limit")
+        || combined.contains("rate_limit")
+    {
+        ("rate_limit_error", Some("rate_limit_exceeded"))
+    } else if combined.contains("quota")
+        || combined.contains("insufficient_quota")
+        || combined.contains("credit balance")
+    {
+        ("insufficient_quota", Some("insufficient_quota"))
+    } else if status.is_server_error()
+        || combined.contains("overloaded")
+        || combined.contains("slow down")
+        || combined.contains("server_is_overloaded")
+        || combined.contains("temporarily unavailable")
+        || combined.contains("service unavailable")
+    {
+        ("server_error", Some("server_is_overloaded"))
+    } else if combined.contains("context_length_exceeded")
+        || combined.contains("context window")
+        || combined.contains("maximum context length")
+        || combined.contains("prompt is too long")
+        || combined.contains("prompt too long")
+        || combined.contains("too many tokens")
+        || combined.contains("token limit exceeded")
+    {
+        ("invalid_request_error", Some("context_length_exceeded"))
+    } else if combined.contains("invalid_prompt")
+        || combined.contains("safety reasons")
+        || combined.contains("prompt blocked")
+    {
+        ("invalid_request_error", Some("invalid_prompt"))
+    } else if status.is_client_error() {
+        ("invalid_request_error", Some("invalid_request_error"))
+    } else {
+        ("server_error", None)
+    };
+
+    NormalizedUpstreamError {
+        message: extracted_message,
+        error_type,
+        code,
+    }
+}
+
+fn extract_error_message(body: &Value) -> Option<String> {
+    body.get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            body.get("error")
+                .and_then(|error| error.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| body.get("message").and_then(Value::as_str))
+        .map(ToString::to_string)
+}
+
+fn extract_error_signal(body: &Value) -> String {
+    let candidates = [
+        body.get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str),
+        body.get("error")
+            .and_then(|error| error.get("type"))
+            .and_then(Value::as_str),
+        body.get("error")
+            .and_then(|error| error.get("status"))
+            .and_then(Value::as_str),
+        body.get("code").and_then(Value::as_str),
+        body.get("type").and_then(Value::as_str),
+        body.get("status").and_then(Value::as_str),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn openai_error_body(error: &NormalizedUpstreamError) -> Value {
+    serde_json::json!({
+        "error": {
+            "message": error.message,
+            "type": error.error_type,
+            "code": error.code,
+        }
+    })
+}
+
+fn collect_request_compatibility_warnings(
+    client_format: crate::formats::UpstreamFormat,
+    upstream_format: crate::formats::UpstreamFormat,
+    body: &Value,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if client_format == crate::formats::UpstreamFormat::OpenAiResponses
+        && upstream_format != crate::formats::UpstreamFormat::OpenAiResponses
+    {
+        for field in [
+            "previous_response_id",
+            "truncation",
+            "max_tool_calls",
+            "include",
+            "reasoning",
+            "prompt_cache_key",
+        ] {
+            if body.get(field).is_some() {
+                warnings.push(format!(
+                    "field `{field}` is not portable from Responses to {upstream_format} and may be dropped or degraded"
+                ));
+            }
+        }
+        if upstream_format != crate::formats::UpstreamFormat::OpenAiCompletion
+            && body.get("store").is_some()
+        {
+            warnings.push(format!(
+                "field `store` is not portable from Responses to {upstream_format} and will be dropped"
+            ));
+        }
+        if upstream_format != crate::formats::UpstreamFormat::OpenAiResponses {
+            if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+                if tools
+                    .iter()
+                    .any(|tool| tool.get("name").is_none() && tool.get("function").is_none())
+                {
+                    warnings.push(format!(
+                        "non-function Responses tools are not portable to {upstream_format} and will be dropped"
+                    ));
+                }
+            }
+        }
+    }
+    if upstream_format == crate::formats::UpstreamFormat::Anthropic
+        && body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+    {
+        warnings.push(
+            "Anthropic does not support `parallel_tool_calls`; proxy approximates this with `disable_parallel_tool_use`".to_string(),
+        );
+    }
+    if client_format == crate::formats::UpstreamFormat::Anthropic
+        && matches!(
+            upstream_format,
+            crate::formats::UpstreamFormat::OpenAiCompletion
+                | crate::formats::UpstreamFormat::OpenAiResponses
+        )
+        && body.get("metadata").is_some()
+    {
+        warnings.push(
+            "Anthropic `metadata` is not universally supported by OpenAI-style upstreams; proxy may drop it for compatibility".to_string(),
+        );
+    }
+    warnings
+}
+
+fn append_compatibility_warning_headers(response: &mut Response<Body>, warnings: &[String]) {
+    for warning in warnings {
+        let sanitized = warning.replace(['\r', '\n'], " ");
+        if let Ok(value) = axum::http::HeaderValue::from_str(&sanitized) {
+            response
+                .headers_mut()
+                .append("x-proxy-compat-warning", value);
+        }
+    }
+}
+
+fn normalized_non_stream_upstream_error(
+    upstream_format: crate::formats::UpstreamFormat,
+    client_format: crate::formats::UpstreamFormat,
+    upstream_body: &Value,
+) -> Option<(StatusCode, String)> {
+    if !matches!(
+        client_format,
+        crate::formats::UpstreamFormat::OpenAiCompletion
+            | crate::formats::UpstreamFormat::OpenAiResponses
+    ) {
+        return None;
+    }
+
+    match upstream_format {
+        crate::formats::UpstreamFormat::Anthropic => {
+            let stop_reason = upstream_body.get("stop_reason").and_then(Value::as_str)?;
+            if stop_reason == "model_context_window_exceeded" {
+                return Some((
+                    StatusCode::BAD_REQUEST,
+                    "Your input exceeds the context window of this model. Please adjust your input and try again.".to_string(),
+                ));
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -1541,4 +1847,135 @@ fn extract_api_key_from_headers(headers: &[(String, String)]) -> Option<String> 
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_upstream_error_maps_context_window_messages() {
+        let error = normalize_upstream_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215000 tokens > 200000 limit"}}"#,
+        );
+
+        assert_eq!(
+            error,
+            NormalizedUpstreamError {
+                message: "prompt is too long: 215000 tokens > 200000 limit".to_string(),
+                error_type: "invalid_request_error",
+                code: Some("context_length_exceeded"),
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_upstream_error_preserves_rate_limit_signal() {
+        let error = normalize_upstream_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"Please slow down.","type":"rate_limit_error"}}"#,
+        );
+
+        assert_eq!(
+            error,
+            NormalizedUpstreamError {
+                message: "Please slow down.".to_string(),
+                error_type: "rate_limit_error",
+                code: Some("rate_limit_exceeded"),
+            }
+        );
+    }
+
+    #[test]
+    fn streaming_error_response_returns_responses_failed_event() {
+        let response = streaming_error_response(
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            StatusCode::BAD_REQUEST,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let body = runtime.block_on(async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body bytes");
+            String::from_utf8(bytes.to_vec()).expect("utf8 body")
+        });
+
+        assert!(body.contains("event: response.failed"));
+        assert!(body.contains("\"code\":\"context_length_exceeded\""));
+        assert!(body.contains("\"message\":\"prompt is too long\""));
+    }
+
+    #[test]
+    fn normalized_non_stream_upstream_error_maps_anthropic_context_window_stop() {
+        let upstream_body = serde_json::json!({
+            "type": "message",
+            "stop_reason": "model_context_window_exceeded"
+        });
+
+        let actual = normalized_non_stream_upstream_error(
+            crate::formats::UpstreamFormat::Anthropic,
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            &upstream_body,
+        );
+
+        assert_eq!(
+            actual,
+            Some((
+                StatusCode::BAD_REQUEST,
+                "Your input exceeds the context window of this model. Please adjust your input and try again.".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn collect_request_compatibility_warnings_flags_non_portable_responses_fields() {
+        let body = serde_json::json!({
+            "previous_response_id": "resp_1",
+            "truncation": "auto",
+            "store": true,
+            "tools": [{ "type": "web_search" }]
+        });
+        let warnings = collect_request_compatibility_warnings(
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            crate::formats::UpstreamFormat::Anthropic,
+            &body,
+        );
+        assert!(warnings.iter().any(|w| w.contains("previous_response_id")));
+        assert!(warnings.iter().any(|w| w.contains("truncation")));
+        assert!(warnings.iter().any(|w| w.contains("store")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("non-function Responses tools")));
+    }
+
+    #[test]
+    fn append_compatibility_warning_headers_exposes_each_warning() {
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .expect("response");
+        let warnings = vec![
+            "first warning".to_string(),
+            "second warning with\nnewline".to_string(),
+        ];
+
+        append_compatibility_warning_headers(&mut response, &warnings);
+
+        let values: Vec<_> = response
+            .headers()
+            .get_all("x-proxy-compat-warning")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(values, vec!["first warning", "second warning with newline"]);
+    }
 }

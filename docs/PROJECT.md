@@ -29,7 +29,8 @@ llm-universal-proxy/
 └── docs/
     ├── DESIGN.md
     ├── PROJECT.md (this file)
-    └── protocol-baselines/     # Official protocol reference baselines (source + date in each file)
+    ├── protocol-baselines/     # Official protocol reference baselines (source + date in each file)
+    └── protocol-compatibility-matrix.md  # Field-level mapping, degradations, and unsupported cases
         ├── README.md           # Index, source URLs, capture date
         ├── openai-chat-completions.md
         ├── openai-responses.md
@@ -63,6 +64,44 @@ We write or extend tests first, then implement to pass.
   - **Markdown report:** `test-reports/report-<timestamp>.md` and `test-reports/report-latest.md` (summary table, failed test names, log tail).
   - **JSON report:** `test-reports/report-<timestamp>.json` and `test-reports/report-latest.json` (timestamp, success, passed, failed, total, failed_tests).
 - **Make target:** `make test-report` runs the script. Use for CI or local verification with a single report artifact.
+
+## Compatibility policy
+
+- Cross-protocol translation is intentionally conservative: preserve downstream behavior first, even when the exact upstream wire shape cannot be reproduced.
+- When the proxy must drop or approximate request semantics, it should emit `x-proxy-compat-warning` response headers and matching server log warnings instead of silently pretending to provide 1:1 fidelity.
+- Field-level degradations and unsupported cases are tracked in [protocol-compatibility-matrix.md](/home/percy/works/llm-universal-proxy/docs/protocol-compatibility-matrix.md).
+
+## Codex custom-model guidance
+
+- Codex can bypass fallback model metadata for unknown custom model slugs by setting config overrides at launch time.
+- The two relevant overrides are:
+  - `model_context_window`: the model's real maximum context window, in tokens.
+  - `model_auto_compact_token_limit`: the absolute token count at which Codex should trigger auto-compaction.
+- This matters for proxy deployments because custom slugs such as `codex-anthropic` or `claude-local` are not present in Codex's built-in model registry. When that happens, Codex warns that model metadata was not found and falls back to:
+  - `context_window = 272000`
+  - `auto_compact_token_limit = None`
+  - `effective_context_window_percent = 95`
+- In fallback mode, the UI and some context calculations treat the usable window as roughly `272000 * 95% = 258400`, but auto-compaction does not trigger from that percentage alone. If `model_auto_compact_token_limit` is unset, Codex effectively uses no automatic compaction threshold.
+- Recommended launch-time override pattern:
+
+```bash
+codex resume \
+  -c 'model="codex-anthropic"' \
+  -c 'model_provider="my-proxy"' \
+  -c 'model_context_window=128000' \
+  -c 'model_auto_compact_token_limit=110000'
+```
+
+- Recommended sizing rules:
+  - Set `model_context_window` to the upstream model's real published limit, not Codex's fallback `272000`.
+  - Set `model_auto_compact_token_limit` to a conservative absolute threshold below the real limit.
+  - A practical default is `85%` to `92%` of the real context window.
+  - If the upstream is known to add significant hidden prompt overhead, use the lower end of that range.
+- Example thresholds:
+  - Real window `128000` -> start with `model_auto_compact_token_limit=105000` to `115000`
+  - Real window `200000` -> start with `model_auto_compact_token_limit=170000` to `184000`
+  - Real window `256000` -> start with `model_auto_compact_token_limit=218000` to `235000`
+- If you want behavior closer to official Codex-hosted models, always set both values together. Setting only `model_context_window` improves the status display, but does not by itself define when auto-compaction starts.
 
 ## Rust version
 

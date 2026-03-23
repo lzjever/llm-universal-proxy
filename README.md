@@ -43,6 +43,41 @@ This is a real Codex CLI session using a local alias routed to `GLM-5-Turbo` thr
 - **Cross-provider protocol bridge**: You can place Anthropic-compatible, OpenAI-compatible, and Gemini-style upstreams behind one consistent interface instead of teaching each client multiple protocols.
 - **Built-in observability for analysis**: `usage` hooks export metering data; `exchange` hooks export full client-facing query/response pairs. That makes it practical to persist production traffic for auditing, analytics, evaluation, or later model-training pipelines.
 
+## Client Namespace Map
+
+Use the namespace that matches the client protocol instead of the upstream vendor:
+
+| Client | Namespace | Typical Use |
+|------|------|------|
+| Codex CLI | `/openai/v1` | Responses client in front of Anthropic or OpenAI-compatible coding models |
+| Claude Code | `/anthropic/v1` | Anthropic Messages client in front of Anthropic-compatible upstreams |
+| Gemini CLI | `/google/v1beta` | Gemini-native client in front of Google-style or translated upstreams |
+
+## Codex With GLM-5-Turbo
+
+When Codex uses a custom local model alias through the proxy, Codex may fall back to built-in default metadata for unknown model names. That fallback assumes a `272000` token window and does not set an automatic compaction threshold, which can make auto-compact happen too late or not at all.
+
+For `GLM-5-Turbo`, set both values explicitly at launch time:
+
+```bash
+HOME="/tmp/tmp-codex" GLM_APIKEY='...' codex resume --yolo \
+  -C /path/to/worktree \
+  -c 'model="claude-local"' \
+  -c 'model_provider="glm-proxy"' \
+  -c 'model_providers.glm-proxy.name="GLM Proxy"' \
+  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:18149/openai/v1"' \
+  -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
+  -c 'model_providers.glm-proxy.wire_api="responses"' \
+  -c 'model_context_window=200000' \
+  -c 'model_auto_compact_token_limit=176000'
+```
+
+Recommended thresholds for `GLM-5-Turbo`:
+- Default: `176000` (`88%` of 200k)
+- More conservative: `170000`
+- More aggressive: `184000`
+
+Set `model_context_window` to the real upstream limit and tune only `model_auto_compact_token_limit` if you want compaction earlier or later.
 ## Installation
 
 ### Download Binary

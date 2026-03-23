@@ -383,6 +383,59 @@ async fn openai_namespace_chat_completions_works() {
 }
 
 #[tokio::test]
+async fn openai_namespace_chat_completions_accepts_gzip_upstream_json() {
+    async fn gzip_openai_handler() -> Response {
+        let compressed = vec![
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 77, 142, 93, 14, 130, 64, 12, 132, 239,
+            50, 207, 96, 212, 199, 61, 129, 119, 48, 134, 172, 75, 133, 10, 108, 9, 173,
+            137, 145, 112, 119, 139, 241, 239, 169, 201, 124, 51, 157, 153, 193, 53, 2,
+            82, 27, 45, 13, 99, 95, 54, 15, 30, 81, 64, 206, 87, 74, 246, 6, 155, 36, 142,
+            200, 88, 178, 163, 52, 81, 52, 242, 208, 174, 192, 32, 53, 245, 238, 90, 83,
+            229, 32, 169, 91, 121, 43, 156, 72, 17, 142, 51, 56, 215, 116, 71, 216, 186,
+            147, 84, 99, 67, 8, 51, 38, 233, 253, 34, 170, 178, 90, 204, 182, 102, 36, 27,
+            229, 181, 239, 192, 88, 10, 92, 56, 179, 182, 149, 55, 169, 119, 6, 168, 201,
+            136, 229, 84, 224, 246, 121, 50, 78, 190, 201, 42, 147, 142, 178, 190, 182,
+            252, 70, 254, 171, 38, 22, 251, 175, 176, 95, 150, 39, 28, 44, 142, 26, 241,
+            0, 0, 0,
+        ];
+        Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .header("Content-Encoding", "gzip")
+            .body(Body::from(compressed))
+            .unwrap()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(gzip_openai_handler))
+        .route("/chat/completions", post(gzip_openai_handler));
+    let _mock = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let mock_base = format!("http://127.0.0.1:{}", port);
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["message"]["content"], "Hi");
+}
+
+#[tokio::test]
 async fn openai_namespace_responses_works() {
     let (mock_base, _mock) = spawn_openai_responses_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);

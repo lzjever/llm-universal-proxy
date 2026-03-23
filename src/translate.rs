@@ -95,6 +95,15 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
     if finish_reason == "tool_use" {
         finish_reason = "tool_calls".to_string();
     }
+    if finish_reason == "model_context_window_exceeded" {
+        finish_reason = "context_length_exceeded".to_string();
+    }
+    if finish_reason == "pause_turn" {
+        finish_reason = "pause_turn".to_string();
+    }
+    if finish_reason == "refusal" {
+        finish_reason = "content_filter".to_string();
+    }
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!(format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()))),
         "object": "chat.completion",
@@ -299,6 +308,14 @@ fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
         .to_string();
     if finish == "tool_calls" {
         finish = "tool_use".to_string();
+    } else if finish == "length" {
+        finish = "max_tokens".to_string();
+    } else if finish == "content_filter" {
+        finish = "refusal".to_string();
+    } else if finish == "context_length_exceeded" {
+        finish = "model_context_window_exceeded".to_string();
+    } else if finish == "pause_turn" {
+        finish = "pause_turn".to_string();
     }
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or(serde_json::Value::Null),
@@ -461,12 +478,24 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
             .unwrap()
             .as_secs())
     });
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
+    let incomplete_reason = match finish_reason {
+        "length" => Some("max_output_tokens"),
+        "content_filter" => Some("content_filter"),
+        "pause_turn" => Some("pause_turn"),
+        _ => None,
+    };
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or(serde_json::Value::Null),
         "object": "response",
         "created_at": created_at,
         "output": output,
-        "status": "completed"
+        "status": if incomplete_reason.is_some() { "incomplete" } else { "completed" },
+        "incomplete_details": incomplete_reason.map(|reason| serde_json::json!({ "reason": reason })).unwrap_or(serde_json::Value::Null),
+        "error": serde_json::Value::Null
     });
     if let Some(u) = body.get("usage") {
         result["usage"] = openai_usage_to_responses_usage(u);
@@ -654,6 +683,16 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
     }
     flush_assistant(&mut messages, &mut current_assistant);
     body["messages"] = Value::Array(messages);
+    if let Some(tool_choice) = body.get("tool_choice").cloned() {
+        if let Some(mapped_tool_choice) = responses_tool_choice_to_openai_tool_choice(&tool_choice) {
+            body["tool_choice"] = mapped_tool_choice;
+        } else if let Some(obj) = body.as_object_mut() {
+            obj.remove("tool_choice");
+        }
+    }
+    if let Some(parallel_tool_calls) = body.get("parallel_tool_calls").cloned() {
+        body["parallel_tool_calls"] = parallel_tool_calls;
+    }
 
     // Convert tools from Responses API format to Chat Completions format
     // Responses: { "name": "...", "description": "...", "parameters": {...} }
@@ -798,10 +837,61 @@ fn messages_to_responses(body: &mut Value) -> Result<(), String> {
     }
     body["input"] = Value::Array(input);
     body["instructions"] = Value::String(instructions);
+    if let Some(tool_choice) = body.get("tool_choice").cloned() {
+        if let Some(mapped_tool_choice) = openai_tool_choice_to_responses_tool_choice(&tool_choice)
+        {
+            body["tool_choice"] = mapped_tool_choice;
+        } else if let Some(obj) = body.as_object_mut() {
+            obj.remove("tool_choice");
+        }
+    }
+    if let Some(parallel_tool_calls) = body.get("parallel_tool_calls").cloned() {
+        body["parallel_tool_calls"] = parallel_tool_calls;
+    }
     if let Some(obj) = body.as_object_mut() {
         obj.remove("messages");
     }
     Ok(())
+}
+
+fn responses_tool_choice_to_openai_tool_choice(choice: &Value) -> Option<Value> {
+    if choice.is_string() {
+        return Some(choice.clone());
+    }
+    let obj = choice.as_object()?;
+    let ty = obj.get("type").and_then(Value::as_str)?;
+    match ty {
+        "function" => {
+            let name = obj
+                .get("name")
+                .or_else(|| obj.get("function").and_then(|f| f.get("name")))?;
+            Some(serde_json::json!({
+                "type": "function",
+                "function": { "name": name }
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn openai_tool_choice_to_responses_tool_choice(choice: &Value) -> Option<Value> {
+    if choice.is_string() {
+        return Some(choice.clone());
+    }
+    let obj = choice.as_object()?;
+    let ty = obj.get("type").and_then(Value::as_str)?;
+    match ty {
+        "function" => {
+            let name = obj
+                .get("name")
+                .or_else(|| obj.get("function").and_then(|f| f.get("name")))?;
+            Some(serde_json::json!({
+                "type": "function",
+                "name": name
+            }))
+        }
+        _ => None,
+    }
 }
 
 fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -> Vec<Value> {
@@ -970,6 +1060,20 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
     if let Some(t) = body.get("temperature") {
         result["temperature"] = t.clone();
     }
+    if let Some(tp) = body.get("top_p") {
+        result["top_p"] = tp.clone();
+    }
+    if let Some(stop_sequences) = body.get("stop_sequences") {
+        result["stop"] = if stop_sequences
+            .as_array()
+            .map(|arr| arr.len() == 1)
+            .unwrap_or(false)
+        {
+            stop_sequences[0].clone()
+        } else {
+            stop_sequences.clone()
+        };
+    }
     // System: strip cache_control from blocks
     // Reference: 9router claudeHelper.js - remove all cache_control, add only to last block
     if let Some(system) = body.get("system") {
@@ -1091,16 +1195,7 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
     if !tool_results.is_empty() {
         let mut out: Vec<Value> = tool_results;
         if !parts.is_empty() {
-            let content = if parts.len() == 1
-                && parts[0].get("type").and_then(Value::as_str) == Some("text")
-            {
-                parts[0]
-                    .get("text")
-                    .cloned()
-                    .unwrap_or(Value::String(String::new()))
-            } else {
-                Value::Array(parts)
-            };
+            let content = collapse_claude_text_parts_for_openai(&parts);
             out.push(serde_json::json!({ "role": "user", "content": content }));
         }
         return Some(out);
@@ -1108,16 +1203,7 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
     if !tool_calls.is_empty() {
         let mut m = serde_json::json!({ "role": "assistant", "tool_calls": tool_calls });
         if !parts.is_empty() {
-            m["content"] = if parts.len() == 1
-                && parts[0].get("type").and_then(Value::as_str) == Some("text")
-            {
-                parts[0]
-                    .get("text")
-                    .cloned()
-                    .unwrap_or(Value::String(String::new()))
-            } else {
-                Value::Array(parts)
-            };
+            m["content"] = collapse_claude_text_parts_for_openai(&parts);
         }
         return Some(vec![m]);
     }
@@ -1126,18 +1212,25 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
             serde_json::json!({ "role": openai_role, "content": "" }),
         ]);
     }
-    let content =
-        if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text") {
-            parts[0]
-                .get("text")
-                .cloned()
-                .unwrap_or(Value::String(String::new()))
-        } else {
-            Value::Array(parts)
-        };
+    let content = collapse_claude_text_parts_for_openai(&parts);
     Some(vec![
         serde_json::json!({ "role": openai_role, "content": content }),
     ])
+}
+
+fn collapse_claude_text_parts_for_openai(parts: &[Value]) -> Value {
+    let all_text = parts
+        .iter()
+        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"));
+    if all_text {
+        return Value::String(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<String>(),
+        );
+    }
+    Value::Array(parts.to_vec())
 }
 
 fn openai_to_claude(body: &mut Value) -> Result<(), String> {
@@ -1149,6 +1242,31 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
     });
     if let Some(t) = body.get("temperature") {
         result["temperature"] = t.clone();
+    }
+    if let Some(tp) = body.get("top_p") {
+        result["top_p"] = tp.clone();
+    }
+    if let Some(stop) = body.get("stop") {
+        result["stop_sequences"] = if stop.is_array() {
+            stop.clone()
+        } else {
+            Value::Array(vec![stop.clone()])
+        };
+    }
+    if let Some(metadata) = body.get("metadata") {
+        result["metadata"] = metadata.clone();
+    }
+    if let Some(tool_choice) = body.get("tool_choice") {
+        if let Some(mapped_tool_choice) =
+            openai_tool_choice_to_claude_tool_choice(tool_choice, body.get("parallel_tool_calls"))
+        {
+            result["tool_choice"] = mapped_tool_choice;
+        }
+    } else if body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+        && body.get("tools").and_then(Value::as_array).map(|t| !t.is_empty()).unwrap_or(false)
+    {
+        result["tool_choice"] =
+            serde_json::json!({ "type": "auto", "disable_parallel_tool_use": true });
     }
     let messages = body
         .get("messages")
@@ -1233,6 +1351,38 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
     }
     *body = result;
     Ok(())
+}
+
+fn openai_tool_choice_to_claude_tool_choice(
+    choice: &Value,
+    parallel_tool_calls: Option<&Value>,
+) -> Option<Value> {
+    let disable_parallel_tool_use = parallel_tool_calls.and_then(Value::as_bool) == Some(false);
+    let mut mapped = if let Some(choice_str) = choice.as_str() {
+        match choice_str {
+            "none" => serde_json::json!({ "type": "none" }),
+            "auto" => serde_json::json!({ "type": "auto" }),
+            "required" => serde_json::json!({ "type": "any" }),
+            _ => return None,
+        }
+    } else {
+        let obj = choice.as_object()?;
+        let ty = obj.get("type").and_then(Value::as_str)?;
+        match ty {
+            "function" => {
+                let name = obj
+                    .get("name")
+                    .or_else(|| obj.get("function").and_then(|f| f.get("name")))?;
+                serde_json::json!({ "type": "tool", "name": name })
+            }
+            _ => return None,
+        }
+    };
+
+    if disable_parallel_tool_use && mapped.get("type").and_then(Value::as_str) != Some("none") {
+        mapped["disable_parallel_tool_use"] = Value::Bool(true);
+    }
+    Some(mapped)
 }
 
 fn extract_text_content(content: Option<&Value>) -> String {
@@ -1766,6 +1916,27 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_responses_to_openai_maps_tool_choice_and_parallel_calls() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "tool_choice": { "type": "function", "name": "lookup" },
+            "parallel_tool_calls": false
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["function"]["name"], "lookup");
+        assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
     fn translate_request_openai_to_claude_has_system_and_messages() {
         let mut body = json!({
             "model": "claude-3",
@@ -1793,6 +1964,49 @@ mod tests {
         assert_eq!(system[0]["cache_control"]["ttl"], "1h");
         assert!(body.get("messages").is_some());
         assert!(!body["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn translate_request_openai_to_claude_maps_tool_choice_and_parallel_calls() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tool_choice": { "type": "function", "function": { "name": "lookup" } },
+            "parallel_tool_calls": false
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "lookup");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+    }
+
+    #[test]
+    fn translate_request_openai_to_claude_preserves_top_p_stop_and_metadata() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "top_p": 0.7,
+            "stop": ["END"],
+            "metadata": { "trace_id": "abc" }
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["top_p"], 0.7);
+        assert_eq!(body["stop_sequences"][0], "END");
+        assert_eq!(body["metadata"]["trace_id"], "abc");
     }
 
     #[test]
@@ -1834,6 +2048,27 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_openai_to_responses_maps_tool_choice() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tool_choice": { "type": "function", "function": { "name": "lookup" } },
+            "parallel_tool_calls": false
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["name"], "lookup");
+        assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
     fn translate_request_claude_to_openai_omitted_stream_defaults_false() {
         let mut body = json!({
             "model": "claude-3",
@@ -1848,6 +2083,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn translate_request_claude_to_openai_collapses_text_blocks_to_string() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "alpha\n" },
+                    { "type": "text", "text": "beta" }
+                ]
+            }]
+        });
+        translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["messages"][0]["content"], "alpha\nbeta");
+    }
+
+    #[test]
+    fn translate_request_claude_to_openai_drops_metadata_for_compatibility() {
+        let mut body = json!({
+            "model": "claude-3",
+            "metadata": { "user_id": "abc" },
+            "messages": [{ "role": "user", "content": "Hi" }]
+        });
+        translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        assert!(body.get("metadata").is_none());
     }
 
     #[test]
@@ -1922,6 +2198,57 @@ mod tests {
     }
 
     #[test]
+    fn translate_response_claude_context_window_stop_maps_to_openai_error_reason() {
+        let body = json!({
+            "id": "msg_1",
+            "content": [{ "type": "text", "text": "" }],
+            "stop_reason": "model_context_window_exceeded",
+            "model": "claude-3"
+        });
+        let out = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["choices"][0]["finish_reason"], "context_length_exceeded");
+    }
+
+    #[test]
+    fn translate_response_claude_refusal_maps_to_content_filter() {
+        let body = json!({
+            "id": "msg_1",
+            "content": [{ "type": "text", "text": "I can't help with that." }],
+            "stop_reason": "refusal",
+            "model": "claude-3"
+        });
+        let out = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn translate_response_claude_pause_turn_maps_to_pause_turn_finish() {
+        let body = json!({
+            "id": "msg_1",
+            "content": [{ "type": "text", "text": "" }],
+            "stop_reason": "pause_turn",
+            "model": "claude-3"
+        });
+        let out = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["choices"][0]["finish_reason"], "pause_turn");
+    }
+
+    #[test]
     fn translate_response_openai_to_claude_has_content_array() {
         let body = json!({
             "id": "chatcmpl-1",
@@ -1940,6 +2267,57 @@ mod tests {
             .unwrap()
             .iter()
             .any(|b| b.get("type").and_then(Value::as_str) == Some("text")));
+    }
+
+    #[test]
+    fn translate_response_openai_error_finishes_to_claude_stop_reasons() {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "choices": [{ "message": { "role": "assistant", "content": "" }, "finish_reason": "context_length_exceeded" }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["stop_reason"], "model_context_window_exceeded");
+    }
+
+    #[test]
+    fn translate_response_openai_pause_turn_to_claude_stop_reason() {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "choices": [{ "message": { "role": "assistant", "content": "" }, "finish_reason": "pause_turn" }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["stop_reason"], "pause_turn");
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_maps_pause_turn_to_incomplete() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "" },
+                "finish_reason": "pause_turn"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "pause_turn");
     }
 
     #[test]
@@ -2029,6 +2407,48 @@ mod tests {
         assert_eq!(out["output"][0]["type"], "reasoning");
         assert_eq!(out["output"][0]["summary"][0]["text"], "thinking");
         assert_eq!(out["output"][1]["type"], "message");
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_maps_length_to_incomplete() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "length"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_maps_content_filter_to_incomplete() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "content_filter"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "content_filter");
     }
 
     #[test]
