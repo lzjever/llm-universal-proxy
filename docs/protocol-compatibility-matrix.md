@@ -95,3 +95,9 @@
 - For Codex and other Responses-native clients, normalize hard failures into `response.failed` and truncations into `response.incomplete`; downstream behavior is better than returning a superficially successful `response.completed`.
 - When a field is dropped intentionally, prefer documenting it over inventing unsupported wire shapes.
 - When a request requires degradation, inspect `x-proxy-compat-warning` response headers or server logs; the proxy emits one warning per dropped or approximated feature.
+- For Codex custom model slugs that are not in Codex's built-in model registry, avoid fallback metadata by passing explicit launch-time overrides such as `-c 'model_context_window=128000'` and `-c 'model_auto_compact_token_limit=110000'`.
+- Codex fallback metadata currently assumes `context_window=272000`, `effective_context_window_percent=95`, and `auto_compact_token_limit=None`. That fallback can make context status and auto-compaction timing drift far from the upstream model's real limits.
+- `model_context_window` and `model_auto_compact_token_limit` are independent controls:
+  - `model_context_window` tells Codex how large the model window is.
+  - `model_auto_compact_token_limit` is the absolute total-token threshold that actually triggers automatic compaction.
+- For proxy-backed custom models, set `model_auto_compact_token_limit` to roughly `85%` to `92%` of the real upstream window unless you have provider-specific evidence that a tighter or looser threshold is safe.
