@@ -15,11 +15,13 @@ use axum::{
 };
 use bytes::Bytes;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 
-use crate::config::{AuthPolicy, Config, UpstreamConfig};
+use crate::config::{AuthPolicy, Config, RuntimeConfigPayload, UpstreamConfig};
 use crate::dashboard::run_dashboard;
 use crate::discovery::UpstreamCapability;
 use crate::hooks::{
@@ -31,6 +33,8 @@ use crate::telemetry::RuntimeMetrics;
 use crate::translate::{translate_request, translate_response};
 use crate::upstream;
 use futures_util::StreamExt;
+
+const DEFAULT_NAMESPACE: &str = "default";
 
 pub async fn run_with_config_path(
     path: impl AsRef<std::path::Path>,
@@ -62,9 +66,11 @@ async fn run_internal(
     config: Config,
     dashboard_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    config
-        .validate()
-        .map_err(|e| format!("invalid config: {}", e))?;
+    if !config.upstreams.is_empty() {
+        config
+            .validate()
+            .map_err(|e| format!("invalid config: {}", e))?;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -90,17 +96,15 @@ pub async fn run_with_listener(
     config: Config,
     listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    config
-        .validate()
-        .map_err(|e| format!("invalid config: {}", e))?;
-    let upstreams = resolve_upstreams(&config).await;
-    let client = upstream::build_client(&config);
+    if !config.upstreams.is_empty() {
+        config
+            .validate()
+            .map_err(|e| format!("invalid config: {}", e))?;
+    }
     let metrics = RuntimeMetrics::new(&config);
+    let runtime = build_runtime_state(config, None).await?;
     let state = Arc::new(AppState {
-        config: config.clone(),
-        upstreams,
-        client,
-        hooks: HookDispatcher::new(&config.hooks),
+        runtime: Arc::new(RwLock::new(runtime)),
         metrics,
     });
     run_server(state, listener).await
@@ -110,22 +114,20 @@ pub async fn run_with_listener_and_dashboard(
     config: Config,
     listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    config
-        .validate()
-        .map_err(|e| format!("invalid config: {}", e))?;
-    let upstreams = resolve_upstreams(&config).await;
-    let client = upstream::build_client(&config);
+    if !config.upstreams.is_empty() {
+        config
+            .validate()
+            .map_err(|e| format!("invalid config: {}", e))?;
+    }
     let metrics = RuntimeMetrics::new(&config);
+    let runtime = build_runtime_state(config.clone(), None).await?;
     let state = Arc::new(AppState {
-        config: config.clone(),
-        upstreams,
-        client,
-        hooks: HookDispatcher::new(&config.hooks),
+        runtime: Arc::new(RwLock::new(runtime)),
         metrics: metrics.clone(),
     });
     let server_state = state.clone();
     let config = Arc::new(config);
-    let dashboard_hooks = state.hooks.clone();
+    let dashboard_hooks = HookDispatcher::new(&config.hooks);
     let mut server = tokio::spawn(async move { run_server(server_state, listener).await });
     tokio::select! {
         server_result = &mut server => {
@@ -154,6 +156,15 @@ async fn run_server(
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/admin/state", get(handle_admin_state))
+        .route(
+            "/admin/namespaces/:namespace/config",
+            post(handle_admin_namespace_config),
+        )
+        .route(
+            "/admin/namespaces/:namespace/state",
+            get(handle_admin_namespace_state),
+        )
         .route(
             "/openai/v1/chat/completions",
             post(handle_openai_chat_completions),
@@ -166,8 +177,44 @@ async fn run_server(
         .route("/anthropic/v1/models/:id", get(handle_anthropic_model))
         .route("/google/v1beta/models", get(handle_google_models))
         .route(
+            "/namespaces/:namespace/openai/v1/chat/completions",
+            post(handle_openai_chat_completions_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/responses",
+            post(handle_openai_responses_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/models",
+            get(handle_openai_models_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/models/:id",
+            get(handle_openai_model_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/anthropic/v1/messages",
+            post(handle_anthropic_messages_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/anthropic/v1/models",
+            get(handle_anthropic_models_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/anthropic/v1/models/:id",
+            get(handle_anthropic_model_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/google/v1beta/models",
+            get(handle_google_models_namespaced),
+        )
+        .route(
             "/google/v1beta/models/:id",
             get(handle_google_model).post(handle_google_model_action),
+        )
+        .route(
+            "/namespaces/:namespace/google/v1beta/models/:id",
+            get(handle_google_model_namespaced).post(handle_google_model_action_namespaced),
         )
         .layer(cors)
         .with_state(state);
@@ -178,10 +225,7 @@ async fn run_server(
 
 #[derive(Clone)]
 struct AppState {
-    config: Config,
-    upstreams: BTreeMap<String, UpstreamState>,
-    client: Client,
-    hooks: Option<HookDispatcher>,
+    runtime: Arc<RwLock<RuntimeState>>,
     metrics: Arc<RuntimeMetrics>,
 }
 
@@ -189,6 +233,99 @@ struct AppState {
 struct UpstreamState {
     config: UpstreamConfig,
     capability: UpstreamCapability,
+}
+
+#[derive(Clone)]
+struct RuntimeNamespaceState {
+    revision: String,
+    config: Config,
+    upstreams: BTreeMap<String, UpstreamState>,
+    client: Client,
+    hooks: Option<HookDispatcher>,
+}
+
+#[derive(Default)]
+struct RuntimeState {
+    namespaces: BTreeMap<String, RuntimeNamespaceState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeNamespaceSummary {
+    namespace: String,
+    revision: String,
+    upstream_count: usize,
+    model_alias_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeStateResponse {
+    namespaces: Vec<RuntimeNamespaceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NamespaceStateResponse {
+    namespace: String,
+    revision: String,
+    config: RuntimeConfigPayload,
+    upstreams: Vec<NamespaceUpstreamStateResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NamespaceUpstreamStateResponse {
+    name: String,
+    api_root: String,
+    fixed_upstream_format: Option<crate::formats::UpstreamFormat>,
+    supported_formats: Vec<crate::formats::UpstreamFormat>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AdminConfigRequest {
+    revision: String,
+    config: RuntimeConfigPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AdminConfigResponse {
+    namespace: String,
+    revision: String,
+    status: &'static str,
+}
+
+async fn build_runtime_namespace_state(
+    revision: String,
+    config: Config,
+) -> Result<RuntimeNamespaceState, String> {
+    if !config.upstreams.is_empty() {
+        config.validate()?;
+    }
+    let upstreams = resolve_upstreams(&config).await;
+    let client = upstream::build_client(&config);
+    let hooks = HookDispatcher::new(&config.hooks);
+    Ok(RuntimeNamespaceState {
+        revision,
+        config,
+        upstreams,
+        client,
+        hooks,
+    })
+}
+
+async fn build_runtime_state(
+    config: Config,
+    revision: Option<String>,
+) -> Result<RuntimeState, String> {
+    let mut state = RuntimeState::default();
+    if !config.upstreams.is_empty() {
+        state.namespaces.insert(
+            DEFAULT_NAMESPACE.to_string(),
+            build_runtime_namespace_state(
+                revision.unwrap_or_else(|| "startup".to_string()),
+                config,
+            )
+            .await?,
+        );
+    }
+    Ok(state)
 }
 
 #[derive(Clone)]
@@ -262,6 +399,102 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }
 
+async fn handle_admin_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let runtime = state.runtime.read().await;
+    let namespaces = runtime
+        .namespaces
+        .iter()
+        .map(|(namespace, item)| RuntimeNamespaceSummary {
+            namespace: namespace.clone(),
+            revision: item.revision.clone(),
+            upstream_count: item.config.upstreams.len(),
+            model_alias_count: item.config.model_aliases.len(),
+        })
+        .collect::<Vec<_>>();
+    (StatusCode::OK, Json(RuntimeStateResponse { namespaces })).into_response()
+}
+
+async fn handle_admin_namespace_state(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+) -> impl IntoResponse {
+    let runtime = state.runtime.read().await;
+    let Some(item) = runtime.namespaces.get(&namespace) else {
+        return error_response(
+            crate::formats::UpstreamFormat::OpenAiCompletion,
+            StatusCode::NOT_FOUND,
+            "namespace not found",
+        );
+    };
+    let upstreams = item
+        .upstreams
+        .values()
+        .map(|upstream| NamespaceUpstreamStateResponse {
+            name: upstream.config.name.clone(),
+            api_root: upstream.config.api_root.clone(),
+            fixed_upstream_format: upstream.config.fixed_upstream_format,
+            supported_formats: upstream.capability.supported.iter().copied().collect(),
+        })
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        Json(NamespaceStateResponse {
+            namespace,
+            revision: item.revision.clone(),
+            config: RuntimeConfigPayload::from(&item.config),
+            upstreams,
+        }),
+    )
+        .into_response()
+}
+
+async fn handle_admin_namespace_config(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    Json(payload): Json<AdminConfigRequest>,
+) -> impl IntoResponse {
+    let config = match Config::try_from(payload.config) {
+        Ok(config) => config,
+        Err(error) => {
+            return error_response(
+                crate::formats::UpstreamFormat::OpenAiCompletion,
+                StatusCode::BAD_REQUEST,
+                &format!("invalid runtime config: {error}"),
+            );
+        }
+    };
+    let namespace_state = match build_runtime_namespace_state(payload.revision.clone(), config).await {
+        Ok(state) => state,
+        Err(error) => {
+            return error_response(
+                crate::formats::UpstreamFormat::OpenAiCompletion,
+                StatusCode::BAD_REQUEST,
+                &format!("failed to resolve namespace config: {error}"),
+            );
+        }
+    };
+    let mut runtime = state.runtime.write().await;
+    if let Some(current) = runtime.namespaces.get(&namespace) {
+        if current.revision >= payload.revision {
+            return error_response(
+                crate::formats::UpstreamFormat::OpenAiCompletion,
+                StatusCode::CONFLICT,
+                "stale or duplicate revision",
+            );
+        }
+    }
+    runtime.namespaces.insert(namespace.clone(), namespace_state);
+    (
+        StatusCode::OK,
+        Json(AdminConfigResponse {
+            namespace,
+            revision: payload.revision,
+            status: "applied",
+        }),
+    )
+        .into_response()
+}
+
 async fn resolve_upstreams(config: &Config) -> BTreeMap<String, UpstreamState> {
     let mut upstreams = BTreeMap::new();
     for upstream in &config.upstreams {
@@ -297,6 +530,24 @@ async fn handle_openai_chat_completions(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    handle_openai_chat_completions_inner(state, DEFAULT_NAMESPACE.to_string(), headers, body).await
+}
+
+async fn handle_openai_chat_completions_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    handle_openai_chat_completions_inner(state, namespace, headers, body).await
+}
+
+async fn handle_openai_chat_completions_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    headers: HeaderMap,
+    body: Value,
+) -> Response<Body> {
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -304,6 +555,7 @@ async fn handle_openai_chat_completions(
         .to_string();
     handle_request_core(
         state,
+        namespace,
         headers,
         "/openai/v1/chat/completions".to_string(),
         body,
@@ -319,6 +571,24 @@ async fn handle_openai_responses(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    handle_openai_responses_inner(state, DEFAULT_NAMESPACE.to_string(), headers, body).await
+}
+
+async fn handle_openai_responses_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    handle_openai_responses_inner(state, namespace, headers, body).await
+}
+
+async fn handle_openai_responses_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    headers: HeaderMap,
+    body: Value,
+) -> Response<Body> {
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -326,6 +596,7 @@ async fn handle_openai_responses(
         .to_string();
     handle_request_core(
         state,
+        namespace,
         headers,
         "/openai/v1/responses".to_string(),
         body,
@@ -341,6 +612,24 @@ async fn handle_anthropic_messages(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    handle_anthropic_messages_inner(state, DEFAULT_NAMESPACE.to_string(), headers, body).await
+}
+
+async fn handle_anthropic_messages_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    handle_anthropic_messages_inner(state, namespace, headers, body).await
+}
+
+async fn handle_anthropic_messages_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    headers: HeaderMap,
+    body: Value,
+) -> Response<Body> {
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -348,6 +637,7 @@ async fn handle_anthropic_messages(
         .to_string();
     handle_request_core(
         state,
+        namespace,
         headers,
         "/anthropic/v1/messages".to_string(),
         body,
@@ -364,6 +654,25 @@ async fn handle_google_model_action(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    handle_google_model_action_inner(state, DEFAULT_NAMESPACE.to_string(), id, headers, body).await
+}
+
+async fn handle_google_model_action_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    handle_google_model_action_inner(state, namespace, id, headers, body).await
+}
+
+async fn handle_google_model_action_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    id: String,
+    headers: HeaderMap,
+    body: Value,
+) -> Response<Body> {
     let Some((requested_model, action)) = id.split_once(':') else {
         return error_response(
             crate::formats::UpstreamFormat::Google,
@@ -384,6 +693,7 @@ async fn handle_google_model_action(
     };
     handle_request_core(
         state,
+        namespace,
         headers,
         format!("/google/v1beta/models/{id}"),
         body,
@@ -396,6 +706,7 @@ async fn handle_google_model_action(
 
 async fn handle_request_core(
     state: Arc<AppState>,
+    namespace: String,
     headers: HeaderMap,
     path: String,
     mut body: Value,
@@ -421,17 +732,31 @@ async fn handle_request_core(
         serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
     );
 
+    let namespace_state = {
+        let runtime = state.runtime.read().await;
+        match runtime.namespaces.get(&namespace) {
+            Some(item) => item.clone(),
+            None => {
+                return error_response(
+                    client_format,
+                    StatusCode::NOT_FOUND,
+                    &format!("namespace `{namespace}` is not configured"),
+                );
+            }
+        }
+    };
+
     let mut tracker = state
         .metrics
         .start_request(path.as_str(), requested_model.clone(), stream);
-    let resolved_model = match state.config.resolve_model(&requested_model) {
+    let resolved_model = match namespace_state.config.resolve_model(&requested_model) {
         Ok(v) => v,
         Err(e) => {
             tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
             return error_response(client_format, StatusCode::BAD_REQUEST, &e);
         }
     };
-    let upstream_state = match state.upstreams.get(&resolved_model.upstream_name) {
+    let upstream_state = match namespace_state.upstreams.get(&resolved_model.upstream_name) {
         Some(v) => v,
         None => {
             tracker.finish_error(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
@@ -494,7 +819,7 @@ async fn handle_request_core(
         &upstream_state.config.upstream_headers,
         upstream_format,
     );
-    let hook_ctx = state.hooks.as_ref().map(|_| HookRequestContext {
+    let hook_ctx = namespace_state.hooks.as_ref().map(|_| HookRequestContext {
         request_id,
         timestamp_ms: request_timestamp,
         path: path.clone(),
@@ -512,7 +837,7 @@ async fn handle_request_core(
     });
 
     let url = upstream::upstream_url(
-        &state.config,
+        &namespace_state.config,
         &upstream_state.config,
         upstream_format,
         if upstream_format == crate::formats::UpstreamFormat::Google {
@@ -523,7 +848,7 @@ async fn handle_request_core(
         stream,
     );
     debug!("Calling upstream URL: {}", url);
-    let res = match upstream::call_upstream(&state.client, &url, &body, stream, &auth_headers).await
+    let res = match upstream::call_upstream(&namespace_state.client, &url, &body, stream, &auth_headers).await
     {
         Ok(r) => r,
         Err(e) => {
@@ -561,7 +886,7 @@ async fn handle_request_core(
         } else {
             Box::pin(upstream_stream.map(|r| r.map_err(std::io::Error::other)))
         };
-        let body = if let (Some(dispatcher), Some(ctx)) = (state.hooks.clone(), hook_ctx.clone()) {
+        let body = if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.clone(), hook_ctx.clone()) {
             let captured =
                 dispatcher.wrap_stream(body_stream, ctx, status.as_u16(), sse_response_headers());
             Body::from_stream(TrackedBodyStream::new(captured, tracker, status.as_u16()))
@@ -620,7 +945,7 @@ async fn handle_request_core(
             return error_response(client_format, StatusCode::INTERNAL_SERVER_ERROR, &e);
         }
     };
-    if let (Some(dispatcher), Some(ctx)) = (state.hooks.as_ref(), hook_ctx) {
+    if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.as_ref(), hook_ctx) {
         dispatcher.emit_non_stream(ctx, 200, json_response_headers(), out.clone());
     }
     tracker.finish_success(StatusCode::OK.as_u16());
@@ -628,14 +953,54 @@ async fn handle_request_core(
 }
 
 async fn handle_openai_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    (StatusCode::OK, Json(openai_model_list(&state.config))).into_response()
+    handle_openai_models_inner(state, DEFAULT_NAMESPACE.to_string()).await
+}
+
+async fn handle_openai_models_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+) -> impl IntoResponse {
+    handle_openai_models_inner(state, namespace).await
+}
+
+async fn handle_openai_models_inner(state: Arc<AppState>, namespace: String) -> Response<Body> {
+    match namespace_config(&state, &namespace).await {
+        Some(config) => (StatusCode::OK, Json(openai_model_list(&config))).into_response(),
+        None => error_response(
+            crate::formats::UpstreamFormat::OpenAiCompletion,
+            StatusCode::NOT_FOUND,
+            "namespace not found",
+        ),
+    }
 }
 
 async fn handle_openai_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match openai_model_object(&state.config, &id) {
+    handle_openai_model_inner(state, DEFAULT_NAMESPACE.to_string(), id).await
+}
+
+async fn handle_openai_model_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    handle_openai_model_inner(state, namespace, id).await
+}
+
+async fn handle_openai_model_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    id: String,
+) -> Response<Body> {
+    let Some(config) = namespace_config(&state, &namespace).await else {
+        return error_response(
+            crate::formats::UpstreamFormat::OpenAiCompletion,
+            StatusCode::NOT_FOUND,
+            "namespace not found",
+        );
+    };
+    match openai_model_object(&config, &id) {
         Some(model) => (StatusCode::OK, Json(model)).into_response(),
         None => error_response(
             crate::formats::UpstreamFormat::OpenAiCompletion,
@@ -646,14 +1011,57 @@ async fn handle_openai_model(
 }
 
 async fn handle_anthropic_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    (StatusCode::OK, Json(anthropic_model_list(&state.config))).into_response()
+    handle_anthropic_models_inner(state, DEFAULT_NAMESPACE.to_string()).await
+}
+
+async fn handle_anthropic_models_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+) -> impl IntoResponse {
+    handle_anthropic_models_inner(state, namespace).await
+}
+
+async fn handle_anthropic_models_inner(
+    state: Arc<AppState>,
+    namespace: String,
+) -> Response<Body> {
+    match namespace_config(&state, &namespace).await {
+        Some(config) => (StatusCode::OK, Json(anthropic_model_list(&config))).into_response(),
+        None => error_response(
+            crate::formats::UpstreamFormat::Anthropic,
+            StatusCode::NOT_FOUND,
+            "namespace not found",
+        ),
+    }
 }
 
 async fn handle_anthropic_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match anthropic_model_object(&state.config, &id) {
+    handle_anthropic_model_inner(state, DEFAULT_NAMESPACE.to_string(), id).await
+}
+
+async fn handle_anthropic_model_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    handle_anthropic_model_inner(state, namespace, id).await
+}
+
+async fn handle_anthropic_model_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    id: String,
+) -> Response<Body> {
+    let Some(config) = namespace_config(&state, &namespace).await else {
+        return error_response(
+            crate::formats::UpstreamFormat::Anthropic,
+            StatusCode::NOT_FOUND,
+            "namespace not found",
+        );
+    };
+    match anthropic_model_object(&config, &id) {
         Some(model) => (StatusCode::OK, Json(model)).into_response(),
         None => error_response(
             crate::formats::UpstreamFormat::Anthropic,
@@ -664,14 +1072,54 @@ async fn handle_anthropic_model(
 }
 
 async fn handle_google_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    (StatusCode::OK, Json(google_model_list(&state.config))).into_response()
+    handle_google_models_inner(state, DEFAULT_NAMESPACE.to_string()).await
+}
+
+async fn handle_google_models_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+) -> impl IntoResponse {
+    handle_google_models_inner(state, namespace).await
+}
+
+async fn handle_google_models_inner(state: Arc<AppState>, namespace: String) -> Response<Body> {
+    match namespace_config(&state, &namespace).await {
+        Some(config) => (StatusCode::OK, Json(google_model_list(&config))).into_response(),
+        None => error_response(
+            crate::formats::UpstreamFormat::Google,
+            StatusCode::NOT_FOUND,
+            "namespace not found",
+        ),
+    }
 }
 
 async fn handle_google_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match google_model_object(&state.config, &id) {
+    handle_google_model_inner(state, DEFAULT_NAMESPACE.to_string(), id).await
+}
+
+async fn handle_google_model_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    handle_google_model_inner(state, namespace, id).await
+}
+
+async fn handle_google_model_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    id: String,
+) -> Response<Body> {
+    let Some(config) = namespace_config(&state, &namespace).await else {
+        return error_response(
+            crate::formats::UpstreamFormat::Google,
+            StatusCode::NOT_FOUND,
+            "namespace not found",
+        );
+    };
+    match google_model_object(&config, &id) {
         Some(model) => (StatusCode::OK, Json(model)).into_response(),
         None => error_response(
             crate::formats::UpstreamFormat::Google,
@@ -679,6 +1127,11 @@ async fn handle_google_model(
             &format!("model `{}` not found", id),
         ),
     }
+}
+
+async fn namespace_config(state: &Arc<AppState>, namespace: &str) -> Option<Config> {
+    let runtime = state.runtime.read().await;
+    runtime.namespaces.get(namespace).map(|item| item.config.clone())
 }
 
 fn configured_aliases(config: &Config) -> Vec<(&String, &crate::config::ModelAlias)> {

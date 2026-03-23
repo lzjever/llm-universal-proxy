@@ -15,7 +15,8 @@ use bytes::Bytes;
 use common::*;
 use futures_util::{future::join_all, stream, StreamExt};
 use llm_universal_proxy::config::{
-    AuthPolicy, Config, HookConfig, HookEndpointConfig, ModelAlias, UpstreamConfig,
+    AuthPolicy, Config, HookConfig, HookEndpointConfig, ModelAlias, RuntimeConfigPayload,
+    RuntimeHookConfig, RuntimeConfigSnapshot, RuntimeUpstreamConfig, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::run_with_listener;
@@ -107,14 +108,79 @@ async fn start_proxy(
 }
 
 #[tokio::test]
-async fn missing_upstreams_config_is_rejected() {
+async fn empty_startup_config_keeps_health_route_available() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let err = run_with_listener(Config::default(), listener)
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let _proxy = tokio::spawn(async move { run_with_listener(Config::default(), listener).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let client = Client::new();
+    let response = client
+        .get(format!("{base}/health"))
+        .send()
         .await
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("at least one upstream must be configured"));
+        .unwrap();
+    assert!(response.status().is_success());
+}
+
+#[tokio::test]
+async fn runtime_namespace_config_can_be_pushed_after_empty_start() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+
+    let client = Client::new();
+    let apply = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&RuntimeConfigSnapshot {
+            revision: "rev-1".to_string(),
+            config: RuntimeConfigPayload {
+                listen: "127.0.0.1:0".to_string(),
+                upstream_timeout_secs: 30,
+                upstreams: vec![RuntimeUpstreamConfig {
+                    name: "default".to_string(),
+                    api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
+                    fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+                    fallback_credential_env: None,
+                    fallback_credential_actual: None,
+                    auth_policy: AuthPolicy::ClientOrFallback,
+                    upstream_headers: Vec::new(),
+                }],
+                model_aliases: std::collections::BTreeMap::new(),
+                hooks: RuntimeHookConfig::default(),
+            },
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(apply.status().is_success());
+
+    let state: Value = client
+        .get(format!("{}/admin/namespaces/demo/state", proxy_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["revision"], "rev-1");
+    assert_eq!(state["namespace"], "demo");
+
+    let res = client
+        .post(format!(
+            "{}/namespaces/demo/openai/v1/chat/completions",
+            proxy_base
+        ))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
 }
 
 #[test]
@@ -149,7 +215,7 @@ model_aliases:
 }
 
 #[test]
-fn config_rejects_versionless_api_root() {
+fn config_accepts_versionless_absolute_api_root() {
     let config = llm_universal_proxy::config::Config::from_yaml_str(
         r#"
 upstreams:
@@ -159,8 +225,7 @@ upstreams:
 "#,
     )
     .unwrap();
-    let err = config.validate().unwrap_err();
-    assert!(err.contains("api_root must end with an explicit version segment"));
+    assert!(config.validate().is_ok());
 }
 
 #[tokio::test]

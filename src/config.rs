@@ -4,11 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::formats::UpstreamFormat;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum AuthPolicy {
     #[serde(rename = "client_or_fallback", alias = "client-or-fallback")]
     #[default]
@@ -17,7 +17,7 @@ pub enum AuthPolicy {
     ForceServer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookConfig {
     pub max_pending_bytes: usize,
     pub timeout: Duration,
@@ -46,14 +46,14 @@ impl Default for HookConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookEndpointConfig {
     pub url: String,
     pub authorization: Option<String>,
 }
 
 /// Runtime configuration for one named upstream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     /// Stable upstream name referenced by `upstream:model`.
     pub name: String,
@@ -74,7 +74,7 @@ pub struct UpstreamConfig {
 }
 
 /// One local model alias that resolves to a named upstream and upstream model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelAlias {
     pub upstream_name: String,
     pub upstream_model: String,
@@ -100,6 +100,78 @@ pub struct Config {
     pub model_aliases: BTreeMap<String, ModelAlias>,
     /// Optional audit and metering hooks.
     pub hooks: HookConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeHookEndpointConfig {
+    pub url: String,
+    #[serde(default)]
+    pub authorization: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeHookConfig {
+    #[serde(default = "default_hook_max_pending_bytes")]
+    pub max_pending_bytes: usize,
+    #[serde(default = "default_hook_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_hook_failure_threshold")]
+    pub failure_threshold: usize,
+    #[serde(default = "default_hook_cooldown_secs")]
+    pub cooldown_secs: u64,
+    #[serde(default)]
+    pub exchange: Option<RuntimeHookEndpointConfig>,
+    #[serde(default)]
+    pub usage: Option<RuntimeHookEndpointConfig>,
+}
+
+impl Default for RuntimeHookConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_bytes: default_hook_max_pending_bytes(),
+            timeout_secs: default_hook_timeout_secs(),
+            failure_threshold: default_hook_failure_threshold(),
+            cooldown_secs: default_hook_cooldown_secs(),
+            exchange: None,
+            usage: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeUpstreamConfig {
+    pub name: String,
+    pub api_root: String,
+    #[serde(default)]
+    pub fixed_upstream_format: Option<UpstreamFormat>,
+    #[serde(default)]
+    pub fallback_credential_env: Option<String>,
+    #[serde(default)]
+    pub fallback_credential_actual: Option<String>,
+    #[serde(default)]
+    pub auth_policy: AuthPolicy,
+    #[serde(default)]
+    pub upstream_headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfigPayload {
+    #[serde(default = "default_listen")]
+    pub listen: String,
+    #[serde(default = "default_upstream_timeout_secs")]
+    pub upstream_timeout_secs: u64,
+    #[serde(default)]
+    pub upstreams: Vec<RuntimeUpstreamConfig>,
+    #[serde(default)]
+    pub model_aliases: BTreeMap<String, ModelAlias>,
+    #[serde(default)]
+    pub hooks: RuntimeHookConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfigSnapshot {
+    pub revision: String,
+    pub config: RuntimeConfigPayload,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -184,9 +256,7 @@ impl Config {
         let path_ref = path.as_ref();
         let raw = std::fs::read_to_string(path_ref)
             .map_err(|e| format!("failed to read config {}: {}", path_ref.display(), e))?;
-        Self::from_yaml_str(&raw)
-            .and_then(|config| config.validate().map(|_| config))
-            .map_err(|e| format!("invalid config {}: {}", path_ref.display(), e))
+        Self::from_yaml_str(&raw).map_err(|e| format!("invalid config {}: {}", path_ref.display(), e))
     }
 
     /// Load config from YAML text. Intended for tests.
@@ -270,9 +340,24 @@ impl Config {
                     upstream.name
                 ));
             }
-            if !has_version_root(&upstream.api_root) {
+            let parsed = url::Url::parse(&upstream.api_root).map_err(|error| {
+                format!(
+                    "upstream `{}` api_root must be a valid absolute URL: {}",
+                    upstream.name, error
+                )
+            })?;
+            match parsed.scheme() {
+                "http" | "https" => {}
+                scheme => {
+                    return Err(format!(
+                        "upstream `{}` api_root must use http or https, got `{}`",
+                        upstream.name, scheme
+                    ));
+                }
+            }
+            if parsed.host_str().is_none() {
                 return Err(format!(
-                    "upstream `{}` api_root must end with an explicit version segment like `/v1` or `/v1beta`",
+                    "upstream `{}` api_root must include a host",
                     upstream.name
                 ));
             }
@@ -410,6 +495,94 @@ impl Config {
     }
 }
 
+impl TryFrom<RuntimeConfigPayload> for Config {
+    type Error = String;
+
+    fn try_from(value: RuntimeConfigPayload) -> Result<Self, Self::Error> {
+        let upstreams = value
+            .upstreams
+            .into_iter()
+            .map(|item| {
+                let fallback_api_key = item.fallback_credential_actual.clone().or_else(|| {
+                    item.fallback_credential_env
+                        .as_deref()
+                        .and_then(|env_name| std::env::var(env_name).ok())
+                });
+                UpstreamConfig {
+                    name: item.name,
+                    api_root: item.api_root,
+                    fixed_upstream_format: item.fixed_upstream_format,
+                    fallback_credential_env: item.fallback_credential_env,
+                    fallback_credential_actual: item.fallback_credential_actual,
+                    fallback_api_key,
+                    auth_policy: item.auth_policy,
+                    upstream_headers: item.upstream_headers,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let config = Self {
+            listen: value.listen,
+            upstream_timeout: Duration::from_secs(value.upstream_timeout_secs),
+            upstreams,
+            model_aliases: value.model_aliases,
+            hooks: HookConfig {
+                max_pending_bytes: value.hooks.max_pending_bytes,
+                timeout: Duration::from_secs(value.hooks.timeout_secs),
+                failure_threshold: value.hooks.failure_threshold,
+                cooldown: Duration::from_secs(value.hooks.cooldown_secs),
+                exchange: value.hooks.exchange.map(|hook| HookEndpointConfig {
+                    url: hook.url,
+                    authorization: hook.authorization,
+                }),
+                usage: value.hooks.usage.map(|hook| HookEndpointConfig {
+                    url: hook.url,
+                    authorization: hook.authorization,
+                }),
+            },
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+impl From<&Config> for RuntimeConfigPayload {
+    fn from(value: &Config) -> Self {
+        Self {
+            listen: value.listen.clone(),
+            upstream_timeout_secs: value.upstream_timeout.as_secs(),
+            upstreams: value
+                .upstreams
+                .iter()
+                .map(|item| RuntimeUpstreamConfig {
+                    name: item.name.clone(),
+                    api_root: item.api_root.clone(),
+                    fixed_upstream_format: item.fixed_upstream_format,
+                    fallback_credential_env: item.fallback_credential_env.clone(),
+                    fallback_credential_actual: item.fallback_credential_actual.clone(),
+                    auth_policy: item.auth_policy,
+                    upstream_headers: item.upstream_headers.clone(),
+                })
+                .collect(),
+            model_aliases: value.model_aliases.clone(),
+            hooks: RuntimeHookConfig {
+                max_pending_bytes: value.hooks.max_pending_bytes,
+                timeout_secs: value.hooks.timeout.as_secs(),
+                failure_threshold: value.hooks.failure_threshold,
+                cooldown_secs: value.hooks.cooldown.as_secs(),
+                exchange: value.hooks.exchange.as_ref().map(|hook| RuntimeHookEndpointConfig {
+                    url: hook.url.clone(),
+                    authorization: hook.authorization.clone(),
+                }),
+                usage: value.hooks.usage.as_ref().map(|hook| RuntimeHookEndpointConfig {
+                    url: hook.url.clone(),
+                    authorization: hook.authorization.clone(),
+                }),
+            },
+        }
+    }
+}
+
 fn default_listen() -> String {
     "0.0.0.0:8080".to_string()
 }
@@ -460,20 +633,6 @@ pub fn build_upstream_url(
             }
         }
     }
-}
-
-fn has_version_root(base_url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(base_url) else {
-        return false;
-    };
-    let Some(last) = parsed
-        .path_segments()
-        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
-    else {
-        return false;
-    };
-    let suffix = last.strip_prefix('v').unwrap_or("");
-    !suffix.is_empty() && suffix.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]
