@@ -1746,7 +1746,7 @@ fn extract_forwardable_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
-mod tests {
+mod header_tests {
     use super::extract_forwardable_headers;
     use axum::http::{HeaderMap, HeaderValue};
 
