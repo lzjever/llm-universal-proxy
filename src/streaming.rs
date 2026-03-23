@@ -1016,6 +1016,12 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
         state.responses_seq += 1;
         state.responses_seq
     };
+    let response_id = chunk
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| state.message_id.clone())
+        .unwrap_or_else(|| "resp_0".to_string());
 
     if !state.responses_started {
         state.responses_started = true;
@@ -1023,7 +1029,6 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             .get("id")
             .and_then(Value::as_str)
             .map(|s| s.to_string());
-        let response_id = state.message_id.as_deref().unwrap_or("resp_0");
         let created = chunk.get("created").and_then(Value::as_u64).unwrap_or(0);
         let ev = serde_json::json!({
             "type": "response.created",
@@ -1065,6 +1070,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 let added_ev = serde_json::json!({
                     "type": "response.output_item.added",
                     "sequence_number": next_seq(),
+                    "response_id": response_id,
                     "output_index": idx,
                     "item": {
                         "id": item_id,
@@ -1077,6 +1083,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 let part_added_ev = serde_json::json!({
                     "type": "response.reasoning_summary_part.added",
                     "sequence_number": next_seq(),
+                    "response_id": response_id,
                     "item_id": state.responses_reasoning_id,
                     "output_index": idx,
                     "summary_index": 0,
@@ -1090,6 +1097,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             let ev = serde_json::json!({
                 "type": "response.reasoning_summary_text.delta",
                 "sequence_number": next_seq(),
+                "response_id": response_id,
                 "item_id": state.responses_reasoning_id,
                 "output_index": idx,
                 "summary_index": 0,
@@ -1122,6 +1130,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 let output_item_ev = serde_json::json!({
                     "type": "response.output_item.added",
                     "sequence_number": next_seq(),
+                    "response_id": response_id,
                     "output_index": idx,
                     "item": {
                         "id": item_id,
@@ -1149,6 +1158,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 let content_part_ev = serde_json::json!({
                     "type": "response.content_part.added",
                     "sequence_number": next_seq(),
+                    "response_id": response_id,
                     "output_index": idx,
                     "content_index": 0,
                     "item_id": item_id,
@@ -1166,6 +1176,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             let ev = serde_json::json!({
                 "type": "response.output_text.delta",
                 "sequence_number": next_seq(),
+                "response_id": response_id,
                 "output_index": idx,
                 "content_index": 0,
                 "item_id": item_id,
@@ -1205,6 +1216,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 let ev = serde_json::json!({
                     "type": "response.output_item.added",
                     "sequence_number": next_seq(),
+                    "response_id": response_id,
                     "output_index": tc_idx,
                     "item": {
                         "id": format!("fc_{}", call_id),
@@ -1226,6 +1238,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                     let ev = serde_json::json!({
                         "type": "response.function_call_arguments.delta",
                         "sequence_number": next_seq(),
+                        "response_id": response_id,
                         "item_id": entry
                             .id
                             .as_ref()
@@ -1257,6 +1270,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             let text_done_ev = serde_json::json!({
                 "type": "response.reasoning_summary_text.done",
                 "sequence_number": next_seq(),
+                "response_id": response_id,
                 "item_id": item_id,
                 "output_index": idx,
                 "summary_index": 0,
@@ -1270,6 +1284,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             let part_done_ev = serde_json::json!({
                 "type": "response.reasoning_summary_part.done",
                 "sequence_number": next_seq(),
+                "response_id": response_id,
                 "item_id": item_id,
                 "output_index": idx,
                 "summary_index": 0,
@@ -1283,6 +1298,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             let output_item_done_ev = serde_json::json!({
                 "type": "response.output_item.done",
                 "sequence_number": next_seq(),
+                "response_id": response_id,
                 "output_index": idx,
                 "item": {
                     "id": state.responses_reasoning_id,
@@ -1310,6 +1326,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 let args_done_ev = serde_json::json!({
                     "type": "response.function_call_arguments.done",
                     "sequence_number": next_seq(),
+                    "response_id": response_id,
                     "item_id": format!("fc_{}", call_id),
                     "output_index": output_index,
                     "arguments": arguments
@@ -1322,6 +1339,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 let output_item_done_ev = serde_json::json!({
                     "type": "response.output_item.done",
                     "sequence_number": next_seq(),
+                    "response_id": response_id,
                     "output_index": output_index,
                     "item": {
                         "id": format!("fc_{}", call_id),
@@ -1348,6 +1366,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             let text_done_ev = serde_json::json!({
                 "type": "response.output_text.done",
                 "sequence_number": next_seq(),
+                "response_id": response_id,
                 "output_index": idx,
                 "content_index": 0,
                 "item_id": item_id,
@@ -1358,6 +1377,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             let part_done_ev = serde_json::json!({
                 "type": "response.content_part.done",
                 "sequence_number": next_seq(),
+                "response_id": response_id,
                 "output_index": idx,
                 "content_index": 0,
                 "item_id": item_id,
@@ -1378,6 +1398,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             let output_item_done_ev = serde_json::json!({
                 "type": "response.output_item.done",
                 "sequence_number": next_seq(),
+                "response_id": response_id,
                 "output_index": idx,
                 "item": {
                     "id": item_id,
@@ -1393,7 +1414,6 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             ));
         }
 
-        let response_id = state.message_id.as_deref().unwrap_or("resp_0");
         let created = chunk.get("created").and_then(Value::as_u64).unwrap_or(0);
         let mut output = Vec::new();
         if state.responses_reasoning_added {
@@ -2014,5 +2034,35 @@ mod tests {
         assert!(joined.contains("\"total_tokens\":25"));
         assert!(joined.contains("\"input_tokens_details\":{\"cached_tokens\":3}"));
         assert!(joined.contains("\"output_tokens_details\":{\"reasoning_tokens\":2}"));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_includes_response_id_on_child_events() {
+        let mut state = StreamState::default();
+        let text_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": { "content": "Hi" }, "finish_reason": null }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+
+        let out1 = openai_chunk_to_responses_sse(&text_chunk, &mut state);
+        let out2 = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out1
+            .into_iter()
+            .chain(out2)
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"type\":\"response.output_item.added\""));
+        assert!(joined.contains("\"type\":\"response.content_part.added\""));
+        assert!(joined.contains("\"type\":\"response.output_text.delta\""));
+        assert!(joined.contains("\"type\":\"response.output_text.done\""));
+        assert!(joined.contains("\"response_id\":\"chatcmpl-msg123\""));
     }
 }
