@@ -591,11 +591,15 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let content = item.get("content").cloned();
                 let content = map_responses_content_to_openai(content);
-                if role == "assistant" && current_assistant.is_some() {
-                    if let Some(ref mut a) = current_assistant {
-                        a["role"] = Value::String("assistant".to_string());
-                        a["content"] = content;
-                    }
+                if role == "assistant" {
+                    let assistant = current_assistant.get_or_insert_with(|| {
+                        serde_json::json!({
+                            "role": "assistant",
+                            "content": Value::Null
+                        })
+                    });
+                    assistant["role"] = Value::String("assistant".to_string());
+                    assistant["content"] = content;
                 } else {
                     flush_assistant(&mut messages, &mut current_assistant);
                     messages.push(serde_json::json!({ "role": role, "content": content }));
@@ -625,6 +629,9 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                     }));
                 }
                 if let Some(ref mut a) = current_assistant {
+                    if a.get("tool_calls").is_none() {
+                        a["tool_calls"] = Value::Array(Vec::new());
+                    }
                     if let Some(arr) = a.get_mut("tool_calls").and_then(Value::as_array_mut) {
                         arr.push(tc);
                     }
@@ -1312,19 +1319,53 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
         }
     }
 
+    let mut pending_tool_results: Vec<Value> = vec![];
     for (i, msg) in non_system.into_iter().enumerate() {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+
+        if role == "tool" {
+            if let Some(tool_blocks) = openai_message_to_claude_blocks(&msg) {
+                pending_tool_results.extend(tool_blocks);
+            }
+            continue;
+        }
+
         if let Some(mut claude_blocks) = openai_message_to_claude_blocks(&msg) {
+            if role == "user" && !pending_tool_results.is_empty() {
+                let mut merged = pending_tool_results.clone();
+                merged.append(&mut claude_blocks);
+                pending_tool_results.clear();
+                claude_blocks = merged;
+            } else if !pending_tool_results.is_empty() {
+                result["messages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({ "role": "user", "content": pending_tool_results.clone() }));
+                pending_tool_results.clear();
+            }
+
             // Add cache_control to last assistant message's last block
-            if last_assistant_idx == Some(i) && !claude_blocks.is_empty() {
+            if last_assistant_idx == Some(i)
+                && role == "assistant"
+                && !claude_blocks.is_empty()
+                && can_attach_cache_control_to_content_block(&claude_blocks[claude_blocks.len() - 1])
+            {
                 let last_block_idx = claude_blocks.len() - 1;
                 claude_blocks[last_block_idx]["cache_control"] =
                     serde_json::json!({ "type": "ephemeral" });
             }
-            result["messages"]
-                .as_array_mut()
-                .unwrap()
-                .push(serde_json::json!({ "role": if msg.get("role").and_then(Value::as_str) == Some("user") || msg.get("role").and_then(Value::as_str) == Some("tool") { "user" } else { "assistant" }, "content": claude_blocks }));
+            result["messages"].as_array_mut().unwrap().push(serde_json::json!({
+                "role": if role == "assistant" { "assistant" } else { "user" },
+                "content": claude_blocks
+            }));
         }
+    }
+
+    if !pending_tool_results.is_empty() {
+        result["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "role": "user", "content": pending_tool_results }));
     }
 
     // Tools: add cache_control to last tool
@@ -1385,6 +1426,13 @@ fn openai_tool_choice_to_claude_tool_choice(
     Some(mapped)
 }
 
+fn can_attach_cache_control_to_content_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("text") | Some("thinking") | Some("redacted_thinking")
+    )
+}
+
 fn extract_text_content(content: Option<&Value>) -> String {
     let content = match content {
         Some(c) => c,
@@ -1419,29 +1467,33 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Option<Vec<Value>> {
         })]);
     }
     let content = msg.get("content");
-    if let Some(Value::String(s)) = content {
-        return Some(vec![serde_json::json!({ "type": "text", "text": s })]);
-    }
-    let arr = content.and_then(Value::as_array)?;
     let mut blocks: Vec<Value> = vec![];
-    for c in arr {
-        let ty = c.get("type").and_then(Value::as_str);
-        if ty == Some("text") {
-            blocks.push(serde_json::json!({ "type": "text", "text": c.get("text") }));
-        } else if ty == Some("image_url") {
-            let url = c
-                .get("image_url")
-                .and_then(|u| u.get("url").and_then(Value::as_str))
-                .unwrap_or("");
-            if url.starts_with("data:") {
-                let rest = url.strip_prefix("data:").unwrap_or("");
-                let (media, b64) = rest.split_once(";base64,").unwrap_or(("image/png", ""));
-                blocks.push(serde_json::json!({
-                    "type": "image",
-                    "source": { "type": "base64", "media_type": media, "data": b64 }
-                }));
+    match content {
+        Some(Value::String(s)) => {
+            blocks.push(serde_json::json!({ "type": "text", "text": s }));
+        }
+        Some(Value::Array(arr)) => {
+            for c in arr {
+                let ty = c.get("type").and_then(Value::as_str);
+                if ty == Some("text") {
+                    blocks.push(serde_json::json!({ "type": "text", "text": c.get("text") }));
+                } else if ty == Some("image_url") {
+                    let url = c
+                        .get("image_url")
+                        .and_then(|u| u.get("url").and_then(Value::as_str))
+                        .unwrap_or("");
+                    if url.starts_with("data:") {
+                        let rest = url.strip_prefix("data:").unwrap_or("");
+                        let (media, b64) = rest.split_once(";base64,").unwrap_or(("image/png", ""));
+                        blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": media, "data": b64 }
+                        }));
+                    }
+                }
             }
         }
+        _ => {}
     }
     if role == "assistant" {
         if let Some(tc) = msg.get("tool_calls").and_then(Value::as_array) {
@@ -1462,6 +1514,151 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Option<Vec<Value>> {
         return None;
     }
     Some(blocks)
+}
+
+#[cfg(test)]
+mod translate_regression_tests {
+    use super::{
+        can_attach_cache_control_to_content_block, openai_message_to_claude_blocks,
+        openai_to_claude,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn assistant_string_content_preserves_tool_calls_for_claude() {
+        let msg = json!({
+            "role": "assistant",
+            "content": "Let me check that.",
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"pwd\"}"
+                    }
+                }
+            ]
+        });
+
+        let blocks = openai_message_to_claude_blocks(&msg).expect("assistant blocks");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "call_123");
+        assert_eq!(blocks[1]["name"], "exec_command");
+    }
+
+    #[test]
+    fn openai_to_claude_merges_tool_results_into_single_user_message() {
+        let mut body = json!({
+            "model": "codex-anthropic",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "I'll run the commands.",
+                    "tool_calls": [
+                        {
+                            "id": "call_a",
+                            "type": "function",
+                            "function": { "name": "cmd_a", "arguments": "{}" }
+                        },
+                        {
+                            "id": "call_b",
+                            "type": "function",
+                            "function": { "name": "cmd_b", "arguments": "{}" }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_a",
+                    "content": "result-a"
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_b",
+                    "content": "result-b"
+                }
+            ]
+        });
+
+        openai_to_claude(&mut body).expect("translate to claude");
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "user");
+        let content = messages[1]["content"].as_array().expect("user content");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "call_a");
+        assert_eq!(content[1]["type"], "tool_result");
+        assert_eq!(content[1]["tool_use_id"], "call_b");
+    }
+
+    #[test]
+    fn openai_to_claude_puts_user_text_after_tool_results() {
+        let mut body = json!({
+            "model": "codex-anthropic",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_a",
+                            "type": "function",
+                            "function": { "name": "cmd_a", "arguments": "{}" }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_a",
+                    "content": "result-a"
+                },
+                {
+                    "role": "user",
+                    "content": "continue"
+                }
+            ]
+        });
+
+        openai_to_claude(&mut body).expect("translate to claude");
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        let user_content = messages[1]["content"].as_array().expect("user content");
+        assert_eq!(user_content[0]["type"], "tool_result");
+        assert_eq!(user_content[1]["type"], "text");
+        assert_eq!(user_content[1]["text"], "continue");
+    }
+
+    #[test]
+    fn assistant_tool_use_block_does_not_get_cache_control() {
+        let mut body = json!({
+            "model": "codex-anthropic",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "Let me check.",
+                    "tool_calls": [
+                        {
+                            "id": "call_a",
+                            "type": "function",
+                            "function": { "name": "cmd_a", "arguments": "{}" }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        openai_to_claude(&mut body).expect("translate to claude");
+        let messages = body["messages"].as_array().expect("messages array");
+        let assistant_content = messages[0]["content"].as_array().expect("assistant content");
+        assert_eq!(assistant_content[1]["type"], "tool_use");
+        assert!(assistant_content[1].get("cache_control").is_none());
+        assert!(can_attach_cache_control_to_content_block(&assistant_content[0]));
+        assert!(!can_attach_cache_control_to_content_block(&assistant_content[1]));
+    }
 }
 
 fn extract_gemini_text(content: &Value) -> String {
@@ -2066,6 +2263,107 @@ mod tests {
         assert_eq!(body["tool_choice"]["type"], "function");
         assert_eq!(body["tool_choice"]["name"], "lookup");
         assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn translate_request_responses_to_claude_keeps_tool_use_and_result_adjacent() {
+        let mut body = json!({
+            "model": "codex-anthropic",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "Run pwd" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "/home/percy/temp"
+                }
+            ],
+            "stream": true
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Anthropic,
+            "codex-anthropic",
+            &mut body,
+            true,
+        )
+        .unwrap();
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        let assistant_blocks = messages[1]["content"].as_array().expect("assistant content");
+        assert_eq!(assistant_blocks.len(), 1);
+        assert_eq!(assistant_blocks[0]["type"], "tool_use");
+        assert_eq!(assistant_blocks[0]["id"], "call_1");
+        assert_eq!(assistant_blocks[0]["input"]["cmd"], "pwd");
+
+        assert_eq!(messages[2]["role"], "user");
+        let user_blocks = messages[2]["content"].as_array().expect("user content");
+        assert_eq!(user_blocks.len(), 1);
+        assert_eq!(user_blocks[0]["type"], "tool_result");
+        assert_eq!(user_blocks[0]["tool_use_id"], "call_1");
+        assert_eq!(user_blocks[0]["content"], "/home/percy/temp");
+    }
+
+    #[test]
+    fn translate_request_responses_to_claude_merges_assistant_text_with_tool_use() {
+        let mut body = json!({
+            "model": "codex-anthropic",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "Run pwd" }]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Let me check." }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "/home/percy/temp"
+                }
+            ],
+            "stream": true
+        });
+        translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Anthropic,
+            "codex-anthropic",
+            &mut body,
+            true,
+        )
+        .unwrap();
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+        let assistant_blocks = messages[1]["content"].as_array().expect("assistant content");
+        assert_eq!(assistant_blocks[0]["type"], "text");
+        assert_eq!(assistant_blocks[0]["text"], "Let me check.");
+        assert_eq!(assistant_blocks[1]["type"], "tool_use");
+        assert_eq!(assistant_blocks[1]["id"], "call_1");
+        let user_blocks = messages[2]["content"].as_array().expect("user content");
+        assert_eq!(user_blocks[0]["type"], "tool_result");
+        assert_eq!(user_blocks[0]["tool_use_id"], "call_1");
     }
 
     #[test]

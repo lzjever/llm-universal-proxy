@@ -23,8 +23,10 @@ pub fn needs_stream_translation(
 pub struct StreamState {
     pub message_id: Option<String>,
     pub model: Option<String>,
-    pub tool_call_index: usize,
-    pub tool_calls: std::collections::HashMap<usize, ToolCallState>,
+    pub openai_tool_call_index: usize,
+    pub claude_tool_use_index: usize,
+    pub openai_tool_calls: std::collections::HashMap<usize, ToolCallState>,
+    pub claude_tool_uses: std::collections::HashMap<usize, ClaudeToolUseState>,
     pub server_tool_block_index: Option<usize>,
     pub text_block_started: bool,
     pub in_thinking_block: bool,
@@ -61,9 +63,58 @@ pub struct ToolCallState {
     pub id: Option<Value>,
     pub name: String,
     pub arguments: String,
+    pub arguments_seeded_from_start: bool,
     pub block_index: Option<usize>,
     pub responses_item_added: bool,
     pub responses_done: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct ClaudeToolUseState {
+    pub openai_index: usize,
+    pub id: Option<Value>,
+    pub name: String,
+    pub arguments: String,
+    pub arguments_seeded_from_start: bool,
+}
+
+fn dedupe_tool_call_state_by_call_id(
+    tool_calls: &mut std::collections::HashMap<usize, ToolCallState>,
+    tc_idx: usize,
+    incoming_id: Option<&Value>,
+) {
+    let Some(incoming_id) = incoming_id else {
+        return;
+    };
+    let existing_key = tool_calls
+        .iter()
+        .find_map(|(key, entry)| ((*key != tc_idx) && entry.id.as_ref() == Some(incoming_id)).then_some(*key));
+    let Some(existing_key) = existing_key else {
+        return;
+    };
+    let Some(mut existing_entry) = tool_calls.remove(&existing_key) else {
+        return;
+    };
+    existing_entry.index = tc_idx;
+    tool_calls
+        .entry(tc_idx)
+        .and_modify(|entry| {
+            if entry.id.is_none() {
+                entry.id = existing_entry.id.clone();
+            }
+            if entry.name.is_empty() {
+                entry.name = existing_entry.name.clone();
+            }
+            if entry.arguments.is_empty() {
+                entry.arguments = existing_entry.arguments.clone();
+            }
+            if entry.block_index.is_none() {
+                entry.block_index = existing_entry.block_index;
+            }
+            entry.responses_item_added |= existing_entry.responses_item_added;
+            entry.responses_done |= existing_entry.responses_done;
+        })
+        .or_insert(existing_entry);
 }
 
 /// Extract one SSE event from buffer (up to and including first "\n\n"). Returns parsed JSON from "data: " line, or None.
@@ -120,7 +171,8 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                 .and_then(|m| m.get("model"))
                 .and_then(Value::as_str)
                 .map(String::from);
-            state.tool_call_index = 0;
+            state.claude_tool_use_index = 0;
+            state.claude_tool_uses.clear();
             out.push(openai_chunk(
                 state,
                 serde_json::json!({ "role": "assistant" }),
@@ -153,28 +205,34 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
             } else if block_ty == Some("tool_use") {
                 let block = block.unwrap();
                 let idx = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let tc_index = state.tool_call_index;
-                state.tool_call_index += 1;
+                let tc_index = state.claude_tool_use_index;
+                state.claude_tool_use_index += 1;
                 let name = block
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                let seeded_arguments = block
+                    .get("input")
+                    .filter(|input| !input.is_null())
+                    .filter(|input| !matches!(input, Value::Object(map) if map.is_empty()))
+                    .and_then(|input| serde_json::to_string(input).ok())
+                    .filter(|serialized| serialized != "null" && serialized != "{}")
+                    .unwrap_or_default();
                 let tc = serde_json::json!({
                     "index": tc_index,
                     "id": block.get("id"),
                     "type": "function",
-                    "function": { "name": name, "arguments": "" }
+                    "function": { "name": name, "arguments": seeded_arguments }
                 });
-                state.tool_calls.insert(
+                state.claude_tool_uses.insert(
                     idx,
-                    ToolCallState {
-                        index: tc_index,
+                    ClaudeToolUseState {
+                        openai_index: tc_index,
                         id: block.get("id").cloned(),
                         name: name.clone(),
-                        arguments: String::new(),
-                        block_index: None,
-                        ..Default::default()
+                        arguments: seeded_arguments.clone(),
+                        arguments_seeded_from_start: !seeded_arguments.is_empty(),
                     },
                 );
                 out.push(openai_chunk(
@@ -218,15 +276,19 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                 if let Some(pj) = delta.and_then(|d| d.get("partial_json").and_then(Value::as_str))
                 {
                     let chunk_json =
-                        if let Some(tc) = idx.and_then(|i| state.tool_calls.get_mut(&i)) {
-                            tc.arguments.push_str(pj);
-                            Some(serde_json::json!({
-                                "tool_calls": [{
-                                    "index": tc.index,
-                                    "id": tc.id,
-                                    "function": { "arguments": pj }
-                                }]
+                        if let Some(tc) = idx.and_then(|i| state.claude_tool_uses.get_mut(&i)) {
+                            if tc.arguments_seeded_from_start && !tc.arguments.is_empty() {
+                                None
+                            } else {
+                                tc.arguments.push_str(pj);
+                                Some(serde_json::json!({
+                                    "tool_calls": [{
+                                        "index": tc.openai_index,
+                                        "id": tc.id,
+                                        "function": { "arguments": pj }
+                                    }]
                             }))
+                            }
                         } else {
                             None
                         };
@@ -269,7 +331,7 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
         Some("message_stop") => {
             if !state.finish_reason_sent {
                 let fr = state.finish_reason.clone().unwrap_or_else(|| {
-                    if state.tool_calls.is_empty() {
+                    if state.claude_tool_uses.is_empty() {
                         "stop".to_string()
                     } else {
                         "tool_calls".to_string()
@@ -442,7 +504,7 @@ pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                         "type": "function",
                         "function": { "name": name, "arguments": args_str }
                     });
-                    state.tool_calls.insert(
+                    state.openai_tool_calls.insert(
                         tc_index,
                         ToolCallState {
                             index: tc_index,
@@ -490,7 +552,7 @@ pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                     "type": "function",
                     "function": { "name": name, "arguments": args_str }
                 });
-                state.tool_calls.insert(
+                state.openai_tool_calls.insert(
                     tc_index,
                     ToolCallState {
                         index: tc_index,
@@ -555,7 +617,7 @@ pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
 
     if let Some(finish) = candidate.get("finishReason").and_then(Value::as_str) {
         let mut fr = finish.to_lowercase();
-        if fr == "stop" && !state.tool_calls.is_empty() {
+        if fr == "stop" && !state.openai_tool_calls.is_empty() {
             fr = "tool_calls".to_string();
         }
         let mut chunk = openai_chunk(state, serde_json::json!({}), Some(&fr));
@@ -624,8 +686,8 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                 .get("call_id")
                 .and_then(Value::as_str)
                 .map(String::from);
-            let idx = state.tool_call_index;
-            state.tool_call_index += 1;
+            let idx = state.openai_tool_call_index;
+            state.openai_tool_call_index += 1;
             let id = call_id.unwrap_or_else(|| format!("call_{}", idx));
             let tc = serde_json::json!({
                 "index": idx,
@@ -633,7 +695,7 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                 "type": "function",
                 "function": { "name": name, "arguments": "" }
             });
-            state.tool_calls.insert(
+            state.openai_tool_calls.insert(
                 idx,
                 ToolCallState {
                     index: idx,
@@ -658,8 +720,8 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
     {
         let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
         if !delta.is_empty() {
-            let idx = state.tool_call_index.saturating_sub(1);
-            if let Some(tc) = state.tool_calls.get_mut(&idx) {
+            let idx = state.openai_tool_call_index.saturating_sub(1);
+            if let Some(tc) = state.openai_tool_calls.get_mut(&idx) {
                 tc.arguments.push_str(delta);
             }
             out.push(openai_chunk(
@@ -1239,8 +1301,9 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
     if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
         for tc in tcs {
             let tc_idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            dedupe_tool_call_state_by_call_id(&mut state.openai_tool_calls, tc_idx, tc.get("id"));
             let entry = state
-                .tool_calls
+                .openai_tool_calls
                 .entry(tc_idx)
                 .or_insert_with(|| ToolCallState {
                     index: tc_idx,
@@ -1396,7 +1459,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             ));
         }
 
-        let mut tool_calls = state.tool_calls.values_mut().collect::<Vec<_>>();
+        let mut tool_calls = state.openai_tool_calls.values_mut().collect::<Vec<_>>();
         tool_calls.sort_by_key(|tc| tc.index);
         for tool_call in tool_calls {
             if tool_call.responses_item_added && !tool_call.responses_done {
@@ -1530,7 +1593,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                 }]
             }));
         }
-        let mut tool_call_output = state.tool_calls.values().collect::<Vec<_>>();
+        let mut tool_call_output = state.openai_tool_calls.values().collect::<Vec<_>>();
         tool_call_output.sort_by_key(|tc| tc.index);
         for tool_call in tool_call_output {
             if let Some(call_id) = tool_call.id.as_ref().and_then(Value::as_str) {
@@ -1728,6 +1791,11 @@ where
 mod tests {
     use super::*;
     use crate::formats::UpstreamFormat;
+
+    fn parse_sse_json(bytes: &[u8]) -> Value {
+        let mut buf = bytes.to_vec();
+        take_one_sse_event(&mut buf).expect("parse sse event")
+    }
 
     #[test]
     fn take_one_sse_event_parses_data_line() {
@@ -2159,6 +2227,149 @@ mod tests {
         assert!(joined.contains("response.function_call_arguments.done"));
         assert!(joined.contains("response.output_item.done"));
         assert!(joined.contains("\"type\":\"function_call\""));
+    }
+
+    #[test]
+    fn anthropic_tool_use_does_not_duplicate_function_call_in_responses_completed() {
+        let mut state = StreamState::default();
+        let _ = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-test" }
+            }),
+            &mut state,
+        );
+        let _ = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "exec_command",
+                    "input": {}
+                }
+            }),
+            &mut state,
+        );
+        let _ = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": { "type": "input_json_delta", "partial_json": "{\"cmd\":\"pwd\"}" }
+            }),
+            &mut state,
+        );
+        let _ = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "tool_use" },
+                "usage": { "input_tokens": 10, "output_tokens": 5 }
+            }),
+            &mut state,
+        );
+        let out = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({ "type": "message_stop" }),
+            &mut state,
+        );
+
+        let completed = out
+            .iter()
+            .map(|bytes| parse_sse_json(bytes))
+            .find(|event| event.get("type").and_then(Value::as_str) == Some("response.completed"))
+            .expect("response.completed event");
+        let output = completed["response"]["output"]
+            .as_array()
+            .expect("response output array");
+        let function_calls = output
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .collect::<Vec<_>>();
+        assert_eq!(function_calls.len(), 1);
+        assert_eq!(function_calls[0]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn claude_tool_use_start_with_input_seeds_openai_arguments() {
+        let mut state = StreamState::default();
+        let _ = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-test" }
+            }),
+            &mut state,
+        );
+        let chunks = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "exec_command",
+                    "input": { "cmd": "pwd" }
+                }
+            }),
+            &mut state,
+        );
+
+        assert_eq!(chunks.len(), 1);
+        let tool_calls = chunks[0]["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(tool_calls[0]["function"]["arguments"], "{\"cmd\":\"pwd\"}");
+    }
+
+    #[test]
+    fn claude_empty_tool_input_waits_for_delta_arguments() {
+        let mut state = StreamState::default();
+        let _ = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-test" }
+            }),
+            &mut state,
+        );
+        let start_chunks = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "exec_command",
+                    "input": {}
+                }
+            }),
+            &mut state,
+        );
+        let delta_chunks = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": { "type": "input_json_delta", "partial_json": "{\"cmd\":\"pwd\"}" }
+            }),
+            &mut state,
+        );
+
+        let start_tool_calls = start_chunks[0]["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .expect("start tool_calls");
+        assert_eq!(start_tool_calls[0]["function"]["arguments"], "");
+        let delta_tool_calls = delta_chunks[0]["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .expect("delta tool_calls");
+        assert_eq!(delta_tool_calls[0]["function"]["arguments"], "{\"cmd\":\"pwd\"}");
     }
 
     #[test]

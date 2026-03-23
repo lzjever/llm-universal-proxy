@@ -382,6 +382,83 @@ Notes:
 - The client talks OpenAI Responses to the proxy at `/openai/v1/responses`; the proxy resolves local model `GLM-5` to `GLM-OFFICIAL:GLM-5`, then translates upstream to Anthropic Messages.
 - For providers that need extra static headers beyond the Anthropic default, set the upstream's `headers` field in the matching upstream entry.
 
+#### Custom Text-Only Models For Codex
+
+If your local Codex model alias is not present in Codex's built-in model catalog, Codex falls back to generic metadata. That fallback assumes the model supports both text and image input. For proxy-backed custom models, that is often wrong: many upstreams are text-only, and some setups also want the built-in web search tool disabled.
+
+To avoid that mismatch, provide Codex with a custom `model_catalog_json` entry for your local alias. This lets you:
+
+- mark the model as text-only with `input_modalities: ["text"]`
+- disable built-in web search with `supports_search_tool: false` and `web_search="disabled"`
+- set the real context window and compaction threshold for the upstream model
+
+Example `catalog.json` for a proxy-backed `GLM-5-TURBO` alias:
+
+```json
+{
+  "models": [
+    {
+      "slug": "codex-anthropic",
+      "display_name": "codex-anthropic",
+      "description": "Custom proxy-backed Codex model with text-only input.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        { "effort": "low", "description": "Fast responses with lighter reasoning" },
+        { "effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+        { "effort": "high", "description": "Greater reasoning depth for complex problems" },
+        { "effort": "xhigh", "description": "Extra high reasoning depth for complex problems" }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "availability_nux": null,
+      "upgrade": null,
+      "base_instructions": "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.",
+      "model_messages": null,
+      "supports_reasoning_summaries": false,
+      "default_reasoning_summary": "auto",
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "truncation_policy": { "mode": "bytes", "limit": 10000 },
+      "supports_parallel_tool_calls": false,
+      "supports_image_detail_original": false,
+      "context_window": 200000,
+      "auto_compact_token_limit": 176000,
+      "effective_context_window_percent": 95,
+      "experimental_supported_tools": [],
+      "input_modalities": ["text"],
+      "supports_search_tool": false
+    }
+  ]
+}
+```
+
+Start Codex with that custom catalog:
+
+```bash
+HOME="$(mktemp -d)" GLM_APIKEY="your-real-key" codex \
+  -C /path/to/worktree \
+  -m codex-anthropic \
+  -c 'model_provider="glm-proxy"' \
+  -c 'model_providers.glm-proxy.name="GLM Proxy"' \
+  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:18149/openai/v1"' \
+  -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
+  -c 'model_providers.glm-proxy.wire_api="responses"' \
+  -c 'model_catalog_json="/path/to/catalog.json"' \
+  -c 'web_search="disabled"' \
+  -s danger-full-access \
+  -a never
+```
+
+Notes:
+- `model_catalog_json` is applied on startup only. Update the file first, then start a new Codex session.
+- `input_modalities: ["text"]` prevents Codex from treating the model as image-capable.
+- `supports_search_tool: false` removes the built-in search tool from the model metadata, and `web_search="disabled"` ensures the runtime search mode stays off.
+- `context_window` and `auto_compact_token_limit` should match the real upstream model, not Codex's generic fallback values.
+
 ### Isolated CLI Smoke Tests
 
 The following patterns let you verify real CLI clients against the proxy without touching user-level configuration. Every example uses a temporary `HOME` and placeholder credentials.

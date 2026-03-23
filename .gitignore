@@ -3,3 +3,4 @@ test-reports/
 *.log
 test-codex-config.toml
 .tmp-codex-home.*/
+.local/
