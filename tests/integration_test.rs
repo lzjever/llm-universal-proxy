@@ -6,7 +6,7 @@ mod common;
 use axum::{
     body::Body,
     extract::State,
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -181,6 +181,138 @@ async fn runtime_namespace_config_can_be_pushed_after_empty_start() {
     assert!(res.status().is_success());
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["object"], "chat.completion");
+}
+
+#[tokio::test]
+async fn runtime_namespace_config_rejects_stale_or_duplicate_revision() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+
+    let client = Client::new();
+    let payload = RuntimeConfigSnapshot {
+        revision: "rev-2".to_string(),
+        config: RuntimeConfigPayload {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout_secs: 30,
+            upstreams: vec![RuntimeUpstreamConfig {
+                name: "default".to_string(),
+                api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
+                fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+                fallback_credential_env: None,
+                fallback_credential_actual: None,
+                auth_policy: AuthPolicy::ClientOrFallback,
+                upstream_headers: Vec::new(),
+            }],
+            model_aliases: std::collections::BTreeMap::new(),
+            hooks: RuntimeHookConfig::default(),
+        },
+    };
+
+    let first = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let duplicate = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    let duplicate_body = duplicate.text().await.unwrap();
+    assert!(duplicate_body.contains("stale or duplicate revision"));
+
+    let stale = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&RuntimeConfigSnapshot {
+            revision: "rev-1".to_string(),
+            config: payload.config,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn forwarded_headers_whitelist_preserves_protocol_headers_only() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+    let captured = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let captured_clone = captured.clone();
+
+    let app = Router::new().route(
+        "/v1/messages",
+        post(
+            move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_clone.clone();
+                async move {
+                    *captured.lock().unwrap() = headers
+                        .iter()
+                        .map(|(name, value)| {
+                            (
+                                name.as_str().to_string(),
+                                value.to_str().unwrap_or_default().to_string(),
+                            )
+                        })
+                        .collect();
+                    let resp = json!({
+                        "id": "msg_whitelist",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": "Hi" }],
+                        "model": body.get("model").unwrap_or(&json!("claude-3")),
+                        "stop_reason": "end_turn",
+                        "usage": { "input_tokens": 1, "output_tokens": 1 }
+                    });
+                    (StatusCode::OK, Json(resp)).into_response()
+                }
+            },
+        ),
+    );
+    let _mock = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let config = proxy_config(&base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+    let client = Client::new();
+    let response = client
+        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "prompt-caching-2024-07-31")
+        .header("accept-language", "en-US")
+        .header("sec-fetch-mode", "cors")
+        .json(&json!({
+            "model": "claude-3",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let headers = captured.lock().unwrap().clone();
+    let find = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(find("anthropic-version").as_deref(), Some("2023-06-01"));
+    assert_eq!(
+        find("anthropic-beta").as_deref(),
+        Some("prompt-caching-2024-07-31")
+    );
+    assert_eq!(find("accept-language"), None);
+    assert_eq!(find("sec-fetch-mode"), None);
 }
 
 #[test]
