@@ -320,8 +320,19 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
 }
 
 fn openai_chunk(state: &StreamState, delta: Value, finish_reason: Option<&str>) -> Value {
+    let chunk_id = state
+        .message_id
+        .as_deref()
+        .map(|s| {
+            if s.starts_with("chatcmpl-") {
+                s.to_string()
+            } else {
+                format!("chatcmpl-{}", s)
+            }
+        })
+        .unwrap_or_else(|| "chatcmpl-0".to_string());
     let mut c = serde_json::json!({
-        "id": state.message_id.as_deref().map(|s| format!("chatcmpl-{}", s)).unwrap_or_else(|| "chatcmpl-0".to_string()),
+        "id": chunk_id,
         "object": "chat.completion.chunk",
         "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
         "model": state.model.as_deref().unwrap_or(""),
@@ -2186,5 +2197,15 @@ mod tests {
         assert!(joined.contains("\"type\":\"response.completed\""));
         assert!(joined.contains("\"error\":null"));
         assert!(joined.contains("\"incomplete_details\":null"));
+    }
+
+    #[test]
+    fn openai_chunk_does_not_double_prefix_existing_chatcmpl_ids() {
+        let state = StreamState {
+            message_id: Some("chatcmpl-msg123".to_string()),
+            ..Default::default()
+        };
+        let chunk = openai_chunk(&state, serde_json::json!({"content":"Hi"}), None);
+        assert_eq!(chunk["id"], "chatcmpl-msg123");
     }
 }
