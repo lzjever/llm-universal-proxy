@@ -618,6 +618,12 @@ async fn handle_request_core(
             );
         }
     };
+    if let Some((status, message)) =
+        normalized_non_stream_upstream_error(upstream_format, client_format, &upstream_body)
+    {
+        tracker.finish_error(status.as_u16());
+        return error_response(client_format, status, &message);
+    }
     let out = match translate_response(upstream_format, client_format, &upstream_body) {
         Ok(v) => v,
         Err(e) => {
@@ -1000,6 +1006,34 @@ fn openai_error_body(error: &NormalizedUpstreamError) -> Value {
     })
 }
 
+fn normalized_non_stream_upstream_error(
+    upstream_format: crate::formats::UpstreamFormat,
+    client_format: crate::formats::UpstreamFormat,
+    upstream_body: &Value,
+) -> Option<(StatusCode, String)> {
+    if !matches!(
+        client_format,
+        crate::formats::UpstreamFormat::OpenAiCompletion
+            | crate::formats::UpstreamFormat::OpenAiResponses
+    ) {
+        return None;
+    }
+
+    match upstream_format {
+        crate::formats::UpstreamFormat::Anthropic => {
+            let stop_reason = upstream_body.get("stop_reason").and_then(Value::as_str)?;
+            if stop_reason == "model_context_window_exceeded" {
+                return Some((
+                    StatusCode::BAD_REQUEST,
+                    "Your input exceeds the context window of this model. Please adjust your input and try again.".to_string(),
+                ));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn google_status_text(status: StatusCode) -> &'static str {
     match status {
         StatusCode::BAD_REQUEST => "INVALID_ARGUMENT",
@@ -1307,5 +1341,27 @@ mod tests {
         assert!(body.contains("event: response.failed"));
         assert!(body.contains("\"code\":\"context_length_exceeded\""));
         assert!(body.contains("\"message\":\"prompt is too long\""));
+    }
+
+    #[test]
+    fn normalized_non_stream_upstream_error_maps_anthropic_context_window_stop() {
+        let upstream_body = serde_json::json!({
+            "type": "message",
+            "stop_reason": "model_context_window_exceeded"
+        });
+
+        let actual = normalized_non_stream_upstream_error(
+            crate::formats::UpstreamFormat::Anthropic,
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            &upstream_body,
+        );
+
+        assert_eq!(
+            actual,
+            Some((
+                StatusCode::BAD_REQUEST,
+                "Your input exceeds the context window of this model. Please adjust your input and try again.".to_string()
+            ))
+        );
     }
 }

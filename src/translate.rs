@@ -95,6 +95,12 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
     if finish_reason == "tool_use" {
         finish_reason = "tool_calls".to_string();
     }
+    if finish_reason == "model_context_window_exceeded" {
+        finish_reason = "context_length_exceeded".to_string();
+    }
+    if finish_reason == "refusal" {
+        finish_reason = "content_filter".to_string();
+    }
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or_else(|| serde_json::json!(format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()))),
         "object": "chat.completion",
@@ -461,12 +467,23 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
             .unwrap()
             .as_secs())
     });
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
+    let incomplete_reason = match finish_reason {
+        "length" => Some("max_output_tokens"),
+        "content_filter" => Some("content_filter"),
+        _ => None,
+    };
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or(serde_json::Value::Null),
         "object": "response",
         "created_at": created_at,
         "output": output,
-        "status": "completed"
+        "status": if incomplete_reason.is_some() { "incomplete" } else { "completed" },
+        "incomplete_details": incomplete_reason.map(|reason| serde_json::json!({ "reason": reason })).unwrap_or(serde_json::Value::Null),
+        "error": serde_json::Value::Null
     });
     if let Some(u) = body.get("usage") {
         result["usage"] = openai_usage_to_responses_usage(u);
@@ -1922,6 +1939,40 @@ mod tests {
     }
 
     #[test]
+    fn translate_response_claude_context_window_stop_maps_to_openai_error_reason() {
+        let body = json!({
+            "id": "msg_1",
+            "content": [{ "type": "text", "text": "" }],
+            "stop_reason": "model_context_window_exceeded",
+            "model": "claude-3"
+        });
+        let out = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["choices"][0]["finish_reason"], "context_length_exceeded");
+    }
+
+    #[test]
+    fn translate_response_claude_refusal_maps_to_content_filter() {
+        let body = json!({
+            "id": "msg_1",
+            "content": [{ "type": "text", "text": "I can't help with that." }],
+            "stop_reason": "refusal",
+            "model": "claude-3"
+        });
+        let out = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
     fn translate_response_openai_to_claude_has_content_array() {
         let body = json!({
             "id": "chatcmpl-1",
@@ -2029,6 +2080,48 @@ mod tests {
         assert_eq!(out["output"][0]["type"], "reasoning");
         assert_eq!(out["output"][0]["summary"][0]["text"], "thinking");
         assert_eq!(out["output"][1]["type"], "message");
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_maps_length_to_incomplete() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "length"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_maps_content_filter_to_incomplete() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "content_filter"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "content_filter");
     }
 
     #[test]
