@@ -1,4 +1,7 @@
-FROM rust:1.88-bookworm AS builder
+ARG RUST_BASE_IMAGE=rust:1.88-bookworm
+ARG RUNTIME_BASE_IMAGE=debian:bookworm-slim
+
+FROM ${RUST_BASE_IMAGE} AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
@@ -7,7 +10,7 @@ COPY tests ./tests
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM ${RUNTIME_BASE_IMAGE}
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
