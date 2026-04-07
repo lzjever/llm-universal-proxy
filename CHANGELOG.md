@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.3 - 2026-04-07
+
+- Added a real-client E2E smoke script at `scripts/test_cli_clients.sh` that exercises the proxy with actual `codex` and `claude` CLI processes against mixed upstream aliases.
+- Verified cross-protocol routing for Codex CLI over OpenAI Responses and Claude Code over Anthropic Messages, including Anthropic-compatible and OpenAI-compatible upstreams behind one proxy.
+- Isolated Claude Code smoke tests from the user's global configuration by running them with a temporary `CLAUDE_CONFIG_DIR` and `--bare` mode, without modifying `~/.claude/settings.json`.
+- Fixed the Claude smoke-test base URL handling so the client points at `/anthropic` and lets Claude append `/v1/messages` itself.
+- Fixed Codex multi-turn smoke tests in temporary workspaces by adding `--skip-git-repo-check`.
+- Marked the local `qwen-local` alias as an intentional skip for multi-turn code-edit tasks where the model is not reliable enough, while keeping its single-turn smoke coverage enabled.
+- Documented the new smoke script and its constraints in `README.md`, `README_CN.md`, and the archived `HANDOFF.md`.
+
 ## v0.2.2 - 2026-03-20
 
 - Fixed streaming request telemetry so downstream client disconnects are recorded as `cancelled` instead of being misreported as `500` errors.
