@@ -120,10 +120,18 @@ fn dedupe_tool_call_state_by_call_id(
         .or_insert(existing_entry);
 }
 
-/// Extract one SSE event from buffer (up to and including first "\n\n"). Returns parsed JSON from "data: " line, or None.
+/// Extract one SSE event from buffer. Returns parsed JSON from "data: " line, or None.
 /// Buffer is updated: consumed bytes are removed.
+///
+/// Supports both `\n\n` and `\r\n\r\n` line endings, since some upstream servers
+/// (e.g., vLLM/uvicorn) emit SSE with CRLF separators.
 pub fn take_one_sse_event(buffer: &mut Vec<u8>) -> Option<Value> {
-    let pos = buffer.windows(2).position(|w| w == b"\n\n")?;
+    // Try CRLF first (\r\n\r\n), then LF (\n\n)
+    let pos = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 2) // point at the second \r\n so drain removes all 4 bytes
+        .or_else(|| buffer.windows(2).position(|w| w == b"\n\n"))?;
     let event_bytes = buffer.drain(..=pos + 1).collect::<Vec<_>>();
     let event_str = String::from_utf8_lossy(&event_bytes);
     for line in event_str.lines() {
@@ -478,7 +486,7 @@ pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
             let has_thought_sig =
                 part.get("thoughtSignature").is_some() || part.get("thought_signature").is_some();
             let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
-            if has_thought_sig {
+            if has_thought_sig || is_thought {
                 if let Some(t) = part.get("text").and_then(Value::as_str) {
                     if !t.is_empty() {
                         let delta = if is_thought {
@@ -2052,6 +2060,40 @@ mod tests {
             event.as_ref().unwrap().get("type").and_then(Value::as_str),
             Some("message_start")
         );
+    }
+
+    #[test]
+    fn take_one_sse_event_handles_crlf_separators() {
+        // Some upstream servers (e.g., vLLM/uvicorn) use \r\n\r\n as SSE separator
+        let mut buf = b"data: {\"id\":\"chat123\",\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\r\n\r\n".to_vec();
+        let event = take_one_sse_event(&mut buf);
+        assert!(event.is_some());
+        assert_eq!(
+            event.as_ref().unwrap().get("id").and_then(Value::as_str),
+            Some("chat123")
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn take_one_sse_event_handles_crlf_done_marker() {
+        let mut buf = b"data: [DONE]\r\n\r\n".to_vec();
+        let event = take_one_sse_event(&mut buf);
+        assert!(event.is_some());
+        assert_eq!(event.as_ref().unwrap().get("_done"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn take_one_sse_event_handles_mixed_crlf_and_lf() {
+        // Buffer with one CRLF event followed by one LF event
+        let mut buf = b"data: {\"first\":true}\r\n\r\ndata: {\"second\":true}\n\n".to_vec();
+        let e1 = take_one_sse_event(&mut buf);
+        assert!(e1.is_some());
+        assert_eq!(e1.as_ref().unwrap().get("first"), Some(&serde_json::json!(true)));
+        let e2 = take_one_sse_event(&mut buf);
+        assert!(e2.is_some());
+        assert_eq!(e2.as_ref().unwrap().get("second"), Some(&serde_json::json!(true)));
+        assert!(buf.is_empty());
     }
 
     #[test]

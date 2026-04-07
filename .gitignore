@@ -4,3 +4,6 @@ test-reports/
 test-codex-config.toml
 .tmp-codex-home.*/
 .local/
+.env.test
+.env*.local
+proxy-test-*.yaml

@@ -450,6 +450,7 @@ fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
         None => return Ok(body.clone()),
     };
     let mut content = String::new();
+    let mut reasoning_content = String::new();
     let mut tool_calls: Vec<Value> = vec![];
     for item in output {
         let ty = item.get("type").and_then(Value::as_str);
@@ -472,9 +473,21 @@ fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
                 }
             }));
         }
+        if ty == Some("reasoning") {
+            if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                for s in summary {
+                    if let Some(t) = s.get("text").and_then(Value::as_str) {
+                        reasoning_content.push_str(t);
+                    }
+                }
+            }
+        }
     }
     let mut message = serde_json::json!({ "role": "assistant" });
     message["content"] = Value::String(content);
+    if !reasoning_content.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning_content);
+    }
     let has_tool_calls = !tool_calls.is_empty();
     if has_tool_calls {
         message["tool_calls"] = Value::Array(tool_calls);
@@ -1453,6 +1466,7 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
     let mut parts: Vec<Value> = vec![];
     let mut tool_calls: Vec<Value> = vec![];
     let mut tool_results: Vec<Value> = vec![];
+    let mut reasoning_text: String = String::new();
     for block in arr {
         let ty = block.get("type").and_then(Value::as_str)?;
         match ty {
@@ -1493,7 +1507,15 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
                     "content": content_str
                 }));
             }
-            // Skip thinking/redacted_thinking blocks - not part of OpenAI format
+            "thinking" => {
+                // Convert thinking blocks to reasoning_content on assistant messages
+                if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        reasoning_text.push_str(t);
+                    }
+                }
+            }
+            // redacted_thinking: encrypted thinking cannot be translated; silently drop
             _ => {}
         }
     }
@@ -1510,17 +1532,24 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
         if !parts.is_empty() {
             m["content"] = collapse_claude_text_parts_for_openai(&parts);
         }
+        if !reasoning_text.is_empty() {
+            m["reasoning_content"] = Value::String(reasoning_text);
+        }
         return Some(vec![m]);
     }
     if parts.is_empty() {
-        return Some(vec![
-            serde_json::json!({ "role": openai_role, "content": "" }),
-        ]);
+        let mut m = serde_json::json!({ "role": openai_role, "content": "" });
+        if !reasoning_text.is_empty() {
+            m["reasoning_content"] = Value::String(reasoning_text);
+        }
+        return Some(vec![m]);
     }
     let content = collapse_claude_text_parts_for_openai(&parts);
-    Some(vec![
-        serde_json::json!({ "role": openai_role, "content": content }),
-    ])
+    let mut m = serde_json::json!({ "role": openai_role, "content": content });
+    if !reasoning_text.is_empty() {
+        m["reasoning_content"] = Value::String(reasoning_text);
+    }
+    Some(vec![m])
 }
 
 fn collapse_claude_text_parts_for_openai(parts: &[Value]) -> Value {

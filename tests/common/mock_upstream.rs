@@ -320,3 +320,250 @@ data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_1"
         (StatusCode::OK, Json(resp)).into_response()
     }
 }
+
+/// Spawns a mock OpenAI Chat Completions upstream that returns `reasoning_content`.
+pub async fn spawn_openai_completion_reasoning_mock() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(openai_completion_reasoning_handler))
+        .route("/chat/completions", post(openai_completion_reasoning_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn openai_completion_reasoning_handler(Json(body): Json<Value>) -> Response {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("mock");
+    if stream {
+        let chunks = [
+            format!(r#"data: {{"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1,"model":"{model}","choices":[{{"index":0,"delta":{{"role":"assistant","reasoning_content":"think"}},"finish_reason":null}}]}}"#),
+            format!(r#"data: {{"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1,"model":"{model}","choices":[{{"index":0,"delta":{{"content":"Hi"}},"finish_reason":null}}]}}"#),
+            format!(r#"data: {{"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1,"model":"{model}","choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":3,"total_tokens":4,"completion_tokens_details":{{"reasoning_tokens":1}}}}}}"#),
+            "data: [DONE]".to_string(),
+        ];
+        let body = chunks.join("\n\n") + "\n\n";
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    } else {
+        let resp = serde_json::json!({
+            "id": "chatcmpl-rs",
+            "object": "chat.completion",
+            "created": 1,
+            "model": model,
+            "choices": [{ "index": 0, "message": { "role": "assistant", "reasoning_content": "think", "content": "Hi" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 3, "total_tokens": 4, "completion_tokens_details": { "reasoning_tokens": 1 } }
+        });
+        (StatusCode::OK, Json(resp)).into_response()
+    }
+}
+
+/// Spawns a mock Gemini upstream that returns thinking/thought parts with thoughtSignature.
+pub async fn spawn_google_thinking_mock() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+
+    let app = Router::new()
+        .route("/v1beta/models/:model_action", post(google_thinking_handler))
+        .route("/models/:model_action", post(google_thinking_handler))
+        .route("/generateContent", post(google_thinking_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+/// Spawns a mock Gemini upstream with thought parts but NO thoughtSignature field.
+/// Tests the gap where `thought: true` is present without `thoughtSignature`.
+pub async fn spawn_google_thinking_no_signature_mock() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+
+    let app = Router::new()
+        .route("/v1beta/models/:model_action", post(google_thinking_no_sig_handler))
+        .route("/models/:model_action", post(google_thinking_no_sig_handler))
+        .route("/generateContent", post(google_thinking_no_sig_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn google_thinking_no_sig_handler(path: Option<Path<String>>, Json(body): Json<Value>) -> Response {
+    let stream = path
+        .as_ref()
+        .map(|Path(model_action)| model_action.contains(":streamGenerateContent"))
+        .unwrap_or(false)
+        || body
+            .get("generationConfig")
+            .and_then(|g| g.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if stream {
+        // thought parts with `thought: true` but NO `thoughtSignature`
+        let chunks = [
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"think","thought":true}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"thoughtsTokenCount":1,"totalTokenCount":3}}"#,
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"thoughtsTokenCount":1,"totalTokenCount":4}}"#,
+        ];
+        let body = chunks.join("\n\n") + "\n\n";
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    } else {
+        let resp = serde_json::json!({
+            "candidates": [{ "content": { "parts": [
+                { "text": "think", "thought": true },
+                { "text": "Hi" }
+            ], "role": "model" }, "finishReason": "STOP" }],
+            "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 1, "thoughtsTokenCount": 1, "totalTokenCount": 3 }
+        });
+        (StatusCode::OK, Json(resp)).into_response()
+    }
+}
+
+/// Spawns a mock Anthropic upstream that returns thinking + text + tool_use blocks.
+pub async fn spawn_anthropic_thinking_with_tools_mock() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+
+    let app = Router::new()
+        .route("/v1/messages", post(anthropic_thinking_tools_handler))
+        .route("/messages", post(anthropic_thinking_tools_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn anthropic_thinking_tools_handler(Json(body): Json<Value>) -> Response {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream {
+        let events = [
+            r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_tools","type":"message","role":"assistant","model":"claude-3","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"need to call tool"}}"#,
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Calling tool."}}"#,
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":1}"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}"#,
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Tokyo\"}"}}"#,
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":2}"#,
+            r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":5,"output_tokens":10}}"#,
+            r#"event: message_stop
+data: {"type":"message_stop"}"#,
+        ];
+        let body = events.join("\n\n") + "\n\n";
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    } else {
+        let resp = serde_json::json!({
+            "id": "msg_tools",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                { "type": "thinking", "thinking": "need to call tool" },
+                { "type": "text", "text": "Calling tool." },
+                { "type": "tool_use", "id": "tool_1", "name": "get_weather", "input": { "city": "Tokyo" } }
+            ],
+            "model": body.get("model").unwrap_or(&serde_json::json!("claude-3")),
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 5, "output_tokens": 10 }
+        });
+        (StatusCode::OK, Json(resp)).into_response()
+    }
+}
+
+/// Spawns a mock that captures request body and returns a simple OpenAI Chat Completion response.
+/// The captured body can be retrieved via the returned `captured` watch channel.
+pub async fn spawn_capture_openai_completion_mock() -> (String, tokio::task::JoinHandle<()>, tokio::sync::watch::Receiver<Option<Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{}", port);
+
+    let (tx, rx) = tokio::sync::watch::channel(None);
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(capture_openai_completion_handler))
+        .route("/chat/completions", post(capture_openai_completion_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.with_state(tx)).await.ok();
+    });
+    (base, handle, rx)
+}
+
+async fn capture_openai_completion_handler(
+    axum::extract::State(tx): axum::extract::State<tokio::sync::watch::Sender<Option<Value>>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let _ = tx.send(Some(body.clone()));
+    let resp = serde_json::json!({
+        "id": "chatcmpl-captured",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "mock",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "OK" }, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+async fn google_thinking_handler(path: Option<Path<String>>, Json(body): Json<Value>) -> Response {
+    let stream = path
+        .as_ref()
+        .map(|Path(model_action)| model_action.contains(":streamGenerateContent"))
+        .unwrap_or(false)
+        || body
+            .get("generationConfig")
+            .and_then(|g| g.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if stream {
+        let chunks = [
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"think","thought":true}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"thoughtsTokenCount":1,"totalTokenCount":3}}"#,
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"thoughtsTokenCount":1,"totalTokenCount":4}}"#,
+        ];
+        let body = chunks.join("\n\n") + "\n\n";
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    } else {
+        let resp = serde_json::json!({
+            "candidates": [{ "content": { "parts": [
+                { "text": "think", "thought": true },
+                { "text": "Hi" }
+            ], "role": "model" }, "finishReason": "STOP" }],
+            "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 1, "thoughtsTokenCount": 1, "totalTokenCount": 3 }
+        });
+        (StatusCode::OK, Json(resp)).into_response()
+    }
+}
