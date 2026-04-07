@@ -11,53 +11,10 @@
 mod common;
 
 use common::*;
-use llm_universal_proxy::config::{AuthPolicy, Config, DebugTraceConfig, UpstreamConfig};
 use llm_universal_proxy::formats::UpstreamFormat;
-use llm_universal_proxy::server::run_with_listener;
 use reqwest::Client;
 use serde_json::json;
 use serde_json::Value;
-use std::time::Duration;
-use tokio::net::TcpListener;
-
-fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
-    let upstream_base = upstream_base.trim_end_matches('/');
-    let api_root = match format {
-        UpstreamFormat::Google => format!("{}/v1beta", upstream_base),
-        _ => format!("{}/v1", upstream_base),
-    };
-    Config {
-        listen: "127.0.0.1:0".to_string(),
-        upstream_timeout: Duration::from_secs(30),
-        upstreams: vec![UpstreamConfig {
-            name: "default".to_string(),
-            api_root,
-            fixed_upstream_format: Some(format),
-            fallback_credential_env: None,
-            fallback_credential_actual: None,
-            fallback_api_key: None,
-            auth_policy: AuthPolicy::ClientOrFallback,
-            upstream_headers: Vec::new(),
-        }],
-        model_aliases: Default::default(),
-        hooks: Default::default(),
-        debug_trace: DebugTraceConfig::default(),
-    }
-}
-
-async fn start_proxy(
-    config: Config,
-) -> (
-    String,
-    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
-    let handle = tokio::spawn(async move { run_with_listener(config, listener).await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (base, handle)
-}
 
 // ============================================================
 // A. Non-Streaming Cross-Format Reasoning
@@ -106,6 +63,31 @@ async fn anthropic_thinking_to_gemini_non_streaming() {
     assert_eq!(parts[0]["thought"], true);
     assert_eq!(parts[0]["text"], "think");
     assert_eq!(parts[1]["text"], "Hi");
+}
+
+#[tokio::test]
+async fn anthropic_thinking_to_responses_non_streaming() {
+    let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "claude-3",
+            "input": "Hi",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    let output = body["output"].as_array().unwrap();
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[0]["summary"][0]["text"], "think");
+    assert!(output.iter().any(|o| o["type"] == "message"));
 }
 
 #[tokio::test]

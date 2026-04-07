@@ -381,6 +381,39 @@ pub async fn spawn_google_thinking_mock() -> (String, tokio::task::JoinHandle<()
     (base, handle)
 }
 
+async fn google_thinking_handler(path: Option<Path<String>>, Json(body): Json<Value>) -> Response {
+    let stream = path
+        .as_ref()
+        .map(|Path(model_action)| model_action.contains(":streamGenerateContent"))
+        .unwrap_or(false)
+        || body
+            .get("generationConfig")
+            .and_then(|g| g.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if stream {
+        let chunks = [
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"think","thought":true}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"thoughtsTokenCount":1,"totalTokenCount":3}}"#,
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"thoughtsTokenCount":1,"totalTokenCount":4}}"#,
+        ];
+        let body = chunks.join("\n\n") + "\n\n";
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    } else {
+        let resp = serde_json::json!({
+            "candidates": [{ "content": { "parts": [
+                { "text": "think", "thought": true },
+                { "text": "Hi" }
+            ], "role": "model" }, "finishReason": "STOP" }],
+            "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 1, "thoughtsTokenCount": 1, "totalTokenCount": 3 }
+        });
+        (StatusCode::OK, Json(resp)).into_response()
+    }
+}
+
 /// Spawns a mock Gemini upstream with thought parts but NO thoughtSignature field.
 /// Tests the gap where `thought: true` is present without `thoughtSignature`.
 pub async fn spawn_google_thinking_no_signature_mock() -> (String, tokio::task::JoinHandle<()>) {
@@ -533,37 +566,4 @@ async fn capture_openai_completion_handler(
         "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
     });
     (StatusCode::OK, Json(resp)).into_response()
-}
-
-async fn google_thinking_handler(path: Option<Path<String>>, Json(body): Json<Value>) -> Response {
-    let stream = path
-        .as_ref()
-        .map(|Path(model_action)| model_action.contains(":streamGenerateContent"))
-        .unwrap_or(false)
-        || body
-            .get("generationConfig")
-            .and_then(|g| g.get("stream"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    if stream {
-        let chunks = [
-            r#"data: {"candidates":[{"content":{"parts":[{"text":"think","thought":true}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"thoughtsTokenCount":1,"totalTokenCount":3}}"#,
-            r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"thoughtsTokenCount":1,"totalTokenCount":4}}"#,
-        ];
-        let body = chunks.join("\n\n") + "\n\n";
-        Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/event-stream")
-            .body(Body::from(body))
-            .unwrap()
-    } else {
-        let resp = serde_json::json!({
-            "candidates": [{ "content": { "parts": [
-                { "text": "think", "thought": true },
-                { "text": "Hi" }
-            ], "role": "model" }, "finishReason": "STOP" }],
-            "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 1, "thoughtsTokenCount": 1, "totalTokenCount": 3 }
-        });
-        (StatusCode::OK, Json(resp)).into_response()
-    }
 }
