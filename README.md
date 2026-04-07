@@ -135,6 +135,30 @@ make test         # Run all tests
 make run-release  # Build and run in release mode
 ```
 
+## Real CLI E2E Smoke Script
+
+The repo also includes a real-client E2E script at [scripts/test_cli_clients.sh](/home/percy/works/mbos-v1/llm-universal-proxy/scripts/test_cli_clients.sh). It exercises the proxy with actual `codex` and `claude` CLI processes against multiple upstream aliases.
+
+Typical flow:
+
+```bash
+cargo build --release
+bash scripts/test_cli_clients.sh
+```
+
+Useful subsets:
+
+```bash
+bash scripts/test_cli_clients.sh --test codex
+bash scripts/test_cli_clients.sh --test claude
+bash scripts/test_cli_clients.sh --proxy-only
+```
+
+Notes:
+- The script expects a local `proxy-test-minimax-and-local.yaml` file with working upstream credentials.
+- Claude Code tests use a temporary `CLAUDE_CONFIG_DIR`, so your global `~/.claude/settings.json` is not modified.
+- Multi-turn code-edit tests intentionally skip the local `qwen-local` alias where the model is not reliable enough for that task.
+
 ## Configuration
 
 The proxy is configured with a YAML file passed via `--config`:

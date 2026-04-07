@@ -70,6 +70,30 @@ make test         # 运行所有测试
 make run-release  # 构建并以 release 模式运行
 ```
 
+## 真实 CLI 端到端脚本
+
+仓库内还提供了一个真实客户端 E2E 脚本：[scripts/test_cli_clients.sh](/home/percy/works/mbos-v1/llm-universal-proxy/scripts/test_cli_clients.sh)。它会直接调用真实的 `codex` 和 `claude` CLI，通过多个上游别名来验证代理行为。
+
+常用方式：
+
+```bash
+cargo build --release
+bash scripts/test_cli_clients.sh
+```
+
+按子集运行：
+
+```bash
+bash scripts/test_cli_clients.sh --test codex
+bash scripts/test_cli_clients.sh --test claude
+bash scripts/test_cli_clients.sh --proxy-only
+```
+
+说明：
+- 脚本要求本地存在可用的 `proxy-test-minimax-and-local.yaml`，其中需配置真实上游凭证。
+- Claude Code 测试使用临时 `CLAUDE_CONFIG_DIR`，不会修改你的全局 `~/.claude/settings.json`。
+- 多轮代码修复任务会显式跳过本地 `qwen-local` 那一格，因为该模型在这类任务上还不够稳定。
+
 ## 配置
 
 代理通过 YAML 文件配置，并通过 `--config` 指定：
