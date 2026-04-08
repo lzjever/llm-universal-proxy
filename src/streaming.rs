@@ -89,9 +89,9 @@ fn dedupe_tool_call_state_by_call_id(
     let Some(incoming_id) = incoming_id else {
         return;
     };
-    let existing_key = tool_calls
-        .iter()
-        .find_map(|(key, entry)| ((*key != tc_idx) && entry.id.as_ref() == Some(incoming_id)).then_some(*key));
+    let existing_key = tool_calls.iter().find_map(|(key, entry)| {
+        ((*key != tc_idx) && entry.id.as_ref() == Some(incoming_id)).then_some(*key)
+    });
     let Some(existing_key) = existing_key else {
         return;
     };
@@ -293,12 +293,12 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                             } else {
                                 tc.arguments.push_str(pj);
                                 Some(serde_json::json!({
-                                    "tool_calls": [{
-                                        "index": tc.openai_index,
-                                        "id": tc.id,
-                                        "function": { "arguments": pj }
-                                    }]
-                            }))
+                                        "tool_calls": [{
+                                            "index": tc.openai_index,
+                                            "id": tc.id,
+                                            "function": { "arguments": pj }
+                                        }]
+                                }))
                             }
                         } else {
                             None
@@ -911,7 +911,8 @@ fn minimax_reasoning_details_text(value: Option<&Value>) -> Option<String> {
 }
 
 fn is_minimax_chunk(chunk: &Value, state: &StreamState) -> bool {
-    chunk.get("model")
+    chunk
+        .get("model")
         .and_then(Value::as_str)
         .or(state.model.as_deref())
         .map(|model| model.starts_with("MiniMax-"))
@@ -1237,8 +1238,7 @@ fn emit_openai_responses_terminal(
             "total_tokens": total_tokens
         });
         if let Some(cached_tokens) = cached_tokens {
-            usage["input_tokens_details"] =
-                serde_json::json!({ "cached_tokens": cached_tokens });
+            usage["input_tokens_details"] = serde_json::json!({ "cached_tokens": cached_tokens });
         }
         if let Some(reasoning_tokens) = reasoning_tokens {
             usage["output_tokens_details"] =
@@ -1446,10 +1446,7 @@ fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
         state.model = chunk.get("model").and_then(Value::as_str).map(String::from);
     }
 
-    let model = state
-        .model
-        .clone()
-        .unwrap_or_else(|| "gemini".to_string());
+    let model = state.model.clone().unwrap_or_else(|| "gemini".to_string());
     let mut parts: Vec<Value> = vec![];
 
     if let Some(r) = openai_chunk_reasoning_delta(delta, state) {
@@ -1697,13 +1694,14 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
             let mut item_added: Option<(String, String)> = None;
             let mut args_delta: Option<(String, String, String)> = None;
             {
-                let entry = state
-                    .openai_tool_calls
-                    .entry(tc_idx)
-                    .or_insert_with(|| ToolCallState {
-                        index: tc_idx,
-                        ..Default::default()
-                    });
+                let entry =
+                    state
+                        .openai_tool_calls
+                        .entry(tc_idx)
+                        .or_insert_with(|| ToolCallState {
+                            index: tc_idx,
+                            ..Default::default()
+                        });
                 if let Some(id) = tc.get("id").cloned() {
                     entry.id = Some(id);
                 }
@@ -2065,7 +2063,9 @@ mod tests {
     #[test]
     fn take_one_sse_event_handles_crlf_separators() {
         // Some upstream servers (e.g., vLLM/uvicorn) use \r\n\r\n as SSE separator
-        let mut buf = b"data: {\"id\":\"chat123\",\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\r\n\r\n".to_vec();
+        let mut buf =
+            b"data: {\"id\":\"chat123\",\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\r\n\r\n"
+                .to_vec();
         let event = take_one_sse_event(&mut buf);
         assert!(event.is_some());
         assert_eq!(
@@ -2080,7 +2080,10 @@ mod tests {
         let mut buf = b"data: [DONE]\r\n\r\n".to_vec();
         let event = take_one_sse_event(&mut buf);
         assert!(event.is_some());
-        assert_eq!(event.as_ref().unwrap().get("_done"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            event.as_ref().unwrap().get("_done"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     #[test]
@@ -2089,10 +2092,16 @@ mod tests {
         let mut buf = b"data: {\"first\":true}\r\n\r\ndata: {\"second\":true}\n\n".to_vec();
         let e1 = take_one_sse_event(&mut buf);
         assert!(e1.is_some());
-        assert_eq!(e1.as_ref().unwrap().get("first"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            e1.as_ref().unwrap().get("first"),
+            Some(&serde_json::json!(true))
+        );
         let e2 = take_one_sse_event(&mut buf);
         assert!(e2.is_some());
-        assert_eq!(e2.as_ref().unwrap().get("second"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            e2.as_ref().unwrap().get("second"),
+            Some(&serde_json::json!(true))
+        );
         assert!(buf.is_empty());
     }
 
@@ -2645,7 +2654,10 @@ mod tests {
         let delta_tool_calls = delta_chunks[0]["choices"][0]["delta"]["tool_calls"]
             .as_array()
             .expect("delta tool_calls");
-        assert_eq!(delta_tool_calls[0]["function"]["arguments"], "{\"cmd\":\"pwd\"}");
+        assert_eq!(
+            delta_tool_calls[0]["function"]["arguments"],
+            "{\"cmd\":\"pwd\"}"
+        );
     }
 
     #[test]

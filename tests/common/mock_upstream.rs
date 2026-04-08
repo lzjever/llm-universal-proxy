@@ -1,5 +1,6 @@
 //! Mock upstream servers that speak each protocol per official API specs.
 //! Used by integration tests to validate proxy passthrough and translation.
+#![allow(dead_code)]
 
 use axum::{
     body::Body,
@@ -328,8 +329,14 @@ pub async fn spawn_openai_completion_reasoning_mock() -> (String, tokio::task::J
     let base = format!("http://127.0.0.1:{}", port);
 
     let app = Router::new()
-        .route("/v1/chat/completions", post(openai_completion_reasoning_handler))
-        .route("/chat/completions", post(openai_completion_reasoning_handler));
+        .route(
+            "/v1/chat/completions",
+            post(openai_completion_reasoning_handler),
+        )
+        .route(
+            "/chat/completions",
+            post(openai_completion_reasoning_handler),
+        );
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
@@ -341,9 +348,15 @@ async fn openai_completion_reasoning_handler(Json(body): Json<Value>) -> Respons
     let model = body.get("model").and_then(Value::as_str).unwrap_or("mock");
     if stream {
         let chunks = [
-            format!(r#"data: {{"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1,"model":"{model}","choices":[{{"index":0,"delta":{{"role":"assistant","reasoning_content":"think"}},"finish_reason":null}}]}}"#),
-            format!(r#"data: {{"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1,"model":"{model}","choices":[{{"index":0,"delta":{{"content":"Hi"}},"finish_reason":null}}]}}"#),
-            format!(r#"data: {{"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1,"model":"{model}","choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":3,"total_tokens":4,"completion_tokens_details":{{"reasoning_tokens":1}}}}}}"#),
+            format!(
+                r#"data: {{"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1,"model":"{model}","choices":[{{"index":0,"delta":{{"role":"assistant","reasoning_content":"think"}},"finish_reason":null}}]}}"#
+            ),
+            format!(
+                r#"data: {{"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1,"model":"{model}","choices":[{{"index":0,"delta":{{"content":"Hi"}},"finish_reason":null}}]}}"#
+            ),
+            format!(
+                r#"data: {{"id":"chatcmpl-rs","object":"chat.completion.chunk","created":1,"model":"{model}","choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":1,"completion_tokens":3,"total_tokens":4,"completion_tokens_details":{{"reasoning_tokens":1}}}}}}"#
+            ),
             "data: [DONE]".to_string(),
         ];
         let body = chunks.join("\n\n") + "\n\n";
@@ -372,7 +385,10 @@ pub async fn spawn_google_thinking_mock() -> (String, tokio::task::JoinHandle<()
     let base = format!("http://127.0.0.1:{}", port);
 
     let app = Router::new()
-        .route("/v1beta/models/:model_action", post(google_thinking_handler))
+        .route(
+            "/v1beta/models/:model_action",
+            post(google_thinking_handler),
+        )
         .route("/models/:model_action", post(google_thinking_handler))
         .route("/generateContent", post(google_thinking_handler));
     let handle = tokio::spawn(async move {
@@ -422,8 +438,14 @@ pub async fn spawn_google_thinking_no_signature_mock() -> (String, tokio::task::
     let base = format!("http://127.0.0.1:{}", port);
 
     let app = Router::new()
-        .route("/v1beta/models/:model_action", post(google_thinking_no_sig_handler))
-        .route("/models/:model_action", post(google_thinking_no_sig_handler))
+        .route(
+            "/v1beta/models/:model_action",
+            post(google_thinking_no_sig_handler),
+        )
+        .route(
+            "/models/:model_action",
+            post(google_thinking_no_sig_handler),
+        )
         .route("/generateContent", post(google_thinking_no_sig_handler));
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
@@ -431,7 +453,10 @@ pub async fn spawn_google_thinking_no_signature_mock() -> (String, tokio::task::
     (base, handle)
 }
 
-async fn google_thinking_no_sig_handler(path: Option<Path<String>>, Json(body): Json<Value>) -> Response {
+async fn google_thinking_no_sig_handler(
+    path: Option<Path<String>>,
+    Json(body): Json<Value>,
+) -> Response {
     let stream = path
         .as_ref()
         .map(|Path(model_action)| model_action.contains(":streamGenerateContent"))
@@ -536,7 +561,11 @@ data: {"type":"message_stop"}"#,
 
 /// Spawns a mock that captures request body and returns a simple OpenAI Chat Completion response.
 /// The captured body can be retrieved via the returned `captured` watch channel.
-pub async fn spawn_capture_openai_completion_mock() -> (String, tokio::task::JoinHandle<()>, tokio::sync::watch::Receiver<Option<Value>>) {
+pub async fn spawn_capture_openai_completion_mock() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Receiver<Option<Value>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let base = format!("http://127.0.0.1:{}", port);
@@ -544,7 +573,10 @@ pub async fn spawn_capture_openai_completion_mock() -> (String, tokio::task::Joi
     let (tx, rx) = tokio::sync::watch::channel(None);
 
     let app = Router::new()
-        .route("/v1/chat/completions", post(capture_openai_completion_handler))
+        .route(
+            "/v1/chat/completions",
+            post(capture_openai_completion_handler),
+        )
         .route("/chat/completions", post(capture_openai_completion_handler));
     let handle = tokio::spawn(async move {
         axum::serve(listener, app.with_state(tx)).await.ok();

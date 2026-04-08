@@ -52,14 +52,19 @@ async fn anthropic_thinking_to_gemini_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/google/v1beta/models/test:generateContent", proxy_base))
+        .post(format!(
+            "{}/google/v1beta/models/test:generateContent",
+            proxy_base
+        ))
         .json(&json!({ "contents": [{ "parts": [{ "text": "Hi" }] }] }))
         .send()
         .await
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body: Value = res.json().await.unwrap();
-    let parts = body["candidates"][0]["content"]["parts"].as_array().unwrap();
+    let parts = body["candidates"][0]["content"]["parts"]
+        .as_array()
+        .unwrap();
     assert_eq!(parts[0]["thought"], true);
     assert_eq!(parts[0]["text"], "think");
     assert_eq!(parts[1]["text"], "Hi");
@@ -146,14 +151,19 @@ async fn openai_reasoning_to_gemini_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/google/v1beta/models/test:generateContent", proxy_base))
+        .post(format!(
+            "{}/google/v1beta/models/test:generateContent",
+            proxy_base
+        ))
         .json(&json!({ "contents": [{ "parts": [{ "text": "Hi" }] }] }))
         .send()
         .await
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body: Value = res.json().await.unwrap();
-    let parts = body["candidates"][0]["content"]["parts"].as_array().unwrap();
+    let parts = body["candidates"][0]["content"]["parts"]
+        .as_array()
+        .unwrap();
     assert_eq!(parts[0]["thought"], true);
     assert_eq!(parts[0]["text"], "think");
     assert_eq!(parts[1]["text"], "Hi");
@@ -218,14 +228,19 @@ async fn responses_reasoning_to_gemini_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/google/v1beta/models/test:generateContent", proxy_base))
+        .post(format!(
+            "{}/google/v1beta/models/test:generateContent",
+            proxy_base
+        ))
         .json(&json!({ "contents": [{ "parts": [{ "text": "Hi" }] }] }))
         .send()
         .await
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body: Value = res.json().await.unwrap();
-    let parts = body["candidates"][0]["content"]["parts"].as_array().unwrap();
+    let parts = body["candidates"][0]["content"]["parts"]
+        .as_array()
+        .unwrap();
     assert_eq!(parts[0]["thought"], true);
     assert_eq!(parts[0]["text"], "think");
     assert_eq!(parts[1]["text"], "Hi");
@@ -343,7 +358,10 @@ async fn anthropic_thinking_to_responses_streaming() {
         .unwrap();
     assert!(res.status().is_success());
     let text = res.text().await.unwrap();
-    assert!(text.contains("response.reasoning_summary_text.delta"), "body = {text}");
+    assert!(
+        text.contains("response.reasoning_summary_text.delta"),
+        "body = {text}"
+    );
     assert!(
         text.contains("response.output_text.delta") || text.contains("response.completed"),
         "body = {text}"
@@ -390,7 +408,10 @@ async fn openai_reasoning_to_responses_streaming() {
         .unwrap();
     assert!(res.status().is_success());
     let text = res.text().await.unwrap();
-    assert!(text.contains("response.reasoning_summary_text.delta"), "body = {text}");
+    assert!(
+        text.contains("response.reasoning_summary_text.delta"),
+        "body = {text}"
+    );
 }
 
 #[tokio::test]
@@ -501,7 +522,8 @@ async fn gemini_thinking_to_responses_streaming() {
     assert!(res.status().is_success());
     let text = res.text().await.unwrap();
     assert!(
-        text.contains("response.reasoning_summary_text.delta") || text.contains("response.completed"),
+        text.contains("response.reasoning_summary_text.delta")
+            || text.contains("response.completed"),
         "body = {text}"
     );
 }
@@ -559,9 +581,18 @@ async fn anthropic_thinking_with_tools_to_responses_non_streaming() {
     assert!(res.status().is_success(), "status: {}", res.status());
     let body: Value = res.json().await.unwrap();
     let output = body["output"].as_array().unwrap();
-    assert!(output.iter().any(|o| o["type"] == "reasoning"), "missing reasoning: {output:?}");
-    assert!(output.iter().any(|o| o["type"] == "message"), "missing message: {output:?}");
-    assert!(output.iter().any(|o| o["type"] == "function_call"), "missing function_call: {output:?}");
+    assert!(
+        output.iter().any(|o| o["type"] == "reasoning"),
+        "missing reasoning: {output:?}"
+    );
+    assert!(
+        output.iter().any(|o| o["type"] == "message"),
+        "missing message: {output:?}"
+    );
+    assert!(
+        output.iter().any(|o| o["type"] == "function_call"),
+        "missing function_call: {output:?}"
+    );
 }
 
 #[tokio::test]
@@ -584,8 +615,14 @@ async fn anthropic_thinking_with_tools_to_openai_streaming() {
         .unwrap();
     assert!(res.status().is_success());
     let text = res.text().await.unwrap();
-    assert!(text.contains("reasoning_content"), "should have reasoning delta: {text}");
-    assert!(text.contains("tool_calls") || text.contains("get_weather"), "should have tool call: {text}");
+    assert!(
+        text.contains("reasoning_content"),
+        "should have reasoning delta: {text}"
+    );
+    assert!(
+        text.contains("tool_calls") || text.contains("get_weather"),
+        "should have tool call: {text}"
+    );
 }
 
 // ============================================================
@@ -744,7 +781,10 @@ async fn openai_reasoning_with_completion_tokens_details() {
         .unwrap();
     assert!(res.status().is_success());
     let body: Value = res.json().await.unwrap();
-    assert_eq!(body["usage"]["output_tokens_details"]["reasoning_tokens"], 1);
+    assert_eq!(
+        body["usage"]["output_tokens_details"]["reasoning_tokens"],
+        1
+    );
 }
 
 // ============================================================

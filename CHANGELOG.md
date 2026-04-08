@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.4 - 2026-04-07
+
+- Normalized repository-wide Rust formatting so the release `cargo fmt --check` gate passes again.
+- Fixed `clippy -D warnings` failures in the debug trace helpers, request handler linting, and shared test mock utilities.
+- Re-ran the local release gate successfully with:
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings`
+  - `cargo test --locked --verbose`
+- Carries forward the real CLI E2E smoke-script work documented in `v0.2.3`, including real `codex` / `claude` proxy smoke coverage and release-note documentation updates.
+
 ## v0.2.3 - 2026-04-07
 
 - Added a real-client E2E smoke script at `scripts/test_cli_clients.sh` that exercises the proxy with actual `codex` and `claude` CLI processes against mixed upstream aliases.

@@ -150,7 +150,12 @@ impl DebugTraceRecorder {
 
     pub fn record_stream_start(&self, _ctx: &DebugTraceContext) {}
 
-    pub fn wrap_stream<S>(&self, inner: S, ctx: DebugTraceContext, status: u16) -> DebugTraceStream<S>
+    pub fn wrap_stream<S>(
+        &self,
+        inner: S,
+        ctx: DebugTraceContext,
+        status: u16,
+    ) -> DebugTraceStream<S>
     where
         S: Stream<Item = Result<Bytes, std::io::Error>>,
     {
@@ -307,10 +312,7 @@ fn extract_request_delta(format: UpstreamFormat, body: &Value, max_text_chars: u
             let tail = trailing_client_messages(&items, |item| {
                 let ty = item.get("type").and_then(Value::as_str);
                 matches!(ty, Some("reasoning") | Some("function_call"))
-                    || matches!(
-                        item.get("role").and_then(Value::as_str),
-                        Some("assistant")
-                    )
+                    || matches!(item.get("role").and_then(Value::as_str), Some("assistant"))
             });
             Value::Array(
                 tail.iter()
@@ -348,7 +350,7 @@ fn summarize_request_body(format: UpstreamFormat, body: &Value, max_text_chars: 
             "text": body.get("text"),
             "include": body.get("include"),
             "reasoning": body.get("reasoning"),
-            "tool_names": body.get("tools").and_then(Value::as_array).map(tool_names_from_responses),
+            "tool_names": body.get("tools").and_then(Value::as_array).map(|tools| tool_names_from_responses(tools)),
             "input_tail": extract_request_delta(format, body, max_text_chars),
         }),
         UpstreamFormat::OpenAiCompletion => json!({
@@ -360,8 +362,8 @@ fn summarize_request_body(format: UpstreamFormat, body: &Value, max_text_chars: 
             "stop": body.get("stop"),
             "tool_choice": body.get("tool_choice"),
             "parallel_tool_calls": body.get("parallel_tool_calls"),
-            "tool_names": body.get("tools").and_then(Value::as_array).map(tool_names_from_chat_tools),
-            "message_roles": body.get("messages").and_then(Value::as_array).map(message_roles),
+            "tool_names": body.get("tools").and_then(Value::as_array).map(|tools| tool_names_from_chat_tools(tools)),
+            "message_roles": body.get("messages").and_then(Value::as_array).map(|messages| message_roles(messages)),
             "messages_tail": extract_request_delta(format, body, max_text_chars),
         }),
         UpstreamFormat::Anthropic => json!({
@@ -371,8 +373,8 @@ fn summarize_request_body(format: UpstreamFormat, body: &Value, max_text_chars: 
             "temperature": body.get("temperature"),
             "top_p": body.get("top_p"),
             "tool_choice": body.get("tool_choice"),
-            "tool_names": body.get("tools").and_then(Value::as_array).map(tool_names_from_claude_tools),
-            "message_roles": body.get("messages").and_then(Value::as_array).map(message_roles),
+            "tool_names": body.get("tools").and_then(Value::as_array).map(|tools| tool_names_from_claude_tools(tools)),
+            "message_roles": body.get("messages").and_then(Value::as_array).map(|messages| message_roles(messages)),
             "messages_tail": extract_request_delta(format, body, max_text_chars),
         }),
         UpstreamFormat::Google => json!({
@@ -382,14 +384,16 @@ fn summarize_request_body(format: UpstreamFormat, body: &Value, max_text_chars: 
     }
 }
 
-fn tool_names_from_responses(tools: &Vec<Value>) -> Vec<String> {
-    tools.iter()
+fn tool_names_from_responses(tools: &[Value]) -> Vec<String> {
+    tools
+        .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
         .collect()
 }
 
-fn tool_names_from_chat_tools(tools: &Vec<Value>) -> Vec<String> {
-    tools.iter()
+fn tool_names_from_chat_tools(tools: &[Value]) -> Vec<String> {
+    tools
+        .iter()
         .filter_map(|tool| {
             tool.get("function")
                 .and_then(|f| f.get("name"))
@@ -399,13 +403,14 @@ fn tool_names_from_chat_tools(tools: &Vec<Value>) -> Vec<String> {
         .collect()
 }
 
-fn tool_names_from_claude_tools(tools: &Vec<Value>) -> Vec<String> {
-    tools.iter()
+fn tool_names_from_claude_tools(tools: &[Value]) -> Vec<String> {
+    tools
+        .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
         .collect()
 }
 
-fn message_roles(messages: &Vec<Value>) -> Vec<String> {
+fn message_roles(messages: &[Value]) -> Vec<String> {
     messages
         .iter()
         .filter_map(|msg| msg.get("role").and_then(Value::as_str).map(str::to_string))
@@ -443,7 +448,11 @@ fn summarize_chat_message(msg: &Value, max_text_chars: usize) -> Value {
 }
 
 fn summarize_responses_item(item: &Value, max_text_chars: usize) -> Value {
-    match item.get("type").and_then(Value::as_str).unwrap_or("unknown") {
+    match item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+    {
         "message" => json!({
             "type": "message",
             "role": item.get("role").and_then(Value::as_str).unwrap_or("unknown"),
@@ -521,7 +530,11 @@ fn summarize_responses_content(content: Option<&Value>, max_text_chars: usize) -
     )
 }
 
-fn summarize_non_stream_response(format: UpstreamFormat, body: &Value, max_text_chars: usize) -> Value {
+fn summarize_non_stream_response(
+    format: UpstreamFormat,
+    body: &Value,
+    max_text_chars: usize,
+) -> Value {
     match format {
         UpstreamFormat::OpenAiCompletion => {
             let choice = body

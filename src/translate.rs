@@ -677,11 +677,8 @@ fn coalesce_openai_string_messages(body: &mut Value) {
             .map(|text| !text.is_empty())
             .unwrap_or(false);
 
-        let mergeable = role.is_some()
-            && content.is_some()
-            && !has_tools
-            && !has_tool_result
-            && !has_reasoning;
+        let mergeable =
+            role.is_some() && content.is_some() && !has_tools && !has_tool_result && !has_reasoning;
 
         if mergeable {
             if let Some(previous) = merged.last_mut() {
@@ -879,7 +876,8 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                         Some(serde_json::json!({ "role": "user", "content": content }));
                 } else {
                     flush_assistant(&mut messages, &mut current_assistant);
-                    messages.push(serde_json::json!({ "role": normalized_role, "content": content }));
+                    messages
+                        .push(serde_json::json!({ "role": normalized_role, "content": content }));
                 }
             }
             "function_call" => {
@@ -1009,7 +1007,8 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
         out.insert("stop".to_string(), stop);
     }
     if let Some(tool_choice) = body.get("tool_choice").cloned() {
-        if let Some(mapped_tool_choice) = responses_tool_choice_to_openai_tool_choice(&tool_choice) {
+        if let Some(mapped_tool_choice) = responses_tool_choice_to_openai_tool_choice(&tool_choice)
+        {
             out.insert("tool_choice".to_string(), mapped_tool_choice);
         }
     }
@@ -1597,7 +1596,11 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
             result["tool_choice"] = mapped_tool_choice;
         }
     } else if body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
-        && body.get("tools").and_then(Value::as_array).map(|t| !t.is_empty()).unwrap_or(false)
+        && body
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|t| !t.is_empty())
+            .unwrap_or(false)
     {
         result["tool_choice"] =
             serde_json::json!({ "type": "auto", "disable_parallel_tool_use": true });
@@ -1664,10 +1667,9 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
                 pending_tool_results.clear();
                 claude_blocks = merged;
             } else if !pending_tool_results.is_empty() {
-                result["messages"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(serde_json::json!({ "role": "user", "content": pending_tool_results.clone() }));
+                result["messages"].as_array_mut().unwrap().push(
+                    serde_json::json!({ "role": "user", "content": pending_tool_results.clone() }),
+                );
                 pending_tool_results.clear();
             }
 
@@ -1675,16 +1677,21 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
             if last_assistant_idx == Some(i)
                 && role == "assistant"
                 && !claude_blocks.is_empty()
-                && can_attach_cache_control_to_content_block(&claude_blocks[claude_blocks.len() - 1])
+                && can_attach_cache_control_to_content_block(
+                    &claude_blocks[claude_blocks.len() - 1],
+                )
             {
                 let last_block_idx = claude_blocks.len() - 1;
                 claude_blocks[last_block_idx]["cache_control"] =
                     serde_json::json!({ "type": "ephemeral" });
             }
-            result["messages"].as_array_mut().unwrap().push(serde_json::json!({
-                "role": if role == "assistant" { "assistant" } else { "user" },
-                "content": claude_blocks
-            }));
+            result["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "role": if role == "assistant" { "assistant" } else { "user" },
+                    "content": claude_blocks
+                }));
         }
     }
 
@@ -1980,11 +1987,17 @@ mod translate_regression_tests {
 
         openai_to_claude(&mut body).expect("translate to claude");
         let messages = body["messages"].as_array().expect("messages array");
-        let assistant_content = messages[0]["content"].as_array().expect("assistant content");
+        let assistant_content = messages[0]["content"]
+            .as_array()
+            .expect("assistant content");
         assert_eq!(assistant_content[1]["type"], "tool_use");
         assert!(assistant_content[1].get("cache_control").is_none());
-        assert!(can_attach_cache_control_to_content_block(&assistant_content[0]));
-        assert!(!can_attach_cache_control_to_content_block(&assistant_content[1]));
+        assert!(can_attach_cache_control_to_content_block(
+            &assistant_content[0]
+        ));
+        assert!(!can_attach_cache_control_to_content_block(
+            &assistant_content[1]
+        ));
     }
 }
 
@@ -2515,7 +2528,10 @@ mod tests {
         assert_eq!(body["reasoning_split"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages[0]["reasoning_details"][0]["text"], "internal thinking");
+        assert_eq!(
+            messages[0]["reasoning_details"][0]["text"],
+            "internal thinking"
+        );
     }
 
     #[test]
@@ -2893,7 +2909,9 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "assistant");
-        let assistant_blocks = messages[1]["content"].as_array().expect("assistant content");
+        let assistant_blocks = messages[1]["content"]
+            .as_array()
+            .expect("assistant content");
         assert_eq!(assistant_blocks.len(), 1);
         assert_eq!(assistant_blocks[0]["type"], "tool_use");
         assert_eq!(assistant_blocks[0]["id"], "call_1");
@@ -2947,7 +2965,9 @@ mod tests {
 
         let messages = body["messages"].as_array().expect("messages array");
         assert_eq!(messages.len(), 3);
-        let assistant_blocks = messages[1]["content"].as_array().expect("assistant content");
+        let assistant_blocks = messages[1]["content"]
+            .as_array()
+            .expect("assistant content");
         assert_eq!(assistant_blocks[0]["type"], "text");
         assert_eq!(assistant_blocks[0]["text"], "Let me check.");
         assert_eq!(assistant_blocks[1]["type"], "tool_use");
@@ -3148,7 +3168,10 @@ mod tests {
             &body,
         )
         .unwrap();
-        assert_eq!(out["choices"][0]["finish_reason"], "context_length_exceeded");
+        assert_eq!(
+            out["choices"][0]["finish_reason"],
+            "context_length_exceeded"
+        );
     }
 
     #[test]

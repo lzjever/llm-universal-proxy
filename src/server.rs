@@ -22,8 +22,8 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AuthPolicy, Config, RuntimeConfigPayload, UpstreamConfig};
-use crate::debug_trace::{DebugTraceContext, DebugTraceRecorder};
 use crate::dashboard::run_dashboard;
+use crate::debug_trace::{DebugTraceContext, DebugTraceRecorder};
 use crate::discovery::UpstreamCapability;
 use crate::hooks::{
     capture_headers, fingerprint_credential, json_response_headers, new_request_id,
@@ -468,16 +468,17 @@ async fn handle_admin_namespace_config(
             );
         }
     };
-    let namespace_state = match build_runtime_namespace_state(payload.revision.clone(), config).await {
-        Ok(state) => state,
-        Err(error) => {
-            return error_response(
-                crate::formats::UpstreamFormat::OpenAiCompletion,
-                StatusCode::BAD_REQUEST,
-                &format!("failed to resolve namespace config: {error}"),
-            );
-        }
-    };
+    let namespace_state =
+        match build_runtime_namespace_state(payload.revision.clone(), config).await {
+            Ok(state) => state,
+            Err(error) => {
+                return error_response(
+                    crate::formats::UpstreamFormat::OpenAiCompletion,
+                    StatusCode::BAD_REQUEST,
+                    &format!("failed to resolve namespace config: {error}"),
+                );
+            }
+        };
     let mut runtime = state.runtime.write().await;
     if let Some(current) = runtime.namespaces.get(&namespace) {
         if current.revision >= payload.revision {
@@ -488,7 +489,9 @@ async fn handle_admin_namespace_config(
             );
         }
     }
-    runtime.namespaces.insert(namespace.clone(), namespace_state);
+    runtime
+        .namespaces
+        .insert(namespace.clone(), namespace_state);
     (
         StatusCode::OK,
         Json(AdminConfigResponse {
@@ -709,6 +712,7 @@ async fn handle_google_model_action_inner(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_request_core(
     state: Arc<AppState>,
     namespace: String,
@@ -848,18 +852,22 @@ async fn handle_request_core(
         client_request_headers: original_headers,
         client_request_body: original_body.clone(),
     });
-    let debug_ctx = namespace_state.debug_trace.as_ref().map(|_| DebugTraceContext {
-        request_id: request_id.clone(),
-        timestamp_ms: request_timestamp,
-        path: path.clone(),
-        stream,
-        client_model: requested_model.clone(),
-        upstream_name: resolved_model.upstream_name.clone(),
-        upstream_model: resolved_model.upstream_model.clone(),
-        client_format,
-        upstream_format,
-    });
-    if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref()) {
+    let debug_ctx = namespace_state
+        .debug_trace
+        .as_ref()
+        .map(|_| DebugTraceContext {
+            request_id: request_id.clone(),
+            timestamp_ms: request_timestamp,
+            path: path.clone(),
+            stream,
+            client_model: requested_model.clone(),
+            upstream_name: resolved_model.upstream_name.clone(),
+            upstream_model: resolved_model.upstream_model.clone(),
+            client_format,
+            upstream_format,
+        });
+    if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref())
+    {
         recorder.record_request_with_upstream(ctx, &original_body, &body);
     }
 
@@ -875,18 +883,20 @@ async fn handle_request_core(
         stream,
     );
     debug!("Calling upstream URL: {}", url);
-    let res = match upstream::call_upstream(&namespace_state.client, &url, &body, stream, &auth_headers).await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return streaming_error_response(
-                client_format,
-                StatusCode::BAD_GATEWAY,
-                &e.to_string(),
-            );
-        }
-    };
+    let res =
+        match upstream::call_upstream(&namespace_state.client, &url, &body, stream, &auth_headers)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+                return streaming_error_response(
+                    client_format,
+                    StatusCode::BAD_GATEWAY,
+                    &e.to_string(),
+                );
+            }
+        };
 
     if stream {
         let status = res.status();
@@ -925,7 +935,9 @@ async fn handle_request_core(
                 sse_response_headers(),
             ));
         }
-        if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.clone()) {
+        if let (Some(recorder), Some(ctx)) =
+            (namespace_state.debug_trace.as_ref(), debug_ctx.clone())
+        {
             body_stream = Box::pin(recorder.wrap_stream(body_stream, ctx, status.as_u16()));
         }
         let body = Body::from_stream(TrackedBodyStream::new(
@@ -996,7 +1008,8 @@ async fn handle_request_core(
     if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.as_ref(), hook_ctx) {
         dispatcher.emit_non_stream(ctx, 200, json_response_headers(), out.clone());
     }
-    if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref()) {
+    if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref())
+    {
         recorder.record_non_stream_response(ctx, StatusCode::OK.as_u16(), &out);
     }
     tracker.finish_success(StatusCode::OK.as_u16());
@@ -1080,10 +1093,7 @@ async fn handle_anthropic_models_namespaced(
     handle_anthropic_models_inner(state, namespace).await
 }
 
-async fn handle_anthropic_models_inner(
-    state: Arc<AppState>,
-    namespace: String,
-) -> Response<Body> {
+async fn handle_anthropic_models_inner(state: Arc<AppState>, namespace: String) -> Response<Body> {
     match namespace_config(&state, &namespace).await {
         Some(config) => (StatusCode::OK, Json(anthropic_model_list(&config))).into_response(),
         None => error_response(
@@ -1190,7 +1200,10 @@ async fn handle_google_model_inner(
 
 async fn namespace_config(state: &Arc<AppState>, namespace: &str) -> Option<Config> {
     let runtime = state.runtime.read().await;
-    runtime.namespaces.get(namespace).map(|item| item.config.clone())
+    runtime
+        .namespaces
+        .get(namespace)
+        .map(|item| item.config.clone())
 }
 
 fn configured_aliases(config: &Config) -> Vec<(&String, &crate::config::ModelAlias)> {
@@ -1308,16 +1321,12 @@ fn error_response(
 ) -> Response<Body> {
     let normalized_error = normalize_upstream_error(status, message);
     match format {
-        crate::formats::UpstreamFormat::OpenAiCompletion => (
-            status,
-            Json(openai_error_body(&normalized_error)),
-        )
-            .into_response(),
-        crate::formats::UpstreamFormat::OpenAiResponses => (
-            status,
-            Json(openai_error_body(&normalized_error)),
-        )
-            .into_response(),
+        crate::formats::UpstreamFormat::OpenAiCompletion => {
+            (status, Json(openai_error_body(&normalized_error))).into_response()
+        }
+        crate::formats::UpstreamFormat::OpenAiResponses => {
+            (status, Json(openai_error_body(&normalized_error))).into_response()
+        }
         crate::formats::UpstreamFormat::Anthropic => (
             status,
             Json(serde_json::json!({
@@ -1353,10 +1362,7 @@ fn streaming_error_response(
     }
 
     let normalized_error = normalize_upstream_error(status, message);
-    let response_id = format!(
-        "resp_error_{}",
-        uuid::Uuid::new_v4().simple()
-    );
+    let response_id = format!("resp_error_{}", uuid::Uuid::new_v4().simple());
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -1380,9 +1386,7 @@ fn streaming_error_response(
             "metadata": {}
         }
     });
-    let body = format!(
-        "event: response.failed\ndata: {payload}\n\n"
-    );
+    let body = format!("event: response.failed\ndata: {payload}\n\n");
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1786,8 +1790,12 @@ mod header_tests {
         headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
 
         let forwarded = extract_forwardable_headers(&headers);
-        assert!(forwarded.iter().any(|(k, v)| k == "authorization" && v == "Bearer test"));
-        assert!(forwarded.iter().any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
+        assert!(forwarded
+            .iter()
+            .any(|(k, v)| k == "authorization" && v == "Bearer test"));
+        assert!(forwarded
+            .iter()
+            .any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
         assert!(!forwarded.iter().any(|(k, _)| k == "content-type"));
         assert!(!forwarded.iter().any(|(k, _)| k == "accept-language"));
         assert!(!forwarded.iter().any(|(k, _)| k == "sec-fetch-mode"));
@@ -1923,7 +1931,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("text/event-stream")
         );
 

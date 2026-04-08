@@ -287,7 +287,8 @@ impl Config {
         let path_ref = path.as_ref();
         let raw = std::fs::read_to_string(path_ref)
             .map_err(|e| format!("failed to read config {}: {}", path_ref.display(), e))?;
-        Self::from_yaml_str(&raw).map_err(|e| format!("invalid config {}: {}", path_ref.display(), e))
+        Self::from_yaml_str(&raw)
+            .map_err(|e| format!("invalid config {}: {}", path_ref.display(), e))
     }
 
     /// Load config from YAML text. Intended for tests.
@@ -603,14 +604,22 @@ impl From<&Config> for RuntimeConfigPayload {
                 timeout_secs: value.hooks.timeout.as_secs(),
                 failure_threshold: value.hooks.failure_threshold,
                 cooldown_secs: value.hooks.cooldown.as_secs(),
-                exchange: value.hooks.exchange.as_ref().map(|hook| RuntimeHookEndpointConfig {
-                    url: hook.url.clone(),
-                    authorization: hook.authorization.clone(),
-                }),
-                usage: value.hooks.usage.as_ref().map(|hook| RuntimeHookEndpointConfig {
-                    url: hook.url.clone(),
-                    authorization: hook.authorization.clone(),
-                }),
+                exchange: value
+                    .hooks
+                    .exchange
+                    .as_ref()
+                    .map(|hook| RuntimeHookEndpointConfig {
+                        url: hook.url.clone(),
+                        authorization: hook.authorization.clone(),
+                    }),
+                usage: value
+                    .hooks
+                    .usage
+                    .as_ref()
+                    .map(|hook| RuntimeHookEndpointConfig {
+                        url: hook.url.clone(),
+                        authorization: hook.authorization.clone(),
+                    }),
             },
             debug_trace: value.debug_trace.clone(),
         }

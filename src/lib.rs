@@ -3,8 +3,8 @@
 //! Exposes format detection, request/response translation, and HTTP server.
 
 pub mod config;
-pub mod debug_trace;
 pub mod dashboard;
+pub mod debug_trace;
 pub mod detect;
 pub mod discovery;
 pub mod formats;

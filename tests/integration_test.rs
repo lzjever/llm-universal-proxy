@@ -15,8 +15,9 @@ use bytes::Bytes;
 use common::*;
 use futures_util::{future::join_all, stream, StreamExt};
 use llm_universal_proxy::config::{
-    AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ModelAlias, RuntimeConfigPayload,
-    RuntimeHookConfig, RuntimeConfigSnapshot, RuntimeUpstreamConfig, UpstreamConfig,
+    AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ModelAlias,
+    RuntimeConfigPayload, RuntimeConfigSnapshot, RuntimeHookConfig, RuntimeUpstreamConfig,
+    UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::run_with_listener;
@@ -73,11 +74,7 @@ async fn empty_startup_config_keeps_health_route_available() {
     let _proxy = tokio::spawn(async move { run_with_listener(Config::default(), listener).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     let client = Client::new();
-    let response = client
-        .get(format!("{base}/health"))
-        .send()
-        .await
-        .unwrap();
+    let response = client.get(format!("{base}/health")).send().await.unwrap();
     assert!(response.status().is_success());
 }
 
@@ -208,32 +205,30 @@ async fn forwarded_headers_whitelist_preserves_protocol_headers_only() {
 
     let app = Router::new().route(
         "/v1/messages",
-        post(
-            move |headers: HeaderMap, Json(body): Json<Value>| {
-                let captured = captured_clone.clone();
-                async move {
-                    *captured.lock().unwrap() = headers
-                        .iter()
-                        .map(|(name, value)| {
-                            (
-                                name.as_str().to_string(),
-                                value.to_str().unwrap_or_default().to_string(),
-                            )
-                        })
-                        .collect();
-                    let resp = json!({
-                        "id": "msg_whitelist",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{ "type": "text", "text": "Hi" }],
-                        "model": body.get("model").unwrap_or(&json!("claude-3")),
-                        "stop_reason": "end_turn",
-                        "usage": { "input_tokens": 1, "output_tokens": 1 }
-                    });
-                    (StatusCode::OK, Json(resp)).into_response()
-                }
-            },
-        ),
+        post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let captured = captured_clone.clone();
+            async move {
+                *captured.lock().unwrap() = headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            value.to_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect();
+                let resp = json!({
+                    "id": "msg_whitelist",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "Hi" }],
+                    "model": body.get("model").unwrap_or(&json!("claude-3")),
+                    "stop_reason": "end_turn",
+                    "usage": { "input_tokens": 1, "output_tokens": 1 }
+                });
+                (StatusCode::OK, Json(resp)).into_response()
+            }
+        }),
     );
     let _mock = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
@@ -346,17 +341,16 @@ async fn openai_namespace_chat_completions_works() {
 async fn openai_namespace_chat_completions_accepts_gzip_upstream_json() {
     async fn gzip_openai_handler() -> Response {
         let compressed = vec![
-            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 77, 142, 93, 14, 130, 64, 12, 132, 239,
-            50, 207, 96, 212, 199, 61, 129, 119, 48, 134, 172, 75, 133, 10, 108, 9, 173,
-            137, 145, 112, 119, 139, 241, 239, 169, 201, 124, 51, 157, 153, 193, 53, 2,
-            82, 27, 45, 13, 99, 95, 54, 15, 30, 81, 64, 206, 87, 74, 246, 6, 155, 36, 142,
-            200, 88, 178, 163, 52, 81, 52, 242, 208, 174, 192, 32, 53, 245, 238, 90, 83,
-            229, 32, 169, 91, 121, 43, 156, 72, 17, 142, 51, 56, 215, 116, 71, 216, 186,
-            147, 84, 99, 67, 8, 51, 38, 233, 253, 34, 170, 178, 90, 204, 182, 102, 36, 27,
-            229, 181, 239, 192, 88, 10, 92, 56, 179, 182, 149, 55, 169, 119, 6, 168, 201,
-            136, 229, 84, 224, 246, 121, 50, 78, 190, 201, 42, 147, 142, 178, 190, 182,
-            252, 70, 254, 171, 38, 22, 251, 175, 176, 95, 150, 39, 28, 44, 142, 26, 241,
-            0, 0, 0,
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 77, 142, 93, 14, 130, 64, 12, 132, 239, 50, 207, 96,
+            212, 199, 61, 129, 119, 48, 134, 172, 75, 133, 10, 108, 9, 173, 137, 145, 112, 119,
+            139, 241, 239, 169, 201, 124, 51, 157, 153, 193, 53, 2, 82, 27, 45, 13, 99, 95, 54, 15,
+            30, 81, 64, 206, 87, 74, 246, 6, 155, 36, 142, 200, 88, 178, 163, 52, 81, 52, 242, 208,
+            174, 192, 32, 53, 245, 238, 90, 83, 229, 32, 169, 91, 121, 43, 156, 72, 17, 142, 51,
+            56, 215, 116, 71, 216, 186, 147, 84, 99, 67, 8, 51, 38, 233, 253, 34, 170, 178, 90,
+            204, 182, 102, 36, 27, 229, 181, 239, 192, 88, 10, 92, 56, 179, 182, 149, 55, 169, 119,
+            6, 168, 201, 136, 229, 84, 224, 246, 121, 50, 78, 190, 201, 42, 147, 142, 178, 190,
+            182, 252, 70, 254, 171, 38, 22, 251, 175, 176, 95, 150, 39, 28, 44, 142, 26, 241, 0, 0,
+            0,
         ];
         Response::builder()
             .status(200)
@@ -1967,8 +1961,14 @@ async fn debug_trace_records_request_delta_and_stream_summary() {
     let log = std::fs::read_to_string(&trace_path).unwrap();
     assert!(log.contains("\"phase\":\"request\""), "log = {log}");
     assert!(log.contains("\"phase\":\"response\""), "log = {log}");
-    assert!(log.contains("\"new_items\":[{\"role\":\"user\",\"text\":\"Hi\",\"type\":\"message\"}]"), "log = {log}");
-    assert!(log.contains("\"terminal_event\":\"response.completed\""), "log = {log}");
+    assert!(
+        log.contains("\"new_items\":[{\"role\":\"user\",\"text\":\"Hi\",\"type\":\"message\"}]"),
+        "log = {log}"
+    );
+    assert!(
+        log.contains("\"terminal_event\":\"response.completed\""),
+        "log = {log}"
+    );
     assert!(log.contains("\"text\":\"Hi\""), "log = {log}");
 
     let _ = std::fs::remove_file(trace_path);
