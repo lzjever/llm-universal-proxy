@@ -127,6 +127,7 @@ log_header() { echo -e "\n${CYAN}${BOLD}=== $1 ===${NC}"; }
 PROXY_PID=""
 PROXY_STDERR_FILE=""
 CLAUDE_TEST_CONFIG_DIR=""
+PROXY_RUNTIME_CONFIG=""
 
 start_proxy() {
     if ! [ -x "$PROXY_BIN" ]; then
@@ -136,9 +137,26 @@ start_proxy() {
 
     PROXY_STDERR_FILE=$(mktemp /tmp/proxy-test-stderr.XXXXXX)
     rm -f "$TRACE_PATH"
+    PROXY_RUNTIME_CONFIG=$(mktemp /tmp/proxy-test-config.XXXXXX.yaml)
 
-    echo "Starting proxy: $PROXY_BIN --config $PROXY_CONFIG"
-    "$PROXY_BIN" --config "$PROXY_CONFIG" > /dev/null 2>"$PROXY_STDERR_FILE" &
+    python3 - <<'PY' "$PROXY_CONFIG" "$PROXY_RUNTIME_CONFIG" "$PROXY_HOST" "$PROXY_PORT"
+import pathlib
+import re
+import sys
+
+src = pathlib.Path(sys.argv[1]).read_text()
+dst = pathlib.Path(sys.argv[2])
+host = sys.argv[3]
+port = sys.argv[4]
+
+updated = re.sub(r'(?m)^listen:\s*.*$', f'listen: {host}:{port}', src, count=1)
+if updated == src:
+    raise SystemExit("failed to override listen address in proxy config")
+dst.write_text(updated)
+PY
+
+    echo "Starting proxy: $PROXY_BIN --config $PROXY_RUNTIME_CONFIG"
+    "$PROXY_BIN" --config "$PROXY_RUNTIME_CONFIG" > /dev/null 2>"$PROXY_STDERR_FILE" &
     PROXY_PID=$!
     echo "Proxy PID: $PROXY_PID"
 }
@@ -152,7 +170,9 @@ stop_proxy() {
             tail -20 "$PROXY_STDERR_FILE"
         fi
         rm -f "$PROXY_STDERR_FILE"
+        rm -f "$PROXY_RUNTIME_CONFIG"
         PROXY_PID=""
+        PROXY_RUNTIME_CONFIG=""
     fi
 }
 
@@ -344,6 +364,14 @@ run_codex_multi() {
         --skip-git-repo-check \
         --json 2>/dev/null) || exit_code=$?
 
+    if [[ "$exit_code" -ne 0 ]]; then
+        local calc_content
+        calc_content=$(cat "$proj_dir/calc.py" 2>/dev/null | head -3)
+        log_fail "$label" "exit code $exit_code. calc.py: ${calc_content:-<missing>}"
+        rm -rf "$proj_dir"
+        return
+    fi
+
     # Check: was calc.py fixed?
     if grep -q "a + b" "$proj_dir/calc.py" 2>/dev/null; then
         log_pass "$label"
@@ -441,6 +469,14 @@ run_claude_multi() {
         --no-session-persistence \
         --add-dir "$proj_dir" \
         2>/dev/null) || exit_code=$?
+
+    if [[ "$exit_code" -ne 0 ]]; then
+        local calc_content
+        calc_content=$(cat "$proj_dir/calc.py" 2>/dev/null | head -3)
+        log_fail "$label" "exit code $exit_code. calc.py: ${calc_content:-<missing>}"
+        rm -rf "$proj_dir"
+        return
+    fi
 
     # Check: was calc.py fixed?
     if grep -q "a + b" "$proj_dir/calc.py" 2>/dev/null; then

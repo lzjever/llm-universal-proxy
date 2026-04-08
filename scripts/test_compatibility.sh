@@ -86,7 +86,7 @@ test_json() {
     fi
 
     for marker in "$@"; do
-        if ! echo "$body_content" | grep -q "$marker"; then
+        if ! echo "$body_content" | grep -Fq "$marker"; then
             log_fail "$label" "Missing marker: $marker — $(echo "$body_content" | head -c 300)"
             return
         fi
