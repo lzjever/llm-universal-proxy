@@ -35,6 +35,9 @@
 - **兼容 Codex CLI**：可作为 Responses 兼容入口，前接 Anthropic 兼容上游
 - **模型统一层**：可把不同供应商的真实模型，映射成稳定的本地模型名，例如 `opus`、`sonnet`、`haiku`
 
+重要路由边界：
+- OpenAI Responses lifecycle 路由只有在代理能从当前请求上下文唯一确定原生 Responses 上游时才会透传。代理不会自行发明 response 到 upstream 的会话映射。
+
 ## 这个代理为什么有用
 
 - **给不同供应商建立统一模型命名空间**：你可以把不同来源的模型统一映射成稳定的本地名字，例如 `opus`、`sonnet`、`haiku`，或者团队内部自己的 coding model 名称。这样很多依赖固定模型名的工具会更容易接入。
@@ -487,6 +490,10 @@ docker run -p 8080:8080 \
 |------|------|
 | `POST /openai/v1/chat/completions` | OpenAI Chat Completions 视图 |
 | `POST /openai/v1/responses` | OpenAI Responses 视图 |
+| `GET /openai/v1/responses/{response_id}` | OpenAI Responses 查询视图 |
+| `DELETE /openai/v1/responses/{response_id}` | OpenAI Responses 删除视图 |
+| `POST /openai/v1/responses/{response_id}/cancel` | OpenAI Responses 取消视图 |
+| `POST /openai/v1/responses/compact` | OpenAI Responses compact 视图 |
 | `GET /openai/v1/models` | OpenAI 兼容本地模型目录 |
 | `GET /openai/v1/models/{id}` | OpenAI 兼容本地模型详情 |
 | `POST /anthropic/v1/messages` | Anthropic Messages 视图 |

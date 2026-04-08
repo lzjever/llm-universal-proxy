@@ -933,7 +933,12 @@ async fn handle_request_core(
     let mut tracker = state
         .metrics
         .start_request(path.as_str(), requested_model.clone(), stream);
-    let resolved_model = match namespace_state.config.resolve_model(&requested_model) {
+    let resolved_model = match resolve_requested_model_or_error(
+        &namespace_state.config,
+        &requested_model,
+        client_format,
+        &original_body,
+    ) {
         Ok(v) => v,
         Err(e) => {
             tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
@@ -1881,6 +1886,31 @@ fn collect_request_compatibility_warnings(
     warnings
 }
 
+fn resolve_requested_model_or_error(
+    namespace_config: &crate::config::Config,
+    requested_model: &str,
+    client_format: crate::formats::UpstreamFormat,
+    body: &Value,
+) -> Result<crate::config::ResolvedModel, String> {
+    if requested_model.trim().is_empty() && namespace_config.upstreams.len() > 1 {
+        if client_format == crate::formats::UpstreamFormat::OpenAiResponses
+            && body.get("previous_response_id").is_some()
+        {
+            return Err(
+                "Responses requests with `previous_response_id` must also include a routable `model` when this namespace has multiple upstreams; the proxy does not reconstruct response-to-upstream state"
+                    .to_string(),
+            );
+        }
+
+        return Err(
+            "request must include a routable `model` when this namespace has multiple upstreams; use `upstream:model` or configure `model_aliases`"
+                .to_string(),
+        );
+    }
+
+    namespace_config.resolve_model(requested_model)
+}
+
 fn append_compatibility_warning_headers(response: &mut Response<Body>, warnings: &[String]) {
     for warning in warnings {
         let sanitized = warning.replace(['\r', '\n'], " ");
@@ -2319,5 +2349,92 @@ mod tests {
             .filter_map(|v| v.to_str().ok())
             .collect();
         assert_eq!(values, vec!["first warning", "second warning with newline"]);
+    }
+
+    #[test]
+    fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace() {
+        let config = crate::config::Config {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout: std::time::Duration::from_secs(30),
+            upstreams: vec![
+                crate::config::UpstreamConfig {
+                    name: "a".to_string(),
+                    api_root: "https://example.com/v1".to_string(),
+                    fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
+                    fallback_credential_env: None,
+                    fallback_credential_actual: None,
+                    fallback_api_key: None,
+                    auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+                    upstream_headers: Vec::new(),
+                },
+                crate::config::UpstreamConfig {
+                    name: "b".to_string(),
+                    api_root: "https://example.org/v1".to_string(),
+                    fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
+                    fallback_credential_env: None,
+                    fallback_credential_actual: None,
+                    fallback_api_key: None,
+                    auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+                    upstream_headers: Vec::new(),
+                },
+            ],
+            model_aliases: Default::default(),
+            hooks: Default::default(),
+            debug_trace: crate::config::DebugTraceConfig::default(),
+        };
+
+        let error = resolve_requested_model_or_error(
+            &config,
+            "",
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({}),
+        )
+        .expect_err("missing model should fail");
+
+        assert!(error.contains("request must include a routable `model`"));
+    }
+
+    #[test]
+    fn resolve_requested_model_or_error_explains_previous_response_boundary() {
+        let config = crate::config::Config {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout: std::time::Duration::from_secs(30),
+            upstreams: vec![
+                crate::config::UpstreamConfig {
+                    name: "a".to_string(),
+                    api_root: "https://example.com/v1".to_string(),
+                    fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
+                    fallback_credential_env: None,
+                    fallback_credential_actual: None,
+                    fallback_api_key: None,
+                    auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+                    upstream_headers: Vec::new(),
+                },
+                crate::config::UpstreamConfig {
+                    name: "b".to_string(),
+                    api_root: "https://example.org/v1".to_string(),
+                    fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
+                    fallback_credential_env: None,
+                    fallback_credential_actual: None,
+                    fallback_api_key: None,
+                    auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+                    upstream_headers: Vec::new(),
+                },
+            ],
+            model_aliases: Default::default(),
+            hooks: Default::default(),
+            debug_trace: crate::config::DebugTraceConfig::default(),
+        };
+
+        let error = resolve_requested_model_or_error(
+            &config,
+            "",
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({ "previous_response_id": "resp_1" }),
+        )
+        .expect_err("missing model should fail");
+
+        assert!(error.contains("previous_response_id"));
+        assert!(error.contains("does not reconstruct response-to-upstream state"));
     }
 }

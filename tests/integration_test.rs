@@ -66,6 +66,48 @@ fn config_with_alias(
     }
 }
 
+async fn spawn_tagged_openai_responses_mock(
+    tag: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(
+        State(tag): State<&'static str>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("missing-model");
+        (
+            StatusCode::OK,
+            Json(json!({
+                "id": format!("resp_{tag}"),
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": model,
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{ "type": "output_text", "text": format!("hello-from-{tag}") }]
+                    }
+                ],
+                "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+            })),
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/responses", post(handler))
+        .with_state(tag);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
 #[tokio::test]
 async fn empty_startup_config_keeps_health_route_available() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -528,6 +570,146 @@ async fn openai_namespace_response_get_requires_native_responses_upstream() {
         .as_str()
         .unwrap_or_default()
         .contains("natively supports OpenAI Responses"));
+}
+
+#[tokio::test]
+async fn openai_responses_lifecycle_is_ambiguous_with_multiple_native_upstreams() {
+    let (first_base, _first_mock) = spawn_openai_responses_mock().await;
+    let (second_base, _second_mock) = spawn_openai_responses_mock().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![
+            named_upstream(
+                "RESPONSES_A",
+                &first_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+            named_upstream(
+                "RESPONSES_B",
+                &second_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+        ],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .get(format!("{}/openai/v1/responses/resp_123", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("ambiguous"));
+}
+
+#[tokio::test]
+async fn openai_responses_create_with_alias_routes_to_configured_upstream() {
+    let (first_base, _first_mock) = spawn_tagged_openai_responses_mock("a").await;
+    let (second_base, _second_mock) = spawn_tagged_openai_responses_mock("b").await;
+    let mut model_aliases = std::collections::BTreeMap::new();
+    model_aliases.insert(
+        "resp-a".to_string(),
+        ModelAlias {
+            upstream_name: "RESPONSES_A".to_string(),
+            upstream_model: "model-a".to_string(),
+        },
+    );
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![
+            named_upstream(
+                "RESPONSES_A",
+                &first_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+            named_upstream(
+                "RESPONSES_B",
+                &second_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+        ],
+        model_aliases,
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/responses", proxy_base))
+        .json(&json!({
+            "model": "resp-a",
+            "input": "Hi",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "resp_a");
+    assert_eq!(body["model"], "model-a");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hello-from-a");
+}
+
+#[tokio::test]
+async fn openai_responses_previous_response_id_requires_explicit_model_in_multi_upstream_namespace()
+{
+    let (first_base, _first_mock) = spawn_openai_responses_mock().await;
+    let (second_base, _second_mock) = spawn_openai_responses_mock().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![
+            named_upstream(
+                "RESPONSES_A",
+                &first_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+            named_upstream(
+                "RESPONSES_B",
+                &second_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+        ],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/responses", proxy_base))
+        .json(&json!({
+            "input": "Hi again",
+            "previous_response_id": "resp_123",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("previous_response_id"));
+    assert!(message.contains("routable `model`"));
 }
 
 #[tokio::test]

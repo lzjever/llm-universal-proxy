@@ -75,6 +75,9 @@ The proxy MUST expose the following namespaced endpoints:
 |----------|----------|--------|
 | `/openai/v1/chat/completions` | OpenAI Chat Completions | POST |
 | `/openai/v1/responses` | OpenAI Responses | POST |
+| `/openai/v1/responses/:response_id` | OpenAI Responses lifecycle | GET, DELETE |
+| `/openai/v1/responses/:response_id/cancel` | OpenAI Responses lifecycle | POST |
+| `/openai/v1/responses/compact` | OpenAI Responses lifecycle | POST |
 | `/openai/v1/models` | Model catalog | GET |
 | `/anthropic/v1/messages` | Anthropic Messages | POST |
 | `/anthropic/v1/models` | Model catalog | GET |
@@ -327,6 +330,7 @@ When the proxy must drop or approximate fields, it MUST:
 | Limitation | Reason |
 |-----------|--------|
 | `previous_response_id` (Responses) | Stateful chaining cannot be reconstructed in stateless formats |
+| Responses lifecycle routing | Retrieve/delete/cancel requests do not carry a routable model, and the proxy does not persist response-to-upstream session state |
 | Built-in tools (web search, etc.) | Not portable across protocol schemas |
 | `truncation` policy | Provider-specific context management |
 | Reasoning request config | Only reasoning output is mapped, not request policy |

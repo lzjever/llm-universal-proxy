@@ -36,6 +36,9 @@ This is a real Codex CLI session using a local alias routed to `GLM-5-Turbo` thr
 - **Codex CLI Friendly**: Works as a Responses-compatible endpoint in front of Anthropic-compatible upstreams
 - **Model Unification Layer**: Map models from different providers to one stable local naming scheme, such as `opus`, `sonnet`, `haiku`, or team-specific coding aliases
 
+Important routing boundary:
+- OpenAI Responses lifecycle routes are forwarded only when the proxy can uniquely determine the native Responses upstream from the current request context. The proxy does not invent response-to-upstream session state.
+
 ## Why It Is Useful
 
 - **One stable model namespace across providers**: You can map models from different vendors into one local naming layer. For example, different upstream models can be exposed as stable names such as `opus`, `sonnet`, `haiku`, or any team-specific alias. That makes tools that assume fixed model names easier to operate.
@@ -657,6 +660,10 @@ docker run -p 8080:8080 \
 |----------|-------------|
 | `POST /openai/v1/chat/completions` | OpenAI Chat Completions view |
 | `POST /openai/v1/responses` | OpenAI Responses view |
+| `GET /openai/v1/responses/{response_id}` | OpenAI Responses retrieve view |
+| `DELETE /openai/v1/responses/{response_id}` | OpenAI Responses delete view |
+| `POST /openai/v1/responses/{response_id}/cancel` | OpenAI Responses cancel view |
+| `POST /openai/v1/responses/compact` | OpenAI Responses compact view |
 | `GET /openai/v1/models` | OpenAI-compatible local model catalog |
 | `GET /openai/v1/models/{id}` | OpenAI-compatible local model detail |
 | `POST /anthropic/v1/messages` | Anthropic Messages view |

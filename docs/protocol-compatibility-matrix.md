@@ -6,7 +6,7 @@
   - Anthropic Messages API: https://docs.anthropic.com/en/api/messages
   - Anthropic stop reasons: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
 - Purpose: document field-level mappings, intentional degradations, and known non-1:1 cases across the proxy's three primary chat protocols.
-- Updated: 2026-03-22
+- Updated: 2026-04-07
 
 ## Legend
 
@@ -56,6 +56,7 @@
 | `response.failed` from Responses upstream | Explicit failed event | No exact streaming error event | No exact equivalent | Proxy converts to a final OpenAI completion chunk with best-effort finish reason | Approx | Best effort for non-Responses clients. |
 | `response.incomplete` from Responses upstream | Explicit incomplete event | Final chunk with `finish_reason=length/content_filter` | Final Claude stop reason | Proxy maps to best-effort finish reason | Approx | Preserves truncation/filter behavior for downstream consumers. |
 | `pause_turn` | Not a native Responses completion state | Chat `finish_reason` can carry a custom terminal reason | Anthropic successful stop reason for server-tool loops | Preserved as `finish_reason: "pause_turn"` in Chat and downgraded to Responses `status: incomplete`, `reason: "pause_turn"` | Approx | This keeps downstream loops from treating the turn as fully completed, but it still is not a full resume protocol. |
+| Responses lifecycle routes | `GET/DELETE /responses/{id}`, `POST /responses/{id}/cancel`, `POST /responses/compact` | Not native | Not native | Forward only when the proxy can uniquely determine a native Responses upstream from the current request context | Approx | The proxy does not invent response-to-upstream state. |
 
 ## Streaming event lifecycle
 
@@ -74,6 +75,7 @@
 | Source feature | Why no exact mapping exists | Proxy fallback |
 |---------------|-----------------------------|----------------|
 | `previous_response_id` | Responses supports stateful response chaining; Chat and Anthropic are stateless request formats | Drop field when leaving Responses; caller must inline prior context explicitly. |
+| Responses lifecycle routing in multi-upstream namespaces | Retrieve/delete/cancel requests do not carry a routable model, and the proxy does not persist response-to-upstream session state | Fail clearly unless the current request context already identifies one native Responses upstream. |
 | `store` | Persistence model is provider-specific outside the OpenAI family | Preserve within OpenAI-style translations; drop for Anthropic and Gemini. |
 | Responses built-in tools | Chat Completions and Anthropic tool schemas are not the same API surface | Keep function tools only; drop built-ins on cross-protocol translation. |
 | `truncation` | Provider-side context management policy cannot be reproduced in another protocol | Drop field and rely on downstream model/provider defaults. |
