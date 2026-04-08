@@ -435,6 +435,102 @@ async fn openai_namespace_responses_stream_works() {
 }
 
 #[tokio::test]
+async fn openai_namespace_response_get_works() {
+    let (mock_base, _mock) = spawn_openai_responses_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .get(format!("{}/openai/v1/responses/resp_123", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "resp_123");
+    assert_eq!(body["object"], "response");
+}
+
+#[tokio::test]
+async fn openai_namespace_response_delete_works() {
+    let (mock_base, _mock) = spawn_openai_responses_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .delete(format!("{}/openai/v1/responses/resp_123", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "resp_123");
+    assert_eq!(body["deleted"], true);
+}
+
+#[tokio::test]
+async fn openai_namespace_response_cancel_works() {
+    let (mock_base, _mock) = spawn_openai_responses_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "{}/openai/v1/responses/resp_123/cancel",
+            proxy_base
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "resp_123");
+    assert_eq!(body["status"], "cancelled");
+}
+
+#[tokio::test]
+async fn openai_namespace_response_compact_works() {
+    let (mock_base, _mock) = spawn_openai_responses_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/responses/compact", proxy_base))
+        .json(&json!({ "response_id": "resp_123" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "resp_compacted");
+    assert_eq!(body["object"], "response");
+}
+
+#[tokio::test]
+async fn openai_namespace_response_get_requires_native_responses_upstream() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .get(format!("{}/openai/v1/responses/resp_123", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("natively supports OpenAI Responses"));
+}
+
+#[tokio::test]
 async fn anthropic_namespace_messages_works() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
@@ -2047,6 +2143,37 @@ async fn upstream_google_client_openai_translated_non_streaming() {
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["object"], "chat.completion");
     assert_eq!(body["choices"][0]["message"]["content"], "Hi");
+}
+
+#[tokio::test]
+async fn upstream_google_client_openai_accepts_snake_case_input_parts() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "{}/google/v1beta/models/gemini-local:generateContent",
+            proxy_base
+        ))
+        .json(&json!({
+            "model": "gemini-local",
+            "contents": [{
+                "parts": [{
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": "abcd"
+                    }
+                }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "Hi");
 }
 
 #[tokio::test]

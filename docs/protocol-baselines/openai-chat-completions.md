@@ -1,49 +1,61 @@
 # OpenAI Chat Completions API — protocol baseline
 
-- **Source:** [OpenAI API Reference — Chat](https://platform.openai.com/docs/api-reference/chat/create)  
-- **Streaming:** [Streaming responses](https://platform.openai.com/docs/guides/streaming-responses)  
-- **Capture date / version:** 2026-03-05 (documentation as of that date; check source for latest)
+- Source:
+  - https://platform.openai.com/docs/api-reference/chat/create
+  - https://developers.openai.com/api/reference/resources/chat
+- Capture date: 2026-04-07
+- Local snapshot:
+  - `docs/protocol-baselines/snapshots/2026-04-07/openai-chat-completions.html`
 
----
+## Canonical surface
 
-## Endpoint
-
-- **POST** `/chat/completions`  
+- Primary endpoint: `POST /v1/chat/completions`
 - Base URL example: `https://api.openai.com/v1`
 
-## Request (create chat completion)
+## Request shape
 
-Key body parameters:
+- Core fields:
+  - `model`
+  - `messages`
+  - `stream`
+  - `max_tokens`
+  - `temperature`
+  - `top_p`
+  - `tools`
+  - `tool_choice`
+  - `response_format`
+  - `logprobs`
+- `messages` is an ordered array of role/content items.
+- Content may be:
+  - a plain string
+  - an array of typed parts such as text and image input
 
-- **model** (string): Model ID (e.g. `gpt-4o`).
-- **messages** (array): List of messages. Each message: `role` (`"system"` | `"user"` | `"assistant"`), `content` (string or array of content parts).
-- **stream** (boolean, optional): If `true`, response is SSE stream. Default behavior is non-streaming.
-- **max_tokens**, **temperature**, **top_p**, **n**, **tools**, **tool_choice**, **response_format**, **logprobs**, etc. (see official reference).
+## Non-streaming response shape
 
-Content parts for messages can include `type: "text"` with `text`, or image parts, etc.
+- Top-level object type: `chat.completion`
+- Common fields:
+  - `id`
+  - `object`
+  - `created`
+  - `model`
+  - `choices`
+  - `usage`
+- `choices[].message` may carry:
+  - `content`
+  - `tool_calls`
+  - refusal-related fields on supported models
 
-## Response (non-streaming)
+## Streaming shape
 
-- **object:** `"chat.completion"`
-- **id:** string (completion ID)
-- **created:** number (Unix timestamp)
-- **model:** string
-- **choices:** array of:
-  - **index:** number
-  - **message:** object with **role** (`"assistant"`), **content** (string or array of parts), optional **tool_calls** (array of `{ id, type: "function", function: { name, arguments } }`), optional **refusal**
-  - **finish_reason:** `"stop"` | `"length"` | `"tool_calls"` | `"content_filter"` | `"function_call"`
-  - **logprobs:** optional
-- **usage** (optional): `prompt_tokens`, `completion_tokens`, `total_tokens`
+- Transport: SSE
+- Each chunk is a `chat.completion.chunk`
+- Chunks carry `choices[].delta`
+- End-of-stream sentinel remains `data: [DONE]`
 
-## Response (streaming, SSE)
+## Proxy implications
 
-- **Content-Type:** `text/event-stream`
-- Each event: `data: <JSON>\n\n`
-- Chunk object: **object** `"chat.completion.chunk"`, **choices** array with **delta** (e.g. `role`, `content`, or `tool_calls`), **finish_reason** (null until end).
-- Stream end: `data: [DONE]\n\n`
-
-## Notes for proxy
-
-- Detect client format by path `/v1/chat/completions` and body (e.g. `messages` without `input`).
-- Passthrough: forward request/response as-is when upstream is Chat Completions.
-- Translation: pivot via OpenAI Chat Completions when converting to/from other formats.
+- This is still the best pivot format for broad OpenAI-compatible ecosystems such as vLLM and Xinference.
+- Robust compatibility requires tolerating:
+  - SSE `\n\n` and `\r\n\r\n` separators
+  - partial tool-call argument deltas
+  - gzip-compressed upstream responses

@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{OriginalUri, Path, State},
     http::{HeaderMap, Response, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -152,6 +152,7 @@ async fn run_server(
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
+            axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
         .allow_headers(Any);
@@ -172,6 +173,18 @@ async fn run_server(
             post(handle_openai_chat_completions),
         )
         .route("/openai/v1/responses", post(handle_openai_responses))
+        .route(
+            "/openai/v1/responses/compact",
+            post(handle_openai_responses_compact),
+        )
+        .route(
+            "/openai/v1/responses/:response_id",
+            get(handle_openai_response_get).delete(handle_openai_response_delete),
+        )
+        .route(
+            "/openai/v1/responses/:response_id/cancel",
+            post(handle_openai_response_cancel),
+        )
         .route("/openai/v1/models", get(handle_openai_models))
         .route("/openai/v1/models/:id", get(handle_openai_model))
         .route("/anthropic/v1/messages", post(handle_anthropic_messages))
@@ -185,6 +198,19 @@ async fn run_server(
         .route(
             "/namespaces/:namespace/openai/v1/responses",
             post(handle_openai_responses_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/responses/compact",
+            post(handle_openai_responses_compact_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/responses/:response_id",
+            get(handle_openai_response_get_namespaced)
+                .delete(handle_openai_response_delete_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/responses/:response_id/cancel",
+            post(handle_openai_response_cancel_namespaced),
         )
         .route(
             "/namespaces/:namespace/openai/v1/models",
@@ -615,6 +641,155 @@ async fn handle_openai_responses_inner(
     .await
 }
 
+async fn handle_openai_responses_compact(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    handle_openai_responses_compact_inner(state, DEFAULT_NAMESPACE.to_string(), headers, body).await
+}
+
+async fn handle_openai_responses_compact_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    handle_openai_responses_compact_inner(state, namespace, headers, body).await
+}
+
+async fn handle_openai_responses_compact_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    headers: HeaderMap,
+    body: Value,
+) -> Response<Body> {
+    handle_openai_responses_resource(
+        state,
+        namespace,
+        headers,
+        reqwest::Method::POST,
+        "responses/compact".to_string(),
+        Some(body),
+        None,
+    )
+    .await
+}
+
+async fn handle_openai_response_get(
+    State(state): State<Arc<AppState>>,
+    OriginalUri(uri): OriginalUri,
+    Path(response_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    handle_openai_response_get_inner(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        uri,
+        response_id,
+        headers,
+    )
+    .await
+}
+
+async fn handle_openai_response_get_namespaced(
+    State(state): State<Arc<AppState>>,
+    OriginalUri(uri): OriginalUri,
+    Path((namespace, response_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    handle_openai_response_get_inner(state, namespace, uri, response_id, headers).await
+}
+
+async fn handle_openai_response_get_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    uri: axum::http::Uri,
+    response_id: String,
+    headers: HeaderMap,
+) -> Response<Body> {
+    handle_openai_responses_resource(
+        state,
+        namespace,
+        headers,
+        reqwest::Method::GET,
+        format!("responses/{response_id}"),
+        None,
+        uri.query().map(ToString::to_string),
+    )
+    .await
+}
+
+async fn handle_openai_response_delete(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    handle_openai_response_delete_inner(state, DEFAULT_NAMESPACE.to_string(), response_id, headers)
+        .await
+}
+
+async fn handle_openai_response_delete_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, response_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    handle_openai_response_delete_inner(state, namespace, response_id, headers).await
+}
+
+async fn handle_openai_response_delete_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    response_id: String,
+    headers: HeaderMap,
+) -> Response<Body> {
+    handle_openai_responses_resource(
+        state,
+        namespace,
+        headers,
+        reqwest::Method::DELETE,
+        format!("responses/{response_id}"),
+        None,
+        None,
+    )
+    .await
+}
+
+async fn handle_openai_response_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    handle_openai_response_cancel_inner(state, DEFAULT_NAMESPACE.to_string(), response_id, headers)
+        .await
+}
+
+async fn handle_openai_response_cancel_namespaced(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, response_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    handle_openai_response_cancel_inner(state, namespace, response_id, headers).await
+}
+
+async fn handle_openai_response_cancel_inner(
+    state: Arc<AppState>,
+    namespace: String,
+    response_id: String,
+    headers: HeaderMap,
+) -> Response<Body> {
+    handle_openai_responses_resource(
+        state,
+        namespace,
+        headers,
+        reqwest::Method::POST,
+        format!("responses/{response_id}/cancel"),
+        None,
+        None,
+    )
+    .await
+}
+
 async fn handle_anthropic_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1022,6 +1197,136 @@ async fn handle_request_core(
         .unwrap();
     append_compatibility_warning_headers(&mut response, &compatibility_warnings);
     response
+}
+
+async fn handle_openai_responses_resource(
+    state: Arc<AppState>,
+    namespace: String,
+    headers: HeaderMap,
+    method: reqwest::Method,
+    resource_path: String,
+    body: Option<Value>,
+    query: Option<String>,
+) -> Response<Body> {
+    let request_path = format!("/openai/v1/{}", resource_path);
+    let mut tracker = state
+        .metrics
+        .start_request(&request_path, String::new(), false);
+    let namespace_state = {
+        let runtime = state.runtime.read().await;
+        match runtime.namespaces.get(&namespace) {
+            Some(item) => item.clone(),
+            None => {
+                tracker.finish_error(StatusCode::NOT_FOUND.as_u16());
+                return error_response(
+                    crate::formats::UpstreamFormat::OpenAiResponses,
+                    StatusCode::NOT_FOUND,
+                    &format!("namespace `{namespace}` is not configured"),
+                );
+            }
+        }
+    };
+
+    let matching = namespace_state
+        .upstreams
+        .values()
+        .filter(|upstream| {
+            upstream
+                .capability
+                .supported
+                .contains(&crate::formats::UpstreamFormat::OpenAiResponses)
+        })
+        .collect::<Vec<_>>();
+
+    let upstream_state = match matching.as_slice() {
+        [upstream] => *upstream,
+        [] => {
+            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+            return error_response(
+                crate::formats::UpstreamFormat::OpenAiResponses,
+                StatusCode::BAD_REQUEST,
+                "Responses lifecycle endpoints require a configured upstream that natively supports OpenAI Responses",
+            );
+        }
+        _ => {
+            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+            return error_response(
+                crate::formats::UpstreamFormat::OpenAiResponses,
+                StatusCode::BAD_REQUEST,
+                "Responses lifecycle endpoint is ambiguous across multiple Responses-capable upstreams in this namespace",
+            );
+        }
+    };
+
+    tracker.set_upstream(upstream_state.config.name.clone(), String::new());
+    let (mut auth_headers, _effective_credential) = build_auth_headers(
+        &headers,
+        upstream_state,
+        crate::formats::UpstreamFormat::OpenAiResponses,
+    );
+    apply_upstream_headers(
+        &mut auth_headers,
+        &upstream_state.config.upstream_headers,
+        crate::formats::UpstreamFormat::OpenAiResponses,
+    );
+
+    let mut url =
+        crate::config::build_upstream_resource_url(&upstream_state.config.api_root, &resource_path);
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        url.push('?');
+        url.push_str(&query);
+    }
+
+    let response = match upstream::call_upstream_resource(
+        &namespace_state.client,
+        method,
+        &url,
+        body.as_ref(),
+        &auth_headers,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+            return error_response(
+                crate::formats::UpstreamFormat::OpenAiResponses,
+                StatusCode::BAD_GATEWAY,
+                &error.to_string(),
+            );
+        }
+    };
+
+    let status = response.status();
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+            return error_response(
+                crate::formats::UpstreamFormat::OpenAiResponses,
+                StatusCode::BAD_GATEWAY,
+                &error.to_string(),
+            );
+        }
+    };
+
+    if status.is_success() {
+        tracker.finish_success(status.as_u16());
+    } else {
+        tracker.finish_error(status.as_u16());
+    }
+
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| {
+            error_response(
+                crate::formats::UpstreamFormat::OpenAiResponses,
+                StatusCode::BAD_GATEWAY,
+                "failed to build upstream resource response",
+            )
+        })
 }
 
 async fn handle_openai_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {

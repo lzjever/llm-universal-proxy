@@ -682,6 +682,13 @@ pub fn build_upstream_url(
     }
 }
 
+/// Build a full resource URL for auxiliary upstream endpoints.
+pub fn build_upstream_resource_url(api_root: &str, resource_path: &str) -> String {
+    let base = api_root.trim_end_matches('/');
+    let path = resource_path.trim_start_matches('/');
+    format!("{}/{}", base, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,6 +751,14 @@ mod tests {
                 true
             ),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn build_upstream_resource_url_trims_slashes() {
+        assert_eq!(
+            build_upstream_resource_url("https://api.openai.com/v1/", "/responses/resp_1/cancel"),
+            "https://api.openai.com/v1/responses/resp_1/cancel"
         );
     }
 

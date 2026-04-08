@@ -1,4 +1,4 @@
-//! Upstream HTTP client: build request URL, POST body, return response (non-streaming or stream).
+//! Upstream HTTP client: build request URLs and call upstream resources.
 
 use reqwest::Client;
 use serde_json::Value;
@@ -28,6 +28,24 @@ pub async fn call_upstream(
         req = req.header("Accept", "text/event-stream");
     }
     // Forward auth headers
+    for (name, value) in headers {
+        req = req.header(name, value);
+    }
+    req.send().await
+}
+
+/// Call an arbitrary upstream HTTP resource.
+pub async fn call_upstream_resource(
+    client: &Client,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&Value>,
+    headers: &[(String, String)],
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut req = client.request(method, url);
+    if let Some(body) = body {
+        req = req.json(body);
+    }
     for (name, value) in headers {
         req = req.header(name, value);
     }

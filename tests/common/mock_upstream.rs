@@ -7,7 +7,7 @@ use axum::{
     extract::{Json, Path},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use serde_json::Value;
@@ -232,11 +232,65 @@ pub async fn spawn_openai_responses_mock() -> (String, tokio::task::JoinHandle<(
 
     let app = Router::new()
         .route("/v1/responses", post(openai_responses_handler))
+        .route(
+            "/v1/responses/compact",
+            post(openai_responses_compact_handler),
+        )
+        .route(
+            "/v1/responses/:response_id",
+            get(openai_responses_get_handler).delete(openai_responses_delete_handler),
+        )
+        .route(
+            "/v1/responses/:response_id/cancel",
+            post(openai_responses_cancel_handler),
+        )
         .route("/responses", post(openai_responses_handler));
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
     (base, handle)
+}
+
+async fn openai_responses_get_handler(Path(response_id): Path<String>) -> Response {
+    let resp = serde_json::json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "output": [],
+        "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+async fn openai_responses_delete_handler(Path(response_id): Path<String>) -> Response {
+    let resp = serde_json::json!({
+        "id": response_id,
+        "object": "response.deleted",
+        "deleted": true
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+async fn openai_responses_cancel_handler(Path(response_id): Path<String>) -> Response {
+    let resp = serde_json::json!({
+        "id": response_id,
+        "object": "response",
+        "status": "cancelled",
+        "output": []
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+async fn openai_responses_compact_handler(Json(_body): Json<Value>) -> Response {
+    let resp = serde_json::json!({
+        "object": "response",
+        "id": "resp_compacted",
+        "status": "completed",
+        "output": [],
+        "usage": { "input_tokens": 1, "output_tokens": 0, "total_tokens": 1 }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 pub async fn spawn_openai_responses_reasoning_mock() -> (String, tokio::task::JoinHandle<()>) {

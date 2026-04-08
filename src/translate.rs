@@ -2070,6 +2070,14 @@ fn gemini_to_openai(body: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+fn gemini_part_field<'a>(part: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
+    part.get(camel).or_else(|| part.get(snake))
+}
+
+fn gemini_nested_field<'a>(value: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
+    value.get(camel).or_else(|| value.get(snake))
+}
+
 fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
     let role = content
         .get("role")
@@ -2083,9 +2091,10 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
         if part.get("text").is_some() {
             openai_parts.push(serde_json::json!({ "type": "text", "text": part.get("text") }));
         }
-        if let Some(inline) = part.get("inlineData") {
+        if let Some(inline) = gemini_part_field(part, "inlineData", "inline_data") {
             let mime = inline
                 .get("mimeType")
+                .or_else(|| inline.get("mime_type"))
                 .and_then(Value::as_str)
                 .unwrap_or("image/png");
             let data = inline.get("data").and_then(Value::as_str).unwrap_or("");
@@ -2094,7 +2103,7 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
                 "image_url": { "url": format!("data:{};base64,{}", mime, data) }
             }));
         }
-        if let Some(fc) = part.get("functionCall") {
+        if let Some(fc) = gemini_part_field(part, "functionCall", "function_call") {
             let id = fc
                 .get("id")
                 .cloned()
@@ -2108,9 +2117,9 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
                 }
             }));
         }
-        if let Some(fr) = part.get("functionResponse") {
+        if let Some(fr) = gemini_part_field(part, "functionResponse", "function_response") {
             let call_id = fr.get("id").or(fr.get("name")).cloned();
-            let resp = fr.get("response");
+            let resp = gemini_nested_field(fr, "response", "response");
             let content_str = resp
                 .and_then(|r| r.get("result").cloned())
                 .or_else(|| resp.cloned())
@@ -2184,6 +2193,7 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
         .get("messages")
         .and_then(Value::as_array)
         .ok_or("missing messages")?;
+    let mut tool_name_by_call_id = std::collections::HashMap::new();
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
         if role == "system" {
@@ -2215,6 +2225,12 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
             }
             if let Some(tc) = msg.get("tool_calls").and_then(Value::as_array) {
                 for t in tc {
+                    let name = t.get("function").and_then(|f| f.get("name")).cloned();
+                    if let (Some(id), Some(name)) =
+                        (t.get("id").and_then(Value::as_str), name.clone())
+                    {
+                        tool_name_by_call_id.insert(id.to_string(), name);
+                    }
                     let args = t
                         .get("function")
                         .and_then(|f| f.get("arguments"))
@@ -2239,6 +2255,12 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
         }
         if role == "tool" {
             let call_id = msg.get("tool_call_id").cloned();
+            let function_name = msg
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .and_then(|id| tool_name_by_call_id.get(id).cloned())
+                .or_else(|| msg.get("name").cloned())
+                .unwrap_or_else(|| call_id.clone().unwrap_or(Value::Null));
             let content = msg
                 .get("content")
                 .cloned()
@@ -2251,7 +2273,7 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
                     "parts": [{
                         "functionResponse": {
                             "id": call_id,
-                            "name": call_id,
+                            "name": function_name,
                             "response": { "result": content }
                         }
                     }]
@@ -2835,6 +2857,45 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_openai_to_gemini_preserves_function_response_name() {
+        let mut body = json!({
+            "model": "gemini-1.5",
+            "messages": [
+                { "role": "user", "content": "Hi" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "lookup_weather", "arguments": "{\"city\":\"Tokyo\"}" }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "{\"temperature\":22}"
+                }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            "gemini-1.5",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "lookup_weather"
+        );
+    }
+
+    #[test]
     fn translate_request_openai_to_claude_omitted_stream_defaults_false() {
         let mut body = json!({
             "model": "claude-3",
@@ -3117,6 +3178,49 @@ mod tests {
         .unwrap();
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "Reply with exactly: ok");
+    }
+
+    #[test]
+    fn translate_request_gemini_to_openai_accepts_snake_case_parts() {
+        let mut body = json!({
+            "model": "gemini-1.5",
+            "contents": [{
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": "abc123"
+                        }
+                    },
+                    {
+                        "function_call": {
+                            "id": "call_1",
+                            "name": "lookup_weather",
+                            "args": { "city": "Tokyo" }
+                        }
+                    }
+                ]
+            }]
+        });
+        translate_request(
+            UpstreamFormat::Google,
+            UpstreamFormat::OpenAiCompletion,
+            "gemini-1.5",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        assert_eq!(body["messages"][0]["role"], "assistant");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            "lookup_weather"
+        );
+        assert!(body["messages"][0]["content"]
+            .as_array()
+            .expect("array content")
+            .iter()
+            .any(|part| part["type"] == "image_url"));
     }
 
     #[test]

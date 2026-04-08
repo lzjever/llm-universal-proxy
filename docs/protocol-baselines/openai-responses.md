@@ -1,51 +1,70 @@
 # OpenAI Responses API — protocol baseline
 
-- **Source:** [OpenAI API Reference — Responses](https://platform.openai.com/docs/api-reference/responses), [Responses streaming](https://platform.openai.com/docs/api-reference/responses-streaming)  
-- **Streaming guide:** [Streaming API responses](https://platform.openai.com/docs/guides/streaming-responses)  
-- **Capture date / version:** 2026-03-05 (documentation as of that date; check source for latest)
+- Source:
+  - https://platform.openai.com/docs/api-reference/responses
+  - https://developers.openai.com/api/reference/resources/responses
+- Capture date: 2026-04-07
+- Local snapshot:
+  - `docs/protocol-baselines/snapshots/2026-04-07/openai-responses.html`
 
----
+## Canonical surface
 
-## Endpoints
+- Primary create endpoint: `POST /v1/responses`
+- Additional lifecycle endpoints documented by OpenAI:
+  - `GET /v1/responses/{response_id}`
+  - `DELETE /v1/responses/{response_id}`
+  - `POST /v1/responses/{response_id}/cancel`
+  - `POST /v1/responses/compact`
+  - input-item helper endpoints under the same resource family
+- Base URL example: `https://api.openai.com/v1`
 
-- **POST** `/responses` — Create a model response (main endpoint for chat-like usage)
-- **GET** `/responses/{response_id}` — Get a model response
-- **DELETE** `/responses/{response_id}`
-- **POST** `/responses/{response_id}/cancel`
-- **POST** `/responses/compact`
+## Request shape
 
-Base URL example: `https://api.openai.com/v1`
+- Core fields:
+  - `model`
+  - `input`
+  - `instructions`
+  - `stream`
+  - `tools`
+  - `tool_choice`
+  - `metadata`
+- `input` accepts either:
+  - a string
+  - an array of structured input items
+- Structured items include at least:
+  - `type: "message"` with `role` and `content`
+  - tool-related items such as function-call output
+  - reasoning-related items in newer response shapes
 
-## Request (create response)
+## Non-streaming response shape
 
-- **model** (optional): Model ID.
-- **input** (array or string): Conversation input. Array of items (e.g. messages with `type`, `role`, `content`); or string for single text input.
-- **instructions** (optional): System-level instructions.
-- **stream** (boolean, optional): If `true`, response is SSE stream.
-- **truncation**, **tools**, **tool_choice**, **safety_identifier**, etc. (see official reference).
+- Top-level object type is `response`
+- Common fields:
+  - `id`
+  - `object`
+  - `created_at`
+  - `status`
+  - `output`
+  - `usage`
+- `output` is a typed array, commonly containing:
+  - `message`
+  - `function_call`
+  - `reasoning`
 
-Input items can be messages (`type: "message"`, `role`, `content` with e.g. `type: "input_text"`, `text`) or other item types.
+## Streaming shape
 
-## Response (non-streaming)
+- Transport: SSE
+- Common event types documented in the current reference include:
+  - `response.created`
+  - `response.in_progress`
+  - `response.output_text.delta`
+  - `response.output_item.added`
+  - `response.function_call_arguments.delta`
+  - terminal events such as `response.completed`, `response.incomplete`, `response.failed`
+- OpenAI also documents sequence-aware replay/continuation fields on retrieval streaming paths.
 
-- **object:** `"response"`
-- **id:** string
-- **created_at:** number (Unix timestamp)
-- **status:** e.g. `"completed"` | `"in_progress"`
-- **output:** array of output items, e.g.:
-  - **type:** `"message"` — **content** array with e.g. `type: "output_text"`, **text**
-  - **type:** `"function_call"` — **call_id**, **name**, **arguments**
-- **usage** (optional): token counts
+## Proxy implications
 
-## Response (streaming, SSE)
-
-- **Content-Type:** `text/event-stream`
-- Semantic event types (examples): `response.created`, `response.in_progress`, `response.output_text.delta`, `response.output_item.added`, `response.function_call_arguments.delta`, `response.completed`, `error`.
-- Events may include **event:** line (e.g. `event: response.created`) and **data:** line with JSON.
-- Key lifecycle: `response.created` → deltas (e.g. `response.output_text.delta` with **delta** text) → `response.completed`.
-
-## Notes for proxy
-
-- Detect client format by path `/v1/responses` or body with **input** (array or string) and no **messages**.
-- Passthrough when upstream is Responses API.
-- Translation: convert to/from OpenAI Chat Completions pivot; map **input** ↔ **messages**, **output** ↔ **choices[].message**.
+- Detect Responses clients by explicit path or by `input` without `messages`.
+- Treat `POST /v1/responses` as the compatibility minimum.
+- Full spec conformance requires more than the create endpoint; the lifecycle sub-resources are part of the current official surface.

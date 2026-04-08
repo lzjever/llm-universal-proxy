@@ -1,55 +1,73 @@
-# Anthropic Messages API (Claude) — protocol baseline
+# Anthropic Messages API — protocol baseline
 
-- **Source:** [Anthropic API — Messages](https://docs.anthropic.com/en/api/messages)  
-- **Capture date / version:** 2026-03-05 (documentation as of that date; check source for latest)
+- Source:
+  - https://platform.claude.com/docs/en/api/messages
+- Capture date: 2026-04-07
+- Local snapshot:
+  - `docs/protocol-baselines/snapshots/2026-04-07/anthropic-messages.html`
 
----
+## Canonical surface
 
-## Endpoint
+- Primary endpoint: `POST /v1/messages`
+- Closely related current endpoints:
+  - `POST /v1/messages/count_tokens`
+  - models endpoints under the same API family
+- Base URL example: `https://api.anthropic.com`
 
-- **POST** `/v1/messages`  
-- Base URL: `https://api.anthropic.com`  
-- Headers: `x-api-key`, `anthropic-version` (e.g. `2023-06-01`), `content-type: application/json`
+## Required headers
 
-## Request
+- `x-api-key`
+- `anthropic-version`
+- `content-type: application/json`
 
-- **model** (string): Claude model ID (e.g. `claude-3-5-sonnet-20241022`).
-- **max_tokens** (number, required): Maximum tokens to generate.
-- **messages** (array, required): Input messages. Each message:
-  - **role:** `"user"` | `"assistant"`
-  - **content:** string (shorthand for one text block) or array of content blocks.
-- **system** (optional): Top-level system prompt (not a message role).
-- **stream** (optional): If `true`, response is SSE stream.
+## Request shape
 
-Content blocks (input): e.g. `{ "type": "text", "text": "..." }`, `{ "type": "image", "source": { "type": "base64", "media_type": "...", "data": "..." } }`, `type: "tool_use"` / `tool_result`.
+- Core fields:
+  - `model`
+  - `max_tokens`
+  - `messages`
+  - `system`
+  - `stream`
+  - `tools`
+  - `tool_choice`
+  - `metadata`
+- `messages[].role` is primarily `user` or `assistant`
+- `messages[].content` may be:
+  - shorthand string
+  - an array of typed content blocks
+- Common block types in the current reference:
+  - `text`
+  - `image`
+  - `tool_use`
+  - `tool_result`
+  - thinking-related blocks on supported models
 
-## Response (non-streaming)
+## Non-streaming response shape
 
-- **id:** string (message ID)
-- **type:** `"message"`
-- **role:** `"assistant"`
-- **content:** array of content blocks, e.g.:
-  - **type:** `"text"` — **text:** string
-  - **type:** `"thinking"` — **thinking:** string (extended thinking)
-  - **type:** `"tool_use"` — **id**, **name**, **input**
-- **model:** string
-- **stop_reason:** `"end_turn"` | `"max_tokens"` | `"tool_use"` | null | ...
-- **stop_sequence:** optional
-- **usage:** **input_tokens**, **output_tokens**
+- Top-level `type` is `message`
+- Common fields:
+  - `id`
+  - `type`
+  - `role`
+  - `model`
+  - `content`
+  - `stop_reason`
+  - `stop_sequence`
+  - `usage`
 
-## Response (streaming, SSE)
+## Streaming shape
 
-- **Content-Type:** `text/event-stream`
-- Events (with **event:** and **data:** lines):
-  - **message_start** — message object with empty or initial content
-  - **content_block_start** — **index**, **content_block** (e.g. `type: "text"`, `text`)
-  - **content_block_delta** — **index**, **delta** (e.g. `type: "text_delta"`, **text**)
-  - **content_block_stop** — **index**
-  - **message_delta** — **delta** (e.g. **stop_reason**), **usage**
-  - **message_stop**
+- Transport: SSE
+- Core events documented by Anthropic:
+  - `message_start`
+  - `content_block_start`
+  - `content_block_delta`
+  - `content_block_stop`
+  - `message_delta`
+  - `message_stop`
+- Tool use and thinking both appear as typed block events rather than OpenAI-style `delta.tool_calls`.
 
-## Notes for proxy
+## Proxy implications
 
-- Detect client format by body: **messages** plus **system** or **anthropic_version**, or first message **content** as array with Claude-specific block types (e.g. image with `source.type: "base64"`, tool_use / tool_result).
-- Passthrough when upstream is Anthropic.
-- Translation: map **messages** + **system** ↔ OpenAI **messages**; **content** blocks (text / thinking / tool_use) ↔ **choices[].message** (content, reasoning_content, tool_calls).
+- For strict conformance, `max_tokens` and `anthropic-version` should always be present for native Messages requests.
+- Mapping `parallel_tool_calls: false` from OpenAI-style clients is only an approximation; Anthropic exposes this through `disable_parallel_tool_use` inside `tool_choice`.
