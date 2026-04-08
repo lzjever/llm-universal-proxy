@@ -372,6 +372,8 @@ HOME="$(mktemp -d)" GLM_APIKEY="你的真实 Key" codex exec --ephemeral \
 - 这里用了临时 `HOME` 和 `--ephemeral`，不会污染你全局的 Codex CLI 配置。
 - 客户端访问的是代理的 `/openai/v1/responses`；代理会先把本地模型名 `GLM-5` 解析成 `GLM-OFFICIAL:GLM-5`，再转换成 Anthropic Messages 发给上游。
 - 如果上游还需要额外静态协议头，可以在对应 upstream 条目里配置 `headers`。
+- 对于 Kimi，建议将 upstream 配置为 `format: anthropic`，`api_root` 指向 `https://api.kimi.com/coding/v1`，再由代理对外提供 `/openai/v1/responses` 给 Codex 使用。
+- 部分 Anthropic 兼容上游的 SSE 事件会使用 `data:{...}`（冒号后无空格）的形式。代理现已同时兼容 `data: {...}` 和 `data:{...}` 两种写法。
 
 ### 隔离的 CLI Smoke 测试
 

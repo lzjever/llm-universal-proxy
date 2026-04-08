@@ -467,6 +467,8 @@ Notes:
 - This does not modify your global Codex CLI configuration because it uses a temporary `HOME` and `--ephemeral`.
 - The client talks OpenAI Responses to the proxy at `/openai/v1/responses`; the proxy resolves local model `GLM-5` to `GLM-OFFICIAL:GLM-5`, then translates upstream to Anthropic Messages.
 - For providers that need extra static headers beyond the Anthropic default, set the upstream's `headers` field in the matching upstream entry.
+- For Kimi, prefer configuring the upstream as `format: anthropic` against `https://api.kimi.com/coding/v1` and exposing `/openai/v1/responses` from the proxy to Codex.
+- Some Anthropic-compatible upstreams emit SSE `data:` lines without a trailing space. The proxy accepts both `data: {...}` and `data:{...}` forms during stream translation.
 
 #### Custom Text-Only Models For Codex
 
