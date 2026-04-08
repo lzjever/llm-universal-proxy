@@ -120,7 +120,7 @@ fn dedupe_tool_call_state_by_call_id(
         .or_insert(existing_entry);
 }
 
-/// Extract one SSE event from buffer. Returns parsed JSON from "data: " line, or None.
+/// Extract one SSE event from buffer. Returns parsed JSON from a `data:` line, or None.
 /// Buffer is updated: consumed bytes are removed.
 ///
 /// Supports both `\n\n` and `\r\n\r\n` line endings, since some upstream servers
@@ -136,8 +136,8 @@ pub fn take_one_sse_event(buffer: &mut Vec<u8>) -> Option<Value> {
     let event_str = String::from_utf8_lossy(&event_bytes);
     for line in event_str.lines() {
         let line = line.trim();
-        if line.starts_with("data: ") {
-            let data = line.strip_prefix("data: ").unwrap_or("").trim();
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.trim();
             if data == "[DONE]" || data.is_empty() {
                 return Some(serde_json::json!({ "_done": true }));
             }
@@ -2058,6 +2058,18 @@ mod tests {
             event.as_ref().unwrap().get("type").and_then(Value::as_str),
             Some("message_start")
         );
+    }
+
+    #[test]
+    fn take_one_sse_event_parses_data_line_without_space_after_colon() {
+        let mut buf = b"event:message_start\ndata:{\"type\":\"message_start\"}\n\n".to_vec();
+        let event = take_one_sse_event(&mut buf);
+        assert!(event.is_some());
+        assert_eq!(
+            event.as_ref().unwrap().get("type").and_then(Value::as_str),
+            Some("message_start")
+        );
+        assert!(buf.is_empty());
     }
 
     #[test]
