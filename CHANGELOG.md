@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.5 - 2026-04-17
+
+- Added `scripts/real_cli_matrix.py` as the reusable real-client CLI matrix runner for repeatable end-to-end proxy testing across real `codex`, `claude`, and `gemini` processes, including stable matrix listing and case targeting.
+- Kept `scripts/test_cli_clients.sh` as a compatibility shim for older local flows and wrappers by forwarding it directly to the Python runner.
+- Isolated Codex, Claude Code, and Gemini runs with runner-managed home/config/cache state and per-client environment wiring, while reusing a runner-managed Gemini bootstrap home instead of the user's normal profile.
+- Added timestamped report artifacts under `test-reports/cli-matrix/`, including JSON and Markdown summaries, per-case logs, captured workspaces, and a `latest` symlink for quick inspection.
+- Tightened long-horizon verification so the Python bugfix fixture must both repair the `calc.py` implementation and preserve the expected `main.py` behavior, rejecting comment-only or non-functional edits.
+- Kept `qwen-local` as optional coverage enabled only when local env is configured, with the default matrix limiting it to smoke coverage and excluding long-horizon code-edit cases.
+
 ## v0.2.4 - 2026-04-07
 
 - Added `rust-toolchain.toml` as the repository's pinned Rust toolchain source and wired CI / release jobs to install Rust from that value instead of implicit `stable`.
