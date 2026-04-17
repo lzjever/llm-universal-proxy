@@ -1449,9 +1449,11 @@ async fn handle_request_core(
                 );
             }
         };
+    let preserve_native_upstream_protocol_headers = upstream_format == client_format;
 
     if stream {
         let status = res.status();
+        let upstream_response_headers = res.headers().clone();
         debug!("Upstream streaming response status: {}", status);
         if !status.is_success() {
             let error_body = res
@@ -1463,11 +1465,15 @@ async fn handle_request_core(
                 status, error_body
             );
             tracker.finish_error(status.as_u16());
-            return streaming_error_response(
+            let mut response = streaming_error_response(
                 client_format,
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
                 &error_body,
             );
+            if preserve_native_upstream_protocol_headers {
+                append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+            }
+            return response;
         }
         let upstream_stream = res.bytes_stream();
         let mut body_stream: Pin<
@@ -1504,11 +1510,13 @@ async fn handle_request_core(
             .header("Connection", "keep-alive")
             .body(body)
             .unwrap();
+        append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
         append_compatibility_warning_headers(&mut response, &compatibility_warnings);
         return response;
     }
 
     let status = res.status();
+    let upstream_response_headers = res.headers().clone();
     let bytes = match res.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -1523,11 +1531,15 @@ async fn handle_request_core(
             String::from_utf8_lossy(&bytes)
         );
         tracker.finish_error(status.as_u16());
-        return error_response(
+        let mut response = error_response(
             client_format,
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             &String::from_utf8_lossy(&bytes),
         );
+        if preserve_native_upstream_protocol_headers {
+            append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+        }
+        return response;
     }
     let upstream_body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -1548,7 +1560,11 @@ async fn handle_request_core(
         normalized_non_stream_upstream_error(upstream_format, client_format, &upstream_body)
     {
         tracker.finish_error(status.as_u16());
-        return error_response(client_format, status, &message);
+        let mut response = error_response(client_format, status, &message);
+        if preserve_native_upstream_protocol_headers {
+            append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+        }
+        return response;
     }
     let out = match translate_response(upstream_format, client_format, &upstream_body) {
         Ok(v) => v,
@@ -1582,6 +1598,9 @@ async fn handle_request_core(
             serde_json::to_vec(&out).unwrap_or_else(|_| b"{}".to_vec()),
         ))
         .unwrap();
+    if preserve_native_upstream_protocol_headers {
+        append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+    }
     append_compatibility_warning_headers(&mut response, &compatibility_warnings);
     response
 }
@@ -2416,6 +2435,28 @@ fn append_compatibility_warning_headers(response: &mut Response<Body>, warnings:
                 .append("x-proxy-compat-warning", value);
         }
     }
+}
+
+fn append_upstream_protocol_response_headers(
+    response: &mut Response<Body>,
+    upstream_headers: &reqwest::header::HeaderMap,
+) {
+    for (name, value) in upstream_headers.iter() {
+        if is_forwardable_upstream_protocol_response_header(name.as_str())
+            && !response.headers().contains_key(name)
+        {
+            response.headers_mut().append(name, value.clone());
+        }
+    }
+}
+
+fn is_forwardable_upstream_protocol_response_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("request-id")
+        || name.eq_ignore_ascii_case("x-request-id")
+        || name.starts_with("anthropic-")
+        || name.starts_with("openai-")
+        || name.starts_with("ratelimit-")
+        || name.starts_with("x-ratelimit-")
 }
 
 fn normalized_non_stream_upstream_error(

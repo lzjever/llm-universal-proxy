@@ -131,10 +131,11 @@ async fn openai_reasoning_to_anthropic_non_streaming() {
     );
     let body: Value = res.json().await.unwrap();
     let content = body["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "thinking");
-    assert_eq!(content[0]["thinking"], "think");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "think");
     assert_eq!(content[1]["type"], "text");
     assert_eq!(content[1]["text"], "Hi");
+    assert!(content.iter().all(|block| block["type"] != "thinking"));
 }
 
 #[tokio::test]
@@ -244,10 +245,11 @@ async fn responses_reasoning_to_anthropic_non_streaming() {
     );
     let body: Value = res.json().await.unwrap();
     let content = body["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "thinking");
-    assert_eq!(content[0]["thinking"], "think");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "think");
     assert_eq!(content[1]["type"], "text");
     assert_eq!(content[1]["text"], "Hi");
+    assert!(content.iter().all(|block| block["type"] != "thinking"));
 }
 
 #[tokio::test]
@@ -331,10 +333,11 @@ async fn gemini_thinking_to_anthropic_non_streaming() {
     );
     let body: Value = res.json().await.unwrap();
     let content = body["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "thinking");
-    assert_eq!(content[0]["thinking"], "think");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "think");
     assert_eq!(content[1]["type"], "text");
     assert_eq!(content[1]["text"], "Hi");
+    assert!(content.iter().all(|block| block["type"] != "thinking"));
 }
 
 #[tokio::test]
@@ -439,7 +442,8 @@ async fn openai_reasoning_to_anthropic_streaming() {
         .unwrap();
     assert!(res.status().is_success());
     let text = res.text().await.unwrap();
-    assert!(text.contains("thinking_delta"), "body = {text}");
+    assert!(text.contains("text_delta"), "body = {text}");
+    assert!(!text.contains("thinking_delta"), "body = {text}");
     assert!(text.contains("text_delta"), "body = {text}");
     assert!(text.contains("message_stop"), "body = {text}");
 }
@@ -507,7 +511,8 @@ async fn responses_reasoning_to_anthropic_streaming() {
         .unwrap();
     assert!(res.status().is_success());
     let text = res.text().await.unwrap();
-    assert!(text.contains("thinking_delta"), "body = {text}");
+    assert!(text.contains("text_delta"), "body = {text}");
+    assert!(!text.contains("thinking_delta"), "body = {text}");
     assert!(text.contains("message_stop"), "body = {text}");
 }
 
@@ -553,7 +558,8 @@ async fn gemini_thinking_to_anthropic_streaming() {
         .unwrap();
     assert!(res.status().is_success());
     let text = res.text().await.unwrap();
-    assert!(text.contains("thinking_delta"), "body = {text}");
+    assert!(text.contains("text_delta"), "body = {text}");
+    assert!(!text.contains("thinking_delta"), "body = {text}");
     assert!(text.contains("message_stop"), "body = {text}");
 }
 
@@ -759,7 +765,7 @@ async fn multi_turn_openai_reasoning_preserved_in_history_to_claude() {
 }
 
 #[tokio::test]
-async fn multi_turn_openai_reasoning_rehydrates_to_claude_thinking_blocks() {
+async fn multi_turn_openai_reasoning_replays_to_claude_text_blocks() {
     let (mock_base, _mock, mut captured) = spawn_capture_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -790,10 +796,13 @@ async fn multi_turn_openai_reasoning_rehydrates_to_claude_thinking_blocks() {
     let assistant_content = request["messages"][1]["content"]
         .as_array()
         .expect("assistant content");
-    assert_eq!(assistant_content[0]["type"], "thinking");
-    assert_eq!(assistant_content[0]["thinking"], "2+2 equals 4");
+    assert_eq!(assistant_content[0]["type"], "text");
+    assert_eq!(assistant_content[0]["text"], "2+2 equals 4");
     assert_eq!(assistant_content[1]["type"], "text");
     assert_eq!(assistant_content[1]["text"], "The answer is 4");
+    assert!(assistant_content
+        .iter()
+        .all(|block| block["type"] != "thinking"));
     assert!(assistant_content
         .iter()
         .all(|block| block["type"] != "redacted_thinking"));

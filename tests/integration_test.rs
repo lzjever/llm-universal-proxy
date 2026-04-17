@@ -390,6 +390,33 @@ async fn spawn_google_capture_mock() -> (String, tokio::task::JoinHandle<()>, Ca
     (base, handle, captured)
 }
 
+async fn spawn_google_prompt_feedback_mock() -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(
+        Path(_model_action): Path<String>,
+        Json(_body): Json<Value>,
+    ) -> impl IntoResponse {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "promptFeedback": { "blockReason": "SAFETY" },
+                "usageMetadata": { "promptTokenCount": 3, "totalTokenCount": 3 },
+                "modelVersion": "gemini-2.5"
+            })),
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1beta/models/:model_action", post(handler))
+        .route("/models/:model_action", post(handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
 async fn spawn_anthropic_context_window_mock() -> (String, tokio::task::JoinHandle<()>) {
     async fn handler(Json(body): Json<Value>) -> impl IntoResponse {
         (
@@ -2418,6 +2445,140 @@ async fn anthropic_namespace_messages_stream_works() {
 }
 
 #[tokio::test]
+async fn native_anthropic_stream_preserves_upstream_protocol_headers() {
+    let (mock_base, _mock) = spawn_header_streaming_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res.status().is_success());
+    assert_eq!(
+        res.headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_upstream_123")
+    );
+    assert_eq!(
+        res.headers()
+            .get("anthropic-ratelimit-requests-limit")
+            .and_then(|value| value.to_str().ok()),
+        Some("99")
+    );
+}
+
+#[tokio::test]
+async fn native_anthropic_non_stream_preserves_upstream_protocol_headers() {
+    let (mock_base, _mock) = spawn_headered_anthropic_mock(false, StatusCode::OK).await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res.status().is_success());
+    assert_eq!(
+        res.headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_upstream_123")
+    );
+    assert_eq!(
+        res.headers()
+            .get("anthropic-ratelimit-requests-limit")
+            .and_then(|value| value.to_str().ok()),
+        Some("99")
+    );
+}
+
+#[tokio::test]
+async fn native_anthropic_non_stream_error_preserves_upstream_protocol_headers() {
+    let (mock_base, _mock) =
+        spawn_headered_anthropic_mock(false, StatusCode::TOO_MANY_REQUESTS).await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        res.headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_upstream_123")
+    );
+    assert_eq!(
+        res.headers()
+            .get("anthropic-ratelimit-requests-limit")
+            .and_then(|value| value.to_str().ok()),
+        Some("99")
+    );
+}
+
+#[tokio::test]
+async fn native_anthropic_stream_error_preserves_upstream_protocol_headers() {
+    let (mock_base, _mock) =
+        spawn_headered_anthropic_mock(true, StatusCode::TOO_MANY_REQUESTS).await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        res.headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req_upstream_123")
+    );
+    assert_eq!(
+        res.headers()
+            .get("anthropic-ratelimit-requests-limit")
+            .and_then(|value| value.to_str().ok()),
+        Some("99")
+    );
+}
+
+#[tokio::test]
 async fn google_namespace_generate_content_works() {
     let (mock_base, _mock) = spawn_google_mock().await;
     let config = config_with_alias(
@@ -2442,6 +2603,30 @@ async fn google_namespace_generate_content_works() {
     assert!(res.status().is_success(), "status: {}", res.status());
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "Hi");
+}
+
+#[tokio::test]
+async fn gemini_prompt_feedback_without_candidates_does_not_500() {
+    let (mock_base, _mock) = spawn_google_prompt_feedback_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini-2.5",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["finish_reason"], "content_filter");
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
 }
 
 #[tokio::test]
@@ -2927,6 +3112,12 @@ struct CapturedAnthropicRequest {
     body: Value,
 }
 
+#[derive(Clone, Copy)]
+struct HeaderedAnthropicMockConfig {
+    expected_stream: bool,
+    status: StatusCode,
+}
+
 async fn spawn_header_capture_anthropic_mock(
 ) -> (String, tokio::task::JoinHandle<()>, CapturedHeaders) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3087,6 +3278,114 @@ async fn capture_auth_anthropic_handler(
             "usage": { "input_tokens": 1, "output_tokens": 1 }
         })),
     )
+}
+
+async fn spawn_header_streaming_anthropic_mock() -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(Json(body): Json<Value>) -> Response {
+        let stream_enabled = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        assert!(stream_enabled, "expected streaming anthropic request");
+
+        let pieces = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_headers","type":"message","role":"assistant","model":"claude-3","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}
+
+"#,
+            )),
+            Ok(Bytes::from_static(
+                br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":2}}
+
+"#,
+            )),
+            Ok(Bytes::from_static(
+                br#"event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+            )),
+        ];
+        let body_stream = stream::iter(pieces);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .header("request-id", "req_upstream_123")
+            .header("anthropic-ratelimit-requests-limit", "99")
+            .body(Body::from_stream(body_stream))
+            .unwrap()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/messages", post(handler))
+        .route("/messages", post(handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn spawn_headered_anthropic_mock(
+    expected_stream: bool,
+    status: StatusCode,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(
+        State(config): State<HeaderedAnthropicMockConfig>,
+        Json(body): Json<Value>,
+    ) -> Response {
+        let stream_enabled = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        assert_eq!(
+            stream_enabled, config.expected_stream,
+            "unexpected stream flag for anthropic request"
+        );
+
+        let response_body = if config.status.is_success() {
+            json!({
+                "id": "msg_headers",
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Hi" }],
+                "model": "claude-3",
+                "stop_reason": "end_turn",
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            })
+        } else {
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "Too many requests."
+                }
+            })
+        };
+
+        Response::builder()
+            .status(config.status)
+            .header("Content-Type", "application/json")
+            .header("request-id", "req_upstream_123")
+            .header("anthropic-ratelimit-requests-limit", "99")
+            .body(Body::from(
+                serde_json::to_vec(&response_body).expect("serialize anthropic mock response"),
+            ))
+            .unwrap()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/messages", post(handler))
+        .route("/messages", post(handler))
+        .with_state(HeaderedAnthropicMockConfig {
+            expected_stream,
+            status,
+        });
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
 }
 
 async fn spawn_hook_capture_server() -> (String, tokio::task::JoinHandle<()>, CapturedHookPayloads)
@@ -3647,7 +3946,7 @@ async fn hooks_mark_cancelled_when_stream_is_dropped_early() {
 }
 
 #[tokio::test]
-async fn hooks_capture_translated_thinking_blocks_for_messages_stream() {
+async fn hooks_capture_translated_responses_reasoning_as_text_for_messages_stream() {
     let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
     let (hook_base, _hook, captured) = spawn_hook_capture_server().await;
     let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
@@ -3681,7 +3980,8 @@ async fn hooks_capture_translated_thinking_blocks_for_messages_stream() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
-    assert!(body.contains("thinking_delta"));
+    assert!(body.contains("text_delta"));
+    assert!(!body.contains("thinking_delta"));
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let payloads = captured.payloads.lock().unwrap();
@@ -3689,20 +3989,19 @@ async fn hooks_capture_translated_thinking_blocks_for_messages_stream() {
         .iter()
         .find(|payload| payload.get("request").is_some())
         .unwrap();
-    assert_eq!(
-        exchange["response"]["body"]["content"][0]["type"],
-        "thinking"
-    );
-    assert_eq!(
-        exchange["response"]["body"]["content"][0]["thinking"],
-        "think"
-    );
-    assert_eq!(exchange["response"]["body"]["content"][1]["type"], "text");
-    assert_eq!(exchange["response"]["body"]["content"][1]["text"], "Hi");
+    let content = exchange["response"]["body"]["content"]
+        .as_array()
+        .expect("content blocks");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "think");
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "Hi");
+    assert!(content.iter().all(|block| block["type"] != "thinking"));
 }
 
 #[tokio::test]
-async fn concurrent_openai_to_anthropic_requests_keep_headers_and_cache_control_isolated() {
+async fn concurrent_openai_to_anthropic_requests_keep_headers_isolated_without_injecting_cache_control(
+) {
     let (mock_base, _mock, captured) = spawn_concurrent_capture_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -3751,8 +4050,7 @@ async fn concurrent_openai_to_anthropic_requests_keep_headers_and_cache_control_
             .as_array()
             .expect("system should be array");
         assert_eq!(system.len(), 1);
-        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(system[0]["cache_control"]["ttl"], "1h");
+        assert!(system[0].get("cache_control").is_none());
 
         let messages = req.body["messages"]
             .as_array()
@@ -3772,16 +4070,9 @@ async fn concurrent_openai_to_anthropic_requests_keep_headers_and_cache_control_
         let assistant_blocks = messages[1]["content"]
             .as_array()
             .expect("assistant content should be array");
-        let last = assistant_blocks
-            .last()
-            .expect("assistant block should exist");
-        assert_eq!(last["cache_control"]["type"], "ephemeral");
-        assert!(
-            assistant_blocks[..assistant_blocks.len() - 1]
-                .iter()
-                .all(|block| block.get("cache_control").is_none()),
-            "only last assistant block should carry cache_control"
-        );
+        assert!(assistant_blocks
+            .iter()
+            .all(|block| block.get("cache_control").is_none()));
     }
 }
 
@@ -4026,10 +4317,11 @@ async fn messages_endpoint_preserves_responses_reasoning_stream() {
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
     assert!(
-        body.contains("\"type\":\"thinking\"") || body.contains("\"type\": \"thinking\""),
+        body.contains("\"type\":\"text\"") || body.contains("\"type\": \"text\""),
         "body = {body}"
     );
-    assert!(body.contains("thinking_delta"), "body = {body}");
+    assert!(body.contains("text_delta"), "body = {body}");
+    assert!(!body.contains("thinking_delta"), "body = {body}");
     assert!(body.contains("message_stop"), "body = {body}");
 }
 
