@@ -21,7 +21,7 @@
 - Fixed the Claude smoke-test base URL handling so the client points at `/anthropic` and lets Claude append `/v1/messages` itself.
 - Fixed Codex multi-turn smoke tests in temporary workspaces by adding `--skip-git-repo-check`.
 - Marked the local `qwen-local` alias as an intentional skip for multi-turn code-edit tasks where the model is not reliable enough, while keeping its single-turn smoke coverage enabled.
-- Documented the new smoke script and its constraints in `README.md`, `README_CN.md`, and the archived `HANDOFF.md`.
+- Documented the new smoke script and its constraints in `README.md` and `README_CN.md`.
 
 ## v0.2.2 - 2026-03-20
 
