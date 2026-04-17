@@ -955,6 +955,7 @@ impl ResponsesAccumulator {
 #[derive(Debug, Default)]
 struct AnthropicAccumulator {
     message: Value,
+    error: Option<Value>,
     usage: Option<NormalizedUsage>,
 }
 
@@ -976,6 +977,9 @@ impl AnthropicAccumulator {
 
     fn on_event(&mut self, event: &Value) {
         match event.get("type").and_then(Value::as_str) {
+            Some("error") => {
+                self.error = Some(event.clone());
+            }
             Some("message_start") => {
                 if let Some(message) = event.get("message") {
                     self.message = message.clone();
@@ -1090,7 +1094,7 @@ impl AnthropicAccumulator {
     }
 
     fn final_body(&self) -> Value {
-        self.message.clone()
+        self.error.clone().unwrap_or_else(|| self.message.clone())
     }
 
     fn final_usage(&self) -> NormalizedUsage {

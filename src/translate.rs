@@ -6,6 +6,102 @@ use serde_json::Value;
 
 use crate::formats::UpstreamFormat;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranslationIssueLevel {
+    Warning,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranslationIssue {
+    pub level: TranslationIssueLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TranslationAssessment {
+    pub issues: Vec<TranslationIssue>,
+}
+
+impl TranslationAssessment {
+    fn warning(&mut self, message: impl Into<String>) {
+        self.issues.push(TranslationIssue {
+            level: TranslationIssueLevel::Warning,
+            message: message.into(),
+        });
+    }
+
+    fn reject(&mut self, message: impl Into<String>) {
+        self.issues.push(TranslationIssue {
+            level: TranslationIssueLevel::Reject,
+            message: message.into(),
+        });
+    }
+
+    pub(crate) fn decision(&self) -> TranslationDecision {
+        let mut warnings = Vec::new();
+        for issue in &self.issues {
+            match issue.level {
+                TranslationIssueLevel::Reject => {
+                    return TranslationDecision::Reject(issue.message.clone());
+                }
+                TranslationIssueLevel::Warning => warnings.push(issue.message.clone()),
+            }
+        }
+        if warnings.is_empty() {
+            TranslationDecision::Allow
+        } else {
+            TranslationDecision::AllowWithWarnings(warnings)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranslationDecision {
+    Allow,
+    AllowWithWarnings(Vec<String>),
+    Reject(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticToolKind {
+    Function,
+    OpenAiCustom,
+    AnthropicServerTool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SemanticToolResultContent {
+    Text(String),
+    Json(Value),
+    TypedBlocks(Vec<Value>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SemanticTextPart {
+    pub text: String,
+    pub annotations: Vec<Value>,
+}
+
+pub(crate) const OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE: &str =
+    "OpenAI reasoning cannot be replayed to Anthropic without provenance; refusing to translate reasoning as plain text";
+
+fn translation_target_label(format: UpstreamFormat) -> &'static str {
+    match format {
+        UpstreamFormat::OpenAiCompletion => "OpenAI Chat Completions",
+        UpstreamFormat::OpenAiResponses => "OpenAI Responses",
+        UpstreamFormat::Anthropic => "Anthropic",
+        UpstreamFormat::Google => "Gemini",
+    }
+}
+
+pub(crate) fn custom_tools_not_portable_message(upstream_format: UpstreamFormat) -> String {
+    format!(
+        "OpenAI custom tools cannot be faithfully translated to {}; refusing to downgrade them to function tools",
+        translation_target_label(upstream_format)
+    )
+}
+
 /// Translate response body from upstream format to client format.
 /// Converts via OpenAI pivot: upstream → openai → client when formats differ.
 pub fn translate_response(
@@ -46,51 +142,580 @@ fn openai_response_to_client(client_format: UpstreamFormat, body: &Value) -> Res
     }
 }
 
-pub(crate) fn anthropic_tool_use_type_for_openai_tool_call(tool_call: &Value) -> &'static str {
-    match tool_call.get("proxied_tool_kind").and_then(Value::as_str) {
-        Some("anthropic_server_tool_use") => "server_tool_use",
-        _ => "tool_use",
+pub(crate) fn anthropic_tool_use_type_for_openai_tool_call(
+    tool_call: &Value,
+) -> Result<&'static str, String> {
+    match semantic_tool_kind_from_value(tool_call) {
+        SemanticToolKind::OpenAiCustom => {
+            Err(custom_tools_not_portable_message(UpstreamFormat::Anthropic))
+        }
+        SemanticToolKind::AnthropicServerTool => Ok("server_tool_use"),
+        SemanticToolKind::Function => Ok("tool_use"),
     }
 }
 
-fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
-    let content = body
-        .get("content")
+pub(crate) fn semantic_tool_kind_from_value(value: &Value) -> SemanticToolKind {
+    match value.get("proxied_tool_kind").and_then(Value::as_str) {
+        Some("anthropic_server_tool_use") => SemanticToolKind::AnthropicServerTool,
+        _ => match value.get("type").and_then(Value::as_str) {
+            Some("custom") | Some("custom_tool_call") => SemanticToolKind::OpenAiCustom,
+            _ => SemanticToolKind::Function,
+        },
+    }
+}
+
+fn semantic_tool_result_content_from_value(content: Option<&Value>) -> SemanticToolResultContent {
+    match content {
+        Some(Value::String(text)) => SemanticToolResultContent::Text(text.clone()),
+        Some(Value::Array(items))
+            if items.iter().all(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false)
+            }) =>
+        {
+            SemanticToolResultContent::TypedBlocks(items.clone())
+        }
+        Some(other) => SemanticToolResultContent::Json(other.clone()),
+        None => SemanticToolResultContent::Text(String::new()),
+    }
+}
+
+fn semantic_tool_result_content_to_value(content: &SemanticToolResultContent) -> Value {
+    match content {
+        SemanticToolResultContent::Text(text) => Value::String(text.clone()),
+        SemanticToolResultContent::Json(value) => value.clone(),
+        SemanticToolResultContent::TypedBlocks(items) => Value::Array(items.clone()),
+    }
+}
+
+fn semantic_text_part_from_claude_block(block: &Value) -> Option<SemanticTextPart> {
+    let text = block.get("text").and_then(Value::as_str)?.to_string();
+    let annotations = block
+        .get("citations")
         .and_then(Value::as_array)
-        .ok_or("missing content")?;
-    let mut text_content = String::new();
-    let mut reasoning_content = String::new();
-    let mut tool_calls: Vec<Value> = vec![];
-    for block in content {
-        let ty = block.get("type").and_then(Value::as_str);
-        if ty == Some("text") {
-            text_content.push_str(block.get("text").and_then(Value::as_str).unwrap_or(""));
-        } else if ty == Some("thinking") {
-            reasoning_content.push_str(block.get("thinking").and_then(Value::as_str).unwrap_or(""));
-        } else if ty == Some("tool_use") {
-            tool_calls.push(serde_json::json!({
-                "id": block.get("id"),
-                "type": "function",
-                "function": {
-                    "name": block.get("name"),
-                    "arguments": block.get("input").map(|i| serde_json::to_string(i).unwrap_or_else(|_| "{}".into())).unwrap_or_else(|| "{}".to_string())
-                }
-            }));
+        .cloned()
+        .unwrap_or_default();
+    Some(SemanticTextPart { text, annotations })
+}
+
+fn semantic_text_part_from_openai_part(part: &Value) -> Option<SemanticTextPart> {
+    if part.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    Some(SemanticTextPart {
+        text: part.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+        annotations: part
+            .get("annotations")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
+fn semantic_text_part_to_openai_value(part: &SemanticTextPart) -> Value {
+    let mut value = serde_json::json!({
+        "type": "text",
+        "text": part.text,
+    });
+    if !part.annotations.is_empty() {
+        value["annotations"] = Value::Array(part.annotations.clone());
+    }
+    value
+}
+
+fn semantic_text_part_to_responses_value(part: &SemanticTextPart, content_type: &str) -> Value {
+    let mut value = serde_json::json!({
+        "type": content_type,
+        "text": part.text,
+    });
+    if !part.annotations.is_empty() {
+        value["annotations"] = Value::Array(part.annotations.clone());
+    }
+    value
+}
+
+fn openai_tool_arguments_raw(tool_call: &Value) -> Option<&str> {
+    tool_call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .or_else(|| tool_call.get("arguments"))
+        .and_then(Value::as_str)
+}
+
+fn openai_tool_arguments_to_structured_value(
+    tool_call: &Value,
+    target_label: &str,
+) -> Result<Value, String> {
+    let Some(raw) = openai_tool_arguments_raw(tool_call) else {
+        return Ok(serde_json::json!({}));
+    };
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    raw_json_object_to_structured_value(raw, target_label)
+}
+
+fn raw_json_object_to_structured_value(raw: &str, target_label: &str) -> Result<Value, String> {
+    let value: Value = serde_json::from_str(raw).map_err(|error| {
+        format!(
+            "tool arguments for {target_label} must be valid JSON; received `{raw}`: {error}"
+        )
+    })?;
+    if !value.is_object() {
+        return Err(format!(
+            "tool arguments for {target_label} must be a JSON object; received `{raw}`"
+        ));
+    }
+    Ok(value)
+}
+
+fn responses_tool_call_input_raw(item: &Value) -> Option<&str> {
+    match semantic_tool_kind_from_value(item) {
+        SemanticToolKind::OpenAiCustom => item.get("input").and_then(Value::as_str),
+        _ => item.get("arguments").and_then(Value::as_str),
+    }
+}
+
+fn responses_tool_call_to_structured_value(
+    item: &Value,
+    target_label: &str,
+) -> Result<Value, String> {
+    let Some(raw) = responses_tool_call_input_raw(item) else {
+        return Ok(serde_json::json!({}));
+    };
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    raw_json_object_to_structured_value(raw, target_label)
+}
+
+fn responses_tool_call_item_to_openai_tool_call(item: &Value) -> Option<Value> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") | Some("custom_tool_call") => {}
+        _ => return None,
+    }
+
+    let kind = semantic_tool_kind_from_value(item);
+    let default_input = match kind {
+        SemanticToolKind::OpenAiCustom => "",
+        _ => "{}",
+    };
+    let mut tool_call = serde_json::json!({
+        "id": item.get("call_id"),
+        "type": match kind {
+            SemanticToolKind::OpenAiCustom => "custom",
+            _ => "function",
+        },
+        "function": {
+            "name": item.get("name"),
+            "arguments": responses_tool_call_input_raw(item).unwrap_or(default_input)
+        }
+    });
+    if let Some(proxied_tool_kind) = item.get("proxied_tool_kind").cloned() {
+        tool_call["proxied_tool_kind"] = proxied_tool_kind;
+    }
+    Some(tool_call)
+}
+
+fn openai_tool_call_to_responses_item(tool_call: &Value) -> Value {
+    let kind = semantic_tool_kind_from_value(tool_call);
+    let default_input = match kind {
+        SemanticToolKind::OpenAiCustom => "",
+        _ => "{}",
+    };
+    let mut item = match kind {
+        SemanticToolKind::OpenAiCustom => serde_json::json!({
+            "type": "custom_tool_call",
+            "call_id": tool_call.get("id"),
+            "name": tool_call.get("function").and_then(|f| f.get("name")),
+            "input": openai_tool_arguments_raw(tool_call).unwrap_or(default_input)
+        }),
+        _ => serde_json::json!({
+            "type": "function_call",
+            "call_id": tool_call.get("id"),
+            "name": tool_call.get("function").and_then(|f| f.get("name")),
+            "arguments": openai_tool_arguments_raw(tool_call).unwrap_or(default_input)
+        }),
+    };
+    if let Some(proxied_tool_kind) = tool_call.get("proxied_tool_kind").cloned() {
+        item["proxied_tool_kind"] = proxied_tool_kind;
+    }
+    item
+}
+
+fn anthropic_block_has_cache_control(block: &Value) -> bool {
+    block.get("cache_control").is_some()
+}
+
+fn anthropic_protocol_uses_cache_control(body: &Value) -> bool {
+    let system_uses_cache_control = body
+        .get("system")
+        .map(|system| match system {
+            Value::Array(blocks) => blocks.iter().any(anthropic_block_has_cache_control),
+            Value::Object(_) => anthropic_block_has_cache_control(system),
+            _ => false,
+        })
+        .unwrap_or(false);
+    if system_uses_cache_control {
+        return true;
+    }
+
+    let messages_use_cache_control = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|blocks| blocks.iter().any(anthropic_block_has_cache_control))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if messages_use_cache_control {
+        return true;
+    }
+
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| tools.iter().any(anthropic_block_has_cache_control))
+        .unwrap_or(false)
+}
+
+fn extract_openai_refusal(message: &Value) -> Option<String> {
+    message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|text| !text.is_empty())
+}
+
+fn extract_openai_content_text(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn collapse_openai_text_parts(parts: &[Value]) -> Value {
+    let all_plain_text = parts.iter().all(|part| {
+        part.get("type").and_then(Value::as_str) == Some("text")
+            && part
+                .get("annotations")
+                .and_then(Value::as_array)
+                .map(|annotations| annotations.is_empty())
+                .unwrap_or(true)
+    });
+    if all_plain_text {
+        return Value::String(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<String>(),
+        );
+    }
+    Value::Array(parts.to_vec())
+}
+
+fn copy_remaining_usage_fields(
+    source: &Value,
+    target: &mut Value,
+    consumed_fields: &[&str],
+) {
+    let Some(source_map) = source.as_object() else {
+        return;
+    };
+    let Some(target_map) = target.as_object_mut() else {
+        return;
+    };
+    for (key, value) in source_map {
+        if consumed_fields.iter().any(|consumed| consumed == key) {
+            continue;
+        }
+        target_map.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
+fn responses_stateful_request_controls_for_translate(body: &Value) -> Vec<&'static str> {
+    let mut controls = Vec::new();
+    for field in ["previous_response_id", "conversation", "background", "store", "prompt"] {
+        if body.get(field).is_some() {
+            controls.push(field);
         }
     }
-    let mut message = serde_json::json!({ "role": "assistant" });
-    if !text_content.is_empty() {
-        message["content"] = Value::String(text_content);
+    controls
+}
+
+fn request_contains_openai_reasoning_without_provenance(
+    client_format: UpstreamFormat,
+    body: &Value,
+) -> bool {
+    match client_format {
+        UpstreamFormat::OpenAiCompletion => body
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|messages| {
+                messages.iter().any(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("assistant")
+                        && openai_message_reasoning_text(message).is_some()
+                })
+            })
+            .unwrap_or(false),
+        UpstreamFormat::OpenAiResponses => body
+            .get("input")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("reasoning")
+                        || (item.get("type").and_then(Value::as_str) == Some("message")
+                            && item.get("role").and_then(Value::as_str) == Some("assistant")
+                            && extract_responses_text_content(item.get("content")).is_empty()
+                            && item
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .map(|content| {
+                                    content.iter().any(|part| {
+                                        part.get("type").and_then(Value::as_str)
+                                            == Some("summary_text")
+                                    })
+                                })
+                                .unwrap_or(false))
+                })
+            })
+            .unwrap_or(false),
+        _ => false,
     }
-    if !reasoning_content.is_empty() {
-        message["reasoning_content"] = Value::String(reasoning_content);
+}
+
+fn request_has_custom_tools(client_format: UpstreamFormat, body: &Value) -> bool {
+    match client_format {
+        UpstreamFormat::OpenAiCompletion => {
+            body.get("tools")
+                .and_then(Value::as_array)
+                .map(|tools| {
+                    tools.iter().any(|tool| {
+                        semantic_tool_kind_from_value(tool) == SemanticToolKind::OpenAiCustom
+                    })
+                })
+                .unwrap_or(false)
+                || body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .map(|messages| {
+                        messages.iter().any(|message| {
+                            message
+                                .get("tool_calls")
+                                .and_then(Value::as_array)
+                                .map(|tool_calls| {
+                                    tool_calls.iter().any(|tool_call| {
+                                        semantic_tool_kind_from_value(tool_call)
+                                            == SemanticToolKind::OpenAiCustom
+                                    })
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+        }
+        UpstreamFormat::OpenAiResponses => {
+            body.get("tools")
+                .and_then(Value::as_array)
+                .map(|tools| {
+                    tools.iter().any(|tool| {
+                        semantic_tool_kind_from_value(tool) == SemanticToolKind::OpenAiCustom
+                    })
+                })
+                .unwrap_or(false)
+                || body
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items.iter().any(|item| {
+                            responses_tool_call_item_to_openai_tool_call(item)
+                                .map(|tool_call| {
+                                    semantic_tool_kind_from_value(&tool_call)
+                                        == SemanticToolKind::OpenAiCustom
+                                })
+                                .unwrap_or_else(|| {
+                                    semantic_tool_kind_from_value(item)
+                                        == SemanticToolKind::OpenAiCustom
+                                })
+                        })
+                    })
+                    .unwrap_or(false)
+        }
+        _ => false,
     }
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = Value::Array(tool_calls);
+}
+
+fn request_invalid_structured_tool_arguments_message(
+    client_format: UpstreamFormat,
+    body: &Value,
+    target_label: &str,
+) -> Option<String> {
+    match client_format {
+        UpstreamFormat::OpenAiCompletion => body
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| {
+                messages.iter().find_map(|message| {
+                    message.get("tool_calls").and_then(Value::as_array).and_then(|tool_calls| {
+                        tool_calls.iter().find_map(|tool_call| {
+                            (semantic_tool_kind_from_value(tool_call)
+                                != SemanticToolKind::OpenAiCustom)
+                                .then(|| {
+                                    openai_tool_arguments_to_structured_value(
+                                        tool_call,
+                                        target_label,
+                                    )
+                                    .err()
+                                })
+                                .flatten()
+                        })
+                    })
+                })
+            }),
+        UpstreamFormat::OpenAiResponses => body
+            .get("input")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find_map(|item| {
+                    matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("function_call") | Some("custom_tool_call")
+                    )
+                    .then(|| {
+                        (semantic_tool_kind_from_value(item) != SemanticToolKind::OpenAiCustom)
+                            .then(|| {
+                                responses_tool_call_to_structured_value(item, target_label).err()
+                            })
+                            .flatten()
+                    })
+                    .flatten()
+                })
+            }),
+        _ => None,
     }
-    if message.get("content").is_none() && message.get("tool_calls").is_none() {
-        message["content"] = Value::String(String::new());
+}
+
+fn anthropic_cross_protocol_control_names(body: &Value) -> Vec<&'static str> {
+    let mut controls = Vec::new();
+    for field in [
+        "thinking",
+        "top_k",
+        "service_tier",
+        "container",
+        "context_management",
+        "tool_choice",
+    ] {
+        if body.get(field).is_some() {
+            controls.push(field);
+        }
     }
+    if anthropic_protocol_uses_cache_control(body) {
+        controls.push("cache_control");
+    }
+    controls
+}
+
+pub(crate) fn assess_request_translation(
+    client_format: UpstreamFormat,
+    upstream_format: UpstreamFormat,
+    body: &Value,
+) -> TranslationAssessment {
+    let mut assessment = TranslationAssessment::default();
+
+    if client_format == upstream_format {
+        return assessment;
+    }
+
+    if client_format == UpstreamFormat::OpenAiResponses
+        && upstream_format != UpstreamFormat::OpenAiResponses
+    {
+        let controls = responses_stateful_request_controls_for_translate(body);
+        if !controls.is_empty() {
+            let quoted = controls
+                .iter()
+                .map(|field| format!("`{field}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assessment.reject(format!(
+                "Responses request controls {quoted} require a native OpenAI Responses upstream and cannot be translated to {upstream_format}; the proxy does not reconstruct provider state"
+            ));
+        }
+        if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+            if tools.iter().any(|tool| {
+                tool.get("name").is_none()
+                    && semantic_tool_kind_from_value(tool) == SemanticToolKind::Function
+            }) {
+                assessment.warning(format!(
+                    "non-function Responses tools are not portable to {upstream_format} and will be dropped"
+                ));
+            }
+        }
+    }
+
+    if client_format == UpstreamFormat::Anthropic && upstream_format != UpstreamFormat::Anthropic {
+        let controls = anthropic_cross_protocol_control_names(body);
+        if !controls.is_empty() {
+            let quoted = controls
+                .iter()
+                .map(|field| format!("`{field}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assessment.reject(format!(
+                "Anthropic request controls {quoted} have native provider semantics and cannot be faithfully translated to {upstream_format}"
+            ));
+        }
+    }
+
+    if upstream_format == UpstreamFormat::Anthropic
+        && request_contains_openai_reasoning_without_provenance(client_format, body)
+    {
+        assessment.reject(OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE);
+    }
+
+    if upstream_format != UpstreamFormat::OpenAiResponses
+        && request_has_custom_tools(client_format, body)
+    {
+        assessment.reject(custom_tools_not_portable_message(upstream_format));
+    }
+
+    if matches!(upstream_format, UpstreamFormat::Anthropic | UpstreamFormat::Google) {
+        if let Some(message) = request_invalid_structured_tool_arguments_message(
+            client_format,
+            body,
+            translation_target_label(upstream_format),
+        ) {
+            assessment.reject(message);
+        }
+    }
+
+    assessment
+}
+
+fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
+    let content = body.get("content").cloned().ok_or("missing content")?;
+    let mut converted = convert_claude_message_to_openai(&serde_json::json!({
+        "role": "assistant",
+        "content": content
+    }))
+    .ok_or("missing content")?;
+    let mut message = converted
+        .drain(..)
+        .find(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
+        .ok_or("missing assistant message")?;
     let mut finish_reason = body
         .get("stop_reason")
         .and_then(Value::as_str)
@@ -109,6 +734,11 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
         finish_reason = "pause_turn".to_string();
     }
     if finish_reason == "refusal" {
+        let refusal = extract_openai_content_text(message.get("content"));
+        if !refusal.is_empty() {
+            message["refusal"] = Value::String(refusal);
+        }
+        message["content"] = Value::Null;
         finish_reason = "content_filter".to_string();
     }
     let mut result = serde_json::json!({
@@ -154,6 +784,17 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
         if cache_creation > 0 {
             usage_json["cache_creation_input_tokens"] = Value::Number(cache_creation.into());
         }
+
+        copy_remaining_usage_fields(
+            usage,
+            &mut usage_json,
+            &[
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ],
+        );
 
         result["usage"] = usage_json;
     }
@@ -302,14 +943,12 @@ fn responses_finish_reason_to_openai(body: &Value, has_tool_calls: bool) -> Stri
     }
 }
 
-fn push_gemini_function_call_part(parts: &mut Vec<Value>, tool_call: &Value, first_in_step: bool) {
-    let args = tool_call
-        .get("function")
-        .and_then(|f| f.get("arguments"))
-        .and_then(Value::as_str);
-    let args_val = args
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or(serde_json::json!({}));
+fn push_gemini_function_call_part(
+    parts: &mut Vec<Value>,
+    tool_call: &Value,
+    first_in_step: bool,
+) -> Result<(), String> {
+    let args_val = openai_tool_arguments_to_structured_value(tool_call, "Gemini")?;
     let mut part = serde_json::json!({
         "functionCall": {
             "id": tool_call.get("id"),
@@ -321,6 +960,7 @@ fn push_gemini_function_call_part(parts: &mut Vec<Value>, tool_call: &Value, fir
         part["thoughtSignature"] = Value::String(GEMINI_DUMMY_THOUGHT_SIGNATURE.to_string());
     }
     parts.push(part);
+    Ok(())
 }
 
 fn gemini_response_to_openai(body: &Value) -> Result<Value, String> {
@@ -500,37 +1140,19 @@ fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
         .ok_or("missing choices")?;
     let choice = choices.first().ok_or("empty choices")?;
     let message = choice.get("message").ok_or("missing message")?;
-    let mut content: Vec<Value> = vec![];
     if let Some(rc) = openai_message_reasoning_text(message) {
         if !rc.is_empty() {
-            content.push(serde_json::json!({ "type": "text", "text": rc }));
-        }
-    }
-    if let Some(t) = message.get("content").and_then(Value::as_str) {
-        if !t.is_empty() {
-            content.push(serde_json::json!({ "type": "text", "text": t }));
-        }
-    }
-    if content.is_empty() && message.get("tool_calls").is_none() {
-        content.push(serde_json::json!({ "type": "text", "text": "" }));
-    }
-    if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
-        for t in tc {
-            let args = t
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(Value::as_str);
-            let input = args
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or(serde_json::json!({}));
-            content.push(serde_json::json!({
-                "type": anthropic_tool_use_type_for_openai_tool_call(t),
-                "id": t.get("id"),
-                "name": t.get("function").and_then(|f| f.get("name")),
-                "input": input
+            return Ok(serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": format!("{OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE}.")
+                }
             }));
         }
     }
+    let content = openai_message_to_claude_blocks(message)?
+        .unwrap_or_else(|| vec![serde_json::json!({ "type": "text", "text": "" })]);
     let finish = choice
         .get("finish_reason")
         .and_then(Value::as_str)
@@ -589,7 +1211,7 @@ fn openai_response_to_gemini(body: &Value) -> Result<Value, String> {
     }
     if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
         for (idx, t) in tc.iter().enumerate() {
-            push_gemini_function_call_part(&mut parts, t, idx == 0);
+            push_gemini_function_call_part(&mut parts, t, idx == 0)?;
         }
     }
     if parts.is_empty() {
@@ -620,29 +1242,42 @@ fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
         Some(o) => o,
         None => return Ok(body.clone()),
     };
-    let mut content = String::new();
+    let mut content_parts: Vec<Value> = vec![];
     let mut reasoning_content = String::new();
+    let mut refusal = String::new();
     let mut tool_calls: Vec<Value> = vec![];
     for item in output {
         let ty = item.get("type").and_then(Value::as_str);
         if ty == Some("message") {
             if let Some(arr) = item.get("content").and_then(Value::as_array) {
                 for part in arr {
-                    if part.get("type").and_then(Value::as_str) == Some("output_text") {
-                        content.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("output_text") => {
+                            let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                            let annotations = part
+                                .get("annotations")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            content_parts.push(semantic_text_part_to_openai_value(
+                                &SemanticTextPart {
+                                    text: text.to_string(),
+                                    annotations,
+                                },
+                            ));
+                        }
+                        Some("refusal") => {
+                            refusal.push_str(
+                                part.get("refusal").and_then(Value::as_str).unwrap_or(""),
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
         }
-        if ty == Some("function_call") {
-            tool_calls.push(serde_json::json!({
-                "id": item.get("call_id"),
-                "type": "function",
-                "function": {
-                    "name": item.get("name"),
-                    "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or("{}")
-                }
-            }));
+        if let Some(tool_call) = responses_tool_call_item_to_openai_tool_call(item) {
+            tool_calls.push(tool_call);
         }
         if ty == Some("reasoning") {
             if let Some(summary) = item.get("summary").and_then(Value::as_array) {
@@ -659,8 +1294,11 @@ fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
         message["reasoning_content"] = Value::String(reasoning_content);
     }
     let has_tool_calls = !tool_calls.is_empty();
-    if !content.is_empty() {
-        message["content"] = Value::String(content);
+    if !refusal.is_empty() {
+        message["refusal"] = Value::String(refusal);
+        message["content"] = Value::Null;
+    } else if !content_parts.is_empty() {
+        message["content"] = collapse_openai_text_parts(&content_parts);
     } else if has_tool_calls || message.get("reasoning_content").is_some() {
         message["content"] = Value::Null;
     } else {
@@ -703,7 +1341,13 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
             }));
         }
     }
-    let content = openai_message_content_to_responses_output(message.get("content"));
+    let mut content = openai_message_content_to_responses_output(message.get("content"));
+    if let Some(refusal) = extract_openai_refusal(message) {
+        content.push(serde_json::json!({
+            "type": "refusal",
+            "refusal": refusal
+        }));
+    }
     if !content.is_empty() {
         output.push(serde_json::json!({
             "type": "message",
@@ -719,12 +1363,7 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
     }
     if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
         for t in tc {
-            output.push(serde_json::json!({
-                "type": "function_call",
-                "call_id": t.get("id"),
-                "name": t.get("function").and_then(|f| f.get("name")),
-                "arguments": t.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str).unwrap_or("{}")
-            }));
+            output.push(openai_tool_call_to_responses_item(t));
         }
     }
     let created_at = body.get("created").cloned().unwrap_or_else(|| {
@@ -806,6 +1445,12 @@ pub fn translate_request(
     body: &mut Value,
     stream: bool,
 ) -> Result<(), String> {
+    if let TranslationDecision::Reject(message) =
+        assess_request_translation(client_format, upstream_format, body).decision()
+    {
+        return Err(message);
+    }
+
     if client_format == upstream_format {
         if stream && (client_format != UpstreamFormat::OpenAiCompletion || !is_minimax_model(model))
         {
@@ -1102,22 +1747,11 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                     messages.push(serde_json::json!({ "role": role, "content": content }));
                 }
             }
-            "function_call" => {
-                let call_id = item.get("call_id").cloned();
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let args = item
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::json!("{}"));
-                let tc = serde_json::json!({
-                    "id": call_id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": args }
-                });
+            "function_call" | "custom_tool_call" => {
+                let Some(tc) = responses_tool_call_item_to_openai_tool_call(&item) else {
+                    idx += 1;
+                    continue;
+                };
                 if current_assistant.is_none() {
                     current_assistant = Some(serde_json::json!({
                         "role": "assistant",
@@ -1137,16 +1771,13 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
             "function_call_output" => {
                 flush_assistant(&mut messages, &mut current_assistant);
                 let call_id = item.get("call_id").cloned();
-                let output = item.get("output").cloned();
-                let content = match output {
-                    Some(Value::String(s)) => s,
-                    Some(o) => serde_json::to_string(&o).unwrap_or_default(),
-                    None => String::new(),
-                };
                 messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": content
+                    "content": item
+                        .get("output")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new()))
                 }));
                 let next_is_function_output = items
                     .get(idx + 1)
@@ -1295,13 +1926,25 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
         .map(|c| {
             let ty = c.get("type").and_then(Value::as_str);
             if ty == Some("input_text") || ty == Some("output_text") {
-                let text = c
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                plain_text_parts.push(text.clone());
-                return serde_json::json!({ "type": "text", "text": text });
+                let text = c.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                let annotations = c
+                    .get("annotations")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if annotations.is_empty() {
+                    plain_text_parts.push(text.clone());
+                } else {
+                    has_non_text_part = true;
+                }
+                return semantic_text_part_to_openai_value(&SemanticTextPart { text, annotations });
+            }
+            if ty == Some("refusal") {
+                has_non_text_part = true;
+                return serde_json::json!({
+                    "type": "refusal",
+                    "refusal": c.get("refusal").cloned().unwrap_or_else(|| Value::String(String::new()))
+                });
             }
             if ty == Some("input_image") {
                 has_non_text_part = true;
@@ -1387,12 +2030,7 @@ fn messages_to_responses(body: &mut Value) -> Result<(), String> {
         if role == "assistant" {
             if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
                 for tc in tool_calls {
-                    input.push(serde_json::json!({
-                        "type": "function_call",
-                        "call_id": tc.get("id"),
-                        "name": tc.get("function").and_then(|f| f.get("name")).unwrap_or(&serde_json::Value::Null),
-                        "arguments": tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&serde_json::json!("{}"))
-                    }));
+                    input.push(openai_tool_call_to_responses_item(tc));
                 }
             }
         }
@@ -1486,11 +2124,22 @@ fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -
         .map(|c| {
             let ty = c.get("type").and_then(Value::as_str);
             if ty == Some("text") {
-                let text = c
-                    .get("text")
+                let text = c.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                let annotations = c
+                    .get("annotations")
+                    .and_then(Value::as_array)
                     .cloned()
-                    .unwrap_or(Value::String(String::new()));
-                return serde_json::json!({ "type": content_type, "text": text });
+                    .unwrap_or_default();
+                return semantic_text_part_to_responses_value(
+                    &SemanticTextPart { text, annotations },
+                    content_type,
+                );
+            }
+            if ty == Some("refusal") {
+                return serde_json::json!({
+                    "type": "refusal",
+                    "refusal": c.get("refusal").cloned().unwrap_or_else(|| Value::String(String::new()))
+                });
             }
             if ty == Some("image_url") {
                 let image_url = c
@@ -1762,8 +2411,8 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
             // Strip cache_control when converting from Claude to OpenAI
             // Reference: 9router claudeHelper.js - remove all cache_control
             "text" => {
-                let text = block.get("text").cloned().unwrap_or(Value::String(String::new()));
-                parts.push(serde_json::json!({ "type": "text", "text": text }));
+                let text_part = semantic_text_part_from_claude_block(block)?;
+                parts.push(semantic_text_part_to_openai_value(&text_part));
             }
             "image" => {
                 if block.get("source").and_then(|s| s.get("type").and_then(Value::as_str)) == Some("base64") {
@@ -1781,7 +2430,10 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
                 "type": "function",
                 "function": {
                     "name": block.get("name"),
-                    "arguments": block.get("input").map(|i| serde_json::to_string(i).unwrap_or_else(|_| "{}".into())).unwrap_or_else(|| "{}".to_string())
+                    "arguments": block
+                        .get("input")
+                        .and_then(|input| serde_json::to_string(input).ok())
+                        .unwrap_or_else(|| "{}".to_string())
                 }
             })),
             "server_tool_use" => tool_calls.push(serde_json::json!({
@@ -1790,19 +2442,18 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
                 "proxied_tool_kind": "anthropic_server_tool_use",
                 "function": {
                     "name": block.get("name"),
-                    "arguments": block.get("input").map(|i| serde_json::to_string(i).unwrap_or_else(|_| "{}".into())).unwrap_or_else(|| "{}".to_string())
+                    "arguments": block
+                        .get("input")
+                        .and_then(|input| serde_json::to_string(input).ok())
+                        .unwrap_or_else(|| "{}".to_string())
                 }
             })),
             "tool_result" => {
-                let c = block.get("content");
-                let content_str = c
-                    .and_then(Value::as_str)
-                    .map(String::from)
-                    .unwrap_or_else(|| c.map(|x| serde_json::to_string(x).unwrap_or_default()).unwrap_or_default());
+                let semantic_content = semantic_tool_result_content_from_value(block.get("content"));
                 tool_results.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": block.get("tool_use_id"),
-                    "content": content_str
+                    "content": semantic_tool_result_content_to_value(&semantic_content)
                 }));
             }
             "thinking" => {
@@ -1851,18 +2502,7 @@ fn convert_claude_message_to_openai(msg: &Value) -> Option<Vec<Value>> {
 }
 
 fn collapse_claude_text_parts_for_openai(parts: &[Value]) -> Value {
-    let all_text = parts
-        .iter()
-        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"));
-    if all_text {
-        return Value::String(
-            parts
-                .iter()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect::<String>(),
-        );
-    }
-    Value::Array(parts.to_vec())
+    collapse_openai_text_parts(parts)
 }
 
 fn openai_to_claude(body: &mut Value) -> Result<(), String> {
@@ -1948,13 +2588,13 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
 
         if role == "tool" {
-            if let Some(tool_blocks) = openai_message_to_claude_blocks(&msg) {
+            if let Some(tool_blocks) = openai_message_to_claude_blocks(&msg)? {
                 pending_tool_results.extend(tool_blocks);
             }
             continue;
         }
 
-        if let Some(mut claude_blocks) = openai_message_to_claude_blocks(&msg) {
+        if let Some(mut claude_blocks) = openai_message_to_claude_blocks(&msg)? {
             if role == "user" && !pending_tool_results.is_empty() {
                 let mut merged = pending_tool_results.clone();
                 merged.append(&mut claude_blocks);
@@ -2076,24 +2716,27 @@ fn collapse_gemini_parts_for_openai(parts: &[Value]) -> Value {
     Value::Array(parts.to_vec())
 }
 
-fn openai_message_to_claude_blocks(msg: &Value) -> Option<Vec<Value>> {
-    let role = msg.get("role").and_then(Value::as_str)?;
+fn openai_message_to_claude_blocks(msg: &Value) -> Result<Option<Vec<Value>>, String> {
+    let Some(role) = msg.get("role").and_then(Value::as_str) else {
+        return Ok(None);
+    };
     if role == "tool" {
-        return Some(vec![serde_json::json!({
+        let semantic_content = semantic_tool_result_content_from_value(msg.get("content"));
+        return Ok(Some(vec![serde_json::json!({
             "type": "tool_result",
             "tool_use_id": msg.get("tool_call_id"),
-            "content": msg.get("content").and_then(Value::as_str).unwrap_or("")
-        })]);
+            "content": semantic_tool_result_content_to_value(&semantic_content)
+        })]));
     }
     let content = msg.get("content");
     let mut blocks: Vec<Value> = vec![];
     if role == "assistant" {
-        if let Some(reasoning) = openai_message_reasoning_text(msg) {
-            if !reasoning.is_empty() {
-                blocks.push(serde_json::json!({
-                    "type": "text",
-                    "text": reasoning
-                }));
+        if openai_message_reasoning_text(msg).is_some() {
+            return Err(OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE.to_string());
+        }
+        if let Some(refusal) = extract_openai_refusal(msg) {
+            if !refusal.is_empty() {
+                blocks.push(serde_json::json!({ "type": "text", "text": refusal }));
             }
         }
     }
@@ -2105,7 +2748,14 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Option<Vec<Value>> {
             for c in arr {
                 let ty = c.get("type").and_then(Value::as_str);
                 if ty == Some("text") {
-                    blocks.push(serde_json::json!({ "type": "text", "text": c.get("text") }));
+                    let text_part = semantic_text_part_from_openai_part(c)
+                        .ok_or("invalid OpenAI text content part")?;
+                    blocks.push(serde_json::json!({ "type": "text", "text": text_part.text }));
+                } else if ty == Some("refusal") {
+                    blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": c.get("refusal").cloned().unwrap_or_else(|| Value::String(String::new()))
+                    }));
                 } else if ty == Some("image_url") {
                     let url = c
                         .get("image_url")
@@ -2128,21 +2778,21 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Option<Vec<Value>> {
         if let Some(tc) = msg.get("tool_calls").and_then(Value::as_array) {
             for t in tc {
                 blocks.push(serde_json::json!({
-                    "type": anthropic_tool_use_type_for_openai_tool_call(t),
+                    "type": anthropic_tool_use_type_for_openai_tool_call(t)?,
                     "id": t.get("id"),
                     "name": t.get("function").and_then(|f| f.get("name")),
-                    "input": t.get("function").and_then(|f| f.get("arguments")).and_then(|a| serde_json::from_str(a.as_str().unwrap_or("{}")).ok()).unwrap_or(serde_json::json!({}))
+                    "input": openai_tool_arguments_to_structured_value(t, "Anthropic")?
                 }));
             }
         }
     }
     if blocks.is_empty() && content.is_some() {
-        return Some(vec![serde_json::json!({ "type": "text", "text": "" })]);
+        return Ok(Some(vec![serde_json::json!({ "type": "text", "text": "" })]));
     }
     if blocks.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(blocks)
+    Ok(Some(blocks))
 }
 
 #[cfg(test)]
@@ -2150,6 +2800,7 @@ mod translate_regression_tests {
     use super::{
         can_attach_cache_control_to_content_block, convert_claude_message_to_openai,
         openai_message_to_claude_blocks, openai_to_claude,
+        OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
     };
     use serde_json::json;
 
@@ -2170,7 +2821,9 @@ mod translate_regression_tests {
             ]
         });
 
-        let blocks = openai_message_to_claude_blocks(&msg).expect("assistant blocks");
+        let blocks = openai_message_to_claude_blocks(&msg)
+            .expect("translate blocks")
+            .expect("assistant blocks");
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[1]["type"], "tool_use");
@@ -2179,7 +2832,7 @@ mod translate_regression_tests {
     }
 
     #[test]
-    fn assistant_reasoning_content_rehydrates_to_claude_thinking_before_text_and_tools() {
+    fn assistant_reasoning_content_without_provenance_is_rejected_for_claude_blocks() {
         let msg = json!({
             "role": "assistant",
             "reasoning_content": "I should call a tool.",
@@ -2196,18 +2849,9 @@ mod translate_regression_tests {
             ]
         });
 
-        let blocks = openai_message_to_claude_blocks(&msg).expect("assistant blocks");
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["text"], "I should call a tool.");
-        assert_eq!(blocks[1]["type"], "text");
-        assert_eq!(blocks[2]["type"], "tool_use");
-        assert!(blocks
-            .iter()
-            .all(|block| block["type"] != "redacted_thinking"));
-        assert!(blocks
-            .iter()
-            .all(|block| block["type"] != "server_tool_use"));
+        let err = openai_message_to_claude_blocks(&msg)
+            .expect_err("reasoning without provenance should fail closed");
+        assert_eq!(err, OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE);
     }
 
     #[test]
@@ -2248,7 +2892,9 @@ mod translate_regression_tests {
             }]
         });
 
-        let blocks = openai_message_to_claude_blocks(&message).expect("assistant blocks");
+        let blocks = openai_message_to_claude_blocks(&message)
+            .expect("translate blocks")
+            .expect("assistant blocks");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "server_tool_use");
         assert_eq!(blocks[0]["name"], "web_search");
@@ -2714,7 +3360,7 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
                         tool_sort_key_by_call_id.insert(id.to_string(), next_tool_sort_key);
                         next_tool_sort_key += 1;
                     }
-                    push_gemini_function_call_part(&mut parts, t, idx == 0);
+                    push_gemini_function_call_part(&mut parts, t, idx == 0)?;
                 }
             }
             if !parts.is_empty() {
@@ -3325,7 +3971,8 @@ mod tests {
     }
 
     #[test]
-    fn translate_request_responses_to_openai_drops_responses_only_fields() {
+    fn translate_request_responses_to_openai_translates_portable_fields_and_drops_responses_only_fields()
+    {
         let mut body = json!({
             "model": "gpt-4o",
             "input": "Hello",
@@ -3334,9 +3981,7 @@ mod tests {
             "include": ["reasoning.encrypted_content"],
             "text": { "format": { "type": "text" } },
             "reasoning": { "effort": "medium" },
-            "store": true,
             "prompt_cache_key": "cache-key",
-            "previous_response_id": "resp_123",
             "truncation": "auto"
         });
         translate_request(
@@ -3352,10 +3997,34 @@ mod tests {
         assert!(body.get("include").is_none());
         assert!(body.get("text").is_none());
         assert!(body.get("reasoning").is_none());
-        assert!(body.get("store").is_none());
         assert!(body.get("prompt_cache_key").is_none());
-        assert!(body.get("previous_response_id").is_none());
         assert!(body.get("truncation").is_none());
+    }
+
+    #[test]
+    fn translate_request_responses_to_openai_rejects_stateful_responses_controls() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "store": true,
+            "previous_response_id": "resp_123"
+        });
+
+        let err = translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            true,
+        )
+        .expect_err("stateful responses controls should fail closed");
+
+        assert_eq!(
+            err,
+            "Responses request controls `previous_response_id`, `store` require a native OpenAI Responses upstream and cannot be translated to openai-completion; the proxy does not reconstruct provider state"
+        );
+        assert_eq!(body["previous_response_id"], "resp_123");
+        assert_eq!(body["store"], true);
     }
 
     #[test]
@@ -3553,7 +4222,8 @@ mod tests {
     }
 
     #[test]
-    fn translate_request_openai_to_claude_does_not_emit_invalid_thinking_blocks_or_cache_control() {
+    fn translate_request_openai_to_claude_rejects_reasoning_without_provenance_before_mutating_blocks_or_cache_control()
+    {
         let mut body = json!({
             "model": "claude-3",
             "messages": [
@@ -3571,15 +4241,37 @@ mod tests {
             &mut body,
             false,
         )
-        .unwrap();
+        .expect_err("reasoning replay to claude should fail closed");
 
-        let blocks = body["messages"][0]["content"]
-            .as_array()
-            .expect("assistant blocks");
-        assert!(blocks.iter().all(|block| block["type"] != "thinking"));
-        assert!(blocks
-            .iter()
-            .all(|block| block.get("cache_control").is_none()));
+        assert_eq!(
+            body["messages"][0]["reasoning_content"],
+            "private reasoning"
+        );
+        assert_eq!(body["messages"][0]["content"], "Visible answer");
+        assert!(body["messages"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn translate_request_openai_reasoning_to_claude_rejects_without_replay_provenance() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{
+                "role": "assistant",
+                "reasoning_content": "internal chain of thought",
+                "content": "Visible answer"
+            }]
+        });
+
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .expect_err("reasoning replay to claude should fail closed");
+
+        assert_eq!(err, OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE);
     }
 
     #[test]
@@ -3924,6 +4616,126 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_openai_custom_tool_to_responses_preserves_custom_type() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tools": [{
+                "type": "custom",
+                "name": "code_exec",
+                "description": "Executes code with provider-managed semantics"
+            }]
+        });
+
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            &mut body,
+            false,
+        )
+        .unwrap();
+
+        let tools = body["tools"].as_array().expect("responses tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "custom");
+        assert_eq!(tools[0]["name"], "code_exec");
+    }
+
+    #[test]
+    fn translate_request_openai_history_custom_tool_call_to_responses_preserves_custom_type() {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "custom",
+                    "function": {
+                        "name": "code_exec",
+                        "arguments": "print('hi')"
+                    }
+                }]
+            }]
+        });
+
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            &mut body,
+            false,
+        )
+        .unwrap();
+
+        let input = body["input"].as_array().expect("responses input");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "custom_tool_call");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[0]["name"], "code_exec");
+        assert_eq!(input[0]["input"], "print('hi')");
+    }
+
+    #[test]
+    fn translate_request_openai_history_custom_tool_call_to_gemini_rejects() {
+        let mut body = json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "custom",
+                    "function": {
+                        "name": "code_exec",
+                        "arguments": "print('hi')"
+                    }
+                }]
+            }]
+        });
+
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            "gemini-2.5-flash",
+            &mut body,
+            false,
+        )
+        .expect_err("custom tool calls in history should fail closed");
+
+        assert_eq!(
+            err,
+            "OpenAI custom tools cannot be faithfully translated to Gemini; refusing to downgrade them to function tools"
+        );
+    }
+
+    #[test]
+    fn translate_request_openai_custom_tool_to_anthropic_rejects() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tools": [{
+                "type": "custom",
+                "name": "code_exec",
+                "description": "Executes code with provider-managed semantics"
+            }]
+        });
+
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .expect_err("custom tools should fail closed for anthropic");
+
+        assert_eq!(
+            err,
+            "OpenAI custom tools cannot be faithfully translated to Anthropic; refusing to downgrade them to function tools"
+        );
+    }
+
+    #[test]
     fn translate_request_openai_to_responses_maps_max_completion_tokens_to_max_output_tokens() {
         let mut body = json!({
             "model": "gpt-4o",
@@ -4145,6 +4957,66 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_claude_structured_tool_result_content_round_trips() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "lookup_weather",
+                        "input": { "city": "Tokyo" }
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            { "type": "text", "text": "done" },
+                            { "type": "json", "json": { "temperature": 22 } }
+                        ]
+                    }]
+                }
+            ]
+        });
+
+        translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+
+        let messages = body["messages"].as_array().expect("openai messages");
+        assert_eq!(messages[1]["role"], "tool");
+        assert!(
+            messages[1]["content"].is_array(),
+            "content should stay structured, body = {body:?}"
+        );
+
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+
+        let content = body["messages"][1]["content"].as_array().expect("claude content");
+        assert_eq!(content[0]["type"], "tool_result");
+        assert!(content[0]["content"].is_array(), "body = {body:?}");
+        assert_eq!(content[0]["content"][0]["type"], "text");
+        assert_eq!(content[0]["content"][1]["type"], "json");
+    }
+
+    #[test]
     fn translate_request_claude_to_openai_omitted_stream_defaults_false() {
         let mut body = json!({
             "model": "claude-3",
@@ -4159,6 +5031,126 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn translate_request_claude_to_openai_allows_business_cache_control_keys() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [
+                { "role": "user", "content": "Use the tool" },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "lookup_weather",
+                        "input": {
+                            "city": "Tokyo",
+                            "cache_control": "business-value"
+                        }
+                    }]
+                }
+            ],
+            "tools": [{
+                "name": "lookup_weather",
+                "description": "Weather lookup",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "city": { "type": "string" },
+                        "cache_control": { "type": "string" }
+                    }
+                }
+            }]
+        });
+
+        translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+
+        let tool_calls = body["messages"][1]["tool_calls"]
+            .as_array()
+            .expect("assistant tool calls");
+        let arguments: Value = serde_json::from_str(
+            tool_calls[0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments string"),
+        )
+        .expect("tool arguments json");
+        assert_eq!(arguments["cache_control"], "business-value");
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"]["properties"]["cache_control"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn translate_request_openai_invalid_tool_arguments_to_claude_rejects_instead_of_coercing_empty_object(
+    ) {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_weather",
+                        "arguments": "{\"city\":\"Tokyo\""
+                    }
+                }]
+            }]
+        });
+
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .expect_err("invalid JSON arguments should fail closed");
+
+        assert!(err.contains("arguments"), "err = {err}");
+        assert!(err.contains("JSON"), "err = {err}");
+    }
+
+    #[test]
+    fn translate_request_openai_non_object_tool_arguments_to_gemini_rejects() {
+        let mut body = json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_weather",
+                        "arguments": "[]"
+                    }
+                }]
+            }]
+        });
+
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            "gemini-2.5-flash",
+            &mut body,
+            false,
+        )
+        .expect_err("non-object tool input should fail closed");
+
+        assert!(
+            err.contains("JSON object"),
+            "expected object-specific failure, got {err}"
+        );
     }
 
     #[test]
@@ -4388,6 +5380,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn translate_response_claude_refusal_sets_openai_refusal_surface() {
+        let body = json!({
+            "id": "msg_1",
+            "content": [{ "type": "text", "text": "I can't help with that." }],
+            "stop_reason": "refusal",
+            "model": "claude-3"
+        });
+
+        let openai = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(openai["choices"][0]["finish_reason"], "content_filter");
+        assert_eq!(
+            openai["choices"][0]["message"]["refusal"],
+            "I can't help with that."
+        );
+        assert!(openai["choices"][0]["message"]["content"].is_null());
+
+        let responses = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(responses["status"], "incomplete");
+        let output = responses["output"].as_array().expect("responses output");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["type"], "refusal");
+        assert_eq!(
+            output[0]["content"][0]["refusal"],
+            "I can't help with that."
+        );
+    }
+
+    #[test]
+    fn translate_response_claude_server_tool_use_preserved_non_streaming() {
+        let body = json!({
+            "id": "msg_server_tool",
+            "content": [{
+                "type": "server_tool_use",
+                "id": "toolu_server_1",
+                "name": "web_search",
+                "input": { "query": "rust" }
+            }],
+            "stop_reason": "tool_use",
+            "model": "claude-3"
+        });
+
+        let out = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+
+        let tool_calls = out["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .expect("tool calls");
+        assert_eq!(tool_calls[0]["proxied_tool_kind"], "anthropic_server_tool_use");
+        assert_eq!(tool_calls[0]["function"]["name"], "web_search");
     }
 
     #[test]
@@ -4693,6 +5751,139 @@ mod tests {
     }
 
     #[test]
+    fn translate_response_openai_annotations_round_trip_to_responses() {
+        let body = json!({
+            "id": "chatcmpl_annotations",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": "Rust",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://www.rust-lang.org"
+                        }]
+                    }]
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+
+        let content = out["output"][0]["content"].as_array().expect("responses content");
+        assert_eq!(content[0]["type"], "output_text");
+        assert_eq!(
+            content[0]["annotations"][0]["url"],
+            "https://www.rust-lang.org"
+        );
+    }
+
+    #[test]
+    fn translate_response_responses_to_openai_preserves_interleaved_annotation_order() {
+        let body = json!({
+            "id": "resp_annotations",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "annotated-1",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://one.example"
+                        }]
+                    },
+                    {
+                        "type": "output_text",
+                        "text": "plain-middle"
+                    },
+                    {
+                        "type": "output_text",
+                        "text": "annotated-2",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://two.example"
+                        }]
+                    }
+                ]
+            }]
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+
+        let content = out["choices"][0]["message"]["content"]
+            .as_array()
+            .expect("openai content array");
+        assert_eq!(content[0]["text"], "annotated-1");
+        assert_eq!(content[1]["text"], "plain-middle");
+        assert_eq!(content[2]["text"], "annotated-2");
+        assert_eq!(content[0]["annotations"][0]["url"], "https://one.example");
+        assert!(content[1].get("annotations").is_none(), "content = {content:?}");
+        assert_eq!(content[2]["annotations"][0]["url"], "https://two.example");
+    }
+
+    #[test]
+    fn translate_response_responses_to_openai_preserves_custom_and_proxied_tool_kinds() {
+        let body = json!({
+            "id": "resp_tools",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "output": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom",
+                    "name": "code_exec",
+                    "input": "print('hi')"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_server",
+                    "name": "web_search",
+                    "arguments": "{\"query\":\"rust\"}",
+                    "proxied_tool_kind": "anthropic_server_tool_use"
+                }
+            ]
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+
+        let tool_calls = out["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .expect("tool calls");
+        assert_eq!(tool_calls[0]["type"], "custom");
+        assert_eq!(tool_calls[0]["function"]["name"], "code_exec");
+        assert_eq!(tool_calls[0]["function"]["arguments"], "print('hi')");
+        assert_eq!(
+            tool_calls[1]["proxied_tool_kind"],
+            "anthropic_server_tool_use"
+        );
+    }
+
+    #[test]
     fn translate_response_openai_to_claude_restores_server_tool_use_from_marker() {
         let body = json!({
             "id": "chatcmpl_server_tool",
@@ -4726,6 +5917,90 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "server_tool_use");
         assert_eq!(content[0]["name"], "web_search");
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_preserves_custom_and_proxied_tool_kinds() {
+        let body = json!({
+            "id": "chatcmpl_tools",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_custom",
+                            "type": "custom",
+                            "function": {
+                                "name": "code_exec",
+                                "arguments": "print('hi')"
+                            }
+                        },
+                        {
+                            "id": "call_server",
+                            "type": "function",
+                            "proxied_tool_kind": "anthropic_server_tool_use",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": "{\"query\":\"rust\"}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+
+        let output = out["output"].as_array().expect("responses output");
+        assert_eq!(output[0]["type"], "custom_tool_call");
+        assert_eq!(output[0]["input"], "print('hi')");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["proxied_tool_kind"], "anthropic_server_tool_use");
+    }
+
+    #[test]
+    fn translate_response_claude_usage_preserves_extra_usage_fields() {
+        let body = json!({
+            "id": "msg_usage",
+            "content": [{ "type": "text", "text": "Hi" }],
+            "stop_reason": "end_turn",
+            "model": "claude-3",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 2,
+                "cache_creation_input_tokens": 3,
+                "service_tier": "priority",
+                "output_tokens_details": {
+                    "reasoning_tokens": 4
+                }
+            }
+        });
+
+        let out = translate_response(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(out["usage"]["prompt_tokens"], 15);
+        assert_eq!(out["usage"]["completion_tokens"], 5);
+        assert_eq!(out["usage"]["cache_read_input_tokens"], 2);
+        assert_eq!(out["usage"]["cache_creation_input_tokens"], 3);
+        assert_eq!(out["usage"]["service_tier"], "priority");
+        assert_eq!(
+            out["usage"]["output_tokens_details"]["reasoning_tokens"],
+            4
+        );
     }
 
     #[test]

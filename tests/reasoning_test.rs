@@ -16,6 +16,37 @@ use reqwest::Client;
 use serde_json::json;
 use serde_json::Value;
 
+async fn assert_reasoning_to_anthropic_rejected(res: reqwest::Response) {
+    let status = res.status();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body = {body:?}");
+    if let Some(body_type) = body.get("type").and_then(Value::as_str) {
+        assert_eq!(body_type, "error", "body = {body:?}");
+    }
+    assert_eq!(body["error"]["type"], "invalid_request_error", "body = {body:?}");
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("anthropic error message");
+    assert!(message.contains("reasoning"), "body = {body:?}");
+    assert!(message.contains("provenance"), "body = {body:?}");
+}
+
+async fn assert_reasoning_to_anthropic_stream_rejected(res: reqwest::Response) {
+    let status = res.status();
+    let body = res.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "body = {body}");
+    assert!(body.contains("event: error"), "body = {body}");
+    assert!(body.contains("\"type\":\"error\""), "body = {body}");
+    assert!(
+        body.contains("\"type\":\"invalid_request_error\""),
+        "body = {body}"
+    );
+    assert!(body.contains("reasoning"), "body = {body}");
+    assert!(body.contains("provenance"), "body = {body}");
+    assert!(!body.contains("text_delta"), "body = {body}");
+    assert!(!body.contains("message_stop"), "body = {body}");
+}
+
 // ============================================================
 // A. Non-Streaming Cross-Format Reasoning
 // ============================================================
@@ -107,7 +138,7 @@ async fn anthropic_thinking_to_responses_non_streaming() {
 }
 
 #[tokio::test]
-async fn openai_reasoning_to_anthropic_non_streaming() {
+async fn openai_reasoning_to_anthropic_non_streaming_rejects_without_provenance() {
     let (mock_base, _mock) = spawn_openai_completion_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -124,18 +155,7 @@ async fn openai_reasoning_to_anthropic_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(
-        res.status().is_success(),
-        "status: {status}",
-        status = res.status()
-    );
-    let body: Value = res.json().await.unwrap();
-    let content = body["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "think");
-    assert_eq!(content[1]["type"], "text");
-    assert_eq!(content[1]["text"], "Hi");
-    assert!(content.iter().all(|block| block["type"] != "thinking"));
+    assert_reasoning_to_anthropic_rejected(res).await;
 }
 
 #[tokio::test]
@@ -221,7 +241,7 @@ async fn responses_reasoning_to_openai_chat_non_streaming() {
 }
 
 #[tokio::test]
-async fn responses_reasoning_to_anthropic_non_streaming() {
+async fn responses_reasoning_to_anthropic_non_streaming_rejects_without_provenance() {
     let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -238,18 +258,7 @@ async fn responses_reasoning_to_anthropic_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(
-        res.status().is_success(),
-        "status: {status}",
-        status = res.status()
-    );
-    let body: Value = res.json().await.unwrap();
-    let content = body["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "think");
-    assert_eq!(content[1]["type"], "text");
-    assert_eq!(content[1]["text"], "Hi");
-    assert!(content.iter().all(|block| block["type"] != "thinking"));
+    assert_reasoning_to_anthropic_rejected(res).await;
 }
 
 #[tokio::test]
@@ -309,7 +318,7 @@ async fn gemini_thinking_to_openai_chat_non_streaming() {
 }
 
 #[tokio::test]
-async fn gemini_thinking_to_anthropic_non_streaming() {
+async fn gemini_thinking_to_anthropic_non_streaming_rejects_without_provenance() {
     let (mock_base, _mock) = spawn_google_thinking_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -326,18 +335,7 @@ async fn gemini_thinking_to_anthropic_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(
-        res.status().is_success(),
-        "status: {status}",
-        status = res.status()
-    );
-    let body: Value = res.json().await.unwrap();
-    let content = body["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "think");
-    assert_eq!(content[1]["type"], "text");
-    assert_eq!(content[1]["text"], "Hi");
-    assert!(content.iter().all(|block| block["type"] != "thinking"));
+    assert_reasoning_to_anthropic_rejected(res).await;
 }
 
 #[tokio::test]
@@ -423,7 +421,7 @@ async fn anthropic_thinking_to_responses_streaming() {
 }
 
 #[tokio::test]
-async fn openai_reasoning_to_anthropic_streaming() {
+async fn openai_reasoning_to_anthropic_streaming_rejects_without_provenance() {
     let (mock_base, _mock) = spawn_openai_completion_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -440,12 +438,7 @@ async fn openai_reasoning_to_anthropic_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success());
-    let text = res.text().await.unwrap();
-    assert!(text.contains("text_delta"), "body = {text}");
-    assert!(!text.contains("thinking_delta"), "body = {text}");
-    assert!(text.contains("text_delta"), "body = {text}");
-    assert!(text.contains("message_stop"), "body = {text}");
+    assert_reasoning_to_anthropic_stream_rejected(res).await;
 }
 
 #[tokio::test]
@@ -492,7 +485,7 @@ async fn responses_reasoning_to_openai_chat_streaming() {
 }
 
 #[tokio::test]
-async fn responses_reasoning_to_anthropic_streaming() {
+async fn responses_reasoning_to_anthropic_streaming_rejects_without_provenance() {
     let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -509,11 +502,7 @@ async fn responses_reasoning_to_anthropic_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success());
-    let text = res.text().await.unwrap();
-    assert!(text.contains("text_delta"), "body = {text}");
-    assert!(!text.contains("thinking_delta"), "body = {text}");
-    assert!(text.contains("message_stop"), "body = {text}");
+    assert_reasoning_to_anthropic_stream_rejected(res).await;
 }
 
 #[tokio::test]
@@ -539,7 +528,7 @@ async fn gemini_thinking_to_openai_chat_streaming() {
 }
 
 #[tokio::test]
-async fn gemini_thinking_to_anthropic_streaming() {
+async fn gemini_thinking_to_anthropic_streaming_rejects_without_provenance() {
     let (mock_base, _mock) = spawn_google_thinking_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -556,11 +545,7 @@ async fn gemini_thinking_to_anthropic_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success());
-    let text = res.text().await.unwrap();
-    assert!(text.contains("text_delta"), "body = {text}");
-    assert!(!text.contains("thinking_delta"), "body = {text}");
-    assert!(text.contains("message_stop"), "body = {text}");
+    assert_reasoning_to_anthropic_stream_rejected(res).await;
 }
 
 #[tokio::test]
@@ -730,8 +715,7 @@ async fn multi_turn_anthropic_thinking_preserved_in_history() {
 }
 
 #[tokio::test]
-async fn multi_turn_openai_reasoning_preserved_in_history_to_claude() {
-    // reasoning_content in assistant messages → thinking blocks on Anthropic upstream
+async fn multi_turn_openai_reasoning_in_history_to_claude_rejects_without_provenance() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -751,22 +735,12 @@ async fn multi_turn_openai_reasoning_preserved_in_history_to_claude() {
         .send()
         .await
         .unwrap();
-    assert!(
-        res.status().is_success(),
-        "status: {status}",
-        status = res.status()
-    );
-    let body: Value = res.json().await.unwrap();
-    // OpenAI chat completions format uses choices[0].message.content
-    assert!(
-        body.get("choices").is_some() || body.get("content").is_some(),
-        "unexpected response: {body:?}"
-    );
+    assert_reasoning_to_anthropic_rejected(res).await;
 }
 
 #[tokio::test]
-async fn multi_turn_openai_reasoning_replays_to_claude_text_blocks() {
-    let (mock_base, _mock, mut captured) = spawn_capture_anthropic_mock().await;
+async fn multi_turn_openai_reasoning_to_claude_does_not_replay_blocks_without_provenance() {
+    let (mock_base, _mock, captured) = spawn_capture_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -785,30 +759,11 @@ async fn multi_turn_openai_reasoning_replays_to_claude_text_blocks() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success());
-    let _body: Value = res.json().await.unwrap();
-
-    captured.changed().await.unwrap();
-    let request = captured
-        .borrow()
-        .clone()
-        .expect("captured anthropic request");
-    let assistant_content = request["messages"][1]["content"]
-        .as_array()
-        .expect("assistant content");
-    assert_eq!(assistant_content[0]["type"], "text");
-    assert_eq!(assistant_content[0]["text"], "2+2 equals 4");
-    assert_eq!(assistant_content[1]["type"], "text");
-    assert_eq!(assistant_content[1]["text"], "The answer is 4");
-    assert!(assistant_content
-        .iter()
-        .all(|block| block["type"] != "thinking"));
-    assert!(assistant_content
-        .iter()
-        .all(|block| block["type"] != "redacted_thinking"));
-    assert!(assistant_content
-        .iter()
-        .all(|block| block["type"] != "server_tool_use"));
+    assert_reasoning_to_anthropic_rejected(res).await;
+    assert!(
+        captured.borrow().is_none(),
+        "request should be rejected before contacting Anthropic upstream"
+    );
 }
 
 #[tokio::test]
@@ -913,7 +868,7 @@ async fn anthropic_thinking_usage_translated_to_openai() {
 }
 
 #[tokio::test]
-async fn openai_reasoning_usage_translated_to_anthropic() {
+async fn openai_reasoning_usage_to_anthropic_rejects_without_provenance() {
     let (mock_base, _mock) = spawn_openai_completion_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -930,10 +885,7 @@ async fn openai_reasoning_usage_translated_to_anthropic() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success());
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["usage"]["input_tokens"], 1);
-    assert_eq!(body["usage"]["output_tokens"], 3);
+    assert_reasoning_to_anthropic_rejected(res).await;
 }
 
 #[tokio::test]

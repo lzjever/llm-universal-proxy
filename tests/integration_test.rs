@@ -3980,8 +3980,15 @@ async fn hooks_capture_translated_responses_reasoning_as_text_for_messages_strea
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
-    assert!(body.contains("text_delta"));
-    assert!(!body.contains("thinking_delta"));
+    assert!(body.contains("event: error"), "body = {body}");
+    assert!(
+        body.contains("\"type\":\"invalid_request_error\""),
+        "body = {body}"
+    );
+    assert!(body.contains("reasoning"), "body = {body}");
+    assert!(body.contains("provenance"), "body = {body}");
+    assert!(!body.contains("text_delta"), "body = {body}");
+    assert!(!body.contains("message_stop"), "body = {body}");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let payloads = captured.payloads.lock().unwrap();
@@ -3989,14 +3996,16 @@ async fn hooks_capture_translated_responses_reasoning_as_text_for_messages_strea
         .iter()
         .find(|payload| payload.get("request").is_some())
         .unwrap();
-    let content = exchange["response"]["body"]["content"]
-        .as_array()
-        .expect("content blocks");
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "think");
-    assert_eq!(content[1]["type"], "text");
-    assert_eq!(content[1]["text"], "Hi");
-    assert!(content.iter().all(|block| block["type"] != "thinking"));
+    assert_eq!(exchange["response"]["body"]["type"], "error");
+    assert_eq!(
+        exchange["response"]["body"]["error"]["type"],
+        "invalid_request_error"
+    );
+    let message = exchange["response"]["body"]["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("reasoning"), "payload = {exchange:?}");
+    assert!(message.contains("provenance"), "payload = {exchange:?}");
 }
 
 #[tokio::test]
@@ -4316,13 +4325,15 @@ async fn messages_endpoint_preserves_responses_reasoning_stream() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
+    assert!(body.contains("event: error"), "body = {body}");
     assert!(
-        body.contains("\"type\":\"text\"") || body.contains("\"type\": \"text\""),
+        body.contains("\"type\":\"invalid_request_error\""),
         "body = {body}"
     );
-    assert!(body.contains("text_delta"), "body = {body}");
-    assert!(!body.contains("thinking_delta"), "body = {body}");
-    assert!(body.contains("message_stop"), "body = {body}");
+    assert!(body.contains("reasoning"), "body = {body}");
+    assert!(body.contains("provenance"), "body = {body}");
+    assert!(!body.contains("text_delta"), "body = {body}");
+    assert!(!body.contains("message_stop"), "body = {body}");
 }
 
 #[tokio::test]
