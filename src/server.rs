@@ -44,6 +44,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const DEFAULT_NAMESPACE: &str = "default";
+const TEST_FORCE_UNAVAILABLE_UPSTREAMS_ENV: &str =
+    "LLM_UNIVERSAL_PROXY_TEST_FORCE_UNAVAILABLE_UPSTREAMS";
 
 pub async fn run_with_config_path(
     path: impl AsRef<std::path::Path>,
@@ -860,7 +862,7 @@ async fn handle_admin_namespace_config(
 async fn resolve_upstreams(config: &Config) -> BTreeMap<String, UpstreamState> {
     let mut upstreams = BTreeMap::new();
     for upstream in &config.upstreams {
-        let discovered = if let Some(f) = upstream.fixed_upstream_format {
+        let mut discovered = if let Some(f) = upstream.fixed_upstream_format {
             DiscoveredUpstream::fixed(f)
         } else {
             let supported = crate::discovery::discover_supported_formats(
@@ -872,6 +874,10 @@ async fn resolve_upstreams(config: &Config) -> BTreeMap<String, UpstreamState> {
             .await;
             DiscoveredUpstream::from_supported(supported)
         };
+        if test_forced_upstream_unavailable(&upstream.name) {
+            discovered.availability =
+                UpstreamAvailability::unavailable("forced unavailable by test override");
+        }
         upstreams.insert(
             upstream.name.clone(),
             UpstreamState {
@@ -1551,16 +1557,26 @@ async fn handle_request_core(
             return error_response(client_format, StatusCode::INTERNAL_SERVER_ERROR, &e);
         }
     };
+    let response_status = classify_post_translation_non_stream_status(client_format, &out);
     if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.as_ref(), hook_ctx) {
-        dispatcher.emit_non_stream(ctx, 200, json_response_headers(), out.clone());
+        dispatcher.emit_non_stream(
+            ctx,
+            response_status.as_u16(),
+            json_response_headers(),
+            out.clone(),
+        );
     }
     if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref())
     {
-        recorder.record_non_stream_response(ctx, StatusCode::OK.as_u16(), &out);
+        recorder.record_non_stream_response(ctx, response_status.as_u16(), &out);
     }
-    tracker.finish_success(StatusCode::OK.as_u16());
+    if response_status.is_success() {
+        tracker.finish_success(response_status.as_u16());
+    } else {
+        tracker.finish_error(response_status.as_u16());
+    }
     let mut response = Response::builder()
-        .status(StatusCode::OK)
+        .status(response_status)
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&out).unwrap_or_else(|_| b"{}".to_vec()),
@@ -1598,7 +1614,16 @@ async fn handle_openai_responses_resource(
         }
     };
 
-    let matching = available_native_responses_upstreams(&namespace_state);
+    if responses_owner_provenance_is_ambiguous(&namespace_state) {
+        tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+        return error_response(
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            StatusCode::BAD_REQUEST,
+            &responses_auto_discovery_ambiguity_message("Responses lifecycle endpoints"),
+        );
+    }
+
+    let matching = provenance_free_native_responses_upstreams(&namespace_state);
 
     let upstream_state = match matching.as_slice() {
         [upstream] => *upstream,
@@ -1621,6 +1646,17 @@ async fn handle_openai_responses_resource(
     };
 
     tracker.set_upstream(upstream_state.config.name.clone(), String::new());
+    if !upstream_state.availability.is_available() {
+        tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+        return error_response(
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format_upstream_unavailable_message(
+                &upstream_state.config.name,
+                &upstream_state.availability,
+            ),
+        );
+    }
     let (mut auth_headers, _effective_credential) = build_auth_headers(
         &headers,
         upstream_state,
@@ -1996,13 +2032,7 @@ fn error_response(
         }
         crate::formats::UpstreamFormat::Anthropic => (
             status,
-            Json(serde_json::json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": message
-                }
-            })),
+            Json(anthropic_error_body(status, &normalized_error)),
         )
             .into_response(),
         crate::formats::UpstreamFormat::Google => (
@@ -2178,6 +2208,28 @@ fn openai_error_body(error: &NormalizedUpstreamError) -> Value {
     })
 }
 
+fn anthropic_error_body(status: StatusCode, error: &NormalizedUpstreamError) -> Value {
+    let error_type = match status.as_u16() {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        400..=499 => "invalid_request_error",
+        500..=599 => "api_error",
+        _ => "api_error",
+    };
+
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": error.message,
+        }
+    })
+}
+
 fn collect_request_compatibility_warnings(
     client_format: crate::formats::UpstreamFormat,
     upstream_format: crate::formats::UpstreamFormat,
@@ -2334,17 +2386,23 @@ fn resolve_native_responses_stateful_route_or_error(
     }
 
     let quoted_controls = quoted_field_list(&stateful_controls);
-    let matching = available_native_responses_upstreams(namespace_state);
+    if responses_owner_provenance_is_ambiguous(namespace_state) {
+        return Err(format!(
+            "Responses requests with stateful controls {quoted_controls} must include a routable `model` in namespaces that use auto-discovery; set `fixed_upstream_format` on the owning upstream because provenance-free routing cannot rely on discovery-time capabilities"
+        ));
+    }
+
+    let matching = provenance_free_native_responses_upstreams(namespace_state);
     match matching.as_slice() {
         [upstream] => Ok(Some(crate::config::ResolvedModel {
             upstream_name: upstream.config.name.clone(),
             upstream_model: String::new(),
         })),
         [] => Err(format!(
-            "Responses requests with stateful controls {quoted_controls} require exactly one available native OpenAI Responses upstream when `model` is omitted; the proxy does not reconstruct provider state"
+            "Responses requests with stateful controls {quoted_controls} require exactly one configured native OpenAI Responses upstream when `model` is omitted; the proxy does not reconstruct provider state"
         )),
         _ => Err(format!(
-            "Responses requests with stateful controls {quoted_controls} must include a routable `model` when this namespace has multiple available native OpenAI Responses upstreams; the proxy does not reconstruct response-to-upstream state"
+            "Responses requests with stateful controls {quoted_controls} must include a routable `model` when this namespace has multiple configured native OpenAI Responses upstreams; the proxy does not reconstruct response-to-upstream state"
         )),
     }
 }
@@ -2379,21 +2437,86 @@ fn normalized_non_stream_upstream_error(
     }
 }
 
-fn available_native_responses_upstreams(
+fn classify_post_translation_non_stream_status(
+    client_format: crate::formats::UpstreamFormat,
+    body: &Value,
+) -> StatusCode {
+    match client_format {
+        crate::formats::UpstreamFormat::Anthropic => {
+            match body.get("type").and_then(Value::as_str) {
+                Some("error") => match body
+                    .get("error")
+                    .and_then(|error| error.get("type"))
+                    .and_then(Value::as_str)
+                {
+                    Some("invalid_request_error") => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                },
+                _ => StatusCode::OK,
+            }
+        }
+        _ => StatusCode::OK,
+    }
+}
+
+fn pinned_native_responses_upstreams(
     namespace_state: &RuntimeNamespaceState,
 ) -> Vec<&UpstreamState> {
     namespace_state
         .upstreams
         .values()
         .filter(|upstream| {
-            upstream.availability.is_available()
-                && upstream.capability.as_ref().is_some_and(|capability| {
+            upstream.config.fixed_upstream_format
+                == Some(crate::formats::UpstreamFormat::OpenAiResponses)
+        })
+        .collect()
+}
+
+fn provenance_free_native_responses_upstreams(
+    namespace_state: &RuntimeNamespaceState,
+) -> Vec<&UpstreamState> {
+    if namespace_state.config.upstreams.len() == 1 {
+        return namespace_state
+            .upstreams
+            .values()
+            .filter(|upstream| {
+                upstream.capability.as_ref().is_some_and(|capability| {
                     capability
                         .supported
                         .contains(&crate::formats::UpstreamFormat::OpenAiResponses)
                 })
+            })
+            .collect();
+    }
+
+    pinned_native_responses_upstreams(namespace_state)
+}
+
+fn responses_owner_provenance_is_ambiguous(namespace_state: &RuntimeNamespaceState) -> bool {
+    namespace_state.config.upstreams.len() > 1
+        && namespace_state
+            .config
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.fixed_upstream_format.is_none())
+}
+
+fn responses_auto_discovery_ambiguity_message(request_kind: &str) -> String {
+    format!(
+        "{request_kind} are ambiguous in multi-upstream namespaces that use auto-discovery; set `fixed_upstream_format` on the owning upstream or route explicitly because provenance-free routing cannot rely on discovery-time capabilities"
+    )
+}
+
+fn test_forced_upstream_unavailable(name: &str) -> bool {
+    std::env::var(TEST_FORCE_UNAVAILABLE_UPSTREAMS_ENV)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| !candidate.is_empty() && candidate == name)
         })
-        .collect()
+        .unwrap_or(false)
 }
 
 fn responses_stateful_request_controls(body: &Value) -> Vec<&'static str> {
@@ -2731,10 +2854,17 @@ mod tests {
         name: &str,
         format: crate::formats::UpstreamFormat,
     ) -> crate::config::UpstreamConfig {
+        test_upstream_config_with_fixed_format(name, Some(format))
+    }
+
+    fn test_upstream_config_with_fixed_format(
+        name: &str,
+        fixed_upstream_format: Option<crate::formats::UpstreamFormat>,
+    ) -> crate::config::UpstreamConfig {
         crate::config::UpstreamConfig {
             name: name.to_string(),
             api_root: format!("https://{name}.example/v1"),
-            fixed_upstream_format: Some(format),
+            fixed_upstream_format,
             fallback_credential_env: None,
             fallback_credential_actual: None,
             fallback_api_key: None,
@@ -2819,6 +2949,126 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn error_response_anthropic_raw_429_uses_rate_limit_error_and_normalized_message() {
+        let response = error_response(
+            crate::formats::UpstreamFormat::Anthropic,
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"Please slow down.","type":"rate_limit_error"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "Please slow down.");
+    }
+
+    #[tokio::test]
+    async fn error_response_anthropic_raw_401_maps_to_authentication_error() {
+        let response = error_response(
+            crate::formats::UpstreamFormat::Anthropic,
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"Bad API key.","type":"invalid_request_error"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["message"], "Bad API key.");
+    }
+
+    #[tokio::test]
+    async fn error_response_anthropic_raw_403_maps_to_permission_error() {
+        let response = error_response(
+            crate::formats::UpstreamFormat::Anthropic,
+            StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"Access denied.","type":"invalid_request_error"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert_eq!(body["error"]["message"], "Access denied.");
+    }
+
+    #[tokio::test]
+    async fn error_response_anthropic_raw_404_maps_to_not_found_error() {
+        let response = error_response(
+            crate::formats::UpstreamFormat::Anthropic,
+            StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"Model not found.","type":"invalid_request_error"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["message"], "Model not found.");
+    }
+
+    #[tokio::test]
+    async fn error_response_anthropic_raw_413_maps_to_request_too_large() {
+        let response = error_response(
+            crate::formats::UpstreamFormat::Anthropic,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            r#"{"error":{"message":"Payload too large.","type":"invalid_request_error"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(body["error"]["message"], "Payload too large.");
+    }
+
+    #[tokio::test]
+    async fn error_response_anthropic_raw_503_maps_to_api_error() {
+        let response = error_response(
+            crate::formats::UpstreamFormat::Anthropic,
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"message":"Backend overloaded.","type":"server_error"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "Backend overloaded.");
+    }
+
     #[test]
     fn streaming_error_response_returns_responses_failed_event() {
         let response = streaming_error_response(
@@ -2863,6 +3113,51 @@ mod tests {
         );
 
         assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn classify_post_translation_non_stream_status_keeps_anthropic_message_success() {
+        let status = classify_post_translation_non_stream_status(
+            crate::formats::UpstreamFormat::Anthropic,
+            &serde_json::json!({
+                "type": "message",
+                "content": [{ "type": "text", "text": "Hi" }]
+            }),
+        );
+
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn classify_post_translation_non_stream_status_maps_anthropic_tool_error_to_400() {
+        let status = classify_post_translation_non_stream_status(
+            crate::formats::UpstreamFormat::Anthropic,
+            &serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "The provider reported a tool or protocol error."
+                }
+            }),
+        );
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn classify_post_translation_non_stream_status_maps_anthropic_api_error_to_500() {
+        let status = classify_post_translation_non_stream_status(
+            crate::formats::UpstreamFormat::Anthropic,
+            &serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "The provider returned an error."
+                }
+            }),
+        );
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -3101,7 +3396,85 @@ mod tests {
         )
         .expect_err("multiple native upstreams should fail");
 
-        assert!(error.contains("multiple available native OpenAI Responses upstreams"));
+        assert!(error.contains("multiple configured native OpenAI Responses upstreams"));
+    }
+
+    #[test]
+    fn resolve_native_responses_stateful_route_or_error_rejects_multiple_configured_native_upstreams_even_if_only_one_is_available(
+    ) {
+        let namespace_state = runtime_namespace_state_for_tests(&[
+            ("a", crate::formats::UpstreamFormat::OpenAiResponses, true),
+            ("b", crate::formats::UpstreamFormat::OpenAiResponses, false),
+        ]);
+
+        let error = resolve_native_responses_stateful_route_or_error(
+            &namespace_state,
+            "",
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({ "previous_response_id": "resp_1" }),
+        )
+        .expect_err("configured ownership should stay ambiguous");
+
+        assert!(error.contains("multiple"));
+        assert!(error.contains("configured"));
+        assert!(error.contains("previous_response_id"));
+    }
+
+    #[test]
+    fn resolve_native_responses_stateful_route_or_error_rejects_multi_upstream_auto_discovery_without_explicit_owner_pin(
+    ) {
+        let pinned =
+            test_upstream_config("responses", crate::formats::UpstreamFormat::OpenAiResponses);
+        let auto = test_upstream_config_with_fixed_format("auto", None);
+        let config = crate::config::Config {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout: std::time::Duration::from_secs(30),
+            upstreams: vec![pinned.clone(), auto.clone()],
+            model_aliases: Default::default(),
+            hooks: Default::default(),
+            debug_trace: crate::config::DebugTraceConfig::default(),
+        };
+        let upstreams = std::collections::BTreeMap::from([
+            (
+                "responses".to_string(),
+                UpstreamState {
+                    config: pinned,
+                    capability: Some(crate::discovery::UpstreamCapability::fixed(
+                        crate::formats::UpstreamFormat::OpenAiResponses,
+                    )),
+                    availability: crate::discovery::UpstreamAvailability::available(),
+                },
+            ),
+            (
+                "auto".to_string(),
+                UpstreamState {
+                    config: auto,
+                    capability: Some(crate::discovery::UpstreamCapability::fixed(
+                        crate::formats::UpstreamFormat::Anthropic,
+                    )),
+                    availability: crate::discovery::UpstreamAvailability::available(),
+                },
+            ),
+        ]);
+        let namespace_state = RuntimeNamespaceState {
+            revision: "test-revision".to_string(),
+            config,
+            upstreams,
+            client: Client::new(),
+            hooks: None,
+            debug_trace: None,
+        };
+
+        let error = resolve_native_responses_stateful_route_or_error(
+            &namespace_state,
+            "",
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({ "background": true }),
+        )
+        .expect_err("auto-discovery should block provenance-free routing");
+
+        assert!(error.contains("auto-discovery"));
+        assert!(error.contains("fixed_upstream_format"));
     }
 
     #[test]

@@ -29,6 +29,11 @@ use tokio::net::TcpListener;
 
 static ADMIN_TOKEN_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+static TEST_UPSTREAM_AVAILABILITY_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+const TEST_FORCE_UNAVAILABLE_UPSTREAMS_ENV: &str =
+    "LLM_UNIVERSAL_PROXY_TEST_FORCE_UNAVAILABLE_UPSTREAMS";
 
 type CapturedDiscoveryRequests = Arc<Mutex<Vec<(String, String, String)>>>;
 type CapturedGoogleRequests = Arc<Mutex<Vec<(String, Value)>>>;
@@ -221,6 +226,122 @@ async fn spawn_discovery_empty_mock() -> (
         axum::serve(listener, app).await.ok();
     });
     (base, handle, captured)
+}
+
+async fn spawn_openai_completion_terminal_mock(
+    finish_reason: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(
+        State(finish_reason): State<&'static str>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "id": "chatcmpl-terminal",
+                "object": "chat.completion",
+                "created": 1,
+                "model": body.get("model").cloned().unwrap_or_else(|| json!("mock")),
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "" },
+                    "finish_reason": finish_reason
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1 }
+            })),
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handler))
+        .route("/chat/completions", post(handler))
+        .with_state(finish_reason);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn spawn_openai_completion_http_error_mock(
+    status: StatusCode,
+    body: Value,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(
+        State((status, body)): State<(StatusCode, Value)>,
+        Json(_request): Json<Value>,
+    ) -> impl IntoResponse {
+        (status, Json(body))
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handler))
+        .route("/chat/completions", post(handler))
+        .with_state((status, body));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+fn multi_native_responses_config(first_base: &str, second_base: &str) -> Config {
+    Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![
+            named_upstream(
+                "RESPONSES_A",
+                first_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+            named_upstream(
+                "RESPONSES_B",
+                second_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+        ],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    }
+}
+
+fn pinned_responses_plus_auto_discovery_config(
+    pinned_base: &str,
+    auto_discovery_base: &str,
+) -> Config {
+    Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![
+            named_upstream(
+                "RESPONSES_A",
+                pinned_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+            UpstreamConfig {
+                name: "AUTO".to_string(),
+                api_root: auto_discovery_base.to_string(),
+                fixed_upstream_format: None,
+                fallback_credential_env: None,
+                fallback_credential_actual: None,
+                fallback_api_key: None,
+                auth_policy: AuthPolicy::ClientOrFallback,
+                upstream_headers: Vec::new(),
+            },
+        ],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    }
 }
 
 async fn spawn_google_capture_mock() -> (String, tokio::task::JoinHandle<()>, CapturedGoogleRequests)
@@ -1307,32 +1428,105 @@ async fn openai_namespace_response_get_requires_available_native_responses_upstr
 async fn openai_responses_lifecycle_is_ambiguous_with_multiple_native_upstreams() {
     let (first_base, _first_mock) = spawn_openai_responses_mock().await;
     let (second_base, _second_mock) = spawn_openai_responses_mock().await;
-    let config = Config {
-        listen: "127.0.0.1:0".to_string(),
-        upstream_timeout: Duration::from_secs(30),
-        upstreams: vec![
-            named_upstream(
-                "RESPONSES_A",
-                &first_base,
-                UpstreamFormat::OpenAiResponses,
-                None,
-            ),
-            named_upstream(
-                "RESPONSES_B",
-                &second_base,
-                UpstreamFormat::OpenAiResponses,
-                None,
-            ),
-        ],
-        model_aliases: Default::default(),
-        hooks: Default::default(),
-        debug_trace: DebugTraceConfig::default(),
-    };
+    let config = multi_native_responses_config(&first_base, &second_base);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let client = Client::new();
     let res = client
         .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("ambiguous"));
+}
+
+#[tokio::test]
+async fn responses_lifecycle_get_rejects_multi_upstream_auto_discovery_without_explicit_owner_pin()
+{
+    let (responses_base, _responses_mock) = spawn_openai_responses_mock().await;
+    let (auto_base, _auto_mock, _captured) = spawn_discovery_empty_mock().await;
+    let config = pinned_responses_plus_auto_discovery_config(&responses_base, &auto_base);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("auto-discovery"), "message = {message}");
+    assert!(
+        message.contains("fixed_upstream_format"),
+        "message = {message}"
+    );
+}
+
+#[tokio::test]
+async fn responses_compact_rejects_multi_upstream_auto_discovery_without_explicit_owner_pin() {
+    let (responses_base, _responses_mock) = spawn_openai_responses_mock().await;
+    let (auto_base, _auto_mock, _captured) = spawn_discovery_empty_mock().await;
+    let config = pinned_responses_plus_auto_discovery_config(&responses_base, &auto_base);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses/compact"))
+        .json(&json!({ "response_id": "resp_123" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("auto-discovery"), "message = {message}");
+    assert!(
+        message.contains("fixed_upstream_format"),
+        "message = {message}"
+    );
+}
+
+#[tokio::test]
+async fn responses_lifecycle_get_is_ambiguous_when_only_one_configured_native_owner_is_available() {
+    let _env_guard = TEST_UPSTREAM_AVAILABILITY_ENV_LOCK.lock().await;
+    let _forced_unavailable =
+        ScopedEnvVar::set(TEST_FORCE_UNAVAILABLE_UPSTREAMS_ENV, "RESPONSES_B");
+    let (first_base, _first_mock) = spawn_openai_responses_mock().await;
+    let (second_base, _second_mock) = spawn_openai_responses_mock().await;
+    let config = multi_native_responses_config(&first_base, &second_base);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("ambiguous"));
+}
+
+#[tokio::test]
+async fn responses_compact_is_ambiguous_when_only_one_configured_native_owner_is_available() {
+    let _env_guard = TEST_UPSTREAM_AVAILABILITY_ENV_LOCK.lock().await;
+    let _forced_unavailable =
+        ScopedEnvVar::set(TEST_FORCE_UNAVAILABLE_UPSTREAMS_ENV, "RESPONSES_B");
+    let (first_base, _first_mock) = spawn_openai_responses_mock().await;
+    let (second_base, _second_mock) = spawn_openai_responses_mock().await;
+    let config = multi_native_responses_config(&first_base, &second_base);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses/compact"))
+        .json(&json!({ "response_id": "resp_123" }))
         .send()
         .await
         .unwrap();
@@ -1587,27 +1781,7 @@ async fn openai_responses_previous_response_id_requires_explicit_model_in_multi_
 {
     let (first_base, _first_mock) = spawn_openai_responses_mock().await;
     let (second_base, _second_mock) = spawn_openai_responses_mock().await;
-    let config = Config {
-        listen: "127.0.0.1:0".to_string(),
-        upstream_timeout: Duration::from_secs(30),
-        upstreams: vec![
-            named_upstream(
-                "RESPONSES_A",
-                &first_base,
-                UpstreamFormat::OpenAiResponses,
-                None,
-            ),
-            named_upstream(
-                "RESPONSES_B",
-                &second_base,
-                UpstreamFormat::OpenAiResponses,
-                None,
-            ),
-        ],
-        model_aliases: Default::default(),
-        hooks: Default::default(),
-        debug_trace: DebugTraceConfig::default(),
-    };
+    let config = multi_native_responses_config(&first_base, &second_base);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let client = Client::new();
@@ -1626,6 +1800,118 @@ async fn openai_responses_previous_response_id_requires_explicit_model_in_multi_
     let message = body["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("previous_response_id"));
     assert!(message.contains("routable `model`"));
+}
+
+#[tokio::test]
+async fn previous_response_id_without_model_is_ambiguous_when_only_one_configured_native_owner_is_available(
+) {
+    let _env_guard = TEST_UPSTREAM_AVAILABILITY_ENV_LOCK.lock().await;
+    let _forced_unavailable =
+        ScopedEnvVar::set(TEST_FORCE_UNAVAILABLE_UPSTREAMS_ENV, "RESPONSES_B");
+    let (first_base, _first_mock) = spawn_openai_responses_mock().await;
+    let (second_base, _second_mock) = spawn_openai_responses_mock().await;
+    let config = multi_native_responses_config(&first_base, &second_base);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "input": "Hi again",
+            "previous_response_id": "resp_123",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("previous_response_id"));
+    assert!(message.contains("routable `model`"));
+}
+
+#[tokio::test]
+async fn previous_response_id_without_model_rejects_multi_upstream_auto_discovery_without_explicit_owner_pin(
+) {
+    let (responses_base, _responses_mock) = spawn_openai_responses_mock().await;
+    let (auto_base, _auto_mock, _captured) = spawn_discovery_empty_mock().await;
+    let config = pinned_responses_plus_auto_discovery_config(&responses_base, &auto_base);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "input": "Hi again",
+            "previous_response_id": "resp_123",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("auto-discovery"), "message = {message}");
+    assert!(
+        message.contains("fixed_upstream_format"),
+        "message = {message}"
+    );
+}
+
+#[tokio::test]
+async fn background_without_model_is_ambiguous_when_only_one_configured_native_owner_is_available()
+{
+    let _env_guard = TEST_UPSTREAM_AVAILABILITY_ENV_LOCK.lock().await;
+    let _forced_unavailable =
+        ScopedEnvVar::set(TEST_FORCE_UNAVAILABLE_UPSTREAMS_ENV, "RESPONSES_B");
+    let (first_base, _first_mock) = spawn_openai_responses_mock().await;
+    let (second_base, _second_mock) = spawn_openai_responses_mock().await;
+    let config = multi_native_responses_config(&first_base, &second_base);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "background": true,
+            "input": "Continue",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("background"));
+    assert!(message.contains("routable `model`"));
+}
+
+#[tokio::test]
+async fn background_without_model_rejects_multi_upstream_auto_discovery_without_explicit_owner_pin()
+{
+    let (responses_base, _responses_mock) = spawn_openai_responses_mock().await;
+    let (auto_base, _auto_mock, _captured) = spawn_discovery_empty_mock().await;
+    let config = pinned_responses_plus_auto_discovery_config(&responses_base, &auto_base);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "background": true,
+            "input": "Continue",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("auto-discovery"), "message = {message}");
+    assert!(
+        message.contains("fixed_upstream_format"),
+        "message = {message}"
+    );
 }
 
 #[tokio::test]
@@ -1732,6 +2018,46 @@ async fn responses_stateful_request_without_model_routes_to_unique_native_respon
 }
 
 #[tokio::test]
+async fn stateful_model_less_create_returns_503_when_unique_configured_native_owner_is_unavailable()
+{
+    let _env_guard = TEST_UPSTREAM_AVAILABILITY_ENV_LOCK.lock().await;
+    let _forced_unavailable =
+        ScopedEnvVar::set(TEST_FORCE_UNAVAILABLE_UPSTREAMS_ENV, "RESPONSES_A");
+    let (responses_base, _responses_mock) = spawn_tagged_openai_responses_mock("a").await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![named_upstream(
+            "RESPONSES_A",
+            &responses_base,
+            UpstreamFormat::OpenAiResponses,
+            None,
+        )],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "previous_response_id": "resp_123",
+            "input": "Continue",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("RESPONSES_A"), "message = {message}");
+    assert!(message.contains("unavailable"), "message = {message}");
+}
+
+#[tokio::test]
 async fn responses_translated_allowed_degradation_emits_warning_headers() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
@@ -1799,6 +2125,272 @@ async fn anthropic_namespace_messages_works() {
     assert!(res.status().is_success());
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["type"], "message");
+}
+
+#[tokio::test]
+async fn translated_anthropic_tool_error_returns_400_with_error_body() {
+    let (mock_base, _mock) = spawn_openai_completion_terminal_mock("tool_error").await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn translated_anthropic_error_returns_500_with_error_body() {
+    let (mock_base, _mock) = spawn_openai_completion_terminal_mock("error").await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "api_error");
+}
+
+#[tokio::test]
+async fn translated_anthropic_message_body_stays_200() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "message");
+}
+
+#[tokio::test]
+async fn anthropic_raw_upstream_429_returns_rate_limit_error() {
+    let (mock_base, _mock) = spawn_openai_completion_http_error_mock(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "error": {
+                "message": "Please slow down.",
+                "type": "rate_limit_error"
+            }
+        }),
+    )
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["message"], "Please slow down.");
+}
+
+#[tokio::test]
+async fn anthropic_raw_upstream_401_returns_authentication_error() {
+    let (mock_base, _mock) = spawn_openai_completion_http_error_mock(
+        StatusCode::UNAUTHORIZED,
+        json!({
+            "error": {
+                "message": "Bad API key.",
+                "type": "invalid_request_error"
+            }
+        }),
+    )
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert_eq!(body["error"]["message"], "Bad API key.");
+}
+
+#[tokio::test]
+async fn anthropic_raw_upstream_403_returns_permission_error() {
+    let (mock_base, _mock) = spawn_openai_completion_http_error_mock(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": {
+                "message": "Access denied.",
+                "type": "invalid_request_error"
+            }
+        }),
+    )
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "permission_error");
+    assert_eq!(body["error"]["message"], "Access denied.");
+}
+
+#[tokio::test]
+async fn anthropic_raw_upstream_404_returns_not_found_error() {
+    let (mock_base, _mock) = spawn_openai_completion_http_error_mock(
+        StatusCode::NOT_FOUND,
+        json!({
+            "error": {
+                "message": "Model not found.",
+                "type": "invalid_request_error"
+            }
+        }),
+    )
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "not_found_error");
+    assert_eq!(body["error"]["message"], "Model not found.");
+}
+
+#[tokio::test]
+async fn anthropic_raw_upstream_413_returns_request_too_large() {
+    let (mock_base, _mock) = spawn_openai_completion_http_error_mock(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        json!({
+            "error": {
+                "message": "Payload too large.",
+                "type": "invalid_request_error"
+            }
+        }),
+    )
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "request_too_large");
+    assert_eq!(body["error"]["message"], "Payload too large.");
+}
+
+#[tokio::test]
+async fn anthropic_raw_upstream_503_returns_api_error() {
+    let (mock_base, _mock) = spawn_openai_completion_http_error_mock(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({
+            "error": {
+                "message": "Backend overloaded.",
+                "type": "server_error"
+            }
+        }),
+    )
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "max_tokens": 32,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(body["error"]["message"], "Backend overloaded.");
 }
 
 #[tokio::test]

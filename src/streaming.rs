@@ -9,6 +9,10 @@ use futures_util::Stream;
 use serde_json::Value;
 
 use crate::formats::UpstreamFormat;
+use crate::translate::{
+    classify_openai_finish_for_anthropic, classify_portable_non_success_terminal,
+    gemini_finish_reason_to_openai, responses_failed_code_to_openai_finish, AnthropicTerminal,
+};
 
 /// Whether we need to transform the upstream SSE stream for the client.
 pub fn needs_stream_translation(
@@ -44,6 +48,7 @@ pub struct StreamState {
     pub tool_block_indices: std::collections::HashMap<usize, usize>,
     // Gemini state
     pub function_index: usize,
+    pub gemini_dummy_signature_emitted: bool,
     // OpenAI Responses API client output state
     pub responses_seq: u64,
     pub responses_started: bool,
@@ -66,6 +71,7 @@ pub struct ToolCallState {
     pub id: Option<Value>,
     pub name: String,
     pub arguments: String,
+    pub gemini_emitted_arguments: Option<String>,
     pub arguments_seeded_from_start: bool,
     pub block_index: Option<usize>,
     pub responses_item_id: Option<String>,
@@ -111,6 +117,9 @@ fn dedupe_tool_call_state_by_call_id(
             }
             if entry.arguments.is_empty() {
                 entry.arguments = existing_entry.arguments.clone();
+            }
+            if entry.gemini_emitted_arguments.is_none() {
+                entry.gemini_emitted_arguments = existing_entry.gemini_emitted_arguments.clone();
             }
             if entry.block_index.is_none() {
                 entry.block_index = existing_entry.block_index;
@@ -426,35 +435,7 @@ fn convert_claude_stop_reason(r: &str) -> String {
 }
 
 fn gemini_finish_reason_to_openai_stream(finish_reason: &str, has_tool_calls: bool) -> String {
-    match finish_reason {
-        "STOP" => {
-            if has_tool_calls {
-                "tool_calls"
-            } else {
-                "stop"
-            }
-        }
-        "MAX_TOKENS" => "length",
-        "SAFETY"
-        | "RECITATION"
-        | "LANGUAGE"
-        | "OTHER"
-        | "BLOCKLIST"
-        | "PROHIBITED_CONTENT"
-        | "SPII"
-        | "MALFORMED_FUNCTION_CALL"
-        | "UNEXPECTED_TOOL_CALL"
-        | "TOO_MANY_TOOL_CALLS"
-        | "MISSING_THOUGHT_SIGNATURE"
-        | "IMAGE_SAFETY"
-        | "IMAGE_PROHIBITED_CONTENT"
-        | "IMAGE_RECITATION"
-        | "IMAGE_OTHER"
-        | "NO_IMAGE"
-        | "FINISH_REASON_UNSPECIFIED" => "content_filter",
-        _ => "content_filter",
-    }
-    .to_string()
+    gemini_finish_reason_to_openai(Some(finish_reason), has_tool_calls)
 }
 
 fn openai_finish_reason_to_gemini_stream(finish_reason: &str) -> &'static str {
@@ -462,7 +443,7 @@ fn openai_finish_reason_to_gemini_stream(finish_reason: &str) -> &'static str {
         "stop" | "tool_calls" => "STOP",
         "length" => "MAX_TOKENS",
         "content_filter" => "SAFETY",
-        "pause_turn" | "context_length_exceeded" => "OTHER",
+        "pause_turn" | "context_length_exceeded" | "tool_error" | "error" => "OTHER",
         _ => "STOP",
     }
 }
@@ -470,11 +451,7 @@ fn openai_finish_reason_to_gemini_stream(finish_reason: &str) -> &'static str {
 const GEMINI_DUMMY_THOUGHT_SIGNATURE_STREAM: &str = "skip_thought_signature_validator";
 
 fn responses_failed_code_to_openai_finish_stream(code: Option<&str>) -> &'static str {
-    match code {
-        Some("context_length_exceeded") => "context_length_exceeded",
-        Some("content_filter") | Some("invalid_prompt") => "content_filter",
-        Some(_) | None => "content_filter",
-    }
+    responses_failed_code_to_openai_finish(code)
 }
 
 fn responses_usage_to_openai_usage_stream(usage: &Value) -> Value {
@@ -1161,6 +1138,24 @@ fn emit_openai_responses_terminal(
         "pause_turn" => Some("pause_turn"),
         _ => None,
     };
+    let failed_error = match finish_reason {
+        "context_length_exceeded" => Some(serde_json::json!({
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "message": "Your input exceeds the context window of this model. Please adjust your input and try again."
+        })),
+        "error" => Some(serde_json::json!({
+            "type": "server_error",
+            "code": "error",
+            "message": "The provider returned an error."
+        })),
+        "tool_error" => Some(serde_json::json!({
+            "type": "invalid_request_error",
+            "code": "tool_error",
+            "message": "The provider reported a tool or protocol error."
+        })),
+        _ => None,
+    };
 
     if state.responses_reasoning_added && !state.responses_reasoning_done {
         state.responses_reasoning_done = true;
@@ -1372,60 +1367,23 @@ fn emit_openai_responses_terminal(
         "id": response_id,
         "object": "response",
         "created_at": created,
-        "status": if incomplete_reason.is_some() { "incomplete" } else { "completed" },
-        "error": null,
+        "status": if failed_error.is_some() {
+            "failed"
+        } else if incomplete_reason.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        },
+        "error": failed_error.clone().unwrap_or(serde_json::Value::Null),
         "incomplete_details": incomplete_reason.map(|reason| serde_json::json!({ "reason": reason })).unwrap_or(serde_json::Value::Null),
         "output": output
     });
     if let Some(ref u) = state.usage {
-        let input_tokens = u
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .or(u.get("prompt_tokens").and_then(Value::as_u64))
-            .unwrap_or(0);
-        let output_tokens = u
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .or(u.get("completion_tokens").and_then(Value::as_u64))
-            .unwrap_or(0);
-        let total_tokens = u
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(input_tokens + output_tokens);
-        let cached_tokens = u
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                u.get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-                    .and_then(Value::as_u64)
-            });
-        let reasoning_tokens = u
-            .get("output_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                u.get("completion_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens"))
-                    .and_then(Value::as_u64)
-            });
-
-        let mut usage = serde_json::json!({
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens
-        });
-        if let Some(cached_tokens) = cached_tokens {
-            usage["input_tokens_details"] = serde_json::json!({ "cached_tokens": cached_tokens });
-        }
-        if let Some(reasoning_tokens) = reasoning_tokens {
-            usage["output_tokens_details"] =
-                serde_json::json!({ "reasoning_tokens": reasoning_tokens });
-        }
-        resp["usage"] = usage;
+        resp["usage"] = openai_usage_to_responses_usage_stream(u);
     }
-    let event_type = if incomplete_reason.is_some() {
+    let event_type = if failed_error.is_some() {
+        "response.failed"
+    } else if incomplete_reason.is_some() {
         "response.incomplete"
     } else {
         "response.completed"
@@ -1440,16 +1398,17 @@ fn emit_openai_responses_terminal(
     out
 }
 
-fn convert_openai_finish_to_claude(reason: &str) -> &'static str {
-    match reason {
-        "stop" => "end_turn",
-        "length" => "max_tokens",
-        "tool_calls" => "tool_use",
-        "pause_turn" => "pause_turn",
-        "content_filter" => "refusal",
-        "context_length_exceeded" => "model_context_window_exceeded",
-        _ => "end_turn",
-    }
+fn anthropic_error_event(error_type: &str, message: &str) -> Vec<u8> {
+    format_sse_event(
+        "error",
+        &serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message
+            }
+        }),
+    )
 }
 
 fn openai_chunk_to_claude_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec<u8>> {
@@ -1461,6 +1420,23 @@ fn openai_chunk_to_claude_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
     let choice = &choices[0];
     let delta = choice.get("delta").unwrap_or(&serde_json::Value::Null);
     let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+
+    if let Some(fr) = finish_reason {
+        if let AnthropicTerminal::Error {
+            error_type,
+            message,
+        } = classify_openai_finish_for_anthropic(fr)
+        {
+            let delta_is_empty = delta
+                .as_object()
+                .map(|obj| obj.is_empty())
+                .unwrap_or_else(|| delta.is_null());
+            if !state.message_start_sent && delta_is_empty {
+                out.push(anthropic_error_event(error_type, message));
+                return out;
+            }
+        }
+    }
 
     if !state.message_start_sent {
         state.message_start_sent = true;
@@ -1585,27 +1561,36 @@ fn openai_chunk_to_claude_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
     }
 
     if let Some(fr) = finish_reason {
-        stop_thinking_block_claude(state, &mut out);
-        stop_text_block_claude(state, &mut out);
-        for &block_index in state.tool_block_indices.values() {
-            let ev = serde_json::json!({ "type": "content_block_stop", "index": block_index });
-            out.push(format_sse_event("content_block_stop", &ev));
+        match classify_openai_finish_for_anthropic(fr) {
+            AnthropicTerminal::StopReason(stop_reason) => {
+                stop_thinking_block_claude(state, &mut out);
+                stop_text_block_claude(state, &mut out);
+                for &block_index in state.tool_block_indices.values() {
+                    let ev =
+                        serde_json::json!({ "type": "content_block_stop", "index": block_index });
+                    out.push(format_sse_event("content_block_stop", &ev));
+                }
+                let usage = state.usage.clone().unwrap_or_else(
+                    || serde_json::json!({ "input_tokens": 0, "output_tokens": 0 }),
+                );
+                let ev = serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": stop_reason },
+                    "usage": usage
+                });
+                out.push(format_sse_event("message_delta", &ev));
+                out.push(format_sse_event(
+                    "message_stop",
+                    &serde_json::json!({ "type": "message_stop" }),
+                ));
+            }
+            AnthropicTerminal::Error {
+                error_type,
+                message,
+            } => {
+                out.push(anthropic_error_event(error_type, message));
+            }
         }
-        let stop_reason = convert_openai_finish_to_claude(fr);
-        let usage = state
-            .usage
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({ "input_tokens": 0, "output_tokens": 0 }));
-        let ev = serde_json::json!({
-            "type": "message_delta",
-            "delta": { "stop_reason": stop_reason },
-            "usage": usage
-        });
-        out.push(format_sse_event("message_delta", &ev));
-        out.push(format_sse_event(
-            "message_stop",
-            &serde_json::json!({ "type": "message_stop" }),
-        ));
     }
     out
 }
@@ -1640,25 +1625,52 @@ fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
     }
     if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
         for tc in tcs {
-            let name = tc
+            let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let entry = state
+                .openai_tool_calls
+                .entry(idx)
+                .or_insert_with(|| ToolCallState {
+                    index: idx,
+                    ..Default::default()
+                });
+            if let Some(id) = tc.get("id").cloned() {
+                entry.id = Some(id);
+            }
+            if let Some(name) = tc
                 .get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
-                .unwrap_or("");
-            let args_str = tc
+            {
+                entry.name = name.to_string();
+            }
+            if let Some(arguments) = tc
                 .get("function")
                 .and_then(|f| f.get("arguments"))
                 .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let args_val: Value =
-                serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({}));
-            let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+            {
+                if !arguments.is_empty() {
+                    entry.arguments.push_str(arguments);
+                }
+            }
+
+            if entry.arguments.is_empty()
+                || entry.gemini_emitted_arguments.as_deref() == Some(entry.arguments.as_str())
+            {
+                continue;
+            }
+
+            let Ok(args_val) = serde_json::from_str::<Value>(&entry.arguments) else {
+                continue;
+            };
+            entry.gemini_emitted_arguments = Some(entry.arguments.clone());
+            let id = entry.id.as_ref().and_then(Value::as_str).unwrap_or("");
             let mut part = serde_json::json!({
-                "functionCall": { "name": name, "args": args_val, "id": id }
+                "functionCall": { "name": entry.name.clone(), "args": args_val, "id": id }
             });
-            if tc.get("index").and_then(Value::as_u64) == Some(0) {
+            if !state.gemini_dummy_signature_emitted {
                 part["thoughtSignature"] =
                     Value::String(GEMINI_DUMMY_THOUGHT_SIGNATURE_STREAM.to_string());
+                state.gemini_dummy_signature_emitted = true;
             }
             parts.push(part);
         }
@@ -2006,32 +2018,17 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
     if let Some(u) = chunk.get("usage") {
         state.usage = Some(u.clone());
     }
-    if finish_reason == Some("context_length_exceeded") {
-        state.responses_terminal_sent = true;
-        let failed = serde_json::json!({
-            "type": "response.failed",
-            "sequence_number": next_responses_seq(state),
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "created_at": chunk.get("created").and_then(Value::as_u64).unwrap_or(0),
-                "status": "failed",
-                "background": false,
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": "context_length_exceeded",
-                    "message": "Your input exceeds the context window of this model. Please adjust your input and try again."
-                },
-                "incomplete_details": null,
-                "usage": state
-                    .usage
-                    .as_ref()
-                    .map(openai_usage_to_responses_usage_stream)
-                    .unwrap_or(serde_json::Value::Null),
-                "metadata": {}
-            }
-        });
-        out.push(format_sse_event("response.failed", &failed));
+    if matches!(
+        finish_reason,
+        Some("context_length_exceeded") | Some("error") | Some("tool_error")
+    ) {
+        state.finish_reason = finish_reason.map(str::to_string);
+        out.extend(emit_openai_responses_terminal(
+            state,
+            &response_id,
+            chunk.get("created").and_then(Value::as_u64).unwrap_or(0),
+            idx,
+        ));
         return out;
     }
     if let Some(fr) = finish_reason {
@@ -2145,10 +2142,20 @@ fn normalize_anthropic_stream_error(
     let lower_type = error_type.to_ascii_lowercase();
     let lower_message = message.to_ascii_lowercase();
     if lower_type.contains("overloaded") || lower_type.contains("api_error") {
-        return ("server_error", Some("server_is_overloaded"), "stop");
+        let code = Some("server_is_overloaded");
+        return (
+            "server_error",
+            code,
+            classify_portable_non_success_terminal(code),
+        );
     }
     if lower_type.contains("rate_limit") {
-        return ("rate_limit_error", Some("rate_limit_exceeded"), "stop");
+        let code = Some("rate_limit_exceeded");
+        return (
+            "rate_limit_error",
+            code,
+            classify_portable_non_success_terminal(code),
+        );
     }
     if lower_type.contains("invalid_request")
         && (lower_message.contains("context window")
@@ -2171,7 +2178,12 @@ fn normalize_anthropic_stream_error(
             "content_filter",
         );
     }
-    ("server_error", Some("server_is_overloaded"), "stop")
+    let code = Some("server_is_overloaded");
+    (
+        "server_error",
+        code,
+        classify_portable_non_success_terminal(code),
+    )
 }
 
 /// Stream that buffers upstream bytes, parses SSE events, and yields translated SSE bytes.
@@ -2570,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_failed_unknown_event_produces_openai_content_filter_finish() {
+    fn responses_failed_unknown_event_produces_openai_error_finish() {
         let event = serde_json::json!({
             "type": "response.failed",
             "response": {
@@ -2588,7 +2600,22 @@ mod tests {
         let mut state = StreamState::default();
         let chunks = responses_event_to_openai_chunks(&event, &mut state);
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "content_filter");
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "error");
+    }
+
+    #[test]
+    fn responses_failed_tool_validation_event_produces_openai_tool_error_finish() {
+        let event = serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_1",
+                "error": { "code": "tool_validation_error" }
+            }
+        });
+        let mut state = StreamState::default();
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "tool_error");
     }
 
     #[test]
@@ -2824,6 +2851,44 @@ mod tests {
     }
 
     #[test]
+    fn openai_chunk_to_claude_sse_emits_error_event_for_error_finish() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }]
+        });
+        let mut state = StreamState::default();
+        let out = openai_chunk_to_claude_sse(&chunk, &mut state);
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"type\":\"error\""));
+        assert!(joined.contains("\"api_error\""));
+        assert!(!joined.contains("\"stop_reason\":\"end_turn\""));
+        assert!(!joined.contains("\"type\":\"message_stop\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_claude_sse_emits_error_event_for_tool_error_finish() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_error" }]
+        });
+        let mut state = StreamState::default();
+        let out = openai_chunk_to_claude_sse(&chunk, &mut state);
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"type\":\"error\""));
+        assert!(joined.contains("\"invalid_request_error\""));
+        assert!(!joined.contains("\"stop_reason\":\"end_turn\""));
+        assert!(!joined.contains("\"type\":\"message_stop\""));
+    }
+
+    #[test]
     fn openai_chunk_to_responses_sse_maps_pause_turn_to_incomplete() {
         let mut state = StreamState::default();
         let finish_chunk = serde_json::json!({
@@ -2978,17 +3043,17 @@ mod tests {
 
     #[test]
     fn gemini_stream_non_success_finish_reasons_do_not_collapse_to_success() {
-        let reasons = [
-            "MALFORMED_FUNCTION_CALL",
-            "UNEXPECTED_TOOL_CALL",
-            "TOO_MANY_TOOL_CALLS",
-            "MISSING_THOUGHT_SIGNATURE",
-            "IMAGE_OTHER",
-            "NO_IMAGE",
-            "LANGUAGE",
+        let cases = [
+            ("MALFORMED_FUNCTION_CALL", "tool_error"),
+            ("UNEXPECTED_TOOL_CALL", "tool_error"),
+            ("TOO_MANY_TOOL_CALLS", "tool_error"),
+            ("MISSING_THOUGHT_SIGNATURE", "tool_error"),
+            ("IMAGE_OTHER", "error"),
+            ("NO_IMAGE", "error"),
+            ("LANGUAGE", "error"),
         ];
 
-        for reason in reasons {
+        for (reason, expected) in cases {
             let event = serde_json::json!({
                 "response": {
                     "responseId": format!("gem_{reason}"),
@@ -3015,10 +3080,163 @@ mod tests {
                 .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
                 .expect("finish chunk");
             assert_eq!(
-                finish_chunk["choices"][0]["finish_reason"], "content_filter",
+                finish_chunk["choices"][0]["finish_reason"], expected,
                 "reason = {reason}, chunk = {finish_chunk:?}"
             );
         }
+    }
+
+    #[test]
+    fn openai_chunk_to_gemini_sse_waits_for_complete_tool_call_arguments() {
+        let mut state = StreamState::default();
+        let first_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {
+                            "name": "lookup_weather",
+                            "arguments": "{\"city\":\"To"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        let second_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": "kyo\"}"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+
+        let out1 = openai_chunk_to_gemini_sse(&first_chunk, &mut state);
+        assert!(
+            out1.is_empty(),
+            "first fragment should not emit partial args"
+        );
+
+        let out2 = openai_chunk_to_gemini_sse(&second_chunk, &mut state);
+        assert_eq!(out2.len(), 1);
+        let payload = parse_sse_json(&out2[0]);
+        let parts = payload["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("gemini parts");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert_eq!(parts[0]["functionCall"]["id"], "call_1");
+        assert_eq!(parts[0]["functionCall"]["name"], "lookup_weather");
+        assert_eq!(parts[0]["functionCall"]["args"]["city"], "Tokyo");
+    }
+
+    #[test]
+    fn openai_chunk_to_gemini_sse_adds_dummy_signature_to_first_parseable_tool_call() {
+        let mut state = StreamState::default();
+        let first_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_0",
+                        "function": {
+                            "name": "lookup_weather",
+                            "arguments": "{\"city\":\"To"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        let second_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 1,
+                        "id": "call_1",
+                        "function": {
+                            "name": "lookup_time",
+                            "arguments": "{\"city\":\"Tokyo\"}"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+
+        let out1 = openai_chunk_to_gemini_sse(&first_chunk, &mut state);
+        assert!(out1.is_empty());
+
+        let out2 = openai_chunk_to_gemini_sse(&second_chunk, &mut state);
+        assert_eq!(out2.len(), 1);
+        let payload = parse_sse_json(&out2[0]);
+        let parts = payload["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("gemini parts");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["functionCall"]["id"], "call_1");
+        assert_eq!(
+            parts[0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_maps_error_finish_to_failed() {
+        let mut state = StreamState::default();
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }]
+        });
+        let out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"type\":\"response.failed\""));
+        assert!(joined.contains("\"code\":\"error\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_maps_tool_error_finish_to_failed() {
+        let mut state = StreamState::default();
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_error" }]
+        });
+        let out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"type\":\"response.failed\""));
+        assert!(joined.contains("\"code\":\"tool_error\""));
     }
 
     #[test]
@@ -3747,5 +3965,86 @@ mod tests {
         assert!(joined.contains("\"finish_reason\":\"context_length_exceeded\""));
         assert!(joined.contains("\"code\":\"context_length_exceeded\""));
         assert!(joined.contains("[DONE]"));
+    }
+
+    #[test]
+    fn anthropic_error_event_maps_non_specialized_failures_to_openai_error_finish() {
+        for (error_type, message) in [
+            ("overloaded_error", "Overloaded"),
+            ("api_error", "Internal server error"),
+            ("rate_limit_error", "Rate limited"),
+            ("fallback_error", "Unknown Anthropic failure"),
+        ] {
+            let mut state = StreamState::default();
+            let out = translate_sse_event(
+                UpstreamFormat::Anthropic,
+                UpstreamFormat::OpenAiCompletion,
+                &serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": error_type,
+                        "message": message
+                    }
+                }),
+                &mut state,
+            );
+
+            let joined = out
+                .into_iter()
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                joined.contains("\"finish_reason\":\"error\""),
+                "expected error finish for {error_type}: {joined}"
+            );
+            assert!(!joined.contains("\"finish_reason\":\"stop\""));
+            assert!(joined.contains("[DONE]"));
+        }
+    }
+
+    #[test]
+    fn anthropic_error_event_preserves_specialized_openai_error_finishes() {
+        for (message, finish_reason, code) in [
+            (
+                "maximum context length exceeded",
+                "context_length_exceeded",
+                "context_length_exceeded",
+            ),
+            (
+                "Request blocked by content filter refusal",
+                "content_filter",
+                "content_filter",
+            ),
+        ] {
+            let mut state = StreamState::default();
+            let out = translate_sse_event(
+                UpstreamFormat::Anthropic,
+                UpstreamFormat::OpenAiCompletion,
+                &serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": message
+                    }
+                }),
+                &mut state,
+            );
+
+            let joined = out
+                .into_iter()
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                joined.contains(&format!("\"finish_reason\":\"{finish_reason}\"")),
+                "expected specialized finish for {message}: {joined}"
+            );
+            assert!(
+                joined.contains(&format!("\"code\":\"{code}\"")),
+                "expected specialized code for {message}: {joined}"
+            );
+            assert!(joined.contains("[DONE]"));
+        }
     }
 }

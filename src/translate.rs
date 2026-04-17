@@ -153,7 +153,61 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
     Ok(result)
 }
 
-fn gemini_finish_reason_to_openai(finish_reason: Option<&str>, has_tool_calls: bool) -> String {
+pub(crate) fn classify_portable_non_success_terminal(code_or_reason: Option<&str>) -> &'static str {
+    let Some(code_or_reason) = code_or_reason else {
+        return "error";
+    };
+
+    let lower = code_or_reason.to_ascii_lowercase();
+    let upper = code_or_reason.to_ascii_uppercase();
+
+    if lower == "context_length_exceeded" {
+        return "context_length_exceeded";
+    }
+
+    if matches!(
+        upper.as_str(),
+        "SAFETY"
+            | "RECITATION"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"
+            | "IMAGE_RECITATION"
+    ) || lower == "content_filter"
+        || lower.contains("safety")
+        || lower.contains("policy")
+        || lower.contains("block")
+        || lower.contains("prohibited")
+        || lower.contains("recitation")
+        || lower.contains("spii")
+    {
+        return "content_filter";
+    }
+
+    if matches!(
+        upper.as_str(),
+        "MALFORMED_FUNCTION_CALL"
+            | "UNEXPECTED_TOOL_CALL"
+            | "TOO_MANY_TOOL_CALLS"
+            | "MISSING_THOUGHT_SIGNATURE"
+    ) || lower.contains("tool")
+        || lower.contains("function")
+        || lower.contains("signature")
+        || lower.contains("schema")
+        || lower.contains("validation")
+    {
+        return "tool_error";
+    }
+
+    "error"
+}
+
+pub(crate) fn gemini_finish_reason_to_openai(
+    finish_reason: Option<&str>,
+    has_tool_calls: bool,
+) -> String {
     match finish_reason.unwrap_or("STOP") {
         "STOP" => {
             if has_tool_calls {
@@ -163,24 +217,7 @@ fn gemini_finish_reason_to_openai(finish_reason: Option<&str>, has_tool_calls: b
             }
         }
         "MAX_TOKENS" => "length",
-        "SAFETY"
-        | "RECITATION"
-        | "LANGUAGE"
-        | "OTHER"
-        | "BLOCKLIST"
-        | "PROHIBITED_CONTENT"
-        | "SPII"
-        | "MALFORMED_FUNCTION_CALL"
-        | "UNEXPECTED_TOOL_CALL"
-        | "TOO_MANY_TOOL_CALLS"
-        | "MISSING_THOUGHT_SIGNATURE"
-        | "IMAGE_SAFETY"
-        | "IMAGE_PROHIBITED_CONTENT"
-        | "IMAGE_RECITATION"
-        | "IMAGE_OTHER"
-        | "NO_IMAGE"
-        | "FINISH_REASON_UNSPECIFIED" => "content_filter",
-        _ => "content_filter",
+        other => classify_portable_non_success_terminal(Some(other)),
     }
     .to_string()
 }
@@ -190,18 +227,43 @@ fn openai_finish_reason_to_gemini(finish_reason: &str) -> &'static str {
         "stop" | "tool_calls" => "STOP",
         "length" => "MAX_TOKENS",
         "content_filter" => "SAFETY",
-        "pause_turn" | "context_length_exceeded" => "OTHER",
+        "pause_turn" | "context_length_exceeded" | "tool_error" | "error" => "OTHER",
         _ => "STOP",
     }
 }
 
 const GEMINI_DUMMY_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
 
-fn responses_failed_code_to_openai_finish(code: Option<&str>) -> &'static str {
-    match code {
-        Some("context_length_exceeded") => "context_length_exceeded",
-        Some("content_filter") | Some("invalid_prompt") => "content_filter",
-        Some(_) | None => "content_filter",
+pub(crate) fn responses_failed_code_to_openai_finish(code: Option<&str>) -> &'static str {
+    classify_portable_non_success_terminal(code)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnthropicTerminal {
+    StopReason(&'static str),
+    Error {
+        error_type: &'static str,
+        message: &'static str,
+    },
+}
+
+pub(crate) fn classify_openai_finish_for_anthropic(reason: &str) -> AnthropicTerminal {
+    match reason {
+        "stop" => AnthropicTerminal::StopReason("end_turn"),
+        "length" => AnthropicTerminal::StopReason("max_tokens"),
+        "tool_calls" => AnthropicTerminal::StopReason("tool_use"),
+        "pause_turn" => AnthropicTerminal::StopReason("pause_turn"),
+        "content_filter" => AnthropicTerminal::StopReason("refusal"),
+        "context_length_exceeded" => AnthropicTerminal::StopReason("model_context_window_exceeded"),
+        "error" => AnthropicTerminal::Error {
+            error_type: "api_error",
+            message: "The provider returned an error.",
+        },
+        "tool_error" => AnthropicTerminal::Error {
+            error_type: "invalid_request_error",
+            message: "The provider reported a tool or protocol error.",
+        },
+        _ => AnthropicTerminal::StopReason("end_turn"),
     }
 }
 
@@ -456,29 +518,34 @@ fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
             }));
         }
     }
-    let mut finish = choice
+    let finish = choice
         .get("finish_reason")
         .and_then(Value::as_str)
-        .unwrap_or("stop")
-        .to_string();
-    if finish == "tool_calls" {
-        finish = "tool_use".to_string();
-    } else if finish == "length" {
-        finish = "max_tokens".to_string();
-    } else if finish == "content_filter" {
-        finish = "refusal".to_string();
-    } else if finish == "context_length_exceeded" {
-        finish = "model_context_window_exceeded".to_string();
-    } else if finish == "pause_turn" {
-        finish = "pause_turn".to_string();
+        .unwrap_or("stop");
+    let terminal = classify_openai_finish_for_anthropic(finish);
+    if let AnthropicTerminal::Error {
+        error_type,
+        message,
+    } = terminal
+    {
+        return Ok(serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message
+            }
+        }));
     }
+    let AnthropicTerminal::StopReason(stop_reason) = terminal else {
+        unreachable!("anthropic terminal must be stop reason after error early return");
+    };
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or(serde_json::Value::Null),
         "type": "message",
         "role": "assistant",
         "content": content,
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
-        "stop_reason": finish
+        "stop_reason": stop_reason
     });
     if let Some(u) = body.get("usage") {
         result["usage"] = serde_json::json!({
@@ -665,6 +732,24 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
             serde_json::json!({
                 "code": "context_length_exceeded",
                 "message": "The conversation exceeded the model context window.",
+                "type": "invalid_request_error"
+            }),
+        ),
+        "error" => (
+            "failed",
+            Value::Null,
+            serde_json::json!({
+                "code": "error",
+                "message": "The provider returned an error.",
+                "type": "server_error"
+            }),
+        ),
+        "tool_error" => (
+            "failed",
+            Value::Null,
+            serde_json::json!({
+                "code": "tool_error",
+                "message": "The provider reported a tool or protocol error.",
                 "type": "invalid_request_error"
             }),
         ),
@@ -3620,6 +3705,40 @@ mod tests {
     }
 
     #[test]
+    fn translate_response_openai_error_finish_to_claude_error_body() {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "choices": [{ "message": { "role": "assistant", "content": "" }, "finish_reason": "error" }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["error"]["type"], "api_error");
+        assert!(out.get("stop_reason").is_none());
+    }
+
+    #[test]
+    fn translate_response_openai_tool_error_finish_to_claude_error_body() {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "choices": [{ "message": { "role": "assistant", "content": "" }, "finish_reason": "tool_error" }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["error"]["type"], "invalid_request_error");
+        assert!(out.get("stop_reason").is_none());
+    }
+
+    #[test]
     fn translate_response_openai_pause_turn_to_claude_stop_reason() {
         let body = json!({
             "id": "chatcmpl-1",
@@ -3753,7 +3872,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_response_responses_failed_unknown_code_maps_to_content_filter() {
+    fn translate_response_responses_failed_unknown_code_maps_to_error() {
         let body = json!({
             "id": "resp_1",
             "object": "response",
@@ -3774,7 +3893,33 @@ mod tests {
             &body,
         )
         .unwrap();
-        assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
+        assert_eq!(out["choices"][0]["finish_reason"], "error");
+        assert!(out["choices"][0]["message"]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn translate_response_responses_failed_tool_validation_maps_to_tool_error() {
+        let body = json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 42,
+            "status": "failed",
+            "error": { "code": "tool_validation_error" },
+            "output": [{
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup_weather",
+                "arguments": "{\"city\":\"Tokyo\"}"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["choices"][0]["finish_reason"], "tool_error");
         assert!(out["choices"][0]["message"]["tool_calls"].is_array());
     }
 
@@ -4019,17 +4164,17 @@ mod tests {
 
     #[test]
     fn translate_response_gemini_non_success_finish_reasons_do_not_collapse_to_success() {
-        let reasons = [
-            "MALFORMED_FUNCTION_CALL",
-            "UNEXPECTED_TOOL_CALL",
-            "TOO_MANY_TOOL_CALLS",
-            "MISSING_THOUGHT_SIGNATURE",
-            "IMAGE_OTHER",
-            "NO_IMAGE",
-            "LANGUAGE",
+        let cases = [
+            ("MALFORMED_FUNCTION_CALL", "tool_error"),
+            ("UNEXPECTED_TOOL_CALL", "tool_error"),
+            ("TOO_MANY_TOOL_CALLS", "tool_error"),
+            ("MISSING_THOUGHT_SIGNATURE", "tool_error"),
+            ("IMAGE_OTHER", "error"),
+            ("NO_IMAGE", "error"),
+            ("LANGUAGE", "error"),
         ];
 
-        for reason in reasons {
+        for (reason, expected) in cases {
             let body = json!({
                 "response": {
                     "responseId": format!("gem_{reason}"),
@@ -4056,10 +4201,52 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                out["choices"][0]["finish_reason"], "content_filter",
+                out["choices"][0]["finish_reason"], expected,
                 "reason = {reason}, body = {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_maps_error_finish_to_failed() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "" },
+                "finish_reason": "error"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["status"], "failed");
+        assert_eq!(out["error"]["code"], "error");
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_maps_tool_error_finish_to_failed() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "" },
+                "finish_reason": "tool_error"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["status"], "failed");
+        assert_eq!(out["error"]["code"], "tool_error");
     }
 
     #[test]
