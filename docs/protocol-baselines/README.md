@@ -1,24 +1,34 @@
-# Protocol reference baselines
+# Protocol Baselines Docs
 
-This directory holds **protocol reference baselines** for the four LLM API formats supported by the proxy. Each baseline is derived from the **official** provider documentation and is used as a reference for request/response shapes, streaming behavior, and field semantics.
+- Status: active
+- Last refreshed: 2026-04-16
+- Audience: proxy implementers, test authors, and maintainers refreshing protocol docs
+- This file is intentionally only an entrypoint and update guide.
 
-**Important:** These baselines are snapshots for implementation and testing. Always refer to the official URLs below for the latest versions and full details.
+## What lives here
 
-| Protocol | Official source | Baseline file | Captured |
-|----------|-----------------|---------------|----------|
-| **OpenAI Chat Completions** | [platform.openai.com/docs/api-reference/chat](https://platform.openai.com/docs/api-reference/chat/create) | [openai-chat-completions.md](openai-chat-completions.md) | 2026-03-05 |
-| **OpenAI Responses API** | [platform.openai.com/docs/api-reference/responses](https://platform.openai.com/docs/api-reference/responses), [streaming](https://platform.openai.com/docs/api-reference/responses-streaming) | [openai-responses.md](openai-responses.md) | 2026-03-05 |
-| **Anthropic Messages (Claude)** | [docs.anthropic.com/en/api/messages](https://docs.anthropic.com/en/api/messages) | [anthropic-messages.md](anthropic-messages.md) | 2026-03-05 |
-| **Google Gemini generateContent** | [ai.google.dev/gemini-api/docs](https://ai.google.dev/gemini-api/docs), [text-generation](https://ai.google.dev/gemini-api/docs/text-generation), [REST API](https://ai.google.dev/api/rest/v1beta/models/generateContent) | [google-gemini.md](google-gemini.md) | 2026-03-05 |
+| Layer | Purpose | Primary docs |
+| --- | --- | --- |
+| Official baselines | Vendor-specific facts copied from official docs, kept per protocol | `openai-responses.md`, `openai-chat-completions.md`, `anthropic-messages.md`, `google-gemini.md` |
+| Capability diffs | Cross-provider comparison of official surface coverage, degradations, and proxy guidance for features that do not map 1:1 | `overview.md`, `capabilities/`, `matrices/` |
+| Versioned audits | Date-stamped refresh notes, change detection, and implementation risk calls | `audits/2026-04-16-spec-refresh.md` |
 
-## Version and date
+## Reading order
 
-- **Capture date:** 2026-03-05  
-- **Purpose:** Stable reference for proxy translation and mock servers.  
-- **Updates:** When updating a baseline, note the new capture date and any API version (e.g. OpenAI API version, Anthropic `anthropic-version`) in the baseline file header.
+| If you need to... | Start here | Then read |
+| --- | --- | --- |
+| Understand the doc set | [`overview.md`](overview.md) | The relevant capability note under [`capabilities/`](capabilities/) |
+| Check vendor wire facts | The vendor baseline file | The matching matrix under [`matrices/`](matrices/) |
+| Refresh docs after upstream changes | This README | The newest file under [`audits/`](audits/) |
+| Get the shortest compatibility summary | [`../protocol-compatibility-matrix.md`](../protocol-compatibility-matrix.md) | [`matrices/provider-capability-matrix.md`](matrices/provider-capability-matrix.md) |
 
-## Usage
+## Update rules
 
-- **Implementation:** Use baselines to align request/response translation in `translate.rs` and `streaming.rs`.  
-- **Mocks:** Use baselines to keep `tests/common/mock_upstream.rs` in line with official request/response and streaming formats.  
-- **Changes:** If a provider changes their API, update the corresponding baseline and the proxy code, then re-run integration tests.
+1. Keep official baseline files vendor-specific and factual. Do not turn them into cross-provider comparison docs.
+2. Put semantic differences, degradations, and proxy guidance in `capabilities/` or `matrices/`, not in vendor baselines.
+3. In summary tables, keep provider-surface facts separate from portability judgments. Provider cells should answer "is this officially documented here?"; notes or mapping-status columns should answer "is it portable?"
+4. Every refresh gets a new dated audit file under `audits/`. Do not silently overwrite an older audit summary.
+5. When a vendor baseline changes meaningfully, update `overview.md` and the affected matrix files in the same change.
+6. Treat `snapshots/` as immutable evidence for the capture that produced them. Add new snapshots in a separate refresh, never rewrite an old capture.
+7. If a feature exists only in a guide, beta surface, or model-specific page, label it that way instead of presenting it as a universal protocol guarantee.
+8. During a staged refresh, snapshot files may land before the matching vendor baseline text is rewritten. That is acceptable; keep the overview, matrices, and audit date-aware without assuming every layer has the same capture date mid-refresh.

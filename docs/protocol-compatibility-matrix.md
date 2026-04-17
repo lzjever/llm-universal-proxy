@@ -1,122 +1,35 @@
 # Protocol Compatibility Matrix
 
-- Sources:
-  - OpenAI Responses API: https://platform.openai.com/docs/api-reference/responses/object
-  - OpenAI Chat Completions API: https://platform.openai.com/docs/api-reference/chat/create
-  - Anthropic Messages API: https://docs.anthropic.com/en/api/messages
-  - Anthropic stop reasons: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
-- Purpose: document field-level mappings, intentional degradations, and known non-1:1 cases across the proxy's three primary chat protocols.
-- Updated: 2026-04-07
+- Status: active summary
+- Last refreshed: 2026-04-16
+- Scope: short entrypoint into the detailed compatibility docs
 
-## Legend
+This file is now the short compatibility front door. Detailed provider comparisons live under [`protocol-baselines/matrices/`](protocol-baselines/matrices/) and the dated refresh audit lives under [`protocol-baselines/audits/`](protocol-baselines/audits/).
 
-| Status | Meaning |
-|--------|---------|
-| Exact | Proxy preserves semantics closely enough for downstream behavior to match. |
-| Approx | Proxy preserves the most important downstream behavior, but the wire shape or provider semantics differ. |
-| Unsupported | No safe 1:1 mapping exists today; the proxy drops or degrades the field and this is intentional. |
+Status cells in the quick matrix answer whether the capability is officially documented on that provider surface. Portability and downgrade guidance live in the linked detailed docs.
 
-## Request fields
+## Quick matrix
 
-| Feature | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Proxy behavior | Status | Notes |
-|--------|-------------------|-------------------------|--------------------|----------------|--------|-------|
-| Basic text input | `input` string or items | `messages` | `messages` plus top-level `system` | Mapped both directions through the chat pivot | Exact | Main conversation path. |
-| System instructions | `instructions` | `system` role message | top-level `system` | Responses `instructions` maps to Chat `system`, then to Anthropic `system` | Approx | Anthropic system is top-level, not a message role. |
-| Function tools | `tools` with function tool definitions | `tools[].function` | `tools[].name/input_schema` | Function tools only are mapped across all three | Approx | Non-function tools are not portable. |
-| Built-in / non-function tools | Responses built-ins like web search, shell, MCP-related tools | Not native in Chat Completions | Anthropic server tools have different shapes | Dropped when converting into Chat/Anthropic request formats | Unsupported | Proxy avoids emitting invalid request shapes. |
-| Tool choice: auto | `tool_choice: "auto"` | `tool_choice: "auto"` | `tool_choice: { "type": "auto" }` | Mapped | Exact | |
-| Tool choice: none | `tool_choice: "none"` | `tool_choice: "none"` | `tool_choice: { "type": "none" }` | Mapped | Exact | |
-| Tool choice: required / any | `tool_choice: "required"` | `tool_choice: "required"` | `tool_choice: { "type": "any" }` | Mapped | Approx | Anthropic uses `any` rather than `required`. |
-| Tool choice: force one function | Responses function choice object | Chat `tool_choice.type=function` | Anthropic `tool_choice.type=tool` | Mapped by function name | Approx | Only function-name forcing is preserved. |
-| `parallel_tool_calls` | Supported | Partially supported in Chat ecosystems | Anthropic uses `disable_parallel_tool_use` | `false` maps to Anthropic `disable_parallel_tool_use: true` when tool choice is present | Approx | Only the "disable parallel calls" intent is preserved. |
-| `max_output_tokens` / `max_tokens` | `max_output_tokens` | `max_tokens` | `max_tokens` | Mapped | Exact | |
-| `previous_response_id` | Supported | Not supported | Not supported | Dropped when leaving Responses | Unsupported | Cannot be reconstructed from stateless Chat or Anthropic requests. |
-| `store` | Supported | Chat-compatible OpenAI implementations may support it | Not portable | Preserved inside OpenAI-style translations; dropped when leaving the OpenAI family | Approx | Anthropic and Gemini have no equivalent storage semantics. |
-| `metadata` | Supported | Supported by many OpenAI-style implementations | Anthropic request metadata exists | Preserved for OpenAI -> Anthropic; Anthropic -> OpenAI may be dropped when targeting compatibility-sensitive OpenAI-style upstreams | Approx | There is still no universal cross-provider metadata contract, and some OpenAI-compatible providers reject Anthropic-style metadata passthrough. |
-| `truncation` | Supported | No exact equivalent | No exact equivalent | Dropped when leaving Responses | Unsupported | The runtime truncation policy cannot be reproduced in other protocols. |
-| `reasoning` request config | Supported | Provider-specific | Provider-specific extended thinking knobs | Dropped when crossing protocols | Unsupported | Only reasoning output usage is mapped today, not request policy. |
-| `include` | Supported | Not equivalent | Not equivalent | Dropped when leaving Responses | Unsupported | Some included fields have no Chat or Anthropic representation. |
-| `max_tool_calls` | Supported | No direct equivalent | No direct equivalent | Dropped when leaving Responses | Unsupported | Downstream cannot enforce the same global built-in-tool cap. |
+| Capability | OpenAI Responses | OpenAI Chat | Anthropic Messages | Gemini `generateContent` | Where to read more |
+| --- | --- | --- | --- | --- | --- |
+| Core text conversation | Native | Native | Native | Native | [`overview.md`](protocol-baselines/overview.md) |
+| Function calling | Native | Native | Native | Native | [`tools.md`](protocol-baselines/capabilities/tools.md) |
+| Hosted / server tools | Native | No official surface | Native | Native | [`tools.md`](protocol-baselines/capabilities/tools.md) |
+| Reasoning controls and output | Native | Limited | Native | Native | [`reasoning.md`](protocol-baselines/capabilities/reasoning.md) |
+| Prompt / context caching | Native | Native | Native | Native | [`cache.md`](protocol-baselines/capabilities/cache.md) |
+| Streaming delivery | Native | Native | Native | Native | [`streaming.md`](protocol-baselines/capabilities/streaming.md) |
+| Rich typed streaming lifecycle | Native | Limited | Native | No official surface | [`streaming.md`](protocol-baselines/capabilities/streaming.md) |
+| Provider-managed conversation state | Native | No official surface | Guide/Beta | No official surface | [`state-continuity.md`](protocol-baselines/capabilities/state-continuity.md) |
 
-## Response fields and statuses
+## Detailed docs
 
-| Feature | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Proxy behavior | Status | Notes |
-|--------|-------------------|-------------------------|--------------------|----------------|--------|-------|
-| Text output | `output[].message.content[].output_text` | `choices[].message.content` | `content[].text` | Mapped | Exact | |
-| Reasoning output | `output[].reasoning.summary[]` | `reasoning_content` side channel | `thinking` blocks | Mapped as summarized reasoning text | Approx | Encrypted / rich reasoning metadata is not preserved. |
-| Function call output | `function_call` / `function_call_output` items | `tool_calls` / `tool` role | `tool_use` / `tool_result` blocks | Mapped | Approx | Function tools only. |
-| Usage: input/output/total | `input_tokens`, `output_tokens`, `total_tokens` | `prompt_tokens`, `completion_tokens`, `total_tokens` | `input_tokens`, `output_tokens` | Mapped | Exact | |
-| Usage: cached tokens | `input_tokens_details.cached_tokens` | `prompt_tokens_details.cached_tokens` | `cache_read_input_tokens` / `cache_creation_input_tokens` | Mapped to best available equivalent | Approx | Anthropic cache creation and cache read do not collapse perfectly into one Responses field. |
-| Usage: reasoning tokens | `output_tokens_details.reasoning_tokens` | `completion_tokens_details.reasoning_tokens` | No exact equivalent in base Messages API | Mapped where present | Approx | Anthropic may not provide the same split. |
-| Completed status | `status: completed` / `response.completed` | `finish_reason: stop` | `stop_reason: end_turn` | Mapped | Exact | |
-| Incomplete due to length | `status: incomplete`, `reason: max_output_tokens` | `finish_reason: length` | `stop_reason: max_tokens` | Mapped | Exact | Responses now emits `response.incomplete` in streaming conversions. |
-| Incomplete due to filtering | `status: incomplete`, `reason: content_filter` | `finish_reason: content_filter` | `stop_reason: refusal` is nearest semantic equivalent | Mapped to incomplete/content filter | Approx | Anthropic refusal is not identical to OpenAI content filtering, but this preserves downstream guardrail handling better than `stop`. |
-| Context window exceeded | `response.failed` with `error.code=context_length_exceeded` | HTTP/context error or synthetic `finish_reason` in some translated streams | `stop_reason: model_context_window_exceeded` in successful responses | Proxy normalizes to Responses failure and OpenAI-style context error semantics | Approx | Anthropic treats this as a successful stop reason; proxy upgrades it into an explicit downstream error because Codex and similar clients need that behavior. |
-| Provider startup error before SSE body | `response.failed` | HTTP error | HTTP error | Proxy synthesizes Responses `response.failed` for Responses clients | Approx | Improves downstream compatibility for Codex. |
-| `response.failed` from Responses upstream | Explicit failed event | No exact streaming error event | No exact equivalent | Proxy converts to a final OpenAI completion chunk with best-effort finish reason | Approx | Best effort for non-Responses clients. |
-| `response.incomplete` from Responses upstream | Explicit incomplete event | Final chunk with `finish_reason=length/content_filter` | Final Claude stop reason | Proxy maps to best-effort finish reason | Approx | Preserves truncation/filter behavior for downstream consumers. |
-| `pause_turn` | Not a native Responses completion state | Chat `finish_reason` can carry a custom terminal reason | Anthropic successful stop reason for server-tool loops | Preserved as `finish_reason: "pause_turn"` in Chat and downgraded to Responses `status: incomplete`, `reason: "pause_turn"` | Approx | This keeps downstream loops from treating the turn as fully completed, but it still is not a full resume protocol. |
-| Responses lifecycle routes | `GET/DELETE /responses/{id}`, `POST /responses/{id}/cancel`, `POST /responses/compact` | Not native | Not native | Forward only when the proxy can uniquely determine a native Responses upstream from the current request context | Approx | The proxy does not invent response-to-upstream state. |
+| Need | Doc |
+| --- | --- |
+| One-page provider comparison | [`protocol-baselines/matrices/provider-capability-matrix.md`](protocol-baselines/matrices/provider-capability-matrix.md) |
+| High-risk field mappings | [`protocol-baselines/matrices/field-mapping-matrix.md`](protocol-baselines/matrices/field-mapping-matrix.md) |
+| Vendor-specific facts | [`protocol-baselines/README.md`](protocol-baselines/README.md) |
+| Latest refresh and implementation risks | [`protocol-baselines/audits/2026-04-16-spec-refresh.md`](protocol-baselines/audits/2026-04-16-spec-refresh.md) |
 
-## Streaming event lifecycle
+## Current compatibility posture
 
-| Feature | Proxy behavior | Status | Notes |
-|--------|----------------|--------|-------|
-| Responses child `response_id` | Emitted on child events | Exact | Added for Codex compatibility. |
-| Function call event metadata | `call_id` and `name` preserved on delta/done events | Exact | |
-| Text part annotations | Empty `annotations: []` emitted on text parts | Approx | Matches common OpenAI Responses examples. |
-| `response.completed` usage details | `total_tokens`, cached tokens, reasoning tokens preserved | Exact | |
-| `response.incomplete` emission | Emitted for `length`, `content_filter`, and `pause_turn` finishes | Approx | `pause_turn` is represented as incomplete to avoid a false `completed` terminal state. |
-| `response.failed` emission for Anthropic context overflows | Emitted | Approx | Upstream Anthropic stop reason is upgraded into an error event. |
-| Compatibility downgrade visibility | `x-proxy-compat-warning` response headers and server logs | Approx | Emitted when the proxy drops or approximates request fields such as `previous_response_id`, `truncation`, or non-function Responses tools. |
-
-## Important non-1:1 differences
-
-| Source feature | Why no exact mapping exists | Proxy fallback |
-|---------------|-----------------------------|----------------|
-| `previous_response_id` | Responses supports stateful response chaining; Chat and Anthropic are stateless request formats | Drop field when leaving Responses; caller must inline prior context explicitly. |
-| Responses lifecycle routing in multi-upstream namespaces | Retrieve/delete/cancel requests do not carry a routable model, and the proxy does not persist response-to-upstream session state | Fail clearly unless the current request context already identifies one native Responses upstream. |
-| `store` | Persistence model is provider-specific outside the OpenAI family | Preserve within OpenAI-style translations; drop for Anthropic and Gemini. |
-| Responses built-in tools | Chat Completions and Anthropic tool schemas are not the same API surface | Keep function tools only; drop built-ins on cross-protocol translation. |
-| `truncation` | Provider-side context management policy cannot be reproduced in another protocol | Drop field and rely on downstream model/provider defaults. |
-| Anthropic `pause_turn` | It is a workflow control signal, not a normal completion state | Preserve `finish_reason: "pause_turn"` in the Chat pivot and emit Responses `incomplete.reason="pause_turn"` so downstream clients do not confuse it with a normal completion. |
-| Anthropic `refusal` | Closest OpenAI equivalent is `content_filter`, but semantics are not identical | Map to `content_filter` because downstream safety handling is closer. |
-
-## Current pragmatic mappings
-
-- `Responses parallel_tool_calls=false` -> `Anthropic tool_choice.disable_parallel_tool_use=true` when a Claude tool choice object is emitted.
-- `Anthropic model_context_window_exceeded` -> OpenAI / Responses context-window error semantics, because downstream tools like Codex need an explicit overflow signal instead of a superficially successful completion.
-- `Anthropic refusal` -> OpenAI `content_filter` / Responses `incomplete.reason=content_filter`, because downstream safety handling is closer to filtering than to natural completion.
-- `Anthropic pause_turn` -> OpenAI Chat `finish_reason=pause_turn` -> Responses `status=incomplete`, `reason=pause_turn`, because that preserves the "not actually done yet" behavior without inventing an unsupported Responses success state.
-- `OpenAI content_filter` -> Anthropic `refusal`.
-- `OpenAI context_length_exceeded` -> Anthropic `model_context_window_exceeded`.
-
-## Operational guidance
-
-- Prefer passthrough whenever the client and upstream both speak the same protocol.
-- For Codex and other Responses-native clients, normalize hard failures into `response.failed` and truncations into `response.incomplete`; downstream behavior is better than returning a superficially successful `response.completed`.
-- When a field is dropped intentionally, prefer documenting it over inventing unsupported wire shapes.
-- When a request requires degradation, inspect `x-proxy-compat-warning` response headers or server logs; the proxy emits one warning per dropped or approximated feature.
-- For Codex custom model slugs that are not in Codex's built-in model registry, avoid fallback metadata by passing explicit launch-time overrides such as `-c 'model_context_window=128000'` and `-c 'model_auto_compact_token_limit=110000'`.
-- Codex fallback metadata currently assumes `context_window=272000`, `effective_context_window_percent=95`, and `auto_compact_token_limit=None`. That fallback can make context status and auto-compaction timing drift far from the upstream model's real limits.
-- `model_context_window` and `model_auto_compact_token_limit` are independent controls:
-  - `model_context_window` tells Codex how large the model window is.
-  - `model_auto_compact_token_limit` is the absolute total-token threshold that actually triggers automatic compaction.
-- For proxy-backed custom models, set `model_auto_compact_token_limit` to roughly `85%` to `92%` of the real upstream window unless you have provider-specific evidence that a tighter or looser threshold is safe.
-
-## Codex compaction semantics with custom providers
-
-- Codex has two distinct compaction implementations:
-  - remote compaction through the official OpenAI `/responses/compact` endpoint
-  - local inline compaction that asks the current model to summarize history
-- The remote path is only selected when Codex believes the provider is the built-in OpenAI provider.
-- A custom provider that exposes a Responses-compatible endpoint through this proxy still uses Codex's local inline compaction path.
-
-Implications for this proxy:
-
-- Compaction quality is model-dependent because the routed upstream model generates the summary.
-- Auto-compaction timing is sensitive to `usage` translation quality. Incorrect token mapping can delay or suppress compaction.
-- Post-compaction turns are especially sensitive to protocol normalization. Codex may inject compacted summaries back into the transcript as `developer/system` or user-summary content, and the proxy must keep those messages valid for the target upstream protocol.
-- The proxy does not own or persist Codex's compaction state. It only translates the client-visible transcript produced by Codex.
-
-Operationally, this means proxy-backed Codex compaction is best treated as "local summary compaction over a translated protocol bridge", not as an exact replica of official OpenAI-hosted Codex compaction behavior.
+The proxy should treat function calling and explicit transcript replay as the common denominator. Hosted tools, provider-managed state, compaction, and cache-control semantics are increasingly vendor-specific and should be preserved only on same-provider paths or documented as intentional degradations.

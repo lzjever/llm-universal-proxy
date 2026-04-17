@@ -1,0 +1,136 @@
+{
+  "vendor": "anthropic",
+  "captured_at_utc": "2026-04-17T07:04:42Z",
+  "captured_at_local": "2026-04-17T00:04:42-07:00",
+  "capture_timezone": "America/Los_Angeles",
+  "snapshot_bucket": "2026-04-16",
+  "snapshot_bucket_note": "This capture completed just after local midnight and remains in the 2026-04-16 bucket because the collection workflow grouped it with the rest of that day's snapshot batch.",
+  "stable_headers": {
+    "x-api-key": "required",
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json"
+  },
+  "beta_notes": [
+    "context_management requires context-management-2025-06-27",
+    "Files API uploads with code execution require files-api-2025-04-14",
+    "model_context_window_exceeded is default on Sonnet 4.5+ and beta-gated on older models via model-context-window-exceeded-2025-08-26",
+    "search_result content blocks are GA; search-results-2025-06-09 is no longer required",
+    "fine-grained tool streaming launched in beta with fine-grained-tool-streaming-2025-05-14 and is described as GA in current docs"
+  ],
+  "source_urls": [
+    "https://docs.anthropic.com/en/api/beta-headers",
+    "https://docs.anthropic.com/en/docs/build-with-claude/citations",
+    "https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/code-execution-tool",
+    "https://docs.claude.com/en/docs/build-with-claude/context-editing",
+    "https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking",
+    "https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/fine-grained-tool-streaming",
+    "https://docs.anthropic.com/en/api/handling-stop-reasons",
+    "https://docs.anthropic.com/en/api/messages",
+    "https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching",
+    "https://docs.anthropic.com/en/release-notes/api",
+    "https://docs.anthropic.com/en/docs/build-with-claude/search-results",
+    "https://docs.anthropic.com/en/api/service-tiers",
+    "https://docs.anthropic.com/en/docs/build-with-claude/streaming",
+    "https://docs.anthropic.com/en/docs/build-with-claude/token-counting",
+    "https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/implement-tool-use",
+    "https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-search-tool"
+  ],
+  "sources": [
+    {
+      "source_url": "https://docs.anthropic.com/en/api/beta-headers",
+      "snapshot_file": "anthropic-beta-headers.html",
+      "size_bytes": 323606,
+      "sha256": "74cca17d426d5ca7cf28c71e435d3244354b672248ce595040a1a838bed65121"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/build-with-claude/citations",
+      "snapshot_file": "anthropic-citations.html",
+      "size_bytes": 575692,
+      "sha256": "220bb4adb1120c7a8a40b4251f58d6b79e9b67b49b9fc8ac354fc586b764ee23"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/code-execution-tool",
+      "snapshot_file": "anthropic-code-execution-tool.html",
+      "size_bytes": 1088932,
+      "sha256": "33e025b4273c512e045bc336e3991a974726049b649d1524f0297924cc910fa4"
+    },
+    {
+      "source_url": "https://docs.claude.com/en/docs/build-with-claude/context-editing",
+      "snapshot_file": "anthropic-context-editing.html",
+      "size_bytes": 1313536,
+      "sha256": "964d8f78159e5abb23864159dcbb2f3730a74735397ec765ee410ca839f1b7c9"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking",
+      "snapshot_file": "anthropic-extended-thinking.html",
+      "size_bytes": 2091324,
+      "sha256": "dfab39d5f533d5a95476b6766dd859a8eefeff4a12543478dfd7ba5fe152e10c"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/fine-grained-tool-streaming",
+      "snapshot_file": "anthropic-fine-grained-tool-streaming.html",
+      "size_bytes": 426776,
+      "sha256": "74fdb8184828cba5967484ac2bb56e4c21c6a9d9c1d13b1bb805b80c88d6e626"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/api/handling-stop-reasons",
+      "snapshot_file": "anthropic-handling-stop-reasons.html",
+      "size_bytes": 743066,
+      "sha256": "6feaf6f42c6d09d88aba5bd51455fbaf3c599906c388da8018203c7b625846bd"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/api/messages",
+      "snapshot_file": "anthropic-messages-api.html",
+      "size_bytes": 228203,
+      "sha256": "0b52e517cb86925be7bf7ae6dac4cc865a8a7ad6b6f38d94719c57d600cdf13d"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching",
+      "snapshot_file": "anthropic-prompt-caching.html",
+      "size_bytes": 1434968,
+      "sha256": "8d1eb9d799565108c80b61f8f94c23961185c819f8c50c65eb68bdc6502d7780"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/release-notes/api",
+      "snapshot_file": "anthropic-release-notes-api.html",
+      "size_bytes": 710092,
+      "sha256": "27e21af893ac01185da763642c83f879bfae1a278a0b2b79011c31299c17880d"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/build-with-claude/search-results",
+      "snapshot_file": "anthropic-search-results.html",
+      "size_bytes": 978657,
+      "sha256": "d878120c428ed73816fbd04b1784b2a522a6dc393d8d33f04003dc15a3e6f4de"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/api/service-tiers",
+      "snapshot_file": "anthropic-service-tiers.html",
+      "size_bytes": 325869,
+      "sha256": "78938e58d3147cbe77e1b2180a9b035fc26c91b6f0c11c3a3d0a27e9adf60ccb"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/build-with-claude/streaming",
+      "snapshot_file": "anthropic-streaming.html",
+      "size_bytes": 1232244,
+      "sha256": "0ac01e69d1091679782cee25344e39c69fc8c10662a9e0d034dab67d9bdf94d7"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/build-with-claude/token-counting",
+      "snapshot_file": "anthropic-token-counting.html",
+      "size_bytes": 858723,
+      "sha256": "1d87b92591867da2df3ba375f3b05ad73b62d15a9ec402179ef172112dc721b1"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/implement-tool-use",
+      "snapshot_file": "anthropic-tool-use.html",
+      "size_bytes": 558561,
+      "sha256": "4579b15fa8be038aa23a579b32cd5f51d38447a5d80e080cc843f76b9cf68144"
+    },
+    {
+      "source_url": "https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-search-tool",
+      "snapshot_file": "anthropic-web-search-tool.html",
+      "size_bytes": 590908,
+      "sha256": "25bc761faa326f2238430d64568288272b17d12f5e97ef5d989bbbad4f183ed8"
+    }
+  ]
+}
