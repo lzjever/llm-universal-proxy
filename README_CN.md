@@ -83,29 +83,45 @@ make run-release  # 构建并以 release 模式运行
 make test-binary-smoke
 ```
 
-## 真实 CLI 端到端脚本
+## 真实客户端矩阵
 
-仓库内还提供了一个真实客户端 E2E 脚本：[scripts/test_cli_clients.sh](/home/percy/works/mbos-v1/llm-universal-proxy/scripts/test_cli_clients.sh)。它会直接调用真实的 `codex` 和 `claude` CLI，通过多个上游别名来验证代理行为。
+正式的自动化真实客户端矩阵以 `scripts/real_cli_matrix.py` 为主入口。它会先基于 `proxy-test-minimax-and-local.yaml` 派生一份临时运行时配置，再通过代理驱动真实的 `codex`、`claude`、`gemini` CLI。
 
 常用方式：
 
 ```bash
 cargo build --release
-bash scripts/test_cli_clients.sh
+python3 scripts/real_cli_matrix.py
 ```
 
-按子集运行：
+兼容 shim 入口：
 
 ```bash
-bash scripts/test_cli_clients.sh --test codex
-bash scripts/test_cli_clients.sh --test claude
+bash scripts/test_cli_clients.sh --list-matrix
+```
+
+这个 runner 会负责：
+- 使用 runner 管理的 home/config 目录和每次运行单独注入的环境变量隔离用户全局配置，避免改写你平时使用的 Codex、Claude Code、Gemini CLI 配置；其中 Gemini 会在 reports root 下复用一份由 runner 管理的 home/cache，而不是回退到你平时的用户目录。
+- 在 `test-reports/cli-matrix/<timestamp>/` 下输出带时间戳的矩阵报告目录，并在运行结束时打印最终路径。
+- 使用 `--list-matrix` 列出 cases，使用 `--case <case-id>` 精确挑选指定行（可重复传入），使用 `--skip-slow` 跳过长时程任务，使用 `--proxy-only` 只启动代理并等待。
+- 可通过 `python3 scripts/real_cli_matrix.py --help` 查看当前 checkout 支持的完整参数集合。
+
+兼容层说明：
+- `scripts/test_cli_clients.sh` 是给旧流程和包装脚本保留的兼容 shim。它会直接转发到 `scripts/real_cli_matrix.py`，所以两种入口支持同一组参数。
+- 常见入口示例：
+
+```bash
+python3 scripts/real_cli_matrix.py --list-matrix
+python3 scripts/real_cli_matrix.py --case <case-id>
+bash scripts/test_cli_clients.sh --skip-slow
 bash scripts/test_cli_clients.sh --proxy-only
 ```
 
 说明：
-- 脚本要求本地存在可用的 `proxy-test-minimax-and-local.yaml`，其中需配置真实上游凭证。
-- Claude Code 测试使用临时 `CLAUDE_CONFIG_DIR`，不会修改你的全局 `~/.claude/settings.json`。
-- 多轮代码修复任务会显式跳过本地 `qwen-local` 那一格，因为该模型在这类任务上还不够稳定。
+- `proxy-test-minimax-and-local.yaml` 是这套矩阵的源配置。runner 会从它派生临时运行时配置，而不是原地修改该文件。
+- `.env.test` 只是可选的本地输入文件，不应提交到仓库。若文件存在，runner 只会把它加载到代理子进程中；这些变量不会变成持久 shell 环境，也不会被当成用户全局 CLI 配置源。需要时可用 `--env-file` 指向其他 dotenv 文件。
+- `qwen-local` 属于可选覆盖项。只有同时配置了 `LOCAL_QWEN_BASE_URL` 和 `LOCAL_QWEN_MODEL` 时，这条 lane 才会启用；否则会被跳过。即使启用，默认矩阵也只把它用于 smoke 覆盖，并会排除长时程代码编辑类 fixture。
+- 这套矩阵用于验证“真实 CLI 端到端行为”。如果你只想验证更低层的协议/HTTP 路径，而不启动真实 CLI，请使用下面介绍的 `scripts/real_endpoint_matrix.py`。
 
 ## 配置
 
@@ -514,7 +530,7 @@ gemini --prompt 'Reply with exactly: gemini-ok' \
 
 ### 真实上游 Smoke 矩阵
 
-仓库里带了一个真实 smoke 脚本，可通过代理联调 Anthropic 兼容和 OpenAI 兼容上游：
+仓库里还带了一个更低层的协议/HTTP smoke 脚本，可通过代理联调 Anthropic 兼容和 OpenAI 兼容上游，但不会启动真实 CLI：
 
 ```bash
 GLM_APIKEY="你的真实 Key" python3 scripts/real_endpoint_matrix.py

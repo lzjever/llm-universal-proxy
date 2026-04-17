@@ -148,29 +148,45 @@ Typical flow:
 make test-binary-smoke
 ```
 
-## Real CLI E2E Smoke Script
+## Real Client Matrix
 
-The repo also includes a real-client E2E script at [scripts/test_cli_clients.sh](/home/percy/works/mbos-v1/llm-universal-proxy/scripts/test_cli_clients.sh). It exercises the proxy with actual `codex` and `claude` CLI processes against multiple upstream aliases.
+The formal automated real-client matrix uses `scripts/real_cli_matrix.py` as the main entrypoint. It starts a proxy runtime config derived from `proxy-test-minimax-and-local.yaml`, then drives real `codex`, `claude`, and `gemini` CLI processes through the proxy.
 
 Typical flow:
 
 ```bash
 cargo build --release
-bash scripts/test_cli_clients.sh
+python3 scripts/real_cli_matrix.py
 ```
 
-Useful subsets:
+Compatibility shim:
 
 ```bash
-bash scripts/test_cli_clients.sh --test codex
-bash scripts/test_cli_clients.sh --test claude
+bash scripts/test_cli_clients.sh --list-matrix
+```
+
+What this runner does:
+- Isolates user-global CLI state with runner-managed home/config directories and per-run env overrides so your normal Codex, Claude Code, and Gemini CLI settings are not rewritten; Gemini keeps a runner-managed home/cache under the reports root instead of reusing your normal profile.
+- Writes a timestamped report directory under `test-reports/cli-matrix/<timestamp>/` and prints the resolved report path at the end of the run.
+- Uses `--list-matrix` to enumerate cases, `--case <case-id>` to target specific rows (repeatable), `--skip-slow` to skip long-horizon tasks, and `--proxy-only` to start the proxy and wait.
+- `python3 scripts/real_cli_matrix.py --help` shows the full current flag set.
+
+Legacy compatibility:
+- `scripts/test_cli_clients.sh` is the compatibility shim for older local flows and wrappers. It forwards directly to `scripts/real_cli_matrix.py`, so the same flags work through either entrypoint.
+- Common entrypoint examples:
+
+```bash
+python3 scripts/real_cli_matrix.py --list-matrix
+python3 scripts/real_cli_matrix.py --case <case-id>
+bash scripts/test_cli_clients.sh --skip-slow
 bash scripts/test_cli_clients.sh --proxy-only
 ```
 
 Notes:
-- The script expects a local `proxy-test-minimax-and-local.yaml` file with working upstream credentials.
-- Claude Code tests use a temporary `CLAUDE_CONFIG_DIR`, so your global `~/.claude/settings.json` is not modified.
-- Multi-turn code-edit tests intentionally skip the local `qwen-local` alias where the model is not reliable enough for that task.
+- `proxy-test-minimax-and-local.yaml` is the source config for this matrix. The runner derives a temporary runtime config from it instead of editing the file in place.
+- `.env.test` is optional local developer input only and should not be committed. When present, the runner loads it into the proxy subprocess only; it does not become persistent shell state or a shared global client config. Use `--env-file` to point at a different dotenv file.
+- `qwen-local` is optional coverage. It is enabled only when `LOCAL_QWEN_BASE_URL` and `LOCAL_QWEN_MODEL` are both configured; otherwise that lane is skipped. When enabled, the default matrix still limits it to smoke coverage and excludes long-horizon code-edit fixtures.
+- Use this matrix for real end-to-end CLI behavior. For lower-level protocol/HTTP smoke without real CLI processes, use `scripts/real_endpoint_matrix.py` as described below.
 
 ## Configuration
 
@@ -686,7 +702,7 @@ Notes:
 
 ### Real Upstream Smoke Matrix
 
-The repository includes a real smoke script that exercises Anthropic-compatible and OpenAI-compatible upstreams through the proxy:
+The repository includes a lower-level protocol/HTTP smoke script that exercises Anthropic-compatible and OpenAI-compatible upstreams through the proxy without launching real CLI clients:
 
 ```bash
 GLM_APIKEY="your-real-key" python3 scripts/real_endpoint_matrix.py

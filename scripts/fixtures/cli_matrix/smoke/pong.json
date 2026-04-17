@@ -1,0 +1,11 @@
+{
+  "id": "smoke_pong",
+  "kind": "smoke",
+  "description": "Single-turn smoke prompt that should return PONG.",
+  "prompt": "Reply with exactly the word PONG and nothing else.",
+  "timeout_secs": 90,
+  "verifier": {
+    "type": "contains",
+    "value": "PONG"
+  }
+}
