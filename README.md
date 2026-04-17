@@ -215,6 +215,56 @@ Notes:
 - `debug_trace` records only the tail "new input" portion of each client request rather than rewriting the full accumulated conversation each turn.
 - For streaming responses, `debug_trace` records the processed client-visible result: aggregated text, reasoning text, tool-call deltas, terminal event, finish reason, and any normalized error. It does not dump raw SSE JSON lines.
 
+## Admin Control Plane
+
+Admin endpoints are intentionally separated from the data plane:
+
+- Admin routes live under `/admin/...`.
+- Admin routes do **not** inherit the proxy's global CORS policy.
+- Data-plane routes such as `/openai/v1/...` still use the permissive browser-facing CORS layer.
+
+Current admin access policy:
+
+- If `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is set, every admin request must send `Authorization: Bearer <token>`.
+- If `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is not set, admin access is limited to loopback clients only (`127.0.0.1` / `::1`).
+
+Current admin endpoints:
+
+- `GET /admin/state`
+- `GET /admin/namespaces/:namespace/state`
+- `POST /admin/namespaces/:namespace/config`
+
+Write/read model boundary:
+
+- `POST /admin/namespaces/:namespace/config` keeps the existing runtime config input shape.
+- Admin read endpoints use a separate redacted view model and never serialize the internal `Config` directly.
+- Admin state responses never return upstream `fallback_credential_actual` or hook `authorization` secrets in plaintext.
+- Redacted state exposes boolean presence flags instead, such as `fallback_credential_configured` and `authorization_configured`.
+
+Example:
+
+```json
+{
+  "namespace": "demo",
+  "revision": "rev-1",
+  "config": {
+    "upstreams": [
+      {
+        "name": "default",
+        "fallback_credential_env": "OPENAI_API_KEY",
+        "fallback_credential_configured": true
+      }
+    ],
+    "hooks": {
+      "exchange": {
+        "url": "https://example.com/hooks/exchange",
+        "authorization_configured": true
+      }
+    }
+  }
+}
+```
+
 ### Full YAML Reference
 
 ```yaml

@@ -202,6 +202,62 @@ pub struct RuntimeConfigSnapshot {
     pub config: RuntimeConfigPayload,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdminModelAliasView {
+    pub upstream_name: String,
+    pub upstream_model: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdminHookEndpointView {
+    pub url: String,
+    pub authorization_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdminHeaderValueView {
+    pub name: String,
+    pub value: Option<String>,
+    pub value_redacted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdminHookConfigView {
+    pub max_pending_bytes: usize,
+    pub timeout_secs: u64,
+    pub failure_threshold: usize,
+    pub cooldown_secs: u64,
+    pub exchange: Option<AdminHookEndpointView>,
+    pub usage: Option<AdminHookEndpointView>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdminDebugTraceConfigView {
+    pub path: Option<String>,
+    pub max_text_chars: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdminUpstreamConfigView {
+    pub name: String,
+    pub api_root: String,
+    pub fixed_upstream_format: Option<UpstreamFormat>,
+    pub fallback_credential_env: Option<String>,
+    pub fallback_credential_configured: bool,
+    pub auth_policy: AuthPolicy,
+    pub upstream_headers: Vec<AdminHeaderValueView>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdminConfigView {
+    pub listen: String,
+    pub upstream_timeout_secs: u64,
+    pub upstreams: Vec<AdminUpstreamConfigView>,
+    pub model_aliases: BTreeMap<String, AdminModelAliasView>,
+    pub hooks: AdminHookConfigView,
+    pub debug_trace: AdminDebugTraceConfigView,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct FileConfig {
     #[serde(default = "default_listen")]
@@ -394,6 +450,12 @@ impl Config {
                     upstream.name
                 ));
             }
+            if url_has_userinfo(&parsed) {
+                return Err(format!(
+                    "upstream `{}` api_root must not include userinfo",
+                    upstream.name
+                ));
+            }
             if upstream.fallback_credential_env.is_some()
                 && upstream.fallback_credential_actual.is_some()
             {
@@ -471,6 +533,9 @@ impl Config {
                     hook_name, scheme
                 ));
             }
+        }
+        if url_has_userinfo(&parsed) {
+            return Err(format!("{} hook url must not include userinfo", hook_name));
         }
         Ok(())
     }
@@ -626,6 +691,134 @@ impl From<&Config> for RuntimeConfigPayload {
     }
 }
 
+impl From<&Config> for AdminConfigView {
+    fn from(value: &Config) -> Self {
+        Self {
+            listen: value.listen.clone(),
+            upstream_timeout_secs: value.upstream_timeout.as_secs(),
+            upstreams: value
+                .upstreams
+                .iter()
+                .map(|item| AdminUpstreamConfigView {
+                    name: item.name.clone(),
+                    api_root: sanitize_url_for_admin(&item.api_root),
+                    fixed_upstream_format: item.fixed_upstream_format,
+                    fallback_credential_env: item.fallback_credential_env.clone(),
+                    fallback_credential_configured: item.fallback_credential_actual.is_some()
+                        || item.fallback_api_key.is_some(),
+                    auth_policy: item.auth_policy,
+                    upstream_headers: item
+                        .upstream_headers
+                        .iter()
+                        .map(|(name, value)| admin_header_view(name, value))
+                        .collect(),
+                })
+                .collect(),
+            model_aliases: value
+                .model_aliases
+                .iter()
+                .map(|(alias, model)| {
+                    (
+                        alias.clone(),
+                        AdminModelAliasView {
+                            upstream_name: model.upstream_name.clone(),
+                            upstream_model: model.upstream_model.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            hooks: AdminHookConfigView {
+                max_pending_bytes: value.hooks.max_pending_bytes,
+                timeout_secs: value.hooks.timeout.as_secs(),
+                failure_threshold: value.hooks.failure_threshold,
+                cooldown_secs: value.hooks.cooldown.as_secs(),
+                exchange: value
+                    .hooks
+                    .exchange
+                    .as_ref()
+                    .map(|hook| AdminHookEndpointView {
+                        url: sanitize_url_for_admin(&hook.url),
+                        authorization_configured: hook.authorization.is_some(),
+                    }),
+                usage: value
+                    .hooks
+                    .usage
+                    .as_ref()
+                    .map(|hook| AdminHookEndpointView {
+                        url: sanitize_url_for_admin(&hook.url),
+                        authorization_configured: hook.authorization.is_some(),
+                    }),
+            },
+            debug_trace: AdminDebugTraceConfigView {
+                path: value.debug_trace.path.clone(),
+                max_text_chars: value.debug_trace.max_text_chars,
+            },
+        }
+    }
+}
+
+pub(crate) fn sanitize_url_for_admin(value: &str) -> String {
+    if let Ok(mut url) = url::Url::parse(value) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        return url.to_string();
+    }
+
+    let value = strip_url_query_and_fragment(value);
+    if let Some(scheme_end) = value.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = value[authority_start..]
+            .find(['/', '?', '#'])
+            .map(|offset| authority_start + offset)
+            .unwrap_or(value.len());
+        if let Some(at_offset) = value[authority_start..authority_end].find('@') {
+            let at_index = authority_start + at_offset;
+            return format!("{}{}", &value[..authority_start], &value[at_index + 1..]);
+        }
+    }
+
+    value.to_string()
+}
+
+fn strip_url_query_and_fragment(value: &str) -> &str {
+    let cutoff = value.find(['?', '#']).unwrap_or(value.len());
+    &value[..cutoff]
+}
+
+fn admin_header_view(name: &str, value: &str) -> AdminHeaderValueView {
+    if is_sensitive_admin_header_name(name) {
+        AdminHeaderValueView {
+            name: name.to_string(),
+            value: None,
+            value_redacted: true,
+        }
+    } else {
+        AdminHeaderValueView {
+            name: name.to_string(),
+            value: Some(value.to_string()),
+            value_redacted: false,
+        }
+    }
+}
+
+fn is_sensitive_admin_header_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized == "authorization"
+        || normalized == "proxy-authorization"
+        || normalized == "cookie"
+        || normalized == "set-cookie"
+        || normalized == "x-api-key"
+        || normalized == "api-key"
+        || normalized == "apikey"
+        || normalized.contains("api-key")
+        || normalized.contains("apikey")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("credential")
+}
+
 fn default_listen() -> String {
     "0.0.0.0:8080".to_string()
 }
@@ -680,6 +873,10 @@ pub fn build_upstream_url(
             }
         }
     }
+}
+
+fn url_has_userinfo(url: &url::Url) -> bool {
+    !url.username().is_empty() || url.password().is_some()
 }
 
 /// Build a full resource URL for auxiliary upstream endpoints.
@@ -1072,5 +1269,193 @@ upstreams:
         )
         .unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_userinfo_in_upstream_api_root_and_hook_url() {
+        let upstream = Config::from_yaml_str(
+            r#"
+upstreams:
+  demo:
+    api_root: https://user:pass@example.com/v1
+    format: openai-completion
+"#,
+        )
+        .unwrap();
+        assert!(upstream.validate().is_err());
+
+        let hook = Config::from_yaml_str(
+            r#"
+hooks:
+  usage:
+    url: https://user:pass@example.com/usage
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+"#,
+        )
+        .unwrap();
+        assert!(hook.validate().is_err());
+    }
+
+    #[test]
+    fn admin_config_view_redacts_inline_credentials_hook_authorization_and_sensitive_headers() {
+        let config = Config {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout: Duration::from_secs(30),
+            upstreams: vec![UpstreamConfig {
+                name: "default".to_string(),
+                api_root: "https://user:pass@api.openai.com/v1?api_key=inline-secret#frag"
+                    .to_string(),
+                fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
+                fallback_credential_env: Some("DEMO_KEY".to_string()),
+                fallback_credential_actual: Some("inline-secret".to_string()),
+                fallback_api_key: Some("inline-secret".to_string()),
+                auth_policy: AuthPolicy::ForceServer,
+                upstream_headers: vec![
+                    ("x-tenant".to_string(), "demo".to_string()),
+                    (
+                        "authorization".to_string(),
+                        "Bearer upstream-secret".to_string(),
+                    ),
+                    (
+                        "proxy-authorization".to_string(),
+                        "Bearer proxy-secret".to_string(),
+                    ),
+                    ("cookie".to_string(), "session=secret".to_string()),
+                    ("set-cookie".to_string(), "session=secret".to_string()),
+                    ("x-service-token".to_string(), "token-secret".to_string()),
+                    ("x-client-secret".to_string(), "secret-secret".to_string()),
+                    (
+                        "x-client-credential".to_string(),
+                        "credential-secret".to_string(),
+                    ),
+                    ("x-service-apikey".to_string(), "apikey-secret".to_string()),
+                ],
+            }],
+            model_aliases: Default::default(),
+            hooks: HookConfig {
+                exchange: Some(HookEndpointConfig {
+                    url: "https://user:pass@example.com/hooks/exchange?token=exchange-secret#frag"
+                        .to_string(),
+                    authorization: Some("Bearer exchange-secret".to_string()),
+                }),
+                usage: Some(HookEndpointConfig {
+                    url: "https://example.com/hooks/usage?sig=keep-out#frag".to_string(),
+                    authorization: None,
+                }),
+                ..HookConfig::default()
+            },
+            debug_trace: DebugTraceConfig::default(),
+        };
+
+        let view = AdminConfigView::from(&config);
+        let json = serde_json::to_value(&view).unwrap();
+
+        assert_eq!(
+            view.upstreams[0].fallback_credential_env.as_deref(),
+            Some("DEMO_KEY")
+        );
+        assert!(view.upstreams[0].fallback_credential_configured);
+        assert_eq!(view.upstreams[0].api_root, "https://api.openai.com/v1");
+        assert!(
+            view.hooks
+                .exchange
+                .as_ref()
+                .unwrap()
+                .authorization_configured
+        );
+        assert_eq!(
+            view.hooks.exchange.as_ref().unwrap().url,
+            "https://example.com/hooks/exchange"
+        );
+        assert!(!view.hooks.usage.as_ref().unwrap().authorization_configured);
+        assert_eq!(view.upstreams[0].upstream_headers[0].name, "x-tenant");
+        assert_eq!(
+            view.upstreams[0].upstream_headers[0].value.as_deref(),
+            Some("demo")
+        );
+        assert!(!view.upstreams[0].upstream_headers[0].value_redacted);
+        assert_eq!(view.upstreams[0].upstream_headers[1].name, "authorization");
+        assert!(view.upstreams[0].upstream_headers[1].value.is_none());
+        assert!(view.upstreams[0].upstream_headers[1].value_redacted);
+        assert_eq!(
+            view.upstreams[0].upstream_headers[2].name,
+            "proxy-authorization"
+        );
+        assert!(view.upstreams[0].upstream_headers[2].value.is_none());
+        assert!(view.upstreams[0].upstream_headers[2].value_redacted);
+        assert_eq!(view.upstreams[0].upstream_headers[3].name, "cookie");
+        assert!(view.upstreams[0].upstream_headers[3].value.is_none());
+        assert!(view.upstreams[0].upstream_headers[3].value_redacted);
+        assert_eq!(view.upstreams[0].upstream_headers[4].name, "set-cookie");
+        assert!(view.upstreams[0].upstream_headers[4].value.is_none());
+        assert!(view.upstreams[0].upstream_headers[4].value_redacted);
+        assert_eq!(
+            view.upstreams[0].upstream_headers[5].name,
+            "x-service-token"
+        );
+        assert!(view.upstreams[0].upstream_headers[5].value.is_none());
+        assert!(view.upstreams[0].upstream_headers[5].value_redacted);
+        assert_eq!(
+            view.upstreams[0].upstream_headers[6].name,
+            "x-client-secret"
+        );
+        assert!(view.upstreams[0].upstream_headers[6].value.is_none());
+        assert!(view.upstreams[0].upstream_headers[6].value_redacted);
+        assert_eq!(
+            view.upstreams[0].upstream_headers[7].name,
+            "x-client-credential"
+        );
+        assert!(view.upstreams[0].upstream_headers[7].value.is_none());
+        assert!(view.upstreams[0].upstream_headers[7].value_redacted);
+        assert_eq!(
+            view.upstreams[0].upstream_headers[8].name,
+            "x-service-apikey"
+        );
+        assert!(view.upstreams[0].upstream_headers[8].value.is_none());
+        assert!(view.upstreams[0].upstream_headers[8].value_redacted);
+        assert!(json["upstreams"][0]
+            .get("fallback_credential_actual")
+            .is_none());
+        assert!(json["hooks"]["exchange"].get("authorization").is_none());
+        assert!(json["upstreams"][0]["upstream_headers"][1]["value"].is_null());
+        assert!(!json.to_string().contains("inline-secret"));
+        assert!(!json.to_string().contains("exchange-secret"));
+        assert!(!json.to_string().contains("upstream-secret"));
+        assert!(!json.to_string().contains("token-secret"));
+        assert!(!json.to_string().contains("secret-secret"));
+        assert!(!json.to_string().contains("proxy-secret"));
+        assert!(!json.to_string().contains("session=secret"));
+        assert!(!json.to_string().contains("credential-secret"));
+        assert!(!json.to_string().contains("apikey-secret"));
+        assert!(!json.to_string().contains("user:pass@"));
+        assert!(!json.to_string().contains("api_key="));
+        assert!(!json.to_string().contains("token="));
+        assert!(!json.to_string().contains("sig="));
+        assert!(!json.to_string().contains("#frag"));
+    }
+
+    #[test]
+    fn sanitize_url_for_admin_strips_userinfo_query_and_fragment() {
+        let sanitized =
+            sanitize_url_for_admin("https://user:pass@example.com/v1/messages?token=secret#frag");
+
+        assert_eq!(sanitized, "https://example.com/v1/messages");
+        assert!(!sanitized.contains("user:pass@"));
+        assert!(!sanitized.contains("?token="));
+        assert!(!sanitized.contains("#frag"));
+    }
+
+    #[test]
+    fn sanitize_url_for_admin_best_effort_scrubs_userinfo_query_and_fragment_when_parsing_fails() {
+        let sanitized =
+            sanitize_url_for_admin("https://user:pass@example.com:bad/v1?api_key=secret#frag");
+
+        assert_eq!(sanitized, "https://example.com:bad/v1");
+        assert!(!sanitized.contains("user:pass@"));
+        assert!(!sanitized.contains("?api_key="));
+        assert!(!sanitized.contains("#frag"));
     }
 }

@@ -1,14 +1,16 @@
 //! HTTP server: single POST endpoint, format detection, proxy to upstream with optional translation.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::{
     body::Body,
-    extract::{OriginalUri, Path, State},
+    extract::{connect_info::ConnectInfo, OriginalUri, Path, State},
     http::{HeaderMap, Response, StatusCode},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -21,13 +23,17 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
-use crate::config::{AuthPolicy, Config, RuntimeConfigPayload, UpstreamConfig};
+use crate::config::{
+    sanitize_url_for_admin, AdminConfigView, AuthPolicy, Config, RuntimeConfigPayload,
+    UpstreamConfig,
+};
 use crate::dashboard::run_dashboard;
 use crate::debug_trace::{DebugTraceContext, DebugTraceRecorder};
-use crate::discovery::UpstreamCapability;
+use crate::discovery::{DiscoveredUpstream, UpstreamAvailability, UpstreamCapability};
 use crate::hooks::{
     capture_headers, fingerprint_credential, json_response_headers, new_request_id,
     now_timestamp_ms, sse_response_headers, CredentialSource, HookDispatcher, HookRequestContext,
+    HookSnapshot,
 };
 use crate::streaming::{needs_stream_translation, TranslateSseStream};
 use crate::telemetry::RuntimeMetrics;
@@ -35,6 +41,7 @@ use crate::translate::{translate_request, translate_response};
 use crate::upstream;
 use futures_util::StreamExt;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 const DEFAULT_NAMESPACE: &str = "default";
 
@@ -104,10 +111,11 @@ pub async fn run_with_listener(
             .map_err(|e| format!("invalid config: {}", e))?;
     }
     let metrics = RuntimeMetrics::new(&config);
-    let runtime = build_runtime_state(config, None).await?;
+    let runtime = build_runtime_state(config).await?;
     let state = Arc::new(AppState {
         runtime: Arc::new(RwLock::new(runtime)),
         metrics,
+        admin_access: AdminAccess::from_env(),
     });
     run_server(state, listener).await
 }
@@ -122,20 +130,20 @@ pub async fn run_with_listener_and_dashboard(
             .map_err(|e| format!("invalid config: {}", e))?;
     }
     let metrics = RuntimeMetrics::new(&config);
-    let runtime = build_runtime_state(config.clone(), None).await?;
+    let runtime = Arc::new(RwLock::new(build_runtime_state(config.clone()).await?));
+    let dashboard_runtime = DashboardRuntimeHandle::new(runtime.clone());
     let state = Arc::new(AppState {
-        runtime: Arc::new(RwLock::new(runtime)),
+        runtime,
         metrics: metrics.clone(),
+        admin_access: AdminAccess::from_env(),
     });
     let server_state = state.clone();
-    let config = Arc::new(config);
-    let dashboard_hooks = HookDispatcher::new(&config.hooks);
     let mut server = tokio::spawn(async move { run_server(server_state, listener).await });
     tokio::select! {
         server_result = &mut server => {
             server_result.map_err(|e| std::io::Error::other(e.to_string()))?
         }
-        dashboard_result = run_dashboard(config, metrics, dashboard_hooks) => {
+        dashboard_result = run_dashboard(dashboard_runtime, metrics) => {
             server.abort();
             dashboard_result.map_err(std::io::Error::other)?;
             Ok(())
@@ -157,8 +165,7 @@ async fn run_server(
         ])
         .allow_headers(Any);
 
-    let app = Router::new()
-        .route("/health", get(health))
+    let admin_router = Router::new()
         .route("/admin/state", get(handle_admin_state))
         .route(
             "/admin/namespaces/:namespace/config",
@@ -168,6 +175,13 @@ async fn run_server(
             "/admin/namespaces/:namespace/state",
             get(handle_admin_namespace_state),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_access,
+        ));
+
+    let data_router = Router::new()
+        .route("/health", get(health))
         .route(
             "/openai/v1/chat/completions",
             post(handle_openai_chat_completions),
@@ -244,10 +258,18 @@ async fn run_server(
             "/namespaces/:namespace/google/v1beta/models/:id",
             get(handle_google_model_namespaced).post(handle_google_model_action_namespaced),
         )
-        .layer(cors)
+        .layer(cors);
+
+    let app = Router::new()
+        .merge(admin_router)
+        .merge(data_router)
         .with_state(state);
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -255,12 +277,36 @@ async fn run_server(
 struct AppState {
     runtime: Arc<RwLock<RuntimeState>>,
     metrics: Arc<RuntimeMetrics>,
+    admin_access: AdminAccess,
+}
+
+#[derive(Clone)]
+enum AdminAccess {
+    BearerToken(String),
+    LoopbackOnly,
+    Misconfigured,
+}
+
+impl AdminAccess {
+    fn from_env() -> Self {
+        Self::from_env_var_result(std::env::var("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN"))
+    }
+
+    fn from_env_var_result(var_result: Result<String, std::env::VarError>) -> Self {
+        match var_result {
+            Ok(token) if token.trim().is_empty() => Self::Misconfigured,
+            Ok(token) => Self::BearerToken(token),
+            Err(std::env::VarError::NotPresent) => Self::LoopbackOnly,
+            Err(std::env::VarError::NotUnicode(_)) => Self::Misconfigured,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct UpstreamState {
     config: UpstreamConfig,
-    capability: UpstreamCapability,
+    capability: Option<UpstreamCapability>,
+    availability: UpstreamAvailability,
 }
 
 #[derive(Clone)]
@@ -274,8 +320,72 @@ struct RuntimeNamespaceState {
 }
 
 #[derive(Default)]
-struct RuntimeState {
+pub(crate) struct RuntimeState {
     namespaces: BTreeMap<String, RuntimeNamespaceState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DashboardUpstreamStatus {
+    pub name: String,
+    pub availability_status: String,
+    pub availability_reason: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DashboardRuntimeHandle {
+    runtime: Arc<RwLock<RuntimeState>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DashboardNamespaceSnapshot {
+    pub config: Config,
+    pub upstreams: Vec<DashboardUpstreamStatus>,
+    pub hooks: Option<HookSnapshot>,
+}
+
+impl DashboardRuntimeHandle {
+    fn new(runtime: Arc<RwLock<RuntimeState>>) -> Self {
+        Self { runtime }
+    }
+
+    pub(crate) fn snapshot(&self) -> DashboardNamespaceSnapshot {
+        let Ok(runtime) = self.runtime.try_read() else {
+            return DashboardNamespaceSnapshot::empty();
+        };
+        runtime
+            .namespaces
+            .get(DEFAULT_NAMESPACE)
+            .map(|namespace| DashboardNamespaceSnapshot {
+                config: namespace.config.clone(),
+                upstreams: namespace
+                    .upstreams
+                    .values()
+                    .map(|upstream| DashboardUpstreamStatus {
+                        name: upstream.config.name.clone(),
+                        availability_status: upstream.availability.status_label().to_string(),
+                        availability_reason: upstream
+                            .availability
+                            .reason()
+                            .map(ToString::to_string),
+                    })
+                    .collect(),
+                hooks: namespace
+                    .hooks
+                    .as_ref()
+                    .map(|dispatcher| dispatcher.snapshot()),
+            })
+            .unwrap_or_else(DashboardNamespaceSnapshot::empty)
+    }
+}
+
+impl DashboardNamespaceSnapshot {
+    fn empty() -> Self {
+        Self {
+            config: Config::default(),
+            upstreams: Vec::new(),
+            hooks: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -295,7 +405,7 @@ struct RuntimeStateResponse {
 struct NamespaceStateResponse {
     namespace: String,
     revision: String,
-    config: RuntimeConfigPayload,
+    config: AdminConfigView,
     upstreams: Vec<NamespaceUpstreamStateResponse>,
 }
 
@@ -305,11 +415,35 @@ struct NamespaceUpstreamStateResponse {
     api_root: String,
     fixed_upstream_format: Option<crate::formats::UpstreamFormat>,
     supported_formats: Vec<crate::formats::UpstreamFormat>,
+    availability: UpstreamAvailabilityResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpstreamAvailabilityResponse {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl From<&UpstreamAvailability> for UpstreamAvailabilityResponse {
+    fn from(value: &UpstreamAvailability) -> Self {
+        Self {
+            status: value.status_label(),
+            reason: value.reason().map(ToString::to_string),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct AdminConfigCasRequest {
+    #[serde(default)]
+    if_revision: Option<String>,
+    config: RuntimeConfigPayload,
+}
+
+#[derive(Debug, Clone)]
 struct AdminConfigRequest {
-    revision: String,
+    if_revision: Option<String>,
     config: RuntimeConfigPayload,
 }
 
@@ -318,6 +452,16 @@ struct AdminConfigResponse {
     namespace: String,
     revision: String,
     status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AdminConfigPreconditionFailedResponse {
+    error: &'static str,
+    current_revision: Option<String>,
+}
+
+enum AdminWriteError {
+    PreconditionFailed { current_revision: Option<String> },
 }
 
 async fn build_runtime_namespace_state(
@@ -341,19 +485,12 @@ async fn build_runtime_namespace_state(
     })
 }
 
-async fn build_runtime_state(
-    config: Config,
-    revision: Option<String>,
-) -> Result<RuntimeState, String> {
+async fn build_runtime_state(config: Config) -> Result<RuntimeState, String> {
     let mut state = RuntimeState::default();
     if !config.upstreams.is_empty() {
         state.namespaces.insert(
             DEFAULT_NAMESPACE.to_string(),
-            build_runtime_namespace_state(
-                revision.unwrap_or_else(|| "startup".to_string()),
-                config,
-            )
-            .await?,
+            build_runtime_namespace_state(generate_admin_revision(), config).await?,
         );
     }
     Ok(state)
@@ -430,6 +567,162 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }
 
+async fn require_admin_access(
+    State(state): State<Arc<AppState>>,
+    request: axum::http::Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let remote_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0)
+        .or_else(|| request.extensions().get::<SocketAddr>().copied());
+
+    match authorize_admin_request(&state.admin_access, request.headers(), remote_addr) {
+        Ok(()) => next.run(request).await,
+        Err((status, message)) => error_response(
+            crate::formats::UpstreamFormat::OpenAiCompletion,
+            status,
+            message,
+        ),
+    }
+}
+
+fn authorize_admin_request<'a>(
+    access: &'a AdminAccess,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+) -> Result<(), (StatusCode, &'a str)> {
+    match access {
+        AdminAccess::BearerToken(expected) => {
+            let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
+                return Err((StatusCode::UNAUTHORIZED, "admin bearer token required"));
+            };
+            let Ok(value) = value.to_str() else {
+                return Err((StatusCode::UNAUTHORIZED, "admin bearer token required"));
+            };
+            let Some(token) = extract_bearer_token(value) else {
+                return Err((StatusCode::UNAUTHORIZED, "admin bearer token required"));
+            };
+            if token == expected {
+                Ok(())
+            } else {
+                Err((StatusCode::UNAUTHORIZED, "admin bearer token invalid"))
+            }
+        }
+        AdminAccess::Misconfigured => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin bearer token misconfigured",
+        )),
+        AdminAccess::LoopbackOnly => {
+            if contains_proxy_forwarding_headers(headers) {
+                Err((
+                    StatusCode::FORBIDDEN,
+                    "admin loopback access rejects proxy forwarding headers",
+                ))
+            } else if remote_addr.is_some_and(|addr| addr.ip().is_loopback()) {
+                Ok(())
+            } else {
+                Err((
+                    StatusCode::FORBIDDEN,
+                    "admin access allowed from loopback clients only",
+                ))
+            }
+        }
+    }
+}
+
+fn generate_admin_revision() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn extract_bearer_token(value: &str) -> Option<&str> {
+    let token = value
+        .get(..7)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("Bearer "))
+        .map(|_| &value[7..])?;
+    if token.trim().is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+fn contains_proxy_forwarding_headers(headers: &HeaderMap) -> bool {
+    const PROXY_HEADERS: &[&str] = &[
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+    ];
+
+    headers.keys().any(|name| {
+        PROXY_HEADERS
+            .iter()
+            .any(|forbidden| name.as_str().eq_ignore_ascii_case(forbidden))
+    })
+}
+
+fn parse_admin_config_request(payload: Value) -> Result<AdminConfigRequest, String> {
+    let Some(object) = payload.as_object() else {
+        return Err("admin config request must be a JSON object".to_string());
+    };
+    if object.contains_key("revision") {
+        return Err(
+            "legacy admin config request shape is no longer supported; use `if_revision`"
+                .to_string(),
+        );
+    }
+
+    let request: AdminConfigCasRequest = serde_json::from_value(payload)
+        .map_err(|error| format!("invalid admin config request: {error}"))?;
+    Ok(AdminConfigRequest {
+        if_revision: request.if_revision,
+        config: request.config,
+    })
+}
+
+fn validate_admin_cas_precondition(
+    current_revision: Option<&str>,
+    if_revision: Option<&str>,
+) -> Result<(), AdminWriteError> {
+    match (current_revision, if_revision) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(AdminWriteError::PreconditionFailed {
+            current_revision: None,
+        }),
+        (Some(current), Some(expected)) if current == expected => Ok(()),
+        (Some(current), _) => Err(AdminWriteError::PreconditionFailed {
+            current_revision: Some(current.to_string()),
+        }),
+    }
+}
+
+fn admin_write_error_response(error: AdminWriteError) -> Response<Body> {
+    match error {
+        AdminWriteError::PreconditionFailed { current_revision } => (
+            StatusCode::PRECONDITION_FAILED,
+            Json(AdminConfigPreconditionFailedResponse {
+                error: "admin config revision precondition failed",
+                current_revision,
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn format_upstream_unavailable_message(name: &str, availability: &UpstreamAvailability) -> String {
+    match availability {
+        UpstreamAvailability::Available => {
+            format!("resolved upstream `{name}` is unavailable")
+        }
+        UpstreamAvailability::Unavailable { reason } => {
+            format!("resolved upstream `{name}` is unavailable: {reason}")
+        }
+    }
+}
+
 async fn handle_admin_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let runtime = state.runtime.read().await;
     let namespaces = runtime
@@ -462,9 +755,14 @@ async fn handle_admin_namespace_state(
         .values()
         .map(|upstream| NamespaceUpstreamStateResponse {
             name: upstream.config.name.clone(),
-            api_root: upstream.config.api_root.clone(),
+            api_root: sanitize_url_for_admin(&upstream.config.api_root),
             fixed_upstream_format: upstream.config.fixed_upstream_format,
-            supported_formats: upstream.capability.supported.iter().copied().collect(),
+            supported_formats: upstream
+                .capability
+                .as_ref()
+                .map(|capability| capability.supported.iter().copied().collect())
+                .unwrap_or_default(),
+            availability: UpstreamAvailabilityResponse::from(&upstream.availability),
         })
         .collect::<Vec<_>>();
     (
@@ -472,7 +770,7 @@ async fn handle_admin_namespace_state(
         Json(NamespaceStateResponse {
             namespace,
             revision: item.revision.clone(),
-            config: RuntimeConfigPayload::from(&item.config),
+            config: AdminConfigView::from(&item.config),
             upstreams,
         }),
     )
@@ -482,9 +780,20 @@ async fn handle_admin_namespace_state(
 async fn handle_admin_namespace_config(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
-    Json(payload): Json<AdminConfigRequest>,
+    Json(payload): Json<Value>,
 ) -> impl IntoResponse {
-    let config = match Config::try_from(payload.config) {
+    let request = match parse_admin_config_request(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                crate::formats::UpstreamFormat::OpenAiCompletion,
+                StatusCode::BAD_REQUEST,
+                &error,
+            );
+        }
+    };
+    let runtime_config = request.config.clone();
+    let config = match Config::try_from(runtime_config) {
         Ok(config) => config,
         Err(error) => {
             return error_response(
@@ -494,26 +803,38 @@ async fn handle_admin_namespace_config(
             );
         }
     };
-    let namespace_state =
-        match build_runtime_namespace_state(payload.revision.clone(), config).await {
-            Ok(state) => state,
-            Err(error) => {
-                return error_response(
-                    crate::formats::UpstreamFormat::OpenAiCompletion,
-                    StatusCode::BAD_REQUEST,
-                    &format!("failed to resolve namespace config: {error}"),
-                );
-            }
-        };
-    let mut runtime = state.runtime.write().await;
-    if let Some(current) = runtime.namespaces.get(&namespace) {
-        if current.revision >= payload.revision {
+    let current = {
+        let runtime = state.runtime.read().await;
+        runtime
+            .namespaces
+            .get(&namespace)
+            .map(|item| item.revision.clone())
+    };
+    if let Err(response) =
+        validate_admin_cas_precondition(current.as_deref(), request.if_revision.as_deref())
+    {
+        return admin_write_error_response(response);
+    }
+    let revision = generate_admin_revision();
+    let namespace_state = match build_runtime_namespace_state(revision.clone(), config).await {
+        Ok(state) => state,
+        Err(error) => {
             return error_response(
                 crate::formats::UpstreamFormat::OpenAiCompletion,
-                StatusCode::CONFLICT,
-                "stale or duplicate revision",
+                StatusCode::BAD_REQUEST,
+                &format!("failed to resolve namespace config: {error}"),
             );
         }
+    };
+    let mut runtime = state.runtime.write().await;
+    if let Err(response) = validate_admin_cas_precondition(
+        runtime
+            .namespaces
+            .get(&namespace)
+            .map(|item| item.revision.as_str()),
+        request.if_revision.as_deref(),
+    ) {
+        return admin_write_error_response(response);
     }
     runtime
         .namespaces
@@ -522,7 +843,7 @@ async fn handle_admin_namespace_config(
         StatusCode::OK,
         Json(AdminConfigResponse {
             namespace,
-            revision: payload.revision,
+            revision,
             status: "applied",
         }),
     )
@@ -532,8 +853,8 @@ async fn handle_admin_namespace_config(
 async fn resolve_upstreams(config: &Config) -> BTreeMap<String, UpstreamState> {
     let mut upstreams = BTreeMap::new();
     for upstream in &config.upstreams {
-        let capability = if let Some(f) = upstream.fixed_upstream_format {
-            UpstreamCapability::fixed(f)
+        let discovered = if let Some(f) = upstream.fixed_upstream_format {
+            DiscoveredUpstream::fixed(f)
         } else {
             let supported = crate::discovery::discover_supported_formats(
                 &upstream.api_root,
@@ -542,17 +863,14 @@ async fn resolve_upstreams(config: &Config) -> BTreeMap<String, UpstreamState> {
                 &upstream.upstream_headers,
             )
             .await;
-            if supported.is_empty() {
-                UpstreamCapability::fixed(crate::formats::UpstreamFormat::OpenAiCompletion)
-            } else {
-                UpstreamCapability::from_supported(supported)
-            }
+            DiscoveredUpstream::from_supported(supported)
         };
         upstreams.insert(
             upstream.name.clone(),
             UpstreamState {
                 config: upstream.clone(),
-                capability,
+                capability: discovered.capability,
+                availability: discovered.availability,
             },
         );
     }
@@ -963,10 +1281,30 @@ async fn handle_request_core(
         resolved_model.upstream_name.clone(),
         resolved_model.upstream_model.clone(),
     );
+    if !upstream_state.availability.is_available() {
+        tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+        return error_response(
+            client_format,
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format_upstream_unavailable_message(
+                &resolved_model.upstream_name,
+                &upstream_state.availability,
+            ),
+        );
+    }
 
-    let upstream_format = upstream_state
-        .capability
-        .upstream_format_for_request(client_format);
+    let Some(capability) = upstream_state.capability.as_ref() else {
+        tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+        return error_response(
+            client_format,
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format_upstream_unavailable_message(
+                &resolved_model.upstream_name,
+                &upstream_state.availability,
+            ),
+        );
+    };
+    let upstream_format = capability.upstream_format_for_request(client_format);
     let compatibility_warnings =
         collect_request_compatibility_warnings(client_format, upstream_format, &original_body);
     for warning in &compatibility_warnings {
@@ -1236,21 +1574,23 @@ async fn handle_openai_responses_resource(
         .upstreams
         .values()
         .filter(|upstream| {
-            upstream
-                .capability
-                .supported
-                .contains(&crate::formats::UpstreamFormat::OpenAiResponses)
+            upstream.availability.is_available()
+                && upstream.capability.as_ref().is_some_and(|capability| {
+                    capability
+                        .supported
+                        .contains(&crate::formats::UpstreamFormat::OpenAiResponses)
+                })
         })
         .collect::<Vec<_>>();
 
     let upstream_state = match matching.as_slice() {
         [upstream] => *upstream,
         [] => {
-            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+            tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
             return error_response(
                 crate::formats::UpstreamFormat::OpenAiResponses,
-                StatusCode::BAD_REQUEST,
-                "Responses lifecycle endpoints require a configured upstream that natively supports OpenAI Responses",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Responses lifecycle endpoints require an available upstream that natively supports OpenAI Responses",
             );
         }
         _ => {
@@ -2221,6 +2561,30 @@ fn extract_api_key_from_headers(headers: &[(String, String)]) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<str>) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value.as_ref());
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn normalize_upstream_error_maps_context_window_messages() {
@@ -2436,5 +2800,343 @@ mod tests {
 
         assert!(error.contains("previous_response_id"));
         assert!(error.contains("does not reconstruct response-to-upstream state"));
+    }
+
+    #[test]
+    fn authorize_admin_request_accepts_matching_bearer_token() {
+        let access = AdminAccess::BearerToken("secret-token".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+
+        assert_eq!(
+            authorize_admin_request(
+                &access,
+                &headers,
+                Some("203.0.113.10:8080".parse().unwrap())
+            ),
+            Ok(())
+        );
+
+        let mut lowercase = HeaderMap::new();
+        lowercase.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("bearer secret-token"),
+        );
+        assert_eq!(
+            authorize_admin_request(
+                &access,
+                &lowercase,
+                Some("203.0.113.10:8080".parse().unwrap())
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn authorize_admin_request_rejects_missing_or_invalid_bearer_token() {
+        let access = AdminAccess::BearerToken("secret-token".to_string());
+        let missing = HeaderMap::new();
+        assert_eq!(
+            authorize_admin_request(&access, &missing, Some("127.0.0.1:8080".parse().unwrap())),
+            Err((StatusCode::UNAUTHORIZED, "admin bearer token required"))
+        );
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        assert_eq!(
+            authorize_admin_request(&access, &wrong, Some("127.0.0.1:8080".parse().unwrap())),
+            Err((StatusCode::UNAUTHORIZED, "admin bearer token invalid"))
+        );
+    }
+
+    #[test]
+    fn extract_bearer_token_rejects_blank_values() {
+        assert_eq!(extract_bearer_token("Bearer "), None);
+        assert_eq!(extract_bearer_token("bearer   "), None);
+        assert_eq!(extract_bearer_token("Bearer\t"), None);
+    }
+
+    #[test]
+    fn authorize_admin_request_allows_loopback_only_without_token() {
+        let access = AdminAccess::LoopbackOnly;
+
+        assert_eq!(
+            authorize_admin_request(
+                &access,
+                &HeaderMap::new(),
+                Some("127.0.0.1:8080".parse().unwrap())
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_admin_request(
+                &access,
+                &HeaderMap::new(),
+                Some("[::1]:8080".parse().unwrap())
+            ),
+            Ok(())
+        );
+        let mut proxied = HeaderMap::new();
+        proxied.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+        assert_eq!(
+            authorize_admin_request(&access, &proxied, Some("127.0.0.1:8080".parse().unwrap())),
+            Err((
+                StatusCode::FORBIDDEN,
+                "admin loopback access rejects proxy forwarding headers"
+            ))
+        );
+        assert_eq!(
+            authorize_admin_request(
+                &access,
+                &HeaderMap::new(),
+                Some("203.0.113.10:8080".parse().unwrap())
+            ),
+            Err((
+                StatusCode::FORBIDDEN,
+                "admin access allowed from loopback clients only"
+            ))
+        );
+        assert_eq!(
+            authorize_admin_request(&access, &HeaderMap::new(), None),
+            Err((
+                StatusCode::FORBIDDEN,
+                "admin access allowed from loopback clients only"
+            ))
+        );
+    }
+
+    #[test]
+    fn admin_access_from_env_treats_blank_value_as_misconfigured() {
+        let _admin_token = ScopedEnvVar::set("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN", "   ");
+
+        assert!(matches!(
+            AdminAccess::from_env(),
+            AdminAccess::Misconfigured
+        ));
+    }
+
+    #[test]
+    fn admin_access_from_env_var_result_treats_not_present_as_loopback_only() {
+        assert!(matches!(
+            AdminAccess::from_env_var_result(Err(std::env::VarError::NotPresent)),
+            AdminAccess::LoopbackOnly
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_access_from_env_var_result_treats_non_unicode_as_misconfigured() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        assert!(matches!(
+            AdminAccess::from_env_var_result(Err(std::env::VarError::NotUnicode(
+                OsString::from_vec(vec![0x66, 0x80])
+            ))),
+            AdminAccess::Misconfigured
+        ));
+    }
+
+    #[tokio::test]
+    async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
+        let config = crate::config::Config {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout: std::time::Duration::from_secs(30),
+            upstreams: vec![crate::config::UpstreamConfig {
+                name: "default".to_string(),
+                api_root: "https://user:pass@api.openai.com/v1?api_key=inline-secret#frag"
+                    .to_string(),
+                fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
+                fallback_credential_env: Some("DEMO_KEY".to_string()),
+                fallback_credential_actual: Some("inline-secret".to_string()),
+                fallback_api_key: Some("inline-secret".to_string()),
+                auth_policy: crate::config::AuthPolicy::ForceServer,
+                upstream_headers: vec![
+                    ("x-tenant".to_string(), "demo".to_string()),
+                    (
+                        "authorization".to_string(),
+                        "Bearer upstream-secret".to_string(),
+                    ),
+                ],
+            }],
+            model_aliases: Default::default(),
+            hooks: crate::config::HookConfig {
+                exchange: Some(crate::config::HookEndpointConfig {
+                    url: "https://user:pass@example.com/hooks/exchange?token=exchange-secret#frag"
+                        .to_string(),
+                    authorization: Some("Bearer exchange-secret".to_string()),
+                }),
+                ..crate::config::HookConfig::default()
+            },
+            debug_trace: crate::config::DebugTraceConfig::default(),
+        };
+        let mut upstreams = BTreeMap::new();
+        upstreams.insert(
+            "default".to_string(),
+            UpstreamState {
+                config: config.upstreams[0].clone(),
+                capability: Some(UpstreamCapability::fixed(
+                    crate::formats::UpstreamFormat::OpenAiResponses,
+                )),
+                availability: UpstreamAvailability::Available,
+            },
+        );
+
+        let mut runtime = RuntimeState::default();
+        runtime.namespaces.insert(
+            "demo".to_string(),
+            RuntimeNamespaceState {
+                revision: "rev-1".to_string(),
+                client: upstream::build_client(&config),
+                hooks: None,
+                debug_trace: None,
+                upstreams,
+                config,
+            },
+        );
+
+        let state = Arc::new(AppState {
+            runtime: Arc::new(RwLock::new(runtime)),
+            metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
+            admin_access: AdminAccess::LoopbackOnly,
+        });
+
+        let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(
+            body["config"]["upstreams"][0]["api_root"],
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            body["upstreams"][0]["api_root"],
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            body["config"]["hooks"]["exchange"]["url"],
+            "https://example.com/hooks/exchange"
+        );
+        assert!(body["config"]["upstreams"][0]["upstream_headers"][1]["value"].is_null());
+        assert_eq!(
+            body["config"]["upstreams"][0]["upstream_headers"][1]["value_redacted"],
+            true
+        );
+        let body_string = serde_json::to_string(&body).expect("body string");
+        assert!(!body_string.contains("user:pass@"));
+        assert!(!body_string.contains("inline-secret"));
+        assert!(!body_string.contains("exchange-secret"));
+        assert!(!body_string.contains("upstream-secret"));
+        assert!(!body_string.contains("api_key="));
+        assert!(!body_string.contains("token="));
+        assert!(!body_string.contains("#frag"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
+        let mut config = crate::config::Config {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout: std::time::Duration::from_secs(30),
+            upstreams: vec![crate::config::UpstreamConfig {
+                name: "auto".to_string(),
+                api_root: "https://example.com/v1".to_string(),
+                fixed_upstream_format: None,
+                fallback_credential_env: None,
+                fallback_credential_actual: None,
+                fallback_api_key: None,
+                auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+                upstream_headers: Vec::new(),
+            }],
+            model_aliases: Default::default(),
+            hooks: crate::config::HookConfig {
+                exchange: Some(crate::config::HookEndpointConfig {
+                    url: "https://example.com/hooks/exchange".to_string(),
+                    authorization: Some("Bearer hook-1".to_string()),
+                }),
+                ..Default::default()
+            },
+            debug_trace: crate::config::DebugTraceConfig::default(),
+        };
+        config.model_aliases.insert(
+            "alias-1".to_string(),
+            crate::config::ModelAlias {
+                upstream_name: "auto".to_string(),
+                upstream_model: "model-a".to_string(),
+            },
+        );
+        let initial_hooks = HookDispatcher::new(&config.hooks);
+        let mut upstreams = BTreeMap::new();
+        upstreams.insert(
+            "auto".to_string(),
+            UpstreamState {
+                config: config.upstreams[0].clone(),
+                capability: None,
+                availability: UpstreamAvailability::Unavailable {
+                    reason: "protocol discovery returned no supported formats".to_string(),
+                },
+            },
+        );
+
+        let mut runtime = RuntimeState::default();
+        runtime.namespaces.insert(
+            DEFAULT_NAMESPACE.to_string(),
+            RuntimeNamespaceState {
+                revision: "rev-1".to_string(),
+                config: config.clone(),
+                client: upstream::build_client(&config),
+                hooks: initial_hooks,
+                debug_trace: None,
+                upstreams,
+            },
+        );
+
+        let handle = DashboardRuntimeHandle::new(Arc::new(RwLock::new(runtime)));
+        let snapshot = handle.snapshot();
+
+        assert_eq!(snapshot.config.model_aliases.len(), 1);
+        assert_eq!(snapshot.upstreams.len(), 1);
+        assert_eq!(snapshot.upstreams[0].name, "auto");
+        assert_eq!(snapshot.upstreams[0].availability_status, "unavailable");
+        assert_eq!(
+            snapshot.upstreams[0].availability_reason.as_deref(),
+            Some("protocol discovery returned no supported formats")
+        );
+        assert!(snapshot.hooks.is_some());
+
+        {
+            let mut runtime = handle.runtime.write().await;
+            let namespace = runtime
+                .namespaces
+                .get_mut(DEFAULT_NAMESPACE)
+                .expect("default namespace");
+            namespace.config.model_aliases.insert(
+                "alias-2".to_string(),
+                crate::config::ModelAlias {
+                    upstream_name: "auto".to_string(),
+                    upstream_model: "model-b".to_string(),
+                },
+            );
+            namespace.upstreams.get_mut("auto").unwrap().availability =
+                UpstreamAvailability::Available;
+            namespace.hooks = HookDispatcher::new(&crate::config::HookConfig::default());
+        }
+
+        let updated = handle.snapshot();
+        assert_eq!(updated.config.model_aliases.len(), 2);
+        assert_eq!(updated.upstreams[0].availability_status, "available");
+        assert!(updated.upstreams[0].availability_reason.is_none());
+        assert!(updated.hooks.is_none());
     }
 }

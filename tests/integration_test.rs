@@ -6,9 +6,9 @@ mod common;
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{any, post},
     Json, Router,
 };
 use bytes::Bytes;
@@ -16,17 +16,50 @@ use common::*;
 use futures_util::{future::join_all, stream, StreamExt};
 use llm_universal_proxy::config::{
     AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ModelAlias,
-    RuntimeConfigPayload, RuntimeConfigSnapshot, RuntimeHookConfig, RuntimeUpstreamConfig,
-    UpstreamConfig,
+    RuntimeConfigPayload, RuntimeHookConfig, RuntimeUpstreamConfig, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::run_with_listener;
 use reqwest::Client;
 use serde_json::json;
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
+
+static ADMIN_TOKEN_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+type CapturedDiscoveryRequests = Arc<Mutex<Vec<(String, String, String)>>>;
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<str>) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value.as_ref());
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
 
 fn named_upstream(
     name: &str,
@@ -63,6 +96,25 @@ fn config_with_alias(
     Config {
         model_aliases,
         ..proxy_config(upstream_base, format)
+    }
+}
+
+fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
+    RuntimeConfigPayload {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout_secs: 30,
+        upstreams: vec![RuntimeUpstreamConfig {
+            name: "default".to_string(),
+            api_root: upstream_api_root(mock_base, UpstreamFormat::OpenAiCompletion),
+            fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+            fallback_credential_env: None,
+            fallback_credential_actual: None,
+            auth_policy: AuthPolicy::ClientOrFallback,
+            upstream_headers: Vec::new(),
+        }],
+        model_aliases: std::collections::BTreeMap::new(),
+        hooks: RuntimeHookConfig::default(),
+        debug_trace: DebugTraceConfig::default(),
     }
 }
 
@@ -108,6 +160,37 @@ async fn spawn_tagged_openai_responses_mock(
     (base, handle)
 }
 
+async fn spawn_discovery_empty_mock() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    CapturedDiscoveryRequests,
+) {
+    async fn handler(
+        State(captured): State<CapturedDiscoveryRequests>,
+        method: Method,
+        uri: Uri,
+        body: String,
+    ) -> impl IntoResponse {
+        captured
+            .lock()
+            .unwrap()
+            .push((method.to_string(), uri.path().to_string(), body));
+        StatusCode::NOT_FOUND
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .fallback(any(handler))
+        .with_state(captured.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle, captured)
+}
+
 #[tokio::test]
 async fn empty_startup_config_keeps_health_route_available() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -121,36 +204,68 @@ async fn empty_startup_config_keeps_health_route_available() {
 }
 
 #[tokio::test]
-async fn runtime_namespace_config_can_be_pushed_after_empty_start() {
+async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_missing_if_revision()
+{
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
     let (mock_base, _mock) = spawn_openai_completion_mock().await;
     let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+    let payload = RuntimeConfigPayload {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout_secs: 30,
+        upstreams: vec![RuntimeUpstreamConfig {
+            name: "default".to_string(),
+            api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
+            fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+            fallback_credential_env: Some("DEMO_KEY".to_string()),
+            fallback_credential_actual: None,
+            auth_policy: AuthPolicy::ClientOrFallback,
+            upstream_headers: vec![
+                ("x-tenant".to_string(), "demo".to_string()),
+                (
+                    "authorization".to_string(),
+                    "Bearer upstream-secret".to_string(),
+                ),
+                (
+                    "proxy-authorization".to_string(),
+                    "Bearer proxy-secret".to_string(),
+                ),
+                ("cookie".to_string(), "session=secret".to_string()),
+                ("set-cookie".to_string(), "session=secret".to_string()),
+                ("x-session-token".to_string(), "session-secret".to_string()),
+                ("x-api-key".to_string(), "api-secret".to_string()),
+            ],
+        }],
+        model_aliases: std::collections::BTreeMap::new(),
+        hooks: RuntimeHookConfig {
+            exchange: Some(llm_universal_proxy::config::RuntimeHookEndpointConfig {
+                url: "https://example.com/hooks/exchange".to_string(),
+                authorization: Some("Bearer exchange-secret".to_string()),
+            }),
+            usage: Some(llm_universal_proxy::config::RuntimeHookEndpointConfig {
+                url: "https://example.com/hooks/usage".to_string(),
+                authorization: Some("Bearer usage-secret".to_string()),
+            }),
+            ..RuntimeHookConfig::default()
+        },
+        debug_trace: DebugTraceConfig::default(),
+    };
 
     let client = Client::new();
-    let apply = client
+    let apply_with_null = client
         .post(format!("{}/admin/namespaces/demo/config", proxy_base))
-        .json(&RuntimeConfigSnapshot {
-            revision: "rev-1".to_string(),
-            config: RuntimeConfigPayload {
-                listen: "127.0.0.1:0".to_string(),
-                upstream_timeout_secs: 30,
-                upstreams: vec![RuntimeUpstreamConfig {
-                    name: "default".to_string(),
-                    api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
-                    fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
-                    fallback_credential_env: None,
-                    fallback_credential_actual: None,
-                    auth_policy: AuthPolicy::ClientOrFallback,
-                    upstream_headers: Vec::new(),
-                }],
-                model_aliases: std::collections::BTreeMap::new(),
-                hooks: RuntimeHookConfig::default(),
-                debug_trace: DebugTraceConfig::default(),
-            },
-        })
+        .json(&json!({
+            "if_revision": null,
+            "config": payload,
+        }))
         .send()
         .await
         .unwrap();
-    assert!(apply.status().is_success());
+    assert!(apply_with_null.status().is_success());
+    let apply_body: Value = apply_with_null.json().await.unwrap();
+    let first_revision = apply_body["revision"].as_str().unwrap().to_string();
+    assert_eq!(apply_body["status"], "applied");
+    assert!(!first_revision.is_empty());
 
     let state: Value = client
         .get(format!("{}/admin/namespaces/demo/state", proxy_base))
@@ -160,8 +275,28 @@ async fn runtime_namespace_config_can_be_pushed_after_empty_start() {
         .json()
         .await
         .unwrap();
-    assert_eq!(state["revision"], "rev-1");
+    assert_eq!(state["revision"], first_revision);
     assert_eq!(state["namespace"], "demo");
+    assert_eq!(state["config"]["listen"], "127.0.0.1:0");
+    assert_eq!(state["config"]["upstreams"][0]["name"], "default");
+    assert_eq!(
+        state["config"]["upstreams"][0]["fallback_credential_configured"],
+        false
+    );
+
+    let apply_missing = client
+        .post(format!("{}/admin/namespaces/second/config", proxy_base))
+        .json(&json!({
+            "config": demo_runtime_config(&mock_base),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(apply_missing.status().is_success());
+    let apply_missing_body: Value = apply_missing.json().await.unwrap();
+    let second_revision = apply_missing_body["revision"].as_str().unwrap();
+    assert!(!second_revision.is_empty());
+    assert_ne!(second_revision, first_revision);
 
     let res = client
         .post(format!(
@@ -182,59 +317,553 @@ async fn runtime_namespace_config_can_be_pushed_after_empty_start() {
 }
 
 #[tokio::test]
-async fn runtime_namespace_config_rejects_stale_or_duplicate_revision() {
+async fn runtime_namespace_config_updates_with_exact_if_revision_and_generates_new_revision() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
     let (mock_base, _mock) = spawn_openai_completion_mock().await;
     let (proxy_base, _proxy) = start_proxy(Config::default()).await;
 
     let client = Client::new();
-    let payload = RuntimeConfigSnapshot {
-        revision: "rev-2".to_string(),
-        config: RuntimeConfigPayload {
-            listen: "127.0.0.1:0".to_string(),
-            upstream_timeout_secs: 30,
-            upstreams: vec![RuntimeUpstreamConfig {
-                name: "default".to_string(),
-                api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
-                fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
-                fallback_credential_env: None,
-                fallback_credential_actual: None,
-                auth_policy: AuthPolicy::ClientOrFallback,
-                upstream_headers: Vec::new(),
-            }],
-            model_aliases: std::collections::BTreeMap::new(),
-            hooks: RuntimeHookConfig::default(),
-            debug_trace: DebugTraceConfig::default(),
-        },
-    };
-
-    let first = client
+    let create = client
         .post(format!("{}/admin/namespaces/demo/config", proxy_base))
-        .json(&payload)
+        .json(&json!({
+            "config": demo_runtime_config(&mock_base),
+        }))
         .send()
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(create.status(), StatusCode::OK);
+    let create_body: Value = create.json().await.unwrap();
+    let initial_revision = create_body["revision"].as_str().unwrap().to_string();
 
-    let duplicate = client
+    let state: Value = client
+        .get(format!("{}/admin/namespaces/demo/state", proxy_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["revision"], initial_revision);
+
+    let update = client
         .post(format!("{}/admin/namespaces/demo/config", proxy_base))
-        .json(&payload)
+        .json(&json!({
+            "if_revision": initial_revision,
+            "config": demo_runtime_config(&mock_base),
+        }))
         .send()
         .await
         .unwrap();
-    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
-    let duplicate_body = duplicate.text().await.unwrap();
-    assert!(duplicate_body.contains("stale or duplicate revision"));
+    assert_eq!(update.status(), StatusCode::OK);
+    let update_body: Value = update.json().await.unwrap();
+    let next_revision = update_body["revision"].as_str().unwrap().to_string();
+    assert_ne!(next_revision, state["revision"].as_str().unwrap());
+}
+
+#[tokio::test]
+async fn runtime_namespace_config_rejects_stale_or_missing_if_revision_with_412_and_current_revision(
+) {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+
+    let client = Client::new();
+    let create = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&json!({
+            "config": demo_runtime_config(&mock_base),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let create_body: Value = create.json().await.unwrap();
+    let initial_revision = create_body["revision"].as_str().unwrap().to_string();
+
+    let update = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&json!({
+            "if_revision": initial_revision,
+            "config": demo_runtime_config(&mock_base),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let update_body: Value = update.json().await.unwrap();
+    let current_revision = update_body["revision"].as_str().unwrap().to_string();
 
     let stale = client
         .post(format!("{}/admin/namespaces/demo/config", proxy_base))
-        .json(&RuntimeConfigSnapshot {
-            revision: "rev-1".to_string(),
-            config: payload.config,
-        })
+        .json(&json!({
+            "if_revision": create_body["revision"],
+            "config": demo_runtime_config(&mock_base),
+        }))
         .send()
         .await
         .unwrap();
-    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+    let stale_body: Value = stale.json().await.unwrap();
+    assert_eq!(stale_body["current_revision"], current_revision);
+
+    let missing = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&json!({
+            "config": demo_runtime_config(&mock_base),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::PRECONDITION_FAILED);
+    let missing_body: Value = missing.json().await.unwrap();
+    assert_eq!(missing_body["current_revision"], current_revision);
+}
+
+#[tokio::test]
+async fn runtime_namespace_config_rejects_non_null_if_revision_when_namespace_does_not_exist() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+
+    let client = Client::new();
+    let response = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&json!({
+            "if_revision": "rev-does-not-exist",
+            "config": demo_runtime_config(&mock_base),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    let body: Value = response.json().await.unwrap();
+    assert!(body["current_revision"].is_null());
+}
+
+#[tokio::test]
+async fn default_namespace_startup_config_requires_exact_cas_update() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = Config::try_from(demo_runtime_config(&mock_base)).unwrap();
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let state: Value = client
+        .get(format!("{}/admin/namespaces/default/state", proxy_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let initial_revision = state["revision"].as_str().unwrap().to_string();
+    assert!(!initial_revision.is_empty());
+    assert_ne!(initial_revision, "startup");
+
+    let update = client
+        .post(format!("{}/admin/namespaces/default/config", proxy_base))
+        .json(&json!({
+            "if_revision": initial_revision,
+            "config": demo_runtime_config(&mock_base),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let update_body: Value = update.json().await.unwrap();
+    assert_ne!(update_body["revision"], state["revision"]);
+}
+
+#[tokio::test]
+async fn runtime_namespace_config_rejects_simultaneous_revision_and_if_revision() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+
+    let client = Client::new();
+    let response = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&json!({
+            "revision": "legacy-rev",
+            "if_revision": null,
+            "config": demo_runtime_config(&mock_base),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn runtime_namespace_config_rejects_legacy_revision_shape_with_400() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+
+    let client = Client::new();
+    let response = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&json!({
+            "revision": "legacy-rev-1",
+            "config": demo_runtime_config(&mock_base),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let _demo_key = ScopedEnvVar::set("DEMO_KEY", "env-secret");
+
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+
+    let client = Client::new();
+    let apply = client
+        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .json(&json!({
+            "if_revision": null,
+            "config": RuntimeConfigPayload {
+                listen: "127.0.0.1:0".to_string(),
+                upstream_timeout_secs: 30,
+                upstreams: vec![RuntimeUpstreamConfig {
+                    name: "default".to_string(),
+                    api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
+                    fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+                    fallback_credential_env: Some("DEMO_KEY".to_string()),
+                    fallback_credential_actual: None,
+                    auth_policy: AuthPolicy::ForceServer,
+                    upstream_headers: vec![
+                        ("x-tenant".to_string(), "demo".to_string()),
+                        ("authorization".to_string(), "Bearer upstream-secret".to_string()),
+                        ("proxy-authorization".to_string(), "Bearer proxy-secret".to_string()),
+                        ("cookie".to_string(), "session=secret".to_string()),
+                        ("set-cookie".to_string(), "session=secret".to_string()),
+                        ("x-session-token".to_string(), "session-secret".to_string()),
+                        ("x-api-key".to_string(), "api-secret".to_string()),
+                        ("x-client-secret".to_string(), "secret-secret".to_string()),
+                        (
+                            "x-client-credential".to_string(),
+                            "credential-secret".to_string(),
+                        ),
+                        ("x-service-apikey".to_string(), "apikey-secret".to_string()),
+                    ],
+                }],
+                model_aliases: std::collections::BTreeMap::new(),
+                hooks: RuntimeHookConfig {
+                    exchange: Some(llm_universal_proxy::config::RuntimeHookEndpointConfig {
+                        url: "https://example.com/hooks/exchange".to_string(),
+                        authorization: Some("Bearer exchange-secret".to_string()),
+                    }),
+                    usage: Some(llm_universal_proxy::config::RuntimeHookEndpointConfig {
+                        url: "https://example.com/hooks/usage".to_string(),
+                        authorization: Some("Bearer usage-secret".to_string()),
+                    }),
+                    ..RuntimeHookConfig::default()
+                },
+                debug_trace: DebugTraceConfig::default(),
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(apply.status().is_success());
+    let apply_body: Value = apply.json().await.unwrap();
+    let applied_revision = apply_body["revision"].as_str().unwrap().to_string();
+
+    let state: Value = client
+        .get(format!("{}/admin/namespaces/demo/state", proxy_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(state["revision"], applied_revision);
+    assert_eq!(
+        state["config"]["upstreams"][0]["fallback_credential_env"],
+        "DEMO_KEY"
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["api_root"],
+        upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion)
+    );
+    assert_eq!(
+        state["upstreams"][0]["api_root"],
+        upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion)
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["fallback_credential_configured"],
+        true
+    );
+    assert_eq!(
+        state["config"]["hooks"]["exchange"]["authorization_configured"],
+        true
+    );
+    assert_eq!(
+        state["config"]["hooks"]["usage"]["authorization_configured"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][0]["value"],
+        "demo"
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][1]["name"],
+        "authorization"
+    );
+    assert!(state["config"]["upstreams"][0]["upstream_headers"][1]["value"].is_null());
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][1]["value_redacted"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][2]["name"],
+        "proxy-authorization"
+    );
+    assert!(state["config"]["upstreams"][0]["upstream_headers"][2]["value"].is_null());
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][2]["value_redacted"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][3]["name"],
+        "cookie"
+    );
+    assert!(state["config"]["upstreams"][0]["upstream_headers"][3]["value"].is_null());
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][3]["value_redacted"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][4]["name"],
+        "set-cookie"
+    );
+    assert!(state["config"]["upstreams"][0]["upstream_headers"][4]["value"].is_null());
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][4]["value_redacted"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][5]["name"],
+        "x-session-token"
+    );
+    assert!(state["config"]["upstreams"][0]["upstream_headers"][5]["value"].is_null());
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][5]["value_redacted"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][6]["name"],
+        "x-api-key"
+    );
+    assert!(state["config"]["upstreams"][0]["upstream_headers"][6]["value"].is_null());
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][6]["value_redacted"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][7]["name"],
+        "x-client-secret"
+    );
+    assert!(state["config"]["upstreams"][0]["upstream_headers"][7]["value"].is_null());
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][7]["value_redacted"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][8]["name"],
+        "x-client-credential"
+    );
+    assert!(state["config"]["upstreams"][0]["upstream_headers"][8]["value"].is_null());
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][8]["value_redacted"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][9]["name"],
+        "x-service-apikey"
+    );
+    assert!(state["config"]["upstreams"][0]["upstream_headers"][9]["value"].is_null());
+    assert_eq!(
+        state["config"]["upstreams"][0]["upstream_headers"][9]["value_redacted"],
+        true
+    );
+    assert!(state["config"]["upstreams"][0]
+        .get("fallback_credential_actual")
+        .is_none());
+    assert!(state["config"]["hooks"]["exchange"]
+        .get("authorization")
+        .is_none());
+    assert!(state["config"]["hooks"]["usage"]
+        .get("authorization")
+        .is_none());
+
+    let body = serde_json::to_string(&state).unwrap();
+    assert!(!body.contains("env-secret"));
+    assert!(!body.contains("exchange-secret"));
+    assert!(!body.contains("usage-secret"));
+    assert!(!body.contains("upstream-secret"));
+    assert!(!body.contains("session-secret"));
+    assert!(!body.contains("proxy-secret"));
+    assert!(!body.contains("secret-secret"));
+    assert!(!body.contains("credential-secret"));
+    assert!(!body.contains("apikey-secret"));
+}
+
+#[tokio::test]
+async fn admin_routes_require_bearer_token_when_env_is_configured() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::set("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN", "super-secret-token");
+
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+    let client = Client::new();
+
+    let missing = client
+        .get(format!("{}/admin/state", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong = client
+        .get(format!("{}/admin/state", proxy_base))
+        .header("authorization", "Bearer wrong-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let ok = client
+        .get(format!("{}/admin/state", proxy_base))
+        .header("authorization", "Bearer super-secret-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    let ok_lowercase = client
+        .get(format!("{}/admin/state", proxy_base))
+        .header("authorization", "bearer super-secret-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_lowercase.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_routes_fail_closed_when_admin_token_env_is_empty() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::set("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN", "");
+
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+    let client = Client::new();
+
+    let missing = client
+        .get(format!("{}/admin/state", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let wrong = client
+        .get(format!("{}/admin/state", proxy_base))
+        .header("authorization", "Bearer wrong-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let blank = client
+        .get(format!("{}/admin/state", proxy_base))
+        .header("authorization", "Bearer ")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blank.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn admin_routes_allow_loopback_when_admin_token_env_is_absent() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+    let client = Client::new();
+
+    let response = client
+        .get(format!("{}/admin/state", proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_routes_reject_proxy_forwarding_headers_in_loopback_mode() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+    let client = Client::new();
+
+    for header_name in [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+    ] {
+        let response = client
+            .get(format!("{}/admin/state", proxy_base))
+            .header(header_name, "203.0.113.10")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{header_name}");
+    }
+}
+
+#[tokio::test]
+async fn admin_routes_do_not_inherit_global_cors_headers() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+    let client = Client::new();
+
+    let health = client
+        .get(format!("{}/health", proxy_base))
+        .header("origin", "https://example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        health
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("*")
+    );
+
+    let admin = client
+        .get(format!("{}/admin/state", proxy_base))
+        .header("origin", "https://example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin.status(), StatusCode::OK);
+    assert!(admin.headers().get("access-control-allow-origin").is_none());
 }
 
 #[tokio::test]
@@ -553,7 +1182,7 @@ async fn openai_namespace_response_compact_works() {
 }
 
 #[tokio::test]
-async fn openai_namespace_response_get_requires_native_responses_upstream() {
+async fn openai_namespace_response_get_requires_available_native_responses_upstream() {
     let (mock_base, _mock) = spawn_openai_completion_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -564,12 +1193,12 @@ async fn openai_namespace_response_get_requires_native_responses_upstream() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: Value = res.json().await.unwrap();
     assert!(body["error"]["message"]
         .as_str()
         .unwrap_or_default()
-        .contains("natively supports OpenAI Responses"));
+        .contains("available upstream that natively supports OpenAI Responses"));
 }
 
 #[tokio::test]
@@ -611,6 +1240,98 @@ async fn openai_responses_lifecycle_is_ambiguous_with_multiple_native_upstreams(
         .as_str()
         .unwrap_or_default()
         .contains("ambiguous"));
+}
+
+#[tokio::test]
+async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_503() {
+    let (mock_base, _mock, captured) = spawn_discovery_empty_mock().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![UpstreamConfig {
+            name: "AUTO".to_string(),
+            api_root: mock_base.clone(),
+            fixed_upstream_format: None,
+            fallback_credential_env: None,
+            fallback_credential_actual: None,
+            fallback_api_key: None,
+            auth_policy: AuthPolicy::ClientOrFallback,
+            upstream_headers: Vec::new(),
+        }],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("unavailable"));
+    assert!(message.contains("no supported formats"));
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 4, "only discovery probes should run");
+    assert!(!captured
+        .iter()
+        .any(|(_, _, body)| body.contains("\"content\":\"Hi\"")));
+}
+
+#[tokio::test]
+async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+
+    let (mock_base, _mock, _captured) = spawn_discovery_empty_mock().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![UpstreamConfig {
+            name: "AUTO".to_string(),
+            api_root: mock_base,
+            fixed_upstream_format: None,
+            fallback_credential_env: None,
+            fallback_credential_actual: None,
+            fallback_api_key: None,
+            auth_policy: AuthPolicy::ClientOrFallback,
+            upstream_headers: Vec::new(),
+        }],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let state: Value = Client::new()
+        .get(format!("{}/admin/namespaces/default/state", proxy_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(state["upstreams"][0]["name"], "AUTO");
+    assert_eq!(state["upstreams"][0]["supported_formats"], json!([]));
+    assert_eq!(
+        state["upstreams"][0]["availability"]["status"],
+        "unavailable"
+    );
+    assert!(state["upstreams"][0]["availability"]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no supported formats"));
 }
 
 #[tokio::test]

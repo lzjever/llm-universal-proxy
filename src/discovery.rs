@@ -22,6 +22,48 @@ pub struct UpstreamCapability {
     pub default_target: UpstreamFormat,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamAvailability {
+    Available,
+    Unavailable { reason: String },
+}
+
+impl UpstreamAvailability {
+    pub fn available() -> Self {
+        Self::Available
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Available => None,
+            Self::Unavailable { reason } => Some(reason.as_str()),
+        }
+    }
+
+    pub fn status_label(&self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable { .. } => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredUpstream {
+    pub capability: Option<UpstreamCapability>,
+    pub availability: UpstreamAvailability,
+}
+
 impl UpstreamCapability {
     /// Use a single fixed format (no discovery): supported = {format}, default_target = format.
     pub fn fixed(format: UpstreamFormat) -> Self {
@@ -34,16 +76,19 @@ impl UpstreamCapability {
     }
 
     /// Choose default target as first in DEFAULT_TARGET_ORDER that is in supported.
-    pub fn from_supported(supported: HashSet<UpstreamFormat>) -> Self {
+    pub fn from_supported(supported: HashSet<UpstreamFormat>) -> Option<Self> {
+        if supported.is_empty() {
+            return None;
+        }
         let default_target = DEFAULT_TARGET_ORDER
             .iter()
             .find(|f| supported.contains(f))
             .copied()
-            .unwrap_or(UpstreamFormat::OpenAiCompletion);
-        Self {
+            .expect("supported formats are non-empty");
+        Some(Self {
             supported,
             default_target,
-        }
+        })
     }
 
     /// Upstream format to use for this request: client format if supported, else default target.
@@ -58,6 +103,30 @@ impl UpstreamCapability {
     /// Whether we should passthrough (no translation) for this client format.
     pub fn should_passthrough(&self, client_format: UpstreamFormat) -> bool {
         self.supported.contains(&client_format)
+    }
+}
+
+impl DiscoveredUpstream {
+    pub fn fixed(format: UpstreamFormat) -> Self {
+        Self {
+            capability: Some(UpstreamCapability::fixed(format)),
+            availability: UpstreamAvailability::available(),
+        }
+    }
+
+    pub fn from_supported(supported: HashSet<UpstreamFormat>) -> Self {
+        match UpstreamCapability::from_supported(supported) {
+            Some(capability) => Self {
+                capability: Some(capability),
+                availability: UpstreamAvailability::available(),
+            },
+            None => Self {
+                capability: None,
+                availability: UpstreamAvailability::unavailable(
+                    "protocol discovery returned no supported formats",
+                ),
+            },
+        }
     }
 }
 
@@ -169,7 +238,7 @@ mod tests {
         let mut supported = HashSet::new();
         supported.insert(UpstreamFormat::Google);
         supported.insert(UpstreamFormat::OpenAiCompletion);
-        let cap = UpstreamCapability::from_supported(supported);
+        let cap = UpstreamCapability::from_supported(supported).expect("capability");
         assert_eq!(cap.default_target, UpstreamFormat::OpenAiCompletion);
         assert_eq!(
             cap.upstream_format_for_request(UpstreamFormat::OpenAiResponses),
@@ -189,10 +258,8 @@ mod tests {
     }
 
     #[test]
-    fn from_supported_empty_defaults_to_openai_completion() {
-        let cap = UpstreamCapability::from_supported(HashSet::new());
-        assert_eq!(cap.default_target, UpstreamFormat::OpenAiCompletion);
-        assert!(cap.supported.is_empty());
+    fn from_supported_empty_returns_no_capability() {
+        assert!(UpstreamCapability::from_supported(HashSet::new()).is_none());
     }
 
     #[test]
@@ -200,7 +267,33 @@ mod tests {
         let mut supported = HashSet::new();
         supported.insert(UpstreamFormat::Google);
         supported.insert(UpstreamFormat::Anthropic);
-        let cap = UpstreamCapability::from_supported(supported);
+        let cap = UpstreamCapability::from_supported(supported).expect("capability");
         assert_eq!(cap.default_target, UpstreamFormat::Anthropic);
+    }
+
+    #[test]
+    fn discovered_upstream_marks_empty_discovery_as_unavailable() {
+        let discovered = DiscoveredUpstream::from_supported(HashSet::new());
+
+        assert!(discovered.capability.is_none());
+        assert_eq!(
+            discovered.availability,
+            UpstreamAvailability::Unavailable {
+                reason: "protocol discovery returned no supported formats".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn discovered_upstream_fixed_format_is_available() {
+        let discovered = DiscoveredUpstream::fixed(UpstreamFormat::OpenAiResponses);
+
+        assert!(discovered.availability.is_available());
+        assert!(discovered
+            .capability
+            .as_ref()
+            .expect("capability")
+            .supported
+            .contains(&UpstreamFormat::OpenAiResponses));
     }
 }

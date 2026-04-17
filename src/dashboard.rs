@@ -18,22 +18,21 @@ use ratatui::{
 
 use crate::config::{AuthPolicy, Config};
 use crate::hooks::HookSnapshot;
+use crate::server::{DashboardNamespaceSnapshot, DashboardRuntimeHandle, DashboardUpstreamStatus};
 use crate::telemetry::{RequestOutcome, RuntimeMetrics};
 
-pub async fn run_dashboard(
-    config: Arc<Config>,
+pub(crate) async fn run_dashboard(
+    runtime: DashboardRuntimeHandle,
     metrics: Arc<RuntimeMetrics>,
-    hooks: Option<crate::hooks::HookDispatcher>,
 ) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || run_dashboard_blocking(config, metrics, hooks))
+    tokio::task::spawn_blocking(move || run_dashboard_blocking(runtime, metrics))
         .await
         .unwrap_or_else(|join_err| Err(io::Error::other(join_err.to_string())))
 }
 
 fn run_dashboard_blocking(
-    config: Arc<Config>,
+    runtime: DashboardRuntimeHandle,
     metrics: Arc<RuntimeMetrics>,
-    hooks: Option<crate::hooks::HookDispatcher>,
 ) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -42,7 +41,7 @@ fn run_dashboard_blocking(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = dashboard_loop(&mut terminal, config, metrics, hooks);
+    let result = dashboard_loop(&mut terminal, runtime, metrics);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -52,14 +51,13 @@ fn run_dashboard_blocking(
 
 fn dashboard_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    config: Arc<Config>,
+    runtime: DashboardRuntimeHandle,
     metrics: Arc<RuntimeMetrics>,
-    hooks: Option<crate::hooks::HookDispatcher>,
 ) -> io::Result<()> {
     loop {
-        let snapshot = metrics.snapshot(&config);
-        let hook_snapshot = hooks.as_ref().map(|dispatcher| dispatcher.snapshot());
-        terminal.draw(|frame| draw_dashboard(frame, &config, &snapshot, hook_snapshot.as_ref()))?;
+        let snapshot = runtime.snapshot();
+        let metrics_snapshot = metrics.snapshot(&snapshot.config);
+        terminal.draw(|frame| draw_dashboard(frame, &snapshot, &metrics_snapshot))?;
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -76,9 +74,8 @@ fn dashboard_loop(
 
 fn draw_dashboard(
     frame: &mut ratatui::Frame<'_>,
-    config: &Config,
-    snapshot: &crate::telemetry::MetricsSnapshot,
-    hooks: Option<&HookSnapshot>,
+    runtime_snapshot: &DashboardNamespaceSnapshot,
+    metrics_snapshot: &crate::telemetry::MetricsSnapshot,
 ) {
     let area = frame.area();
     frame.render_widget(
@@ -96,16 +93,28 @@ fn draw_dashboard(
         ])
         .split(area);
 
-    render_header(frame, vertical[0], snapshot);
-    render_summary(frame, vertical[1], config, snapshot, hooks);
-    render_config(frame, vertical[2], config, hooks);
+    render_header(frame, vertical[0], metrics_snapshot);
+    render_summary(
+        frame,
+        vertical[1],
+        &runtime_snapshot.config,
+        metrics_snapshot,
+        runtime_snapshot.hooks.as_ref(),
+    );
+    render_config(
+        frame,
+        vertical[2],
+        &runtime_snapshot.config,
+        &runtime_snapshot.upstreams,
+        runtime_snapshot.hooks.as_ref(),
+    );
 
     let lower = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
         .split(vertical[3]);
-    render_upstreams(frame, lower[0], snapshot);
-    render_recent(frame, lower[1], snapshot);
+    render_upstreams(frame, lower[0], metrics_snapshot);
+    render_recent(frame, lower[1], metrics_snapshot);
 }
 
 fn render_header(
@@ -251,6 +260,7 @@ fn render_config(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     config: &Config,
+    upstream_statuses: &[DashboardUpstreamStatus],
     hooks: Option<&HookSnapshot>,
 ) {
     let chunks = Layout::default()
@@ -297,7 +307,12 @@ fn render_config(
                 .fixed_upstream_format
                 .map(|value| format!("{value:?}"))
                 .unwrap_or_else(|| "auto".to_string());
-            format!("{}  [{format}]  {mode}", upstream.name)
+            let availability = upstream_statuses
+                .iter()
+                .find(|status| status.name == upstream.name)
+                .map(format_dashboard_availability)
+                .unwrap_or_else(|| "status unknown".to_string());
+            format!("{}  [{format}]  {mode}  {availability}", upstream.name)
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -325,6 +340,13 @@ fn render_config(
             .wrap(Wrap { trim: false }),
         chunks[2],
     );
+}
+
+fn format_dashboard_availability(status: &DashboardUpstreamStatus) -> String {
+    match status.availability_reason.as_deref() {
+        Some(reason) => format!("{} ({reason})", status.availability_status),
+        None => status.availability_status.clone(),
+    }
 }
 
 fn render_upstreams(

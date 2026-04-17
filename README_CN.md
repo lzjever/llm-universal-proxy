@@ -143,6 +143,56 @@ hooks:
 - `auth_policy` 支持 `client_or_fallback` 和 `force_server`。
 - hooks 是异步 best-effort 模式。通常只开 `usage` 就够；`exchange` 会在请求结束后上报完整的 client-facing request/response pair。
 
+## Admin 控制面
+
+admin 路由与数据面是显式分离的：
+
+- admin 路由统一位于 `/admin/...`
+- admin 路由**不会**继承代理对数据面的全局 CORS 策略
+- `/openai/v1/...` 这类数据面路由仍保留面向浏览器客户端的宽松 CORS
+
+当前 admin 访问策略：
+
+- 如果设置了环境变量 `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`，所有 admin 请求都必须带 `Authorization: Bearer <token>`
+- 如果没有设置 `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`，则只允许 loopback 客户端访问 admin（`127.0.0.1` / `::1`）
+
+当前 admin 接口：
+
+- `GET /admin/state`
+- `GET /admin/namespaces/:namespace/state`
+- `POST /admin/namespaces/:namespace/config`
+
+读写模型边界：
+
+- `POST /admin/namespaces/:namespace/config` 继续沿用现有 runtime config 写入形状
+- admin 读接口使用单独的 redacted view model，不会直接序列化内部 `Config`
+- admin state 响应绝不会明文返回上游 `fallback_credential_actual` 或 hook `authorization`
+- 对应位置会改为布尔标记，例如 `fallback_credential_configured` 和 `authorization_configured`
+
+示例：
+
+```json
+{
+  "namespace": "demo",
+  "revision": "rev-1",
+  "config": {
+    "upstreams": [
+      {
+        "name": "default",
+        "fallback_credential_env": "OPENAI_API_KEY",
+        "fallback_credential_configured": true
+      }
+    ],
+    "hooks": {
+      "exchange": {
+        "url": "https://example.com/hooks/exchange",
+        "authorization_configured": true
+      }
+    }
+  }
+}
+```
+
 ### 完整 YAML 参考
 
 ```yaml

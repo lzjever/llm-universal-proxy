@@ -4,17 +4,30 @@
 
 Single-binary HTTP proxy that:
 
-1. **Single service URL** — One base URL (e.g. `http://localhost:8080/v1/chat/completions` or `/v1/responses`).
+1. **Separated planes** — One data plane for client traffic (for example `http://localhost:8080/openai/v1/...`) and one admin control plane under `http://localhost:8080/admin/...`.
 2. **Four client request formats** — Clients can send requests in any of:
-   - **Google (Gemini)** — e.g. `contents[]`, `generateContent`-style.
-   - **Anthropic (Claude)** — e.g. `/v1/messages`, `messages[]` with content blocks, `system`.
-   - **OpenAI Chat Completions** — `/v1/chat/completions`, `messages[]`, `stream`, `temperature`, etc.
-   - **OpenAI Responses API** — `/v1/responses`, `input[]`, `instructions`.
+   - **Google (Gemini)** — e.g. `/google/v1beta/models/:id`, `contents[]`, `generateContent`-style.
+   - **Anthropic (Claude)** — e.g. `/anthropic/v1/messages`, `messages[]` with content blocks, `system`.
+   - **OpenAI Chat Completions** — `/openai/v1/chat/completions`, `messages[]`, `stream`, `temperature`, etc.
+   - **OpenAI Responses API** — `/openai/v1/responses`, `input[]`, `instructions`.
 3. **Upstream formats** — The proxy connects to one **upstream** base URL. The upstream may support one or more of the four formats; the proxy **discovers** which formats are supported and uses the **most generic** as the default conversion target when translation is needed.
 4. **Concurrency** — The proxy must support **concurrent requests**. Handlers are async and non-blocking; Axum’s default concurrency is used; no shared mutable state that would serialize requests.
 5. **Passthrough** — If the client’s request format is **supported by the upstream**, the proxy forwards the request and response in that format (no translation). This reduces errors and improves efficiency. When the client format is not supported, the proxy translates to the default (most generic) upstream format.
 6. **Streaming** — Must support streaming (SSE) in all cases: passthrough = pipe bytes; otherwise = translate stream chunks from upstream format to client format.
 7. **Minimal loss** — When translating, preserve as much as possible: tool calls, thinking/reasoning, usage, finish reasons, and content structure.
+
+### Admin control plane boundary
+
+- Admin routes are independent from the data-plane router so that browser-facing data-plane middleware does not leak onto `/admin/...`.
+- The data plane keeps the permissive global CORS layer; the admin plane does not inherit that CORS layer.
+- Admin access policy is intentionally narrow:
+  - if `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is set, admin requests must present `Authorization: Bearer <token>`
+  - otherwise admin is available only to loopback clients (`127.0.0.1` / `::1`)
+- Admin writes keep the existing runtime config payload shape.
+- Admin reads use a dedicated redacted view model:
+  - upstream fallback credentials are exposed only as metadata such as `fallback_credential_env` and `fallback_credential_configured`
+  - hook authorization headers are exposed only as `authorization_configured`
+  - plaintext `fallback_credential_actual` and hook `authorization` values are never serialized in admin state responses
 
 ### Upstream format discovery and passthrough
 
@@ -35,15 +48,14 @@ Logic is inspired by the **9router** reference project (in this workspace at `fo
 ## Architecture
 
 ```
-Client (any of 4 formats)  →  Proxy  →  Upstream (supports one or more formats)
-       POST /v1/chat/completions or /v1/responses
-       Body: OpenAI / OpenAI-Responses / Anthropic / Google
+Client (any of 4 formats)  →  Data Plane  →  Upstream (supports one or more formats)
+Admin client               →  Admin Plane →  Runtime namespace state/config
 ```
 
 - **Detection**: From request path + body shape, infer **client format**.
 - **Config**: **Upstream URL**; optional **UPSTREAM_FORMAT** (if set, no discovery; otherwise proxy discovers supported formats).
 - **Discovery**: Proxy determines **supported upstream formats** and **default conversion target** (most generic among supported).
-- **Request path**: Single logical endpoint (e.g. one route that handles both `/v1/chat/completions` and `/v1/responses` and treats path as a hint for detection).
+- **Request path**: The data plane is namespaced by protocol (`/openai/v1/...`, `/anthropic/v1/...`, `/google/v1beta/...`). The admin plane is `/admin/...`.
 
 ### Request flow
 
