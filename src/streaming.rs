@@ -68,6 +68,7 @@ pub struct ToolCallState {
     pub arguments: String,
     pub arguments_seeded_from_start: bool,
     pub block_index: Option<usize>,
+    pub responses_item_id: Option<String>,
     pub responses_item_added: bool,
     pub responses_done: bool,
 }
@@ -113,6 +114,9 @@ fn dedupe_tool_call_state_by_call_id(
             }
             if entry.block_index.is_none() {
                 entry.block_index = existing_entry.block_index;
+            }
+            if entry.responses_item_id.is_none() {
+                entry.responses_item_id = existing_entry.responses_item_id.clone();
             }
             entry.responses_item_added |= existing_entry.responses_item_added;
             entry.responses_done |= existing_entry.responses_done;
@@ -208,11 +212,6 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                     .get("index")
                     .and_then(Value::as_u64)
                     .map(|i| i as usize);
-                out.push(openai_chunk(
-                    state,
-                    serde_json::json!({ "reasoning_content": "<think>" }),
-                    None,
-                ));
             } else if block_ty == Some("tool_use") {
                 let block = block.unwrap();
                 let idx = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -319,11 +318,6 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                 return out;
             }
             if state.in_thinking_block && state.current_block_index == idx {
-                out.push(openai_chunk(
-                    state,
-                    serde_json::json!({ "reasoning_content": "" }),
-                    None,
-                ));
                 state.in_thinking_block = false;
             }
         }
@@ -423,10 +417,169 @@ fn convert_claude_stop_reason(r: &str) -> String {
         "max_tokens" => "length",
         "tool_use" => "tool_calls",
         "stop_sequence" => "stop",
+        "pause_turn" => "pause_turn",
+        "refusal" => "content_filter",
         "model_context_window_exceeded" => "context_length_exceeded",
         _ => "stop",
     }
     .to_string()
+}
+
+fn gemini_finish_reason_to_openai_stream(finish_reason: &str, has_tool_calls: bool) -> String {
+    match finish_reason {
+        "STOP" => {
+            if has_tool_calls {
+                "tool_calls"
+            } else {
+                "stop"
+            }
+        }
+        "MAX_TOKENS" => "length",
+        "SAFETY"
+        | "RECITATION"
+        | "LANGUAGE"
+        | "OTHER"
+        | "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "MALFORMED_FUNCTION_CALL"
+        | "UNEXPECTED_TOOL_CALL"
+        | "TOO_MANY_TOOL_CALLS"
+        | "MISSING_THOUGHT_SIGNATURE"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "IMAGE_RECITATION"
+        | "IMAGE_OTHER"
+        | "NO_IMAGE"
+        | "FINISH_REASON_UNSPECIFIED" => "content_filter",
+        _ => "content_filter",
+    }
+    .to_string()
+}
+
+fn openai_finish_reason_to_gemini_stream(finish_reason: &str) -> &'static str {
+    match finish_reason {
+        "stop" | "tool_calls" => "STOP",
+        "length" => "MAX_TOKENS",
+        "content_filter" => "SAFETY",
+        "pause_turn" | "context_length_exceeded" => "OTHER",
+        _ => "STOP",
+    }
+}
+
+const GEMINI_DUMMY_THOUGHT_SIGNATURE_STREAM: &str = "skip_thought_signature_validator";
+
+fn responses_failed_code_to_openai_finish_stream(code: Option<&str>) -> &'static str {
+    match code {
+        Some("context_length_exceeded") => "context_length_exceeded",
+        Some("content_filter") | Some("invalid_prompt") => "content_filter",
+        Some(_) | None => "content_filter",
+    }
+}
+
+fn responses_usage_to_openai_usage_stream(usage: &Value) -> Value {
+    let input_tokens = usage
+        .get("input_tokens")
+        .or(usage.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .or(usage.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(input_tokens + output_tokens);
+
+    let mut mapped = serde_json::json!({
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": total_tokens
+    });
+
+    if let Some(cached_tokens) = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
+    {
+        mapped["prompt_tokens_details"] = serde_json::json!({ "cached_tokens": cached_tokens });
+    }
+
+    if let Some(reasoning_tokens) = usage
+        .get("output_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+        })
+    {
+        mapped["completion_tokens_details"] =
+            serde_json::json!({ "reasoning_tokens": reasoning_tokens });
+    }
+
+    mapped
+}
+
+fn openai_usage_to_responses_usage_stream(usage: &Value) -> Value {
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(input_tokens + output_tokens);
+
+    let mut mapped = serde_json::json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens
+    });
+
+    if let Some(details) = usage.get("prompt_tokens_details") {
+        if let Some(cached) = details.get("cached_tokens").and_then(Value::as_u64) {
+            mapped["input_tokens_details"] = serde_json::json!({ "cached_tokens": cached });
+        }
+    }
+    if let Some(details) = usage.get("completion_tokens_details") {
+        if let Some(reasoning) = details.get("reasoning_tokens").and_then(Value::as_u64) {
+            mapped["output_tokens_details"] = serde_json::json!({ "reasoning_tokens": reasoning });
+        }
+    }
+
+    mapped
+}
+
+fn responses_event_tool_call_index(event: &Value, state: &StreamState) -> Option<usize> {
+    if let Some(item_id) = event.get("item_id").and_then(Value::as_str) {
+        if let Some((idx, _)) = state
+            .openai_tool_calls
+            .iter()
+            .find(|(_, tool_call)| tool_call.responses_item_id.as_deref() == Some(item_id))
+        {
+            return Some(*idx);
+        }
+    }
+    event
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .map(|idx| idx as usize)
+        .filter(|idx| state.openai_tool_calls.contains_key(idx))
 }
 
 /// If event is OpenAI chunk (has choices[].delta), return as single-item vec. Else return empty.
@@ -625,15 +778,17 @@ pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                 "cached_tokens": cached_tokens
             });
         }
+        if thoughts_tokens > 0 {
+            usage_json["completion_tokens_details"] = serde_json::json!({
+                "reasoning_tokens": thoughts_tokens
+            });
+        }
 
         state.usage = Some(usage_json);
     }
 
     if let Some(finish) = candidate.get("finishReason").and_then(Value::as_str) {
-        let mut fr = finish.to_lowercase();
-        if fr == "stop" && !state.openai_tool_calls.is_empty() {
-            fr = "tool_calls".to_string();
-        }
+        let fr = gemini_finish_reason_to_openai_stream(finish, !state.openai_tool_calls.is_empty());
         let mut chunk = openai_chunk(state, serde_json::json!({}), Some(&fr));
         if let Some(ref u) = state.usage {
             chunk["usage"] = u.clone();
@@ -696,6 +851,10 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            let output_index = event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|idx| idx as usize);
             let call_id = item
                 .get("call_id")
                 .and_then(Value::as_str)
@@ -703,11 +862,16 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
             let idx = state.openai_tool_call_index;
             state.openai_tool_call_index += 1;
             let id = call_id.unwrap_or_else(|| format!("call_{idx}"));
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let tc = serde_json::json!({
                 "index": idx,
-                "id": id,
+                "id": id.clone(),
                 "type": "function",
-                "function": { "name": name, "arguments": "" }
+                "function": { "name": name.clone(), "arguments": arguments.clone() }
             });
             state.openai_tool_calls.insert(
                 idx,
@@ -715,8 +879,9 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                     index: idx,
                     id: Some(serde_json::json!(id)),
                     name,
-                    arguments: String::new(),
-                    block_index: None,
+                    arguments,
+                    block_index: output_index,
+                    responses_item_id: item.get("id").and_then(Value::as_str).map(String::from),
                     ..Default::default()
                 },
             );
@@ -734,7 +899,8 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
     {
         let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
         if !delta.is_empty() {
-            let idx = state.openai_tool_call_index.saturating_sub(1);
+            let idx = responses_event_tool_call_index(event, state)
+                .unwrap_or_else(|| state.openai_tool_call_index.saturating_sub(1));
             if let Some(tc) = state.openai_tool_calls.get_mut(&idx) {
                 tc.arguments.push_str(delta);
             }
@@ -752,13 +918,24 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
     if ty == "response.completed" || ty == "response.incomplete" || ty == "response.failed" {
         if let Some(resp) = event.get("response") {
             if let Some(u) = resp.get("usage") {
-                state.usage = Some(serde_json::json!({
-                    "prompt_tokens": u.get("input_tokens").or(u.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0),
-                    "completion_tokens": u.get("output_tokens").or(u.get("completion_tokens")).and_then(Value::as_u64).unwrap_or(0)
-                }));
+                state.usage = Some(responses_usage_to_openai_usage_stream(u));
             }
         }
         if !state.finish_reason_sent {
+            let has_tool_calls = !state.openai_tool_calls.is_empty()
+                || event
+                    .get("response")
+                    .and_then(|resp| resp.get("output"))
+                    .and_then(Value::as_array)
+                    .map(|output| {
+                        output.iter().any(|item| {
+                            matches!(
+                                item.get("type").and_then(Value::as_str),
+                                Some("function_call") | Some("custom_tool_call")
+                            )
+                        })
+                    })
+                    .unwrap_or(false);
             let finish_reason = match ty {
                 "response.incomplete" => event
                     .get("response")
@@ -777,13 +954,15 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                     .and_then(|resp| resp.get("error"))
                     .and_then(|error| error.get("code"))
                     .and_then(Value::as_str)
-                    .map(|code| match code {
-                        "context_length_exceeded" => "context_length_exceeded",
-                        "content_filter" | "invalid_prompt" => "content_filter",
-                        _ => "stop",
-                    })
-                    .unwrap_or("stop"),
-                _ => "stop",
+                    .map(|code| responses_failed_code_to_openai_finish_stream(Some(code)))
+                    .unwrap_or_else(|| responses_failed_code_to_openai_finish_stream(None)),
+                _ => {
+                    if has_tool_calls {
+                        "tool_calls"
+                    } else {
+                        "stop"
+                    }
+                }
             };
             let mut chunk = openai_chunk(state, serde_json::json!({}), Some(finish_reason));
             if let Some(ref u) = state.usage {
@@ -1474,24 +1653,74 @@ fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
             let args_val: Value =
                 serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({}));
             let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-            parts.push(serde_json::json!({
+            let mut part = serde_json::json!({
                 "functionCall": { "name": name, "args": args_val, "id": id }
-            }));
+            });
+            if tc.get("index").and_then(Value::as_u64) == Some(0) {
+                part["thoughtSignature"] =
+                    Value::String(GEMINI_DUMMY_THOUGHT_SIGNATURE_STREAM.to_string());
+            }
+            parts.push(part);
         }
     }
 
     if !parts.is_empty() || finish_reason.is_some() {
         let fr = finish_reason
-            .map(|s| s.to_uppercase())
-            .unwrap_or_else(|| "".to_string());
-        let candidate = serde_json::json!({
+            .map(openai_finish_reason_to_gemini_stream)
+            .unwrap_or("");
+        let mut candidate = serde_json::json!({
             "content": { "parts": parts },
             "finishReason": fr
         });
-        let payload = serde_json::json!({
+        if fr.is_empty() {
+            candidate
+                .as_object_mut()
+                .expect("candidate object")
+                .remove("finishReason");
+        }
+        let mut payload = serde_json::json!({
             "candidates": [candidate],
             "modelVersion": model
         });
+        if let Some(response_id) = chunk.get("id").cloned() {
+            payload["responseId"] = response_id;
+        }
+        if let Some(usage) = chunk.get("usage") {
+            let prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let completion_tokens = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let total_tokens = usage
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(prompt_tokens + completion_tokens);
+            let reasoning_tokens = usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let cached_tokens = usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let mut usage_metadata = serde_json::json!({
+                "promptTokenCount": prompt_tokens,
+                "candidatesTokenCount": completion_tokens.saturating_sub(reasoning_tokens),
+                "totalTokenCount": total_tokens
+            });
+            if reasoning_tokens > 0 {
+                usage_metadata["thoughtsTokenCount"] = reasoning_tokens.into();
+            }
+            if cached_tokens > 0 {
+                usage_metadata["cachedContentTokenCount"] = cached_tokens.into();
+            }
+            payload["usageMetadata"] = usage_metadata;
+        }
         out.push(format_sse_data(&payload));
     }
     out
@@ -1778,6 +2007,7 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
         state.usage = Some(u.clone());
     }
     if finish_reason == Some("context_length_exceeded") {
+        state.responses_terminal_sent = true;
         let failed = serde_json::json!({
             "type": "response.failed",
             "sequence_number": next_responses_seq(state),
@@ -1793,7 +2023,11 @@ fn openai_chunk_to_responses_sse(chunk: &Value, state: &mut StreamState) -> Vec<
                     "message": "Your input exceeds the context window of this model. Please adjust your input and try again."
                 },
                 "incomplete_details": null,
-                "usage": null,
+                "usage": state
+                    .usage
+                    .as_ref()
+                    .map(openai_usage_to_responses_usage_stream)
+                    .unwrap_or(serde_json::Value::Null),
                 "metadata": {}
             }
         });
@@ -2212,6 +2446,36 @@ mod tests {
     }
 
     #[test]
+    fn claude_thinking_boundaries_do_not_emit_synthetic_reasoning_markers() {
+        let mut state = StreamState::default();
+        let _ = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-3" }
+            }),
+            &mut state,
+        );
+        let start_chunks = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "thinking", "thinking": "" }
+            }),
+            &mut state,
+        );
+        let stop_chunks = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "content_block_stop",
+                "index": 0
+            }),
+            &mut state,
+        );
+
+        assert!(start_chunks.is_empty());
+        assert!(stop_chunks.is_empty());
+    }
+
+    #[test]
     fn responses_event_output_text_delta_produces_openai_chunk() {
         let event = serde_json::json!({
             "type": "response.output_text.delta",
@@ -2303,6 +2567,208 @@ mod tests {
             chunks[0]["choices"][0]["finish_reason"],
             "context_length_exceeded"
         );
+    }
+
+    #[test]
+    fn responses_failed_unknown_event_produces_openai_content_filter_finish() {
+        let event = serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_1",
+                "error": { "code": "server_error" },
+                "output": [{
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup_weather",
+                    "arguments": "{\"city\":\"Tokyo\"}"
+                }]
+            }
+        });
+        let mut state = StreamState::default();
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn responses_completed_tool_call_event_produces_openai_tool_calls_finish() {
+        let mut state = StreamState::default();
+        let _ = responses_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_item_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup"
+                }
+            }),
+            &mut state,
+        );
+        let chunks = responses_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [{
+                        "id": "fc_item_1",
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "{\"city\":\"Tokyo\"}"
+                    }]
+                }
+            }),
+            &mut state,
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn responses_function_call_argument_delta_binds_by_item_identity() {
+        let mut state = StreamState::default();
+        let _ = responses_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_item_0",
+                    "type": "function_call",
+                    "call_id": "call_0",
+                    "name": "first"
+                }
+            }),
+            &mut state,
+        );
+        let _ = responses_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": "fc_item_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "second"
+                }
+            }),
+            &mut state,
+        );
+
+        let chunks = responses_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_item_0",
+                "output_index": 0,
+                "delta": "{\"city\":\"Tokyo\"}"
+            }),
+            &mut state,
+        );
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0]["choices"][0]["delta"]["tool_calls"][0]["index"],
+            0
+        );
+        assert_eq!(
+            state
+                .openai_tool_calls
+                .get(&0)
+                .expect("first tool")
+                .arguments,
+            "{\"city\":\"Tokyo\"}"
+        );
+        assert_eq!(
+            state
+                .openai_tool_calls
+                .get(&1)
+                .expect("second tool")
+                .arguments,
+            ""
+        );
+    }
+
+    #[test]
+    fn responses_terminal_usage_preserves_cache_and_reasoning_details() {
+        let event = serde_json::json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1",
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 7,
+                    "total_tokens": 18,
+                    "input_tokens_details": { "cached_tokens": 3 },
+                    "output_tokens_details": { "reasoning_tokens": 2 }
+                }
+            }
+        });
+        let mut state = StreamState::default();
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["usage"]["total_tokens"], 18);
+        assert_eq!(
+            chunks[0]["usage"]["prompt_tokens_details"]["cached_tokens"],
+            3
+        );
+        assert_eq!(
+            chunks[0]["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
+    }
+
+    #[test]
+    fn claude_pause_turn_stream_maps_to_openai_pause_turn_finish() {
+        let mut state = StreamState::default();
+        let _ = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-3" }
+            }),
+            &mut state,
+        );
+        let _ = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "pause_turn" }
+            }),
+            &mut state,
+        );
+        let chunks = claude_event_to_openai_chunks(
+            &serde_json::json!({ "type": "message_stop" }),
+            &mut state,
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "pause_turn");
+    }
+
+    #[test]
+    fn claude_refusal_stream_maps_to_openai_content_filter_finish() {
+        let mut state = StreamState::default();
+        let _ = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "message_start",
+                "message": { "id": "msg_1", "model": "claude-3" }
+            }),
+            &mut state,
+        );
+        let _ = claude_event_to_openai_chunks(
+            &serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "refusal" }
+            }),
+            &mut state,
+        );
+        let chunks = claude_event_to_openai_chunks(
+            &serde_json::json!({ "type": "message_stop" }),
+            &mut state,
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "content_filter");
     }
 
     #[test]
@@ -2415,6 +2881,144 @@ mod tests {
             .join("\n");
         assert!(joined.contains("\"thought\":true"));
         assert!(joined.contains("\"text\":\"think\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_gemini_sse_maps_portable_finish_reason_names() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "length" }]
+        });
+        let mut state = StreamState::default();
+        let out = openai_chunk_to_gemini_sse(&chunk, &mut state);
+        let joined = out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"finishReason\":\"MAX_TOKENS\""));
+        assert!(!joined.contains("\"finishReason\":\"LENGTH\""));
+    }
+
+    #[test]
+    fn openai_chunk_to_gemini_sse_adds_dummy_signature_to_first_tool_call() {
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_1",
+                            "function": { "name": "lookup_weather", "arguments": "{\"city\":\"Tokyo\"}" }
+                        },
+                        {
+                            "index": 1,
+                            "id": "call_2",
+                            "function": { "name": "lookup_time", "arguments": "{\"city\":\"Tokyo\"}" }
+                        }
+                    ]
+                },
+                "finish_reason": null
+            }]
+        });
+        let mut state = StreamState::default();
+        let out = openai_chunk_to_gemini_sse(&chunk, &mut state);
+        let joined = out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("\"thoughtSignature\":\"skip_thought_signature_validator\""));
+        assert_eq!(joined.matches("\"thoughtSignature\"").count(), 1);
+    }
+
+    #[test]
+    fn gemini_event_to_openai_chunks_maps_portable_finish_and_reasoning_usage() {
+        let event = serde_json::json!({
+            "response": {
+                "responseId": "gem_resp_1",
+                "modelVersion": "gemini-2.5",
+                "candidates": [{
+                    "content": { "parts": [{ "text": "Hi" }], "role": "model" },
+                    "finishReason": "SAFETY"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 5,
+                    "thoughtsTokenCount": 2,
+                    "totalTokenCount": 18,
+                    "cachedContentTokenCount": 3
+                }
+            }
+        });
+        let mut state = StreamState::default();
+        let chunks = gemini_event_to_openai_chunks(&event, &mut state);
+        let finish_chunk = chunks
+            .iter()
+            .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+            .expect("finish chunk");
+        assert_eq!(
+            finish_chunk["choices"][0]["finish_reason"],
+            "content_filter"
+        );
+        assert_eq!(finish_chunk["usage"]["total_tokens"], 18);
+        assert_eq!(
+            finish_chunk["usage"]["prompt_tokens_details"]["cached_tokens"],
+            3
+        );
+        assert_eq!(
+            finish_chunk["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
+    }
+
+    #[test]
+    fn gemini_stream_non_success_finish_reasons_do_not_collapse_to_success() {
+        let reasons = [
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "TOO_MANY_TOOL_CALLS",
+            "MISSING_THOUGHT_SIGNATURE",
+            "IMAGE_OTHER",
+            "NO_IMAGE",
+            "LANGUAGE",
+        ];
+
+        for reason in reasons {
+            let event = serde_json::json!({
+                "response": {
+                    "responseId": format!("gem_{reason}"),
+                    "modelVersion": "gemini-2.5",
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{
+                                "functionCall": {
+                                    "id": "call_1",
+                                    "name": "lookup_weather",
+                                    "args": { "city": "Tokyo" }
+                                }
+                            }]
+                        },
+                        "finishReason": reason
+                    }]
+                }
+            });
+            let mut state = StreamState::default();
+            let chunks = gemini_event_to_openai_chunks(&event, &mut state);
+            let finish_chunk = chunks
+                .iter()
+                .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+                .expect("finish chunk");
+            assert_eq!(
+                finish_chunk["choices"][0]["finish_reason"], "content_filter",
+                "reason = {reason}, chunk = {finish_chunk:?}"
+            );
+        }
     }
 
     #[test]
@@ -2844,6 +3448,36 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
+        assert!(joined.contains("\"total_tokens\":25"));
+        assert!(joined.contains("\"input_tokens_details\":{\"cached_tokens\":3}"));
+        assert!(joined.contains("\"output_tokens_details\":{\"reasoning_tokens\":2}"));
+    }
+
+    #[test]
+    fn openai_chunk_to_responses_sse_preserves_usage_on_context_failure() {
+        let mut state = StreamState::default();
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 25,
+                "prompt_tokens_details": { "cached_tokens": 3 },
+                "completion_tokens_details": { "reasoning_tokens": 2 }
+            },
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "context_length_exceeded" }]
+        });
+
+        let out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let joined = out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("\"type\":\"response.failed\""));
+        assert!(joined.contains("\"code\":\"context_length_exceeded\""));
         assert!(joined.contains("\"total_tokens\":25"));
         assert!(joined.contains("\"input_tokens_details\":{\"cached_tokens\":3}"));
         assert!(joined.contains("\"output_tokens_details\":{\"reasoning_tokens\":2}"));

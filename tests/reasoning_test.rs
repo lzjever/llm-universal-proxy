@@ -386,6 +386,11 @@ async fn anthropic_thinking_to_openai_chat_streaming() {
     assert!(res.status().is_success());
     let text = res.text().await.unwrap();
     assert!(text.contains("reasoning_content"), "body = {text}");
+    assert!(!text.contains("<think>"), "body = {text}");
+    assert!(
+        !text.contains("\"reasoning_content\":\"\""),
+        "body = {text}"
+    );
 }
 
 #[tokio::test]
@@ -407,6 +412,7 @@ async fn anthropic_thinking_to_responses_streaming() {
         text.contains("response.reasoning_summary_text.delta"),
         "body = {text}"
     );
+    assert!(!text.contains("<think>"), "body = {text}");
     assert!(
         text.contains("response.output_text.delta") || text.contains("response.completed"),
         "body = {text}"
@@ -750,6 +756,124 @@ async fn multi_turn_openai_reasoning_preserved_in_history_to_claude() {
         body.get("choices").is_some() || body.get("content").is_some(),
         "unexpected response: {body:?}"
     );
+}
+
+#[tokio::test]
+async fn multi_turn_openai_reasoning_rehydrates_to_claude_thinking_blocks() {
+    let (mock_base, _mock, mut captured) = spawn_capture_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [
+                { "role": "user", "content": "Think about 2+2" },
+                { "role": "assistant", "reasoning_content": "2+2 equals 4", "content": "The answer is 4" },
+                { "role": "user", "content": "Now what about 3+3?" }
+            ],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let _body: Value = res.json().await.unwrap();
+
+    captured.changed().await.unwrap();
+    let request = captured
+        .borrow()
+        .clone()
+        .expect("captured anthropic request");
+    let assistant_content = request["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "2+2 equals 4");
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "The answer is 4");
+    assert!(assistant_content
+        .iter()
+        .all(|block| block["type"] != "redacted_thinking"));
+    assert!(assistant_content
+        .iter()
+        .all(|block| block["type"] != "server_tool_use"));
+}
+
+#[tokio::test]
+async fn openai_reasoning_tool_turns_replay_to_gemini_with_dummy_signature() {
+    let (mock_base, _mock, mut captured) = spawn_capture_google_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini-test",
+            "messages": [
+                { "role": "user", "content": "Check Tokyo weather" },
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Need to call weather tool first.",
+                    "content": "Calling weather tool.",
+                    "tool_calls": [{
+                        "id": "call_weather",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"Tokyo\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_weather",
+                    "content": "{\"temp_c\":22}"
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Look up weather.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": { "type": "string" }
+                        },
+                        "required": ["city"]
+                    }
+                }
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let _body: Value = res.json().await.unwrap();
+
+    captured.changed().await.unwrap();
+    let request = captured.borrow().clone().expect("captured gemini request");
+    let assistant_parts = request["contents"][1]["parts"]
+        .as_array()
+        .expect("assistant parts");
+    assert!(assistant_parts
+        .iter()
+        .all(|part| part.get("thought").is_none()));
+    assert_eq!(assistant_parts[0]["text"], "Calling weather tool.");
+    assert_eq!(assistant_parts[1]["functionCall"]["name"], "get_weather");
+    assert_eq!(
+        assistant_parts[1]["thoughtSignature"],
+        "skip_thought_signature_validator"
+    );
+    let tool_parts = request["contents"][2]["parts"]
+        .as_array()
+        .expect("tool parts");
+    assert_eq!(tool_parts[0]["functionResponse"]["name"], "get_weather");
 }
 
 // ============================================================

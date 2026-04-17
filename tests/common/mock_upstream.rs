@@ -652,3 +652,90 @@ async fn capture_openai_completion_handler(
     });
     (StatusCode::OK, Json(resp)).into_response()
 }
+
+/// Spawns a mock Gemini upstream that captures request bodies.
+/// The captured body can be retrieved via the returned `captured` watch channel.
+pub async fn spawn_capture_google_mock() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Receiver<Option<Value>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let (tx, rx) = tokio::sync::watch::channel(None);
+
+    let app = Router::new()
+        .route("/v1beta/models/:model_action", post(capture_google_handler))
+        .route("/models/:model_action", post(capture_google_handler))
+        .route("/generateContent", post(capture_google_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.with_state(tx)).await.ok();
+    });
+    (base, handle, rx)
+}
+
+async fn capture_google_handler(
+    axum::extract::State(tx): axum::extract::State<tokio::sync::watch::Sender<Option<Value>>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let _ = tx.send(Some(body.clone()));
+    let resp = serde_json::json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{ "text": "OK" }]
+            },
+            "finishReason": "STOP"
+        }],
+        "modelVersion": "gemini-captured",
+        "responseId": "gem-captured",
+        "usageMetadata": {
+            "promptTokenCount": 1,
+            "candidatesTokenCount": 1,
+            "totalTokenCount": 2
+        }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Spawns a mock Anthropic Messages upstream that captures request bodies.
+/// The captured body can be retrieved via the returned `captured` watch channel.
+pub async fn spawn_capture_anthropic_mock() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Receiver<Option<Value>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let (tx, rx) = tokio::sync::watch::channel(None);
+
+    let app = Router::new()
+        .route("/v1/messages", post(capture_anthropic_handler))
+        .route("/messages", post(capture_anthropic_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.with_state(tx)).await.ok();
+    });
+    (base, handle, rx)
+}
+
+async fn capture_anthropic_handler(
+    axum::extract::State(tx): axum::extract::State<tokio::sync::watch::Sender<Option<Value>>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let _ = tx.send(Some(body.clone()));
+    let resp = serde_json::json!({
+        "id": "msg_captured",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "OK" }],
+        "model": body.get("model").unwrap_or(&serde_json::json!("claude-3")),
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}

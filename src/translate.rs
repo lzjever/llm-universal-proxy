@@ -153,6 +153,107 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
     Ok(result)
 }
 
+fn gemini_finish_reason_to_openai(finish_reason: Option<&str>, has_tool_calls: bool) -> String {
+    match finish_reason.unwrap_or("STOP") {
+        "STOP" => {
+            if has_tool_calls {
+                "tool_calls"
+            } else {
+                "stop"
+            }
+        }
+        "MAX_TOKENS" => "length",
+        "SAFETY"
+        | "RECITATION"
+        | "LANGUAGE"
+        | "OTHER"
+        | "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "MALFORMED_FUNCTION_CALL"
+        | "UNEXPECTED_TOOL_CALL"
+        | "TOO_MANY_TOOL_CALLS"
+        | "MISSING_THOUGHT_SIGNATURE"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "IMAGE_RECITATION"
+        | "IMAGE_OTHER"
+        | "NO_IMAGE"
+        | "FINISH_REASON_UNSPECIFIED" => "content_filter",
+        _ => "content_filter",
+    }
+    .to_string()
+}
+
+fn openai_finish_reason_to_gemini(finish_reason: &str) -> &'static str {
+    match finish_reason {
+        "stop" | "tool_calls" => "STOP",
+        "length" => "MAX_TOKENS",
+        "content_filter" => "SAFETY",
+        "pause_turn" | "context_length_exceeded" => "OTHER",
+        _ => "STOP",
+    }
+}
+
+const GEMINI_DUMMY_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
+fn responses_failed_code_to_openai_finish(code: Option<&str>) -> &'static str {
+    match code {
+        Some("context_length_exceeded") => "context_length_exceeded",
+        Some("content_filter") | Some("invalid_prompt") => "content_filter",
+        Some(_) | None => "content_filter",
+    }
+}
+
+fn responses_finish_reason_to_openai(body: &Value, has_tool_calls: bool) -> String {
+    match body.get("status").and_then(Value::as_str) {
+        Some("incomplete") => match body
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str)
+        {
+            Some("max_output_tokens") => "length".to_string(),
+            Some("content_filter") => "content_filter".to_string(),
+            Some("pause_turn") => "pause_turn".to_string(),
+            _ => "stop".to_string(),
+        },
+        Some("failed") => responses_failed_code_to_openai_finish(
+            body.get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str),
+        )
+        .to_string(),
+        _ => {
+            if has_tool_calls {
+                "tool_calls".to_string()
+            } else {
+                "stop".to_string()
+            }
+        }
+    }
+}
+
+fn push_gemini_function_call_part(parts: &mut Vec<Value>, tool_call: &Value, first_in_step: bool) {
+    let args = tool_call
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(Value::as_str);
+    let args_val = args
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::json!({}));
+    let mut part = serde_json::json!({
+        "functionCall": {
+            "id": tool_call.get("id"),
+            "name": tool_call.get("function").and_then(|f| f.get("name")),
+            "args": args_val
+        }
+    });
+    if first_in_step {
+        part["thoughtSignature"] = Value::String(GEMINI_DUMMY_THOUGHT_SIGNATURE.to_string());
+    }
+    parts.push(part);
+}
+
 fn gemini_response_to_openai(body: &Value) -> Result<Value, String> {
     let response = body.get("response").unwrap_or(body);
     let candidates = response
@@ -202,14 +303,10 @@ fn gemini_response_to_openai(body: &Value) -> Result<Value, String> {
     if message.get("content").is_none() && message.get("tool_calls").is_none() {
         message["content"] = Value::String(String::new());
     }
-    let mut finish_reason = candidate
-        .get("finishReason")
-        .and_then(Value::as_str)
-        .unwrap_or("stop")
-        .to_lowercase();
-    if finish_reason == "stop" && has_tool_calls {
-        finish_reason = "tool_calls".to_string();
-    }
+    let finish_reason = gemini_finish_reason_to_openai(
+        candidate.get("finishReason").and_then(Value::as_str),
+        has_tool_calls,
+    );
     let usage = response.get("usageMetadata").or(body.get("usageMetadata"));
     let mut result = serde_json::json!({
         "id": response.get("responseId").cloned().unwrap_or_else(|| serde_json::json!(format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()))),
@@ -255,6 +352,11 @@ fn gemini_response_to_openai(body: &Value) -> Result<Value, String> {
         if cached_tokens > 0 {
             usage_json["prompt_tokens_details"] = serde_json::json!({
                 "cached_tokens": cached_tokens
+            });
+        }
+        if thoughts_tokens > 0 {
+            usage_json["completion_tokens_details"] = serde_json::json!({
+                "reasoning_tokens": thoughts_tokens
             });
         }
 
@@ -406,30 +508,19 @@ fn openai_response_to_gemini(body: &Value) -> Result<Value, String> {
         }
     }
     if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
-        for t in tc {
-            let args = t
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(Value::as_str);
-            let args_val = args
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or(serde_json::json!({}));
-            parts.push(serde_json::json!({
-                "functionCall": {
-                    "id": t.get("id"),
-                    "name": t.get("function").and_then(|f| f.get("name")),
-                    "args": args_val
-                }
-            }));
+        for (idx, t) in tc.iter().enumerate() {
+            push_gemini_function_call_part(&mut parts, t, idx == 0);
         }
     }
     if parts.is_empty() {
         parts.push(serde_json::json!({ "text": "" }));
     }
-    let finish = choice
-        .get("finish_reason")
-        .and_then(Value::as_str)
-        .unwrap_or("stop");
+    let finish = openai_finish_reason_to_gemini(
+        choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("stop"),
+    );
     let mut result = serde_json::json!({
         "candidates": [{
             "content": { "role": "model", "parts": parts },
@@ -492,11 +583,15 @@ fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
     if has_tool_calls {
         message["tool_calls"] = Value::Array(tool_calls);
     }
-    let finish = if has_tool_calls { "tool_calls" } else { "stop" };
+    let finish = responses_finish_reason_to_openai(body, has_tool_calls);
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or(serde_json::Value::Null),
         "object": "chat.completion",
-        "created": body.get("created").cloned().unwrap_or_else(|| serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())),
+        "created": body
+            .get("created_at")
+            .or(body.get("created"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())),
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "choices": [{ "index": 0, "message": message, "finish_reason": finish }]
     });
@@ -548,20 +643,41 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
         .get("finish_reason")
         .and_then(Value::as_str)
         .unwrap_or("stop");
-    let incomplete_reason = match finish_reason {
-        "length" => Some("max_output_tokens"),
-        "content_filter" => Some("content_filter"),
-        "pause_turn" => Some("pause_turn"),
-        _ => None,
+    let (status, incomplete_details, error) = match finish_reason {
+        "length" => (
+            "incomplete",
+            serde_json::json!({ "reason": "max_output_tokens" }),
+            Value::Null,
+        ),
+        "content_filter" => (
+            "incomplete",
+            serde_json::json!({ "reason": "content_filter" }),
+            Value::Null,
+        ),
+        "pause_turn" => (
+            "incomplete",
+            serde_json::json!({ "reason": "pause_turn" }),
+            Value::Null,
+        ),
+        "context_length_exceeded" => (
+            "failed",
+            Value::Null,
+            serde_json::json!({
+                "code": "context_length_exceeded",
+                "message": "The conversation exceeded the model context window.",
+                "type": "invalid_request_error"
+            }),
+        ),
+        _ => ("completed", Value::Null, Value::Null),
     };
     let mut result = serde_json::json!({
         "id": body.get("id").cloned().unwrap_or(serde_json::Value::Null),
         "object": "response",
         "created_at": created_at,
         "output": output,
-        "status": if incomplete_reason.is_some() { "incomplete" } else { "completed" },
-        "incomplete_details": incomplete_reason.map(|reason| serde_json::json!({ "reason": reason })).unwrap_or(serde_json::Value::Null),
-        "error": serde_json::Value::Null
+        "status": status,
+        "incomplete_details": incomplete_details,
+        "error": error
     });
     if let Some(u) = body.get("usage") {
         result["usage"] = openai_usage_to_responses_usage(u);
@@ -1791,6 +1907,16 @@ fn extract_text_content(content: Option<&Value>) -> String {
         .join("\n")
 }
 
+fn collapse_gemini_parts_for_openai(parts: &[Value]) -> Value {
+    if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text") {
+        return parts[0]
+            .get("text")
+            .cloned()
+            .unwrap_or(Value::String(String::new()));
+    }
+    Value::Array(parts.to_vec())
+}
+
 fn openai_message_to_claude_blocks(msg: &Value) -> Option<Vec<Value>> {
     let role = msg.get("role").and_then(Value::as_str)?;
     if role == "tool" {
@@ -1802,6 +1928,16 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Option<Vec<Value>> {
     }
     let content = msg.get("content");
     let mut blocks: Vec<Value> = vec![];
+    if role == "assistant" {
+        if let Some(reasoning) = openai_message_reasoning_text(msg) {
+            if !reasoning.is_empty() {
+                blocks.push(serde_json::json!({
+                    "type": "thinking",
+                    "thinking": reasoning
+                }));
+            }
+        }
+    }
     match content {
         Some(Value::String(s)) => {
             blocks.push(serde_json::json!({ "type": "text", "text": s }));
@@ -1881,6 +2017,38 @@ mod translate_regression_tests {
         assert_eq!(blocks[1]["type"], "tool_use");
         assert_eq!(blocks[1]["id"], "call_123");
         assert_eq!(blocks[1]["name"], "exec_command");
+    }
+
+    #[test]
+    fn assistant_reasoning_content_rehydrates_to_claude_thinking_before_text_and_tools() {
+        let msg = json!({
+            "role": "assistant",
+            "reasoning_content": "I should call a tool.",
+            "content": "Let me check that.",
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"pwd\"}"
+                    }
+                }
+            ]
+        });
+
+        let blocks = openai_message_to_claude_blocks(&msg).expect("assistant blocks");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "I should call a tool.");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[2]["type"], "tool_use");
+        assert!(blocks
+            .iter()
+            .all(|block| block["type"] != "redacted_thinking"));
+        assert!(blocks
+            .iter()
+            .all(|block| block["type"] != "server_tool_use"));
     }
 
     #[test]
@@ -2043,7 +2211,7 @@ fn gemini_to_openai(body: &mut Value) -> Result<(), String> {
     }
     if let Some(contents) = body.get("contents").and_then(Value::as_array) {
         for content in contents {
-            if let Some(msg) = convert_gemini_content_to_openai(content) {
+            for msg in convert_gemini_content_to_openai(content) {
                 result["messages"].as_array_mut().unwrap().push(msg);
             }
         }
@@ -2078,16 +2246,28 @@ fn gemini_nested_field<'a>(value: &'a Value, camel: &str, snake: &str) -> Option
     value.get(camel).or_else(|| value.get(snake))
 }
 
-fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
+fn convert_gemini_content_to_openai(content: &Value) -> Vec<Value> {
     let role = content
         .get("role")
         .and_then(Value::as_str)
         .unwrap_or("user");
     let openai_role = if role == "user" { "user" } else { "assistant" };
-    let parts = content.get("parts").and_then(Value::as_array)?;
+    let Some(parts) = content.get("parts").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
     let mut openai_parts: Vec<Value> = vec![];
     let mut tool_calls: Vec<Value> = vec![];
+    let mut reasoning_content = String::new();
     for part in parts {
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            if role != "user" {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    reasoning_content.push_str(text);
+                }
+            }
+            continue;
+        }
         if part.get("text").is_some() {
             openai_parts.push(serde_json::json!({ "type": "text", "text": part.get("text") }));
         }
@@ -2118,6 +2298,13 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
             }));
         }
         if let Some(fr) = gemini_part_field(part, "functionResponse", "function_response") {
+            if !openai_parts.is_empty() {
+                messages.push(serde_json::json!({
+                    "role": openai_role,
+                    "content": collapse_gemini_parts_for_openai(&openai_parts)
+                }));
+                openai_parts.clear();
+            }
             let call_id = fr.get("id").or(fr.get("name")).cloned();
             let resp = gemini_nested_field(fr, "response", "response");
             let content_str = resp
@@ -2125,43 +2312,44 @@ fn convert_gemini_content_to_openai(content: &Value) -> Option<Value> {
                 .or_else(|| resp.cloned())
                 .map(|v| serde_json::to_string(&v).unwrap_or_default())
                 .unwrap_or_default();
-            return Some(serde_json::json!({
+            messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": content_str
             }));
+            continue;
         }
     }
     if !tool_calls.is_empty() {
         let mut m = serde_json::json!({ "role": "assistant", "tool_calls": tool_calls });
         if !openai_parts.is_empty() {
-            m["content"] = if openai_parts.len() == 1
-                && openai_parts[0].get("type").and_then(Value::as_str) == Some("text")
-            {
-                openai_parts[0]
-                    .get("text")
-                    .cloned()
-                    .unwrap_or(Value::String(String::new()))
-            } else {
-                Value::Array(openai_parts)
-            };
+            m["content"] = collapse_gemini_parts_for_openai(&openai_parts);
         }
-        return Some(m);
+        if !reasoning_content.is_empty() {
+            m["reasoning_content"] = Value::String(reasoning_content);
+        }
+        messages.push(m);
+        return messages;
     }
     if openai_parts.is_empty() {
-        return None;
+        if !reasoning_content.is_empty() {
+            messages.push(serde_json::json!({
+                "role": openai_role,
+                "content": "",
+                "reasoning_content": reasoning_content
+            }));
+        }
+        return messages;
     }
-    let content = if openai_parts.len() == 1
-        && openai_parts[0].get("type").and_then(Value::as_str) == Some("text")
-    {
-        openai_parts[0]
-            .get("text")
-            .cloned()
-            .unwrap_or(Value::String(String::new()))
-    } else {
-        Value::Array(openai_parts)
-    };
-    Some(serde_json::json!({ "role": openai_role, "content": content }))
+    let mut message = serde_json::json!({
+        "role": openai_role,
+        "content": collapse_gemini_parts_for_openai(&openai_parts)
+    });
+    if !reasoning_content.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning_content);
+    }
+    messages.push(message);
+    messages
 }
 
 fn uuid_simple() -> String {
@@ -2224,26 +2412,14 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
                 }
             }
             if let Some(tc) = msg.get("tool_calls").and_then(Value::as_array) {
-                for t in tc {
+                for (idx, t) in tc.iter().enumerate() {
                     let name = t.get("function").and_then(|f| f.get("name")).cloned();
                     if let (Some(id), Some(name)) =
                         (t.get("id").and_then(Value::as_str), name.clone())
                     {
                         tool_name_by_call_id.insert(id.to_string(), name);
                     }
-                    let args = t
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(Value::as_str)
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or(serde_json::json!({}));
-                    parts.push(serde_json::json!({
-                        "functionCall": {
-                            "id": t.get("id"),
-                            "name": t.get("function").and_then(|f| f.get("name")),
-                            "args": args
-                        }
-                    }));
+                    push_gemini_function_call_part(&mut parts, t, idx == 0);
                 }
             }
             if !parts.is_empty() {
@@ -2896,6 +3072,64 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_openai_to_gemini_tool_turns_use_dummy_signature_without_reasoning_replay()
+    {
+        let mut body = json!({
+            "model": "gemini-1.5",
+            "messages": [
+                { "role": "user", "content": "Hi" },
+                {
+                    "role": "assistant",
+                    "reasoning_content": "internal reasoning",
+                    "content": "Calling tool.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "lookup_weather", "arguments": "{\"city\":\"Tokyo\"}" }
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": { "name": "lookup_time", "arguments": "{\"city\":\"Tokyo\"}" }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "{\"temperature\":22}"
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_2",
+                    "content": "{\"time\":\"10:00\"}"
+                }
+            ]
+        });
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            "gemini-1.5",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        let assistant_parts = body["contents"][1]["parts"]
+            .as_array()
+            .expect("assistant parts");
+        assert!(assistant_parts.iter().all(|part| part["thought"] != true));
+        assert_eq!(assistant_parts[0]["text"], "Calling tool.");
+        assert!(assistant_parts[1].get("functionCall").is_some());
+        assert_eq!(
+            assistant_parts[1]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert!(assistant_parts[2].get("functionCall").is_some());
+        assert!(assistant_parts[2].get("thoughtSignature").is_none());
+    }
+
+    #[test]
     fn translate_request_openai_to_claude_omitted_stream_defaults_false() {
         let mut body = json!({
             "model": "claude-3",
@@ -3224,6 +3458,43 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_gemini_to_openai_preserves_text_and_function_response_order() {
+        let mut body = json!({
+            "model": "gemini-1.5",
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "text": "Before tool." },
+                    {
+                        "functionResponse": {
+                            "id": "call_1",
+                            "name": "lookup_weather",
+                            "response": { "result": { "temperature": 22 } }
+                        }
+                    },
+                    { "text": "After tool." }
+                ]
+            }]
+        });
+        translate_request(
+            UpstreamFormat::Google,
+            UpstreamFormat::OpenAiCompletion,
+            "gemini-1.5",
+            &mut body,
+            false,
+        )
+        .unwrap();
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Before tool.");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "After tool.");
+    }
+
+    #[test]
     fn translate_response_same_format_passthrough() {
         let body = json!({
             "id": "x",
@@ -3418,6 +3689,96 @@ mod tests {
     }
 
     #[test]
+    fn translate_response_responses_incomplete_to_openai_preserves_terminal_and_usage_details() {
+        let body = json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 42,
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [{
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Hi" }]
+            }],
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+                "input_tokens_details": { "cached_tokens": 3 },
+                "output_tokens_details": { "reasoning_tokens": 2 }
+            }
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["choices"][0]["message"]["content"], "Hi");
+        assert_eq!(out["choices"][0]["finish_reason"], "length");
+        assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            out["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
+    }
+
+    #[test]
+    fn translate_response_responses_failed_to_openai_maps_context_failure() {
+        let body = json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 42,
+            "status": "failed",
+            "error": { "code": "context_length_exceeded" },
+            "output": [{
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "" }]
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(
+            out["choices"][0]["finish_reason"],
+            "context_length_exceeded"
+        );
+    }
+
+    #[test]
+    fn translate_response_responses_failed_unknown_code_maps_to_content_filter() {
+        let body = json!({
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 42,
+            "status": "failed",
+            "error": { "code": "server_error" },
+            "output": [{
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup_weather",
+                "arguments": "{\"city\":\"Tokyo\"}"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["choices"][0]["finish_reason"], "content_filter");
+        assert!(out["choices"][0]["message"]["tool_calls"].is_array());
+    }
+
+    #[test]
     fn translate_response_openai_to_responses_maps_usage_fields() {
         let body = json!({
             "id": "chatcmpl_1",
@@ -3516,6 +3877,28 @@ mod tests {
     }
 
     #[test]
+    fn translate_response_openai_to_responses_maps_context_window_to_failed() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "" },
+                "finish_reason": "context_length_exceeded"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["status"], "failed");
+        assert_eq!(out["error"]["code"], "context_length_exceeded");
+        assert_eq!(out["incomplete_details"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn translate_response_openai_to_gemini_maps_usage_fields() {
         let body = json!({
             "id": "chatcmpl_1",
@@ -3544,5 +3927,161 @@ mod tests {
         assert_eq!(out["usageMetadata"]["candidatesTokenCount"], 5);
         assert_eq!(out["usageMetadata"]["thoughtsTokenCount"], 2);
         assert_eq!(out["usageMetadata"]["cachedContentTokenCount"], 3);
+    }
+
+    #[test]
+    fn translate_response_openai_to_gemini_tool_calls_include_dummy_signature() {
+        let body = json!({
+            "id": "chatcmpl_gem_fc",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "Need tools.",
+                    "content": "Calling tools.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "lookup_weather", "arguments": "{\"city\":\"Tokyo\"}" }
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": { "name": "lookup_time", "arguments": "{\"city\":\"Tokyo\"}" }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            &body,
+        )
+        .unwrap();
+        let parts = out["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("gemini parts");
+        let function_parts = parts
+            .iter()
+            .filter(|part| part.get("functionCall").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            function_parts[0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert!(function_parts[1].get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn translate_response_gemini_to_openai_maps_finish_and_reasoning_usage_details() {
+        let body = json!({
+            "response": {
+                "responseId": "gem_resp_1",
+                "modelVersion": "gemini-2.5",
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{ "text": "Hi" }]
+                    },
+                    "finishReason": "MAX_TOKENS"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 5,
+                    "thoughtsTokenCount": 2,
+                    "totalTokenCount": 18,
+                    "cachedContentTokenCount": 3
+                }
+            }
+        });
+        let out = translate_response(
+            UpstreamFormat::Google,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["id"], "gem_resp_1");
+        assert_eq!(out["model"], "gemini-2.5");
+        assert_eq!(out["choices"][0]["finish_reason"], "length");
+        assert_eq!(out["usage"]["prompt_tokens"], 11);
+        assert_eq!(out["usage"]["completion_tokens"], 7);
+        assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            out["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            2
+        );
+    }
+
+    #[test]
+    fn translate_response_gemini_non_success_finish_reasons_do_not_collapse_to_success() {
+        let reasons = [
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "TOO_MANY_TOOL_CALLS",
+            "MISSING_THOUGHT_SIGNATURE",
+            "IMAGE_OTHER",
+            "NO_IMAGE",
+            "LANGUAGE",
+        ];
+
+        for reason in reasons {
+            let body = json!({
+                "response": {
+                    "responseId": format!("gem_{reason}"),
+                    "modelVersion": "gemini-2.5",
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{
+                                "functionCall": {
+                                    "id": "call_1",
+                                    "name": "lookup_weather",
+                                    "args": { "city": "Tokyo" }
+                                }
+                            }]
+                        },
+                        "finishReason": reason
+                    }]
+                }
+            });
+            let out = translate_response(
+                UpstreamFormat::Google,
+                UpstreamFormat::OpenAiCompletion,
+                &body,
+            )
+            .unwrap();
+            assert_eq!(
+                out["choices"][0]["finish_reason"], "content_filter",
+                "reason = {reason}, body = {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn translate_response_openai_to_gemini_maps_portable_finish_reasons() {
+        let body = json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "content_filter"
+            }]
+        });
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(out["responseId"], "chatcmpl_1");
+        assert_eq!(out["modelVersion"], "gpt-4o");
+        assert_eq!(out["candidates"][0]["finishReason"], "SAFETY");
     }
 }

@@ -464,6 +464,13 @@ enum AdminWriteError {
     PreconditionFailed { current_revision: Option<String> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestBoundaryDecision {
+    Allow,
+    AllowWithWarnings(Vec<String>),
+    Reject(String),
+}
+
 async fn build_runtime_namespace_state(
     revision: String,
     config: Config,
@@ -1219,14 +1226,10 @@ async fn handle_request_core(
     let request_id = new_request_id();
     let request_timestamp = now_timestamp_ms();
     let original_body = body.clone();
+    let stateful_responses_controls = responses_stateful_request_controls(&original_body);
     let original_headers = capture_headers(&headers);
     let stream = forced_stream
         .unwrap_or_else(|| body.get("stream").and_then(Value::as_bool).unwrap_or(false));
-    if let Some(obj) = body.as_object_mut() {
-        if let Some(forced_stream) = forced_stream {
-            obj.insert("stream".to_string(), Value::Bool(forced_stream));
-        }
-    }
 
     debug!("Request path: {}", path);
     debug!(
@@ -1251,8 +1254,8 @@ async fn handle_request_core(
     let mut tracker = state
         .metrics
         .start_request(path.as_str(), requested_model.clone(), stream);
-    let resolved_model = match resolve_requested_model_or_error(
-        &namespace_state.config,
+    let resolved_model = match resolve_request_model_or_error(
+        &namespace_state,
         &requested_model,
         client_format,
         &original_body,
@@ -1305,8 +1308,25 @@ async fn handle_request_core(
         );
     };
     let upstream_format = capability.upstream_format_for_request(client_format);
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(forced_stream) = forced_stream {
+            if !(client_format == crate::formats::UpstreamFormat::Google
+                && upstream_format == crate::formats::UpstreamFormat::Google)
+            {
+                obj.insert("stream".to_string(), Value::Bool(forced_stream));
+            }
+        }
+    }
+
     let compatibility_warnings =
-        collect_request_compatibility_warnings(client_format, upstream_format, &original_body);
+        match classify_request_boundary(client_format, upstream_format, &original_body) {
+            RequestBoundaryDecision::Allow => Vec::new(),
+            RequestBoundaryDecision::AllowWithWarnings(warnings) => warnings,
+            RequestBoundaryDecision::Reject(message) => {
+                tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+                return error_response(client_format, StatusCode::BAD_REQUEST, &message);
+            }
+        };
     for warning in &compatibility_warnings {
         warn!(
             "compatibility downgrade: client_format={} upstream_format={} warning={}",
@@ -1331,6 +1351,14 @@ async fn handle_request_core(
     if let Some(obj) = body.as_object_mut() {
         match upstream_format {
             crate::formats::UpstreamFormat::Google => {
+                obj.remove("model");
+            }
+            _ if client_format == crate::formats::UpstreamFormat::OpenAiResponses
+                && upstream_format == crate::formats::UpstreamFormat::OpenAiResponses
+                && requested_model.trim().is_empty()
+                && !stateful_responses_controls.is_empty()
+                && resolved_model.upstream_model.trim().is_empty() =>
+            {
                 obj.remove("model");
             }
             _ => {
@@ -1570,18 +1598,7 @@ async fn handle_openai_responses_resource(
         }
     };
 
-    let matching = namespace_state
-        .upstreams
-        .values()
-        .filter(|upstream| {
-            upstream.availability.is_available()
-                && upstream.capability.as_ref().is_some_and(|capability| {
-                    capability
-                        .supported
-                        .contains(&crate::formats::UpstreamFormat::OpenAiResponses)
-                })
-        })
-        .collect::<Vec<_>>();
+    let matching = available_native_responses_upstreams(&namespace_state);
 
     let upstream_state = match matching.as_slice() {
         [upstream] => *upstream,
@@ -2226,6 +2243,31 @@ fn collect_request_compatibility_warnings(
     warnings
 }
 
+fn classify_request_boundary(
+    client_format: crate::formats::UpstreamFormat,
+    upstream_format: crate::formats::UpstreamFormat,
+    body: &Value,
+) -> RequestBoundaryDecision {
+    if client_format == crate::formats::UpstreamFormat::OpenAiResponses
+        && upstream_format != crate::formats::UpstreamFormat::OpenAiResponses
+    {
+        let stateful_controls = responses_stateful_request_controls(body);
+        if !stateful_controls.is_empty() {
+            let quoted_controls = quoted_field_list(&stateful_controls);
+            return RequestBoundaryDecision::Reject(format!(
+                "Responses request controls {quoted_controls} require a native OpenAI Responses upstream and cannot be translated to {upstream_format}; the proxy does not reconstruct provider state"
+            ));
+        }
+    }
+
+    let warnings = collect_request_compatibility_warnings(client_format, upstream_format, body);
+    if warnings.is_empty() {
+        RequestBoundaryDecision::Allow
+    } else {
+        RequestBoundaryDecision::AllowWithWarnings(warnings)
+    }
+}
+
 fn resolve_requested_model_or_error(
     namespace_config: &crate::config::Config,
     requested_model: &str,
@@ -2251,6 +2293,62 @@ fn resolve_requested_model_or_error(
     namespace_config.resolve_model(requested_model)
 }
 
+fn resolve_request_model_or_error(
+    namespace_state: &RuntimeNamespaceState,
+    requested_model: &str,
+    client_format: crate::formats::UpstreamFormat,
+    body: &Value,
+) -> Result<crate::config::ResolvedModel, String> {
+    if let Some(resolved) = resolve_native_responses_stateful_route_or_error(
+        namespace_state,
+        requested_model,
+        client_format,
+        body,
+    )? {
+        return Ok(resolved);
+    }
+
+    resolve_requested_model_or_error(
+        &namespace_state.config,
+        requested_model,
+        client_format,
+        body,
+    )
+}
+
+fn resolve_native_responses_stateful_route_or_error(
+    namespace_state: &RuntimeNamespaceState,
+    requested_model: &str,
+    client_format: crate::formats::UpstreamFormat,
+    body: &Value,
+) -> Result<Option<crate::config::ResolvedModel>, String> {
+    if client_format != crate::formats::UpstreamFormat::OpenAiResponses
+        || !requested_model.trim().is_empty()
+    {
+        return Ok(None);
+    }
+
+    let stateful_controls = responses_stateful_request_controls(body);
+    if stateful_controls.is_empty() {
+        return Ok(None);
+    }
+
+    let quoted_controls = quoted_field_list(&stateful_controls);
+    let matching = available_native_responses_upstreams(namespace_state);
+    match matching.as_slice() {
+        [upstream] => Ok(Some(crate::config::ResolvedModel {
+            upstream_name: upstream.config.name.clone(),
+            upstream_model: String::new(),
+        })),
+        [] => Err(format!(
+            "Responses requests with stateful controls {quoted_controls} require exactly one available native OpenAI Responses upstream when `model` is omitted; the proxy does not reconstruct provider state"
+        )),
+        _ => Err(format!(
+            "Responses requests with stateful controls {quoted_controls} must include a routable `model` when this namespace has multiple available native OpenAI Responses upstreams; the proxy does not reconstruct response-to-upstream state"
+        )),
+    }
+}
+
 fn append_compatibility_warning_headers(response: &mut Response<Body>, warnings: &[String]) {
     for warning in warnings {
         let sanitized = warning.replace(['\r', '\n'], " ");
@@ -2265,7 +2363,7 @@ fn append_compatibility_warning_headers(response: &mut Response<Body>, warnings:
 fn normalized_non_stream_upstream_error(
     upstream_format: crate::formats::UpstreamFormat,
     client_format: crate::formats::UpstreamFormat,
-    upstream_body: &Value,
+    _upstream_body: &Value,
 ) -> Option<(StatusCode, String)> {
     if !matches!(
         client_format,
@@ -2276,18 +2374,61 @@ fn normalized_non_stream_upstream_error(
     }
 
     match upstream_format {
-        crate::formats::UpstreamFormat::Anthropic => {
-            let stop_reason = upstream_body.get("stop_reason").and_then(Value::as_str)?;
-            if stop_reason == "model_context_window_exceeded" {
-                return Some((
-                    StatusCode::BAD_REQUEST,
-                    "Your input exceeds the context window of this model. Please adjust your input and try again.".to_string(),
-                ));
-            }
-            None
-        }
+        crate::formats::UpstreamFormat::Anthropic => None,
         _ => None,
     }
+}
+
+fn available_native_responses_upstreams(
+    namespace_state: &RuntimeNamespaceState,
+) -> Vec<&UpstreamState> {
+    namespace_state
+        .upstreams
+        .values()
+        .filter(|upstream| {
+            upstream.availability.is_available()
+                && upstream.capability.as_ref().is_some_and(|capability| {
+                    capability
+                        .supported
+                        .contains(&crate::formats::UpstreamFormat::OpenAiResponses)
+                })
+        })
+        .collect()
+}
+
+fn responses_stateful_request_controls(body: &Value) -> Vec<&'static str> {
+    let mut controls = Vec::new();
+    if body.get("previous_response_id").is_some() {
+        controls.push("previous_response_id");
+    }
+    if body.get("conversation").is_some() {
+        controls.push("conversation");
+    }
+    if control_is_enabled(body.get("background")) {
+        controls.push("background");
+    }
+    if control_is_enabled(body.get("store")) {
+        controls.push("store");
+    }
+    if body.get("prompt").is_some() {
+        controls.push("prompt");
+    }
+    controls
+}
+
+fn control_is_enabled(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(false)) | None | Some(Value::Null) => false,
+        Some(_) => true,
+    }
+}
+
+fn quoted_field_list(fields: &[&str]) -> String {
+    fields
+        .iter()
+        .map(|field| format!("`{field}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn google_status_text(status: StatusCode) -> &'static str {
@@ -2586,6 +2727,64 @@ mod tests {
         }
     }
 
+    fn test_upstream_config(
+        name: &str,
+        format: crate::formats::UpstreamFormat,
+    ) -> crate::config::UpstreamConfig {
+        crate::config::UpstreamConfig {
+            name: name.to_string(),
+            api_root: format!("https://{name}.example/v1"),
+            fixed_upstream_format: Some(format),
+            fallback_credential_env: None,
+            fallback_credential_actual: None,
+            fallback_api_key: None,
+            auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+            upstream_headers: Vec::new(),
+        }
+    }
+
+    fn runtime_namespace_state_for_tests(
+        upstreams: &[(&str, crate::formats::UpstreamFormat, bool)],
+    ) -> RuntimeNamespaceState {
+        let config = crate::config::Config {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout: std::time::Duration::from_secs(30),
+            upstreams: upstreams
+                .iter()
+                .map(|(name, format, _)| test_upstream_config(name, *format))
+                .collect(),
+            model_aliases: Default::default(),
+            hooks: Default::default(),
+            debug_trace: crate::config::DebugTraceConfig::default(),
+        };
+        let upstream_states = upstreams
+            .iter()
+            .map(|(name, format, available)| {
+                (
+                    (*name).to_string(),
+                    UpstreamState {
+                        config: test_upstream_config(name, *format),
+                        capability: Some(crate::discovery::UpstreamCapability::fixed(*format)),
+                        availability: if *available {
+                            crate::discovery::UpstreamAvailability::available()
+                        } else {
+                            crate::discovery::UpstreamAvailability::unavailable("test outage")
+                        },
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        RuntimeNamespaceState {
+            revision: "test-revision".to_string(),
+            config,
+            upstreams: upstream_states,
+            client: Client::new(),
+            hooks: None,
+            debug_trace: None,
+        }
+    }
+
     #[test]
     fn normalize_upstream_error_maps_context_window_messages() {
         let error = normalize_upstream_error(
@@ -2651,7 +2850,7 @@ mod tests {
     }
 
     #[test]
-    fn normalized_non_stream_upstream_error_maps_anthropic_context_window_stop() {
+    fn normalized_non_stream_upstream_error_does_not_promote_anthropic_context_window_stop() {
         let upstream_body = serde_json::json!({
             "type": "message",
             "stop_reason": "model_context_window_exceeded"
@@ -2663,13 +2862,74 @@ mod tests {
             &upstream_body,
         );
 
+        assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn responses_stateful_request_controls_detect_provider_owned_fields() {
+        let controls = responses_stateful_request_controls(&serde_json::json!({
+            "previous_response_id": "resp_1",
+            "conversation": { "id": "conv_1" },
+            "background": true,
+            "store": true,
+            "prompt": { "id": "pmpt_1" }
+        }));
+
         assert_eq!(
-            actual,
-            Some((
-                StatusCode::BAD_REQUEST,
-                "Your input exceeds the context window of this model. Please adjust your input and try again.".to_string()
-            ))
+            controls,
+            vec![
+                "previous_response_id",
+                "conversation",
+                "background",
+                "store",
+                "prompt"
+            ]
         );
+    }
+
+    #[test]
+    fn classify_request_boundary_rejects_translated_stateful_responses_controls() {
+        let decision = classify_request_boundary(
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            crate::formats::UpstreamFormat::Anthropic,
+            &serde_json::json!({
+                "conversation": { "id": "conv_1" },
+                "background": true
+            }),
+        );
+
+        let RequestBoundaryDecision::Reject(message) = decision else {
+            panic!("expected rejection, got {decision:?}");
+        };
+        assert!(message.contains("conversation"));
+        assert!(message.contains("background"));
+        assert!(message.contains("native OpenAI Responses"));
+    }
+
+    #[test]
+    fn classify_request_boundary_keeps_warning_path_for_allowed_degradation() {
+        let decision = classify_request_boundary(
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            crate::formats::UpstreamFormat::Anthropic,
+            &serde_json::json!({
+                "truncation": "auto",
+                "prompt_cache_key": "cache-key",
+                "tools": [{ "type": "web_search" }]
+            }),
+        );
+
+        let RequestBoundaryDecision::AllowWithWarnings(warnings) = decision else {
+            panic!("expected warning path, got {decision:?}");
+        };
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("truncation")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("prompt_cache_key")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("non-function Responses tools")));
     }
 
     #[test]
@@ -2800,6 +3060,48 @@ mod tests {
 
         assert!(error.contains("previous_response_id"));
         assert!(error.contains("does not reconstruct response-to-upstream state"));
+    }
+
+    #[test]
+    fn resolve_native_responses_stateful_route_or_error_prefers_unique_available_native_upstream() {
+        let namespace_state = runtime_namespace_state_for_tests(&[
+            (
+                "responses",
+                crate::formats::UpstreamFormat::OpenAiResponses,
+                true,
+            ),
+            ("anthropic", crate::formats::UpstreamFormat::Anthropic, true),
+        ]);
+
+        let resolved = resolve_native_responses_stateful_route_or_error(
+            &namespace_state,
+            "",
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({ "previous_response_id": "resp_1" }),
+        )
+        .expect("resolver should succeed")
+        .expect("native route should be selected");
+
+        assert_eq!(resolved.upstream_name, "responses");
+        assert!(resolved.upstream_model.is_empty());
+    }
+
+    #[test]
+    fn resolve_native_responses_stateful_route_or_error_rejects_multiple_native_upstreams() {
+        let namespace_state = runtime_namespace_state_for_tests(&[
+            ("a", crate::formats::UpstreamFormat::OpenAiResponses, true),
+            ("b", crate::formats::UpstreamFormat::OpenAiResponses, true),
+        ]);
+
+        let error = resolve_native_responses_stateful_route_or_error(
+            &namespace_state,
+            "",
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({ "background": true }),
+        )
+        .expect_err("multiple native upstreams should fail");
+
+        assert!(error.contains("multiple available native OpenAI Responses upstreams"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ mod common;
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{any, post},
@@ -31,6 +31,7 @@ static ADMIN_TOKEN_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 type CapturedDiscoveryRequests = Arc<Mutex<Vec<(String, String, String)>>>;
+type CapturedGoogleRequests = Arc<Mutex<Vec<(String, Value)>>>;
 
 struct ScopedEnvVar {
     key: &'static str,
@@ -220,6 +221,80 @@ async fn spawn_discovery_empty_mock() -> (
         axum::serve(listener, app).await.ok();
     });
     (base, handle, captured)
+}
+
+async fn spawn_google_capture_mock() -> (String, tokio::task::JoinHandle<()>, CapturedGoogleRequests)
+{
+    async fn handler(
+        State(captured): State<CapturedGoogleRequests>,
+        Path(model_action): Path<String>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        captured
+            .lock()
+            .unwrap()
+            .push((model_action.clone(), body.clone()));
+        if model_action.contains(":streamGenerateContent") {
+            let body = r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-mock"}"#
+                .to_string()
+                + "\n\n";
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        } else {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "candidates": [{ "content": { "parts": [{ "text": "Hi" }], "role": "model" }, "finishReason": "STOP" }],
+                    "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2 }
+                })),
+            )
+                .into_response()
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1beta/models/:model_action", post(handler))
+        .route("/models/:model_action", post(handler))
+        .with_state(captured.clone());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle, captured)
+}
+
+async fn spawn_anthropic_context_window_mock() -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(Json(body): Json<Value>) -> impl IntoResponse {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "id": "msg_context_window",
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "" }],
+                "model": body.get("model").cloned().unwrap_or_else(|| json!("claude-3")),
+                "stop_reason": "model_context_window_exceeded",
+                "usage": { "input_tokens": 1, "output_tokens": 0 }
+            })),
+        )
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/messages", post(handler))
+        .route("/messages", post(handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
 }
 
 #[tokio::test]
@@ -1554,6 +1629,156 @@ async fn openai_responses_previous_response_id_requires_explicit_model_in_multi_
 }
 
 #[tokio::test]
+async fn responses_translation_rejects_previous_response_id_without_warning_headers() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "previous_response_id": "resp_123",
+            "input": "Continue",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(res.headers().get("x-proxy-compat-warning").is_none());
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("previous_response_id"),
+        "message = {message}"
+    );
+    assert!(
+        message.contains("native OpenAI Responses"),
+        "message = {message}"
+    );
+}
+
+#[tokio::test]
+async fn responses_translation_rejects_conversation_and_background_stateful_controls() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "conversation": { "id": "conv_123" },
+            "background": true,
+            "input": "Continue",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(res.headers().get("x-proxy-compat-warning").is_none());
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("conversation"), "message = {message}");
+    assert!(message.contains("background"), "message = {message}");
+}
+
+#[tokio::test]
+async fn responses_stateful_request_without_model_routes_to_unique_native_responses_upstream() {
+    let (responses_base, _responses_mock) = spawn_tagged_openai_responses_mock("a").await;
+    let (anthropic_base, _anthropic_mock) = spawn_anthropic_mock().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![
+            named_upstream(
+                "RESPONSES_A",
+                &responses_base,
+                UpstreamFormat::OpenAiResponses,
+                None,
+            ),
+            named_upstream(
+                "ANTHROPIC_B",
+                &anthropic_base,
+                UpstreamFormat::Anthropic,
+                None,
+            ),
+        ],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "previous_response_id": "resp_123",
+            "input": "Continue",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "resp_a");
+    assert_eq!(body["model"], "missing-model");
+}
+
+#[tokio::test]
+async fn responses_translated_allowed_degradation_emits_warning_headers() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "Hi",
+            "truncation": "auto",
+            "prompt_cache_key": "cache-key",
+            "tools": [{ "type": "web_search" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let warnings = res
+        .headers()
+        .get_all("x-proxy-compat-warning")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("truncation")),
+        "warnings = {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("prompt_cache_key")),
+        "warnings = {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("non-function Responses tools")),
+        "warnings = {warnings:?}"
+    );
+}
+
+#[tokio::test]
 async fn anthropic_namespace_messages_works() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
@@ -1659,6 +1884,54 @@ async fn google_namespace_stream_generate_content_works() {
     let body = res.text().await.unwrap();
     assert!(content_type.contains("text/event-stream"));
     assert!(body.contains("\"candidates\""));
+}
+
+#[tokio::test]
+async fn google_passthrough_does_not_inject_top_level_stream_field() {
+    let (mock_base, _mock, captured) = spawn_google_capture_mock().await;
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::Google,
+        "gemini-local",
+        "gemini-local",
+    );
+    let (proxy_base, _proxy) = start_proxy(config).await;
+    let client = Client::new();
+
+    let non_stream = client
+        .post(format!(
+            "{proxy_base}/google/v1beta/models/gemini-local:generateContent"
+        ))
+        .json(&json!({
+            "contents": [{ "parts": [{ "text": "Hi" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        non_stream.status().is_success(),
+        "status: {}",
+        non_stream.status()
+    );
+
+    let stream = client
+        .post(format!(
+            "{proxy_base}/google/v1beta/models/gemini-local:streamGenerateContent"
+        ))
+        .json(&json!({
+            "contents": [{ "parts": [{ "text": "Hi" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(stream.status().is_success(), "status: {}", stream.status());
+    let _ = stream.text().await.unwrap();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2, "captured = {captured:?}");
+    for (_, body) in captured.iter() {
+        assert!(body.get("stream").is_none(), "body = {body}");
+    }
 }
 
 #[tokio::test]
@@ -1984,6 +2257,32 @@ async fn upstream_google_passthrough_non_streaming() {
     // Passthrough: response is native Gemini format
     assert!(body.get("candidates").and_then(|c| c.get(0)).is_some());
     assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "Hi");
+}
+
+#[tokio::test]
+async fn anthropic_context_window_exceeded_non_stream_stays_on_success_path() {
+    let (mock_base, _mock) = spawn_anthropic_context_window_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(
+        body["choices"][0]["finish_reason"],
+        "context_length_exceeded"
+    );
 }
 
 #[tokio::test]
