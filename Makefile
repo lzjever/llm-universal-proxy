@@ -8,23 +8,30 @@ CARGO := $(if $(wildcard $(HOME)/.cargo/bin/cargo),$(HOME)/.cargo/bin/cargo,carg
 # Unset proxy so cargo/git reach tuna mirror and crate hosts directly (avoids TLS/SSL errors).
 CARGO_ENV := env -u RUSTC_WRAPPER -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY
 
-.PHONY: build test check run test-report
+.PHONY: build test check run run-release test-report test-binary-smoke governance
 
 build:
-	$(CARGO_ENV) $(CARGO) build --release
+	$(CARGO_ENV) $(CARGO) build --locked --release
 
 test:
-	$(CARGO_ENV) $(CARGO) test
+	$(CARGO_ENV) $(CARGO) test --locked
+
+# Build the release binary and run the local binary smoke script.
+test-binary-smoke: build
+	bash scripts/test_binary_smoke.sh
 
 # Run all tests (no-fail-fast), generate report in test-reports/
 test-report:
 	@bash scripts/test-and-report.sh --report-dir "$(CURDIR)/test-reports"
 
 check:
-	$(CARGO_ENV) $(CARGO) check && $(CARGO_ENV) $(CARGO) test
+	$(CARGO_ENV) $(CARGO) check --locked && $(CARGO_ENV) $(CARGO) test --locked
 
 run:
-	$(CARGO_ENV) $(CARGO) run
+	$(CARGO_ENV) $(CARGO) run --locked
 
 run-release:
-	$(CARGO_ENV) $(CARGO) run --release
+	$(CARGO_ENV) $(CARGO) run --locked --release
+
+governance:
+	@bash scripts/check-governance.sh

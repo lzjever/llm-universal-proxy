@@ -132,7 +132,7 @@ PROXY_RUNTIME_CONFIG=""
 start_proxy() {
     if ! [ -x "$PROXY_BIN" ]; then
         echo "Building proxy..."
-        cargo build --release 2>&1 | tail -5
+        cargo build --locked --release 2>&1 | tail -5
     fi
 
     PROXY_STDERR_FILE=$(mktemp /tmp/proxy-test-stderr.XXXXXX)

@@ -965,7 +965,7 @@ fn responses_to_messages(body: &mut Value) -> Result<(), String> {
                             .get("reasoning_content")
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        a["reasoning_content"] = Value::String(format!("{}{}", existing, summary));
+                        a["reasoning_content"] = Value::String(format!("{existing}{summary}"));
                     }
                 }
             }
@@ -2170,7 +2170,7 @@ fn uuid_simple() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("{:x}", t)
+    format!("{t:x}")
 }
 
 fn openai_to_gemini(body: &mut Value) -> Result<(), String> {

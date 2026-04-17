@@ -71,7 +71,7 @@ fn named_upstream(
         name: name.to_string(),
         api_root: upstream_api_root(upstream_base, format),
         fixed_upstream_format: Some(format),
-        fallback_credential_env: fallback_api_key.map(|_| format!("{}_KEY_ENV", name)),
+        fallback_credential_env: fallback_api_key.map(|_| format!("{name}_KEY_ENV")),
         fallback_credential_actual: None,
         fallback_api_key: fallback_api_key.map(ToString::to_string),
         auth_policy: AuthPolicy::ClientOrFallback,
@@ -116,6 +116,37 @@ fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
         hooks: RuntimeHookConfig::default(),
         debug_trace: DebugTraceConfig::default(),
     }
+}
+
+fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -> Config {
+    Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        upstreams: vec![UpstreamConfig {
+            name: "AUTO".to_string(),
+            api_root: upstream_api_root(upstream_base, api_root_format),
+            fixed_upstream_format: None,
+            fallback_credential_env: None,
+            fallback_credential_actual: None,
+            fallback_api_key: None,
+            auth_policy: AuthPolicy::ClientOrFallback,
+            upstream_headers: Vec::new(),
+        }],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+    }
+}
+
+async fn default_namespace_state(proxy_base: &str) -> Value {
+    Client::new()
+        .get(format!("{proxy_base}/admin/namespaces/default/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 async fn spawn_tagged_openai_responses_mock(
@@ -253,7 +284,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
 
     let client = Client::new();
     let apply_with_null = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "if_revision": null,
             "config": payload,
@@ -268,7 +299,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
     assert!(!first_revision.is_empty());
 
     let state: Value = client
-        .get(format!("{}/admin/namespaces/demo/state", proxy_base))
+        .get(format!("{proxy_base}/admin/namespaces/demo/state"))
         .send()
         .await
         .unwrap()
@@ -285,7 +316,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
     );
 
     let apply_missing = client
-        .post(format!("{}/admin/namespaces/second/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/second/config"))
         .json(&json!({
             "config": demo_runtime_config(&mock_base),
         }))
@@ -300,8 +331,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
 
     let res = client
         .post(format!(
-            "{}/namespaces/demo/openai/v1/chat/completions",
-            proxy_base
+            "{proxy_base}/namespaces/demo/openai/v1/chat/completions"
         ))
         .json(&json!({
             "model": "gpt-4",
@@ -325,7 +355,7 @@ async fn runtime_namespace_config_updates_with_exact_if_revision_and_generates_n
 
     let client = Client::new();
     let create = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "config": demo_runtime_config(&mock_base),
         }))
@@ -337,7 +367,7 @@ async fn runtime_namespace_config_updates_with_exact_if_revision_and_generates_n
     let initial_revision = create_body["revision"].as_str().unwrap().to_string();
 
     let state: Value = client
-        .get(format!("{}/admin/namespaces/demo/state", proxy_base))
+        .get(format!("{proxy_base}/admin/namespaces/demo/state"))
         .send()
         .await
         .unwrap()
@@ -347,7 +377,7 @@ async fn runtime_namespace_config_updates_with_exact_if_revision_and_generates_n
     assert_eq!(state["revision"], initial_revision);
 
     let update = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "if_revision": initial_revision,
             "config": demo_runtime_config(&mock_base),
@@ -371,7 +401,7 @@ async fn runtime_namespace_config_rejects_stale_or_missing_if_revision_with_412_
 
     let client = Client::new();
     let create = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "config": demo_runtime_config(&mock_base),
         }))
@@ -383,7 +413,7 @@ async fn runtime_namespace_config_rejects_stale_or_missing_if_revision_with_412_
     let initial_revision = create_body["revision"].as_str().unwrap().to_string();
 
     let update = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "if_revision": initial_revision,
             "config": demo_runtime_config(&mock_base),
@@ -396,7 +426,7 @@ async fn runtime_namespace_config_rejects_stale_or_missing_if_revision_with_412_
     let current_revision = update_body["revision"].as_str().unwrap().to_string();
 
     let stale = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "if_revision": create_body["revision"],
             "config": demo_runtime_config(&mock_base),
@@ -409,7 +439,7 @@ async fn runtime_namespace_config_rejects_stale_or_missing_if_revision_with_412_
     assert_eq!(stale_body["current_revision"], current_revision);
 
     let missing = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "config": demo_runtime_config(&mock_base),
         }))
@@ -430,7 +460,7 @@ async fn runtime_namespace_config_rejects_non_null_if_revision_when_namespace_do
 
     let client = Client::new();
     let response = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "if_revision": "rev-does-not-exist",
             "config": demo_runtime_config(&mock_base),
@@ -453,7 +483,7 @@ async fn default_namespace_startup_config_requires_exact_cas_update() {
 
     let client = Client::new();
     let state: Value = client
-        .get(format!("{}/admin/namespaces/default/state", proxy_base))
+        .get(format!("{proxy_base}/admin/namespaces/default/state"))
         .send()
         .await
         .unwrap()
@@ -465,7 +495,7 @@ async fn default_namespace_startup_config_requires_exact_cas_update() {
     assert_ne!(initial_revision, "startup");
 
     let update = client
-        .post(format!("{}/admin/namespaces/default/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/default/config"))
         .json(&json!({
             "if_revision": initial_revision,
             "config": demo_runtime_config(&mock_base),
@@ -487,7 +517,7 @@ async fn runtime_namespace_config_rejects_simultaneous_revision_and_if_revision(
 
     let client = Client::new();
     let response = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "revision": "legacy-rev",
             "if_revision": null,
@@ -508,7 +538,7 @@ async fn runtime_namespace_config_rejects_legacy_revision_shape_with_400() {
 
     let client = Client::new();
     let response = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "revision": "legacy-rev-1",
             "config": demo_runtime_config(&mock_base),
@@ -530,7 +560,7 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
 
     let client = Client::new();
     let apply = client
-        .post(format!("{}/admin/namespaces/demo/config", proxy_base))
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
         .json(&json!({
             "if_revision": null,
             "config": RuntimeConfigPayload {
@@ -582,7 +612,7 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
     let applied_revision = apply_body["revision"].as_str().unwrap().to_string();
 
     let state: Value = client
-        .get(format!("{}/admin/namespaces/demo/state", proxy_base))
+        .get(format!("{proxy_base}/admin/namespaces/demo/state"))
         .send()
         .await
         .unwrap()
@@ -731,14 +761,14 @@ async fn admin_routes_require_bearer_token_when_env_is_configured() {
     let client = Client::new();
 
     let missing = client
-        .get(format!("{}/admin/state", proxy_base))
+        .get(format!("{proxy_base}/admin/state"))
         .send()
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
     let wrong = client
-        .get(format!("{}/admin/state", proxy_base))
+        .get(format!("{proxy_base}/admin/state"))
         .header("authorization", "Bearer wrong-token")
         .send()
         .await
@@ -746,7 +776,7 @@ async fn admin_routes_require_bearer_token_when_env_is_configured() {
     assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
     let ok = client
-        .get(format!("{}/admin/state", proxy_base))
+        .get(format!("{proxy_base}/admin/state"))
         .header("authorization", "Bearer super-secret-token")
         .send()
         .await
@@ -754,7 +784,7 @@ async fn admin_routes_require_bearer_token_when_env_is_configured() {
     assert_eq!(ok.status(), StatusCode::OK);
 
     let ok_lowercase = client
-        .get(format!("{}/admin/state", proxy_base))
+        .get(format!("{proxy_base}/admin/state"))
         .header("authorization", "bearer super-secret-token")
         .send()
         .await
@@ -771,14 +801,14 @@ async fn admin_routes_fail_closed_when_admin_token_env_is_empty() {
     let client = Client::new();
 
     let missing = client
-        .get(format!("{}/admin/state", proxy_base))
+        .get(format!("{proxy_base}/admin/state"))
         .send()
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let wrong = client
-        .get(format!("{}/admin/state", proxy_base))
+        .get(format!("{proxy_base}/admin/state"))
         .header("authorization", "Bearer wrong-token")
         .send()
         .await
@@ -786,7 +816,7 @@ async fn admin_routes_fail_closed_when_admin_token_env_is_empty() {
     assert_eq!(wrong.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let blank = client
-        .get(format!("{}/admin/state", proxy_base))
+        .get(format!("{proxy_base}/admin/state"))
         .header("authorization", "Bearer ")
         .send()
         .await
@@ -803,7 +833,7 @@ async fn admin_routes_allow_loopback_when_admin_token_env_is_absent() {
     let client = Client::new();
 
     let response = client
-        .get(format!("{}/admin/state", proxy_base))
+        .get(format!("{proxy_base}/admin/state"))
         .send()
         .await
         .unwrap();
@@ -826,7 +856,7 @@ async fn admin_routes_reject_proxy_forwarding_headers_in_loopback_mode() {
         "x-real-ip",
     ] {
         let response = client
-            .get(format!("{}/admin/state", proxy_base))
+            .get(format!("{proxy_base}/admin/state"))
             .header(header_name, "203.0.113.10")
             .send()
             .await
@@ -843,7 +873,7 @@ async fn admin_routes_do_not_inherit_global_cors_headers() {
     let client = Client::new();
 
     let health = client
-        .get(format!("{}/health", proxy_base))
+        .get(format!("{proxy_base}/health"))
         .header("origin", "https://example.com")
         .send()
         .await
@@ -857,7 +887,7 @@ async fn admin_routes_do_not_inherit_global_cors_headers() {
     );
 
     let admin = client
-        .get(format!("{}/admin/state", proxy_base))
+        .get(format!("{proxy_base}/admin/state"))
         .header("origin", "https://example.com")
         .send()
         .await
@@ -870,7 +900,7 @@ async fn admin_routes_do_not_inherit_global_cors_headers() {
 async fn forwarded_headers_whitelist_preserves_protocol_headers_only() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
     let captured = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let captured_clone = captured.clone();
 
@@ -909,7 +939,7 @@ async fn forwarded_headers_whitelist_preserves_protocol_headers_only() {
     let (proxy_base, _proxy) = start_proxy(config).await;
     let client = Client::new();
     let response = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .header("anthropic-beta", "prompt-caching-2024-07-31")
         .header("accept-language", "en-US")
@@ -994,7 +1024,7 @@ async fn openai_namespace_chat_completions_works() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1039,13 +1069,13 @@ async fn openai_namespace_chat_completions_accepts_gzip_upstream_json() {
     let _mock = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    let mock_base = format!("http://127.0.0.1:{}", port);
+    let mock_base = format!("http://127.0.0.1:{port}");
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1068,7 +1098,7 @@ async fn openai_namespace_responses_works() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gpt-4",
             "input": "Hi",
@@ -1090,7 +1120,7 @@ async fn openai_namespace_responses_stream_works() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gpt-4",
             "input": "Hi",
@@ -1113,7 +1143,7 @@ async fn openai_namespace_response_get_works() {
 
     let client = Client::new();
     let res = client
-        .get(format!("{}/openai/v1/responses/resp_123", proxy_base))
+        .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
         .send()
         .await
         .unwrap();
@@ -1131,7 +1161,7 @@ async fn openai_namespace_response_delete_works() {
 
     let client = Client::new();
     let res = client
-        .delete(format!("{}/openai/v1/responses/resp_123", proxy_base))
+        .delete(format!("{proxy_base}/openai/v1/responses/resp_123"))
         .send()
         .await
         .unwrap();
@@ -1149,10 +1179,7 @@ async fn openai_namespace_response_cancel_works() {
 
     let client = Client::new();
     let res = client
-        .post(format!(
-            "{}/openai/v1/responses/resp_123/cancel",
-            proxy_base
-        ))
+        .post(format!("{proxy_base}/openai/v1/responses/resp_123/cancel"))
         .send()
         .await
         .unwrap();
@@ -1170,7 +1197,7 @@ async fn openai_namespace_response_compact_works() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses/compact", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses/compact"))
         .json(&json!({ "response_id": "resp_123" }))
         .send()
         .await
@@ -1189,7 +1216,7 @@ async fn openai_namespace_response_get_requires_available_native_responses_upstr
 
     let client = Client::new();
     let res = client
-        .get(format!("{}/openai/v1/responses/resp_123", proxy_base))
+        .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
         .send()
         .await
         .unwrap();
@@ -1230,7 +1257,7 @@ async fn openai_responses_lifecycle_is_ambiguous_with_multiple_native_upstreams(
 
     let client = Client::new();
     let res = client
-        .get(format!("{}/openai/v1/responses/resp_123", proxy_base))
+        .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
         .send()
         .await
         .unwrap();
@@ -1266,7 +1293,7 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1286,6 +1313,99 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
     assert!(!captured
         .iter()
         .any(|(_, _, body)| body.contains("\"content\":\"Hi\"")));
+}
+
+#[tokio::test]
+async fn discovery_single_openai_completion_upstream_is_available_and_not_fixed() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = auto_discovery_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let state = default_namespace_state(&proxy_base).await;
+    assert_eq!(state["upstreams"][0]["name"], "AUTO");
+    assert!(state["upstreams"][0]["fixed_upstream_format"].is_null());
+    assert_eq!(
+        state["upstreams"][0]["supported_formats"],
+        json!(["openai-completion"])
+    );
+    assert_eq!(state["upstreams"][0]["availability"]["status"], "available");
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "Hi");
+}
+
+#[tokio::test]
+async fn discovery_single_anthropic_upstream_drives_responses_translation() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = auto_discovery_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let state = default_namespace_state(&proxy_base).await;
+    assert_eq!(state["upstreams"][0]["name"], "AUTO");
+    assert!(state["upstreams"][0]["fixed_upstream_format"].is_null());
+    assert_eq!(
+        state["upstreams"][0]["supported_formats"],
+        json!(["anthropic"])
+    );
+    assert_eq!(state["upstreams"][0]["availability"]["status"], "available");
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "Hi",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["output"][0]["content"][0]["text"], "Hi");
+}
+
+#[tokio::test]
+async fn discovery_single_openai_responses_upstream_allows_lifecycle_success_path() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_openai_responses_mock().await;
+    let config = auto_discovery_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let state = default_namespace_state(&proxy_base).await;
+    assert_eq!(state["upstreams"][0]["name"], "AUTO");
+    assert!(state["upstreams"][0]["fixed_upstream_format"].is_null());
+    assert_eq!(
+        state["upstreams"][0]["supported_formats"],
+        json!(["openai-responses"])
+    );
+    assert_eq!(state["upstreams"][0]["availability"]["status"], "available");
+
+    let res = Client::new()
+        .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "resp_123");
+    assert_eq!(body["object"], "response");
 }
 
 #[tokio::test]
@@ -1314,7 +1434,7 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let state: Value = Client::new()
-        .get(format!("{}/admin/namespaces/default/state", proxy_base))
+        .get(format!("{proxy_base}/admin/namespaces/default/state"))
         .send()
         .await
         .unwrap()
@@ -1371,7 +1491,7 @@ async fn openai_responses_create_with_alias_routes_to_configured_upstream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "resp-a",
             "input": "Hi",
@@ -1417,7 +1537,7 @@ async fn openai_responses_previous_response_id_requires_explicit_model_in_multi_
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "input": "Hi again",
             "previous_response_id": "resp_123",
@@ -1441,7 +1561,7 @@ async fn anthropic_namespace_messages_works() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "claude-3",
             "max_tokens": 32,
@@ -1464,7 +1584,7 @@ async fn anthropic_namespace_messages_stream_works() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "claude-3",
             "max_tokens": 32,
@@ -1494,8 +1614,7 @@ async fn google_namespace_generate_content_works() {
     let client = Client::new();
     let res = client
         .post(format!(
-            "{}/google/v1beta/models/gemini-local:generateContent",
-            proxy_base
+            "{proxy_base}/google/v1beta/models/gemini-local:generateContent"
         ))
         .json(&json!({
             "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
@@ -1522,8 +1641,7 @@ async fn google_namespace_stream_generate_content_works() {
     let client = Client::new();
     let res = client
         .post(format!(
-            "{}/google/v1beta/models/gemini-local:streamGenerateContent",
-            proxy_base
+            "{proxy_base}/google/v1beta/models/gemini-local:streamGenerateContent"
         ))
         .json(&json!({
             "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
@@ -1556,7 +1674,7 @@ async fn openai_models_endpoint_lists_local_aliases() {
 
     let client = Client::new();
     let res = client
-        .get(format!("{}/openai/v1/models", proxy_base))
+        .get(format!("{proxy_base}/openai/v1/models"))
         .send()
         .await
         .unwrap();
@@ -1580,7 +1698,7 @@ async fn anthropic_models_endpoint_retrieves_local_alias() {
 
     let client = Client::new();
     let res = client
-        .get(format!("{}/anthropic/v1/models/haiku", proxy_base))
+        .get(format!("{proxy_base}/anthropic/v1/models/haiku"))
         .send()
         .await
         .unwrap();
@@ -1603,7 +1721,7 @@ async fn google_models_endpoint_lists_local_aliases() {
 
     let client = Client::new();
     let res = client
-        .get(format!("{}/google/v1beta/models", proxy_base))
+        .get(format!("{proxy_base}/google/v1beta/models"))
         .send()
         .await
         .unwrap();
@@ -1624,7 +1742,7 @@ async fn upstream_openai_completion_passthrough_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1648,7 +1766,7 @@ async fn openai_completion_omitted_stream_defaults_to_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }]
@@ -1679,7 +1797,7 @@ async fn upstream_openai_completion_client_anthropic_translated_non_streaming() 
     // Client sends Anthropic format (system + messages) → proxy translates to OpenAI for upstream, then response back to Anthropic shape.
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "claude-3",
             "system": "You are helpful.",
@@ -1703,7 +1821,7 @@ async fn upstream_anthropic_passthrough_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "claude-3",
             "max_tokens": 100,
@@ -1728,7 +1846,7 @@ async fn upstream_anthropic_client_openai_translated_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -1751,7 +1869,7 @@ async fn anthropic_messages_endpoint_passthrough_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "claude-3",
             "max_tokens": 32,
@@ -1775,7 +1893,7 @@ async fn anthropic_messages_endpoint_translates_to_openai_upstream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "gpt-4",
             "max_tokens": 32,
@@ -1799,7 +1917,7 @@ async fn responses_endpoint_translates_to_anthropic_upstream_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "GLM-5",
             "input": "Hi",
@@ -1822,7 +1940,7 @@ async fn responses_endpoint_preserves_anthropic_reasoning_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "GLM-5",
             "input": "Hi",
@@ -1853,8 +1971,7 @@ async fn upstream_google_passthrough_non_streaming() {
     let client = Client::new();
     let res = client
         .post(format!(
-            "{}/google/v1beta/models/gemini-1.5:generateContent",
-            proxy_base
+            "{proxy_base}/google/v1beta/models/gemini-1.5:generateContent"
         ))
         .json(&json!({
             "contents": [{ "parts": [{ "text": "Hi" }] }]
@@ -1877,7 +1994,7 @@ async fn upstream_openai_responses_passthrough_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gpt-4",
             "input": [{ "type": "message", "role": "user", "content": "Hi" }],
@@ -1923,7 +2040,7 @@ async fn spawn_header_capture_anthropic_mock(
 ) -> (String, tokio::task::JoinHandle<()>, CapturedHeaders) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
     let state = CapturedHeaders::default();
     let app = Router::new()
         .route("/v1/messages", post(capture_anthropic_handler))
@@ -1971,7 +2088,7 @@ async fn spawn_concurrent_capture_anthropic_mock() -> (
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
     let state = CapturedAnthropicRequests::default();
     let app = Router::new()
         .route("/v1/messages", post(capture_concurrent_anthropic_handler))
@@ -2033,7 +2150,7 @@ async fn spawn_auth_capture_anthropic_mock(
 ) -> (String, tokio::task::JoinHandle<()>, CapturedAuthRequests) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
     let state = CapturedAuthRequests::default();
     let app = Router::new()
         .route("/v1/messages", post(capture_auth_anthropic_handler))
@@ -2085,7 +2202,7 @@ async fn spawn_hook_capture_server() -> (String, tokio::task::JoinHandle<()>, Ca
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
     let state = CapturedHookPayloads::default();
     let app = Router::new()
         .route("/hook", post(capture_hook_handler))
@@ -2107,7 +2224,7 @@ async fn capture_hook_handler(
 async fn spawn_slow_openai_completion_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
     let app = Router::new()
         .route("/v1/chat/completions", post(slow_openai_completion_handler))
         .route("/chat/completions", post(slow_openai_completion_handler));
@@ -2174,7 +2291,7 @@ async fn upstream_anthropic_injects_required_version_header() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -2217,7 +2334,7 @@ async fn multi_upstream_supports_explicit_upstream_model_selector() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "GLM-OFFICIAL:GLM-5",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -2264,7 +2381,7 @@ async fn multi_upstream_supports_local_model_alias() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "GLM-5",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -2303,7 +2420,7 @@ async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "shared-model",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -2335,7 +2452,7 @@ async fn multi_upstream_uses_per_upstream_fallback_credential() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "GLM-OFFICIAL:GLM-5",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -2380,7 +2497,7 @@ async fn force_server_auth_policy_ignores_client_key() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .header("authorization", "Bearer client-secret")
         .json(&json!({
             "model": "GLM-OFFICIAL:GLM-5",
@@ -2413,11 +2530,11 @@ async fn usage_and_exchange_hooks_fire_for_non_streaming_requests() {
         failure_threshold: 3,
         cooldown: Duration::from_secs(300),
         exchange: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
         usage: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
     };
@@ -2425,7 +2542,7 @@ async fn usage_and_exchange_hooks_fire_for_non_streaming_requests() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .header("authorization", "Bearer client-secret")
         .json(&json!({
             "model": "gpt-4",
@@ -2471,11 +2588,11 @@ async fn exchange_hook_captures_complete_streaming_response_after_done() {
         failure_threshold: 3,
         cooldown: Duration::from_secs(300),
         exchange: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
         usage: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
     };
@@ -2483,7 +2600,7 @@ async fn exchange_hook_captures_complete_streaming_response_after_done() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -2527,11 +2644,11 @@ async fn hooks_capture_reasoning_for_responses_stream_passthrough() {
         failure_threshold: 3,
         cooldown: Duration::from_secs(300),
         exchange: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
         usage: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
     };
@@ -2539,7 +2656,7 @@ async fn hooks_capture_reasoning_for_responses_stream_passthrough() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gpt-4",
             "input": "Hi",
@@ -2587,11 +2704,11 @@ async fn hooks_mark_cancelled_when_stream_is_dropped_early() {
         failure_threshold: 3,
         cooldown: Duration::from_secs(300),
         exchange: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
         usage: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
     };
@@ -2599,7 +2716,7 @@ async fn hooks_mark_cancelled_when_stream_is_dropped_early() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -2649,11 +2766,11 @@ async fn hooks_capture_translated_thinking_blocks_for_messages_stream() {
         failure_threshold: 3,
         cooldown: Duration::from_secs(300),
         exchange: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
         usage: Some(HookEndpointConfig {
-            url: format!("{}/hook", hook_base),
+            url: format!("{hook_base}/hook"),
             authorization: None,
         }),
     };
@@ -2661,7 +2778,7 @@ async fn hooks_capture_translated_thinking_blocks_for_messages_stream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "gpt-4",
             "max_tokens": 32,
@@ -2706,13 +2823,13 @@ async fn concurrent_openai_to_anthropic_requests_keep_headers_and_cache_control_
         let proxy_base = proxy_base.clone();
         async move {
             client
-                .post(format!("{}/openai/v1/chat/completions", proxy_base))
+                .post(format!("{proxy_base}/openai/v1/chat/completions"))
                 .json(&json!({
                     "model": "gpt-4",
                     "messages": [
-                        { "role": "system", "content": format!("System {}", i) },
-                        { "role": "user", "content": format!("Hello {}", i) },
-                        { "role": "assistant", "content": format!("Answer {}", i) }
+                        { "role": "system", "content": format!("System {i}") },
+                        { "role": "user", "content": format!("Hello {i}") },
+                        { "role": "assistant", "content": format!("Answer {i}") }
                     ]
                 }))
                 .send()
@@ -2785,7 +2902,7 @@ async fn upstream_openai_completion_streaming_passthrough() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -2814,7 +2931,7 @@ async fn upstream_anthropic_streaming_translated_to_openai() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -2845,7 +2962,7 @@ async fn anthropic_messages_endpoint_streaming_translates_to_openai_upstream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "gpt-4",
             "max_tokens": 32,
@@ -2875,7 +2992,7 @@ async fn responses_endpoint_streaming_translates_to_anthropic_upstream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "GLM-5",
             "input": "Hi",
@@ -2904,7 +3021,7 @@ async fn responses_endpoint_streaming_preserves_anthropic_reasoning() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "GLM-5",
             "input": "Hi",
@@ -2943,7 +3060,7 @@ async fn debug_trace_records_request_delta_and_stream_summary() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "GLM-5",
             "input": "Hi",
@@ -2981,7 +3098,7 @@ async fn chat_completions_endpoint_preserves_responses_reasoning_stream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -3005,7 +3122,7 @@ async fn messages_endpoint_preserves_responses_reasoning_stream() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "gpt-4",
             "max_tokens": 32,
@@ -3033,7 +3150,7 @@ async fn upstream_google_client_openai_translated_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -3057,8 +3174,7 @@ async fn upstream_google_client_openai_accepts_snake_case_input_parts() {
     let client = Client::new();
     let res = client
         .post(format!(
-            "{}/google/v1beta/models/gemini-local:generateContent",
-            proxy_base
+            "{proxy_base}/google/v1beta/models/gemini-local:generateContent"
         ))
         .json(&json!({
             "model": "gemini-local",
@@ -3087,7 +3203,7 @@ async fn upstream_openai_responses_client_openai_completion_translated_non_strea
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -3110,7 +3226,7 @@ async fn upstream_openai_responses_streaming_passthrough() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gpt-4",
             "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Hi" }] }],
@@ -3140,7 +3256,7 @@ async fn health_returns_ok() {
 
     let client = Client::new();
     let res = client
-        .get(format!("{}/health", proxy_base))
+        .get(format!("{proxy_base}/health"))
         .send()
         .await
         .unwrap();
@@ -3159,7 +3275,7 @@ async fn post_invalid_json_returns_422_or_400() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .header("Content-Type", "application/json")
         .body("not json")
         .send()
@@ -3180,7 +3296,7 @@ async fn post_empty_body_returns_4xx() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .header("Content-Type", "application/json")
         .body("{}")
         .send()
@@ -3216,7 +3332,7 @@ async fn upstream_unreachable_returns_502() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({ "model": "gpt-4", "messages": [{ "role": "user", "content": "Hi" }], "stream": false }))
         .send()
         .await
@@ -3236,7 +3352,7 @@ async fn nonexistent_path_returns_404() {
 
     let client = Client::new();
     let res = client
-        .get(format!("{}/openai/v1/nonexistent", proxy_base))
+        .get(format!("{proxy_base}/openai/v1/nonexistent"))
         .send()
         .await
         .unwrap();
@@ -3251,7 +3367,7 @@ async fn openai_completion_non_streaming_explicit_false() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -3282,7 +3398,7 @@ async fn upstream_google_streaming_client_openai() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4",
             "messages": [{ "role": "user", "content": "Hi" }],

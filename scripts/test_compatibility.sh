@@ -334,7 +334,7 @@ main() {
         CONFIG="${CONFIG:-proxy-test-minimax-and-local.yaml}"
         if [ ! -f "$BINARY" ]; then
             echo "Building proxy..."
-            cargo build --release
+            cargo build --locked --release
         fi
         $BINARY --config "$CONFIG" &
         PROXY_PID=$!

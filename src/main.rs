@@ -28,7 +28,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<CliArgs, String>
                 );
             }
             other => {
-                return Err(format!("unknown argument `{}`", other));
+                return Err(format!("unknown argument `{other}`"));
             }
         }
     }
@@ -45,7 +45,7 @@ async fn main() {
     let args = match parse_args(std::env::args()) {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("{}", message);
+            eprintln!("{message}");
             std::process::exit(2);
         }
     };
@@ -56,7 +56,7 @@ async fn main() {
         llm_universal_proxy::run_with_config_path(args.config_path).await
     };
     if let Err(e) = result {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
     }
 }

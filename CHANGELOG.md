@@ -2,6 +2,9 @@
 
 ## v0.2.4 - 2026-04-07
 
+- Added `rust-toolchain.toml` as the repository's pinned Rust toolchain source and wired CI / release jobs to install Rust from that value instead of implicit `stable`.
+- Added repository governance checks for `Cargo.toml` / `Cargo.lock` / `CHANGELOG.md` version alignment, `--locked` cargo usage, Dockerfile toolchain parity, and workflow smoke wiring.
+- Added lightweight binary smoke coverage to CI and the Linux release build so tagged artifacts are exercised before packaging.
 - Normalized repository-wide Rust formatting so the release `cargo fmt --check` gate passes again.
 - Fixed `clippy -D warnings` failures in the debug trace helpers, request handler linting, and shared test mock utilities.
 - Re-ran the local release gate successfully with:

@@ -73,6 +73,16 @@ make test         # 运行所有测试
 make run-release  # 构建并以 release 模式运行
 ```
 
+## 本地 Binary Smoke 脚本
+
+仓库内还提供了一个本地 binary smoke 脚本：[scripts/test_binary_smoke.sh](/home/percy/works/mbos-v1/llm-universal-proxy/scripts/test_binary_smoke.sh)。它会先使用 release 二进制启动代理，再在脚本内部拉起 mock upstream，验证少量高价值的启动与路由路径。它的目标是确认“编译出来的二进制确实能启动并跑通核心入口”，不是替代 Rust 集成测试。
+
+常用方式：
+
+```bash
+make test-binary-smoke
+```
+
 ## 真实 CLI 端到端脚本
 
 仓库内还提供了一个真实客户端 E2E 脚本：[scripts/test_cli_clients.sh](/home/percy/works/mbos-v1/llm-universal-proxy/scripts/test_cli_clients.sh)。它会直接调用真实的 `codex` 和 `claude` CLI，通过多个上游别名来验证代理行为。
@@ -637,6 +647,9 @@ curl "http://localhost:8080/google/v1beta/models/gemini-local:generateContent" \
 ```bash
 # 运行测试
 cargo test
+
+# 构建 release 二进制并运行本地 binary smoke
+make test-binary-smoke
 
 # 生成详细测试报告
 make test-report

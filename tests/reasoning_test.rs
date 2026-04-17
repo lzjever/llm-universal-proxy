@@ -28,7 +28,7 @@ async fn anthropic_thinking_to_openai_chat_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -37,7 +37,11 @@ async fn anthropic_thinking_to_openai_chat_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["reasoning_content"], "think");
     assert_eq!(body["choices"][0]["message"]["content"], "Hi");
@@ -53,14 +57,17 @@ async fn anthropic_thinking_to_gemini_non_streaming() {
     let client = Client::new();
     let res = client
         .post(format!(
-            "{}/google/v1beta/models/test:generateContent",
-            proxy_base
+            "{proxy_base}/google/v1beta/models/test:generateContent"
         ))
         .json(&json!({ "contents": [{ "parts": [{ "text": "Hi" }] }] }))
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let parts = body["candidates"][0]["content"]["parts"]
         .as_array()
@@ -78,7 +85,7 @@ async fn anthropic_thinking_to_responses_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "claude-3",
             "input": "Hi",
@@ -87,7 +94,11 @@ async fn anthropic_thinking_to_responses_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let output = body["output"].as_array().unwrap();
     assert_eq!(output[0]["type"], "reasoning");
@@ -103,7 +114,7 @@ async fn openai_reasoning_to_anthropic_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "mock",
             "max_tokens": 256,
@@ -113,7 +124,11 @@ async fn openai_reasoning_to_anthropic_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let content = body["content"].as_array().unwrap();
     assert_eq!(content[0]["type"], "thinking");
@@ -130,12 +145,16 @@ async fn openai_reasoning_to_responses_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "mock", "input": "Hi", "stream": false }))
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let output = body["output"].as_array().unwrap();
     assert_eq!(output[0]["type"], "reasoning");
@@ -152,14 +171,17 @@ async fn openai_reasoning_to_gemini_non_streaming() {
     let client = Client::new();
     let res = client
         .post(format!(
-            "{}/google/v1beta/models/test:generateContent",
-            proxy_base
+            "{proxy_base}/google/v1beta/models/test:generateContent"
         ))
         .json(&json!({ "contents": [{ "parts": [{ "text": "Hi" }] }] }))
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let parts = body["candidates"][0]["content"]["parts"]
         .as_array()
@@ -178,7 +200,7 @@ async fn responses_reasoning_to_openai_chat_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "mock",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -187,7 +209,11 @@ async fn responses_reasoning_to_openai_chat_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["reasoning_content"], "think");
     assert_eq!(body["choices"][0]["message"]["content"], "Hi");
@@ -201,7 +227,7 @@ async fn responses_reasoning_to_anthropic_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "mock",
             "max_tokens": 256,
@@ -211,7 +237,11 @@ async fn responses_reasoning_to_anthropic_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let content = body["content"].as_array().unwrap();
     assert_eq!(content[0]["type"], "thinking");
@@ -229,14 +259,17 @@ async fn responses_reasoning_to_gemini_non_streaming() {
     let client = Client::new();
     let res = client
         .post(format!(
-            "{}/google/v1beta/models/test:generateContent",
-            proxy_base
+            "{proxy_base}/google/v1beta/models/test:generateContent"
         ))
         .json(&json!({ "contents": [{ "parts": [{ "text": "Hi" }] }] }))
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let parts = body["candidates"][0]["content"]["parts"]
         .as_array()
@@ -254,7 +287,7 @@ async fn gemini_thinking_to_openai_chat_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-test",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -263,7 +296,11 @@ async fn gemini_thinking_to_openai_chat_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["reasoning_content"], "think");
     assert_eq!(body["choices"][0]["message"]["content"], "Hi");
@@ -277,7 +314,7 @@ async fn gemini_thinking_to_anthropic_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "gemini-test",
             "max_tokens": 256,
@@ -287,7 +324,11 @@ async fn gemini_thinking_to_anthropic_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let content = body["content"].as_array().unwrap();
     assert_eq!(content[0]["type"], "thinking");
@@ -304,12 +345,16 @@ async fn gemini_thinking_to_responses_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "gemini-test", "input": "Hi", "stream": false }))
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let output = body["output"].as_array().unwrap();
     assert_eq!(output[0]["type"], "reasoning");
@@ -329,7 +374,7 @@ async fn anthropic_thinking_to_openai_chat_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -351,7 +396,7 @@ async fn anthropic_thinking_to_responses_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "claude-3", "input": "Hi", "stream": true }))
         .send()
         .await
@@ -376,7 +421,7 @@ async fn openai_reasoning_to_anthropic_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "mock",
             "max_tokens": 256,
@@ -401,7 +446,7 @@ async fn openai_reasoning_to_responses_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "mock", "input": "Hi", "stream": true }))
         .send()
         .await
@@ -422,7 +467,7 @@ async fn responses_reasoning_to_openai_chat_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "mock",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -444,7 +489,7 @@ async fn responses_reasoning_to_anthropic_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "mock",
             "max_tokens": 256,
@@ -468,7 +513,7 @@ async fn gemini_thinking_to_openai_chat_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-test",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -490,7 +535,7 @@ async fn gemini_thinking_to_anthropic_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "gemini-test",
             "max_tokens": 256,
@@ -514,7 +559,7 @@ async fn gemini_thinking_to_responses_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "gemini-test", "input": "Hi", "stream": true }))
         .send()
         .await
@@ -540,7 +585,7 @@ async fn anthropic_thinking_with_tools_to_openai_chat_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3",
             "messages": [{ "role": "user", "content": "Weather?" }],
@@ -550,7 +595,11 @@ async fn anthropic_thinking_with_tools_to_openai_chat_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let msg = &body["choices"][0]["message"];
     assert_eq!(msg["reasoning_content"], "need to call tool");
@@ -568,7 +617,7 @@ async fn anthropic_thinking_with_tools_to_responses_non_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "claude-3",
             "input": "Weather?",
@@ -578,7 +627,11 @@ async fn anthropic_thinking_with_tools_to_responses_non_streaming() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     let output = body["output"].as_array().unwrap();
     assert!(
@@ -603,7 +656,7 @@ async fn anthropic_thinking_with_tools_to_openai_streaming() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3",
             "messages": [{ "role": "user", "content": "Weather?" }],
@@ -638,7 +691,7 @@ async fn multi_turn_anthropic_thinking_preserved_in_history() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "mock",
             "max_tokens": 256,
@@ -655,7 +708,11 @@ async fn multi_turn_anthropic_thinking_preserved_in_history() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     assert!(body.get("content").is_some());
 }
@@ -669,7 +726,7 @@ async fn multi_turn_openai_reasoning_preserved_in_history_to_claude() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3",
             "messages": [
@@ -682,7 +739,11 @@ async fn multi_turn_openai_reasoning_preserved_in_history_to_claude() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
     let body: Value = res.json().await.unwrap();
     // OpenAI chat completions format uses choices[0].message.content
     assert!(
@@ -703,7 +764,7 @@ async fn anthropic_thinking_usage_translated_to_openai() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -726,7 +787,7 @@ async fn openai_reasoning_usage_translated_to_anthropic() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "mock",
             "max_tokens": 256,
@@ -750,7 +811,7 @@ async fn gemini_thinking_usage_translated_to_openai() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-test",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -774,7 +835,7 @@ async fn openai_reasoning_with_completion_tokens_details() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "mock", "input": "Hi", "stream": false }))
         .send()
         .await
@@ -799,7 +860,7 @@ async fn empty_thinking_block_no_crash() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/anthropic/v1/messages", proxy_base))
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
             "model": "mock",
             "max_tokens": 256,
@@ -823,7 +884,7 @@ async fn reasoning_and_text_both_present_in_response() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/responses", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "mock", "input": "Hi", "stream": false }))
         .send()
         .await
@@ -845,7 +906,7 @@ async fn gemini_thinking_no_signature_streaming_to_openai() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-test",
             "messages": [{ "role": "user", "content": "Hi" }],
@@ -870,7 +931,7 @@ async fn gemini_thinking_no_signature_non_streaming_to_openai() {
 
     let client = Client::new();
     let res = client
-        .post(format!("{}/openai/v1/chat/completions", proxy_base))
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-test",
             "messages": [{ "role": "user", "content": "Hi" }],

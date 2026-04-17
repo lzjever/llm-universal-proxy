@@ -9,8 +9,8 @@ use tokio::net::TcpListener;
 pub fn upstream_api_root(upstream_base: &str, format: UpstreamFormat) -> String {
     let upstream_base = upstream_base.trim_end_matches('/');
     match format {
-        UpstreamFormat::Google => format!("{}/v1beta", upstream_base),
-        _ => format!("{}/v1", upstream_base),
+        UpstreamFormat::Google => format!("{upstream_base}/v1beta"),
+        _ => format!("{upstream_base}/v1"),
     }
 }
 
@@ -43,7 +43,7 @@ pub async fn start_proxy(
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
     let handle = tokio::spawn(async move { run_with_listener(config, listener).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     (base, handle)

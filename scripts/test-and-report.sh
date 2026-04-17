@@ -40,7 +40,7 @@ export CARGO
 CARGO_ENV="env -u RUSTC_WRAPPER -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY"
 
 echo "Running tests (log: $LOG_FILE) ..."
-if $CARGO_ENV $CARGO test --no-fail-fast 2>&1 | tee "$LOG_FILE"; then
+if $CARGO_ENV $CARGO test --locked --no-fail-fast 2>&1 | tee "$LOG_FILE"; then
   TEST_EXIT=0
 else
   TEST_EXIT=$?

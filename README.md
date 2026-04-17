@@ -138,6 +138,16 @@ make test         # Run all tests
 make run-release  # Build and run in release mode
 ```
 
+## Local Binary Smoke Script
+
+The repo also includes a local binary smoke script at [scripts/test_binary_smoke.sh](/home/percy/works/mbos-v1/llm-universal-proxy/scripts/test_binary_smoke.sh). It builds the release binary, starts a mock upstream in-process, and validates a small set of high-value startup and routing paths. It is meant to confirm that the built binary actually boots and serves core endpoints, not to replace the Rust integration test suite.
+
+Typical flow:
+
+```bash
+make test-binary-smoke
+```
+
 ## Real CLI E2E Smoke Script
 
 The repo also includes a real-client E2E script at [scripts/test_cli_clients.sh](/home/percy/works/mbos-v1/llm-universal-proxy/scripts/test_cli_clients.sh). It exercises the proxy with actual `codex` and `claude` CLI processes against multiple upstream aliases.
@@ -808,6 +818,9 @@ curl "http://localhost:8080/google/v1beta/models/gemini-local:generateContent" \
 ```bash
 # Run tests
 cargo test
+
+# Build the release binary and run the local binary smoke
+make test-binary-smoke
 
 # Run with detailed test report
 make test-report

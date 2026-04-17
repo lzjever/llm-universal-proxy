@@ -350,7 +350,7 @@ impl Config {
     /// Load config from YAML text. Intended for tests.
     pub fn from_yaml_str(raw: &str) -> Result<Self, String> {
         let parsed: FileConfig =
-            serde_yaml::from_str(raw).map_err(|e| format!("failed to parse YAML config: {}", e))?;
+            serde_yaml::from_str(raw).map_err(|e| format!("failed to parse YAML config: {e}"))?;
 
         let upstreams = parsed
             .upstreams
@@ -503,8 +503,7 @@ impl Config {
             }
             if target.upstream_model.trim().is_empty() {
                 return Err(format!(
-                    "model alias `{}` must point to a non-empty upstream model",
-                    alias
+                    "model alias `{alias}` must point to a non-empty upstream model"
                 ));
             }
         }
@@ -521,21 +520,20 @@ impl Config {
             return Ok(());
         };
         if hook.url.trim().is_empty() {
-            return Err(format!("{} hook url must not be empty", hook_name));
+            return Err(format!("{hook_name} hook url must not be empty"));
         }
         let parsed = url::Url::parse(&hook.url)
-            .map_err(|e| format!("{} hook url is invalid: {}", hook_name, e))?;
+            .map_err(|e| format!("{hook_name} hook url is invalid: {e}"))?;
         match parsed.scheme() {
             "http" | "https" => {}
             scheme => {
                 return Err(format!(
-                    "{} hook url must use http or https, got `{}`",
-                    hook_name, scheme
+                    "{hook_name} hook url must use http or https, got `{scheme}`"
                 ));
             }
         }
         if url_has_userinfo(&parsed) {
-            return Err(format!("{} hook url must not include userinfo", hook_name));
+            return Err(format!("{hook_name} hook url must not include userinfo"));
         }
         Ok(())
     }
@@ -550,8 +548,7 @@ impl Config {
             if self.upstream(upstream_name).is_some() {
                 if upstream_model.trim().is_empty() {
                     return Err(format!(
-                        "model `{}` must include a non-empty upstream model after `:`",
-                        requested_model
+                        "model `{requested_model}` must include a non-empty upstream model after `:`"
                     ));
                 }
                 return Ok(ResolvedModel {
@@ -576,8 +573,7 @@ impl Config {
         }
 
         Err(format!(
-            "model `{}` is ambiguous; use `upstream:model` or configure model_aliases",
-            requested_model
+            "model `{requested_model}` is ambiguous; use `upstream:model` or configure model_aliases"
         ))
     }
 
@@ -861,15 +857,15 @@ pub fn build_upstream_url(
 ) -> String {
     let base = api_root.trim_end_matches('/');
     match format {
-        UpstreamFormat::OpenAiCompletion => format!("{}/chat/completions", base),
-        UpstreamFormat::OpenAiResponses => format!("{}/responses", base),
-        UpstreamFormat::Anthropic => format!("{}/messages", base),
+        UpstreamFormat::OpenAiCompletion => format!("{base}/chat/completions"),
+        UpstreamFormat::OpenAiResponses => format!("{base}/responses"),
+        UpstreamFormat::Anthropic => format!("{base}/messages"),
         UpstreamFormat::Google => {
             let model = model.filter(|s| !s.is_empty()).unwrap_or("gemini-1.5");
             if stream {
-                format!("{}/models/{}:streamGenerateContent?alt=sse", base, model)
+                format!("{base}/models/{model}:streamGenerateContent?alt=sse")
             } else {
-                format!("{}/models/{}:generateContent", base, model)
+                format!("{base}/models/{model}:generateContent")
             }
         }
     }
@@ -883,7 +879,7 @@ fn url_has_userinfo(url: &url::Url) -> bool {
 pub fn build_upstream_resource_url(api_root: &str, resource_path: &str) -> String {
     let base = api_root.trim_end_matches('/');
     let path = resource_path.trim_start_matches('/');
-    format!("{}/{}", base, path)
+    format!("{base}/{path}")
 }
 
 #[cfg(test)]

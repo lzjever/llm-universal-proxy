@@ -159,7 +159,7 @@ pub fn format_sse_data(value: &Value) -> Vec<u8> {
 /// Format SSE with event type line: "event: {ty}\ndata: {json}\n\n".
 pub fn format_sse_event(event_type: &str, value: &Value) -> Vec<u8> {
     let s = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
-    let mut out = format!("event: {}\n", event_type).into_bytes();
+    let mut out = format!("event: {event_type}\n").into_bytes();
     out.extend_from_slice(b"data: ");
     out.extend_from_slice(s.as_bytes());
     out.extend_from_slice(b"\n\n");
@@ -400,7 +400,7 @@ fn openai_chunk(state: &StreamState, delta: Value, finish_reason: Option<&str>) 
             if s.starts_with("chatcmpl-") {
                 s.to_string()
             } else {
-                format!("chatcmpl-{}", s)
+                format!("chatcmpl-{s}")
             }
         })
         .unwrap_or_else(|| "chatcmpl-0".to_string());
@@ -702,7 +702,7 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                 .map(String::from);
             let idx = state.openai_tool_call_index;
             state.openai_tool_call_index += 1;
-            let id = call_id.unwrap_or_else(|| format!("call_{}", idx));
+            let id = call_id.unwrap_or_else(|| format!("call_{idx}"));
             let tc = serde_json::json!({
                 "index": idx,
                 "id": id,

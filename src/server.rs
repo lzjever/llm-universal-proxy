@@ -78,7 +78,7 @@ async fn run_internal(
     if !config.upstreams.is_empty() {
         config
             .validate()
-            .map_err(|e| format!("invalid config: {}", e))?;
+            .map_err(|e| format!("invalid config: {e}"))?;
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -90,7 +90,7 @@ async fn run_internal(
     let listen = config
         .listen
         .parse::<std::net::SocketAddr>()
-        .map_err(|e| format!("listen addr: {}", e))?;
+        .map_err(|e| format!("listen addr: {e}"))?;
     info!("listening on {}", listen);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     if dashboard_enabled {
@@ -108,7 +108,7 @@ pub async fn run_with_listener(
     if !config.upstreams.is_empty() {
         config
             .validate()
-            .map_err(|e| format!("invalid config: {}", e))?;
+            .map_err(|e| format!("invalid config: {e}"))?;
     }
     let metrics = RuntimeMetrics::new(&config);
     let runtime = build_runtime_state(config).await?;
@@ -127,7 +127,7 @@ pub async fn run_with_listener_and_dashboard(
     if !config.upstreams.is_empty() {
         config
             .validate()
-            .map_err(|e| format!("invalid config: {}", e))?;
+            .map_err(|e| format!("invalid config: {e}"))?;
     }
     let metrics = RuntimeMetrics::new(&config);
     let runtime = Arc::new(RwLock::new(build_runtime_state(config.clone()).await?));
@@ -1551,7 +1551,7 @@ async fn handle_openai_responses_resource(
     body: Option<Value>,
     query: Option<String>,
 ) -> Response<Body> {
-    let request_path = format!("/openai/v1/{}", resource_path);
+    let request_path = format!("/openai/v1/{resource_path}");
     let mut tracker = state
         .metrics
         .start_request(&request_path, String::new(), false);
@@ -1727,7 +1727,7 @@ async fn handle_openai_model_inner(
         None => error_response(
             crate::formats::UpstreamFormat::OpenAiCompletion,
             StatusCode::NOT_FOUND,
-            &format!("model `{}` not found", id),
+            &format!("model `{id}` not found"),
         ),
     }
 }
@@ -1785,7 +1785,7 @@ async fn handle_anthropic_model_inner(
         None => error_response(
             crate::formats::UpstreamFormat::Anthropic,
             StatusCode::NOT_FOUND,
-            &format!("model `{}` not found", id),
+            &format!("model `{id}` not found"),
         ),
     }
 }
@@ -1843,7 +1843,7 @@ async fn handle_google_model_inner(
         None => error_response(
             crate::formats::UpstreamFormat::Google,
             StatusCode::NOT_FOUND,
-            &format!("model `{}` not found", id),
+            &format!("model `{id}` not found"),
         ),
     }
 }
@@ -2489,7 +2489,7 @@ fn auth_header_for_format(
     match format {
         crate::formats::UpstreamFormat::OpenAiCompletion
         | crate::formats::UpstreamFormat::OpenAiResponses => {
-            ("authorization".to_string(), format!("Bearer {}", api_key))
+            ("authorization".to_string(), format!("Bearer {api_key}"))
         }
         crate::formats::UpstreamFormat::Anthropic => ("x-api-key".to_string(), api_key.to_string()),
         crate::formats::UpstreamFormat::Google => {

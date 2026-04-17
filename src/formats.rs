@@ -40,7 +40,7 @@ impl std::str::FromStr for UpstreamFormat {
             "anthropic" | "claude" => Ok(UpstreamFormat::Anthropic),
             "openai" | "openai-completion" | "chat" => Ok(UpstreamFormat::OpenAiCompletion),
             "openai-responses" | "responses" => Ok(UpstreamFormat::OpenAiResponses),
-            _ => Err(format!("unknown format: {}", s)),
+            _ => Err(format!("unknown format: {s}")),
         }
     }
 }

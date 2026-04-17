@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 pub async fn spawn_openai_completion_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route("/v1/chat/completions", post(openai_completion_handler))
@@ -36,8 +36,7 @@ async fn openai_completion_handler(Json(body): Json<Value>) -> Response {
         let id = body.get("model").and_then(Value::as_str).unwrap_or("mock");
         let chunks = [
             format!(
-                r#"data: {{"id":"chatcmpl-{}","object":"chat.completion.chunk","created":1,"model":"{}","choices":[{{"index":0,"delta":{{"role":"assistant"}},"finish_reason":null}}]}}"#,
-                id, id
+                r#"data: {{"id":"chatcmpl-{id}","object":"chat.completion.chunk","created":1,"model":"{id}","choices":[{{"index":0,"delta":{{"role":"assistant"}},"finish_reason":null}}]}}"#
             ),
             r#"data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#.to_string(),
             r#"data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#.to_string(),
@@ -67,7 +66,7 @@ async fn openai_completion_handler(Json(body): Json<Value>) -> Response {
 pub async fn spawn_anthropic_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route("/v1/messages", post(anthropic_handler))
@@ -81,7 +80,7 @@ pub async fn spawn_anthropic_mock() -> (String, tokio::task::JoinHandle<()>) {
 pub async fn spawn_anthropic_thinking_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route("/v1/messages", post(anthropic_thinking_handler))
@@ -182,7 +181,7 @@ data: {"type":"message_stop"}"#,
 pub async fn spawn_google_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route("/v1beta/models/:model_action", post(google_handler))
@@ -228,7 +227,7 @@ async fn google_handler(path: Option<Path<String>>, Json(body): Json<Value>) -> 
 pub async fn spawn_openai_responses_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route("/v1/responses", post(openai_responses_handler))
@@ -296,7 +295,7 @@ async fn openai_responses_compact_handler(Json(_body): Json<Value>) -> Response 
 pub async fn spawn_openai_responses_reasoning_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route("/v1/responses", post(openai_responses_reasoning_handler))
@@ -380,7 +379,7 @@ data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_1"
 pub async fn spawn_openai_completion_reasoning_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route(
@@ -436,7 +435,7 @@ async fn openai_completion_reasoning_handler(Json(body): Json<Value>) -> Respons
 pub async fn spawn_google_thinking_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route(
@@ -489,7 +488,7 @@ async fn google_thinking_handler(path: Option<Path<String>>, Json(body): Json<Va
 pub async fn spawn_google_thinking_no_signature_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route(
@@ -548,7 +547,7 @@ async fn google_thinking_no_sig_handler(
 pub async fn spawn_anthropic_thinking_with_tools_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let app = Router::new()
         .route("/v1/messages", post(anthropic_thinking_tools_handler))
@@ -622,7 +621,7 @@ pub async fn spawn_capture_openai_completion_mock() -> (
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = format!("http://127.0.0.1:{port}");
 
     let (tx, rx) = tokio::sync::watch::channel(None);
 

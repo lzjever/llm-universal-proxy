@@ -11,15 +11,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check
+  governance:
+    name: Governance
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      - name: Check version and toolchain governance
+        run: bash scripts/check-governance.sh
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    needs: governance
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Read repo metadata
+        id: repo_meta
+        run: python scripts/repo_metadata.py github-output
+
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
 
       - name: Check
         run: cargo check --locked --verbose
@@ -27,12 +44,19 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    needs: governance
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      - name: Read repo metadata
+        id: repo_meta
+        run: python scripts/repo_metadata.py github-output
+
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
 
       - name: Run tests
         run: cargo test --locked --verbose
@@ -40,13 +64,19 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    needs: governance
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      - name: Read repo metadata
+        id: repo_meta
+        run: python scripts/repo_metadata.py github-output
+
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
+          toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
           components: rustfmt
 
       - name: Check formatting
@@ -55,14 +85,45 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    needs: governance
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      - name: Read repo metadata
+        id: repo_meta
+        run: python scripts/repo_metadata.py github-output
+
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
+          toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
           components: clippy
 
       - name: Run clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  smoke:
+    name: Binary Smoke
+    runs-on: ubuntu-latest
+    needs: governance
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Read repo metadata
+        id: repo_meta
+        run: python scripts/repo_metadata.py github-output
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --verbose
+
+      - name: Run binary smoke
+        run: bash scripts/test_binary_smoke.sh
+        env:
+          PROXY_BIN: ./target/release/llm-universal-proxy

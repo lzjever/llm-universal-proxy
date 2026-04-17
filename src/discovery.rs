@@ -200,7 +200,7 @@ fn default_headers_for_format(format: UpstreamFormat) -> Vec<(&'static str, &'st
 fn auth_header_for_format(format: UpstreamFormat, api_key: &str) -> (&'static str, String) {
     match format {
         UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses => {
-            ("authorization", format!("Bearer {}", api_key))
+            ("authorization", format!("Bearer {api_key}"))
         }
         UpstreamFormat::Anthropic => ("x-api-key", api_key.to_string()),
         UpstreamFormat::Google => ("x-goog-api-key", api_key.to_string()),
