@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Tightened cross-protocol compatibility handling so more non-portable request and typed-item semantics fail closed or surface explicit compatibility warnings instead of silently widening behavior across OpenAI, Responses, Anthropic, and Gemini paths.
+- Hardened runtime-chain observability during streaming teardown: hooks and `debug_trace` now preserve protocol-level terminal outcomes through disconnects and error endings, while bounded background capture paths surface explicit truncation / overflow accounting instead of silently dropping data or accumulating unbounded exchange payloads.
+- Expanded `debug_trace` coverage for Google / Gemini client-format streaming so traces record protocol-level terminal, error, text, and tool-call summaries rather than only the final transport outcome.
+- Normalized Gemini CLI matrix runner workspace handling so smoke and long-horizon cases use stable absolute `--include-directories` / isolated runner-state paths even when reports are launched from relative directories.
+
 ## v0.2.5 - 2026-04-17
 
 - Added `scripts/real_cli_matrix.py` as the reusable real-client CLI matrix runner for repeatable end-to-end proxy testing across real `codex`, `claude`, and `gemini` processes, including stable matrix listing and case targeting.
