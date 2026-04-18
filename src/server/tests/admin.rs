@@ -191,6 +191,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
         RuntimeNamespaceState {
             revision: "rev-1".to_string(),
             client: crate::upstream::build_client(&config),
+            streaming_client: crate::upstream::build_streaming_client(&config),
             hooks: None,
             debug_trace: None,
             upstreams,

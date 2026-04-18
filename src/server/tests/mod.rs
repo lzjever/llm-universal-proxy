@@ -105,6 +105,7 @@ pub(super) fn runtime_namespace_state_for_tests(
         config,
         upstreams: upstream_states,
         client: Client::new(),
+        streaming_client: Client::new(),
         hooks: None,
         debug_trace: None,
     }
@@ -149,6 +150,18 @@ pub(super) fn app_state_for_single_upstream(
     api_root: String,
     upstream_format: crate::formats::UpstreamFormat,
 ) -> Arc<AppState> {
+    app_state_for_single_upstream_with_timeout(
+        api_root,
+        upstream_format,
+        std::time::Duration::from_secs(30),
+    )
+}
+
+pub(super) fn app_state_for_single_upstream_with_timeout(
+    api_root: String,
+    upstream_format: crate::formats::UpstreamFormat,
+    upstream_timeout: std::time::Duration,
+) -> Arc<AppState> {
     let upstream = crate::config::UpstreamConfig {
         name: "primary".to_string(),
         api_root,
@@ -161,7 +174,7 @@ pub(super) fn app_state_for_single_upstream(
     };
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
-        upstream_timeout: std::time::Duration::from_secs(30),
+        upstream_timeout,
         upstreams: vec![upstream.clone()],
         model_aliases: Default::default(),
         hooks: Default::default(),
@@ -184,6 +197,7 @@ pub(super) fn app_state_for_single_upstream(
                     },
                 )]),
                 client: crate::upstream::build_client(&config),
+                streaming_client: crate::upstream::build_streaming_client(&config),
                 hooks: None,
                 debug_trace: None,
             },
@@ -195,4 +209,89 @@ pub(super) fn app_state_for_single_upstream(
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
     })
+}
+
+pub(super) async fn spawn_delayed_openai_completion_stream_mock(
+    tail_delay: std::time::Duration,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    #[derive(Clone)]
+    struct SlowMockState {
+        tail_delay: std::time::Duration,
+    }
+
+    async fn handle_chat_completions(
+        State(state): State<SlowMockState>,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        let stream_enabled = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        if !stream_enabled {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": "chatcmpl-slow",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": body.get("model").cloned().unwrap_or_else(|| serde_json::json!("mock")),
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "Hi" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+                })),
+            )
+                .into_response();
+        }
+
+        let pieces = vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                br#"data: {"id":"chatcmpl-slow","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            )),
+            Ok(Bytes::from_static(b"\n\n")),
+            Ok(Bytes::from_static(
+                br#"data: {"id":"chatcmpl-slow","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#,
+            )),
+            Ok(Bytes::from_static(b"\n\n")),
+            Ok(Bytes::from_static(
+                br#"data: {"id":"chatcmpl-slow","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            )),
+            Ok(Bytes::from_static(b"\n\n")),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let delay = state.tail_delay;
+        let body_stream =
+            stream::unfold(pieces.into_iter().enumerate(), move |mut iter| async move {
+                if let Some((idx, chunk)) = iter.next() {
+                    if idx >= 2 {
+                        tokio::time::sleep(delay).await;
+                    }
+                    Some((chunk, iter))
+                } else {
+                    None
+                }
+            });
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from_stream(body_stream))
+            .expect("streaming response")
+    }
+
+    let app = Router::new()
+        .route("/chat/completions", post(handle_chat_completions))
+        .with_state(SlowMockState { tail_delay });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind delayed mock upstream");
+    let addr = listener.local_addr().expect("delayed mock local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("delayed mock server");
+    });
+
+    (format!("http://{addr}"), server)
 }

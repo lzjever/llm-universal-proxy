@@ -279,3 +279,81 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
     assert!(error.contains("previous_response_id"));
     assert!(error.contains("does not reconstruct response-to-upstream state"));
 }
+
+#[tokio::test]
+async fn openai_responses_non_stream_transport_error_uses_json_error_shape() {
+    let state = app_state_for_single_upstream_with_timeout(
+        "http://127.0.0.1:9/v1".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        std::time::Duration::from_millis(50),
+    );
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": "Hi",
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(body["error"]["type"], "server_error");
+}
+
+#[tokio::test]
+async fn streaming_requests_are_not_cut_off_by_unary_upstream_timeout() {
+    let (mock_base, server) =
+        spawn_delayed_openai_completion_stream_mock(std::time::Duration::from_millis(150)).await;
+    let state = app_state_for_single_upstream_with_timeout(
+        mock_base,
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        std::time::Duration::from_millis(50),
+    );
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/chat/completions".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("stream body bytes");
+    let body = String::from_utf8(body.to_vec()).expect("utf8 stream body");
+    assert!(body.contains("\"content\":\"Hi\""), "body = {body}");
+    assert!(body.contains("data: [DONE]"), "body = {body}");
+
+    server.abort();
+}

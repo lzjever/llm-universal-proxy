@@ -14,6 +14,17 @@ pub fn build_client(config: &Config) -> Client {
         .unwrap_or_else(|_| Client::new())
 }
 
+/// Build a reqwest client for streaming requests.
+///
+/// Keep the connect/setup timeout, but avoid a total request timeout so long-lived
+/// SSE streams are not cut off mid-body by the unary timeout budget.
+pub fn build_streaming_client(config: &Config) -> Client {
+    Client::builder()
+        .connect_timeout(config.upstream_timeout)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 /// Call upstream with JSON body; for non-streaming, read full body and return (status, body bytes).
 /// For streaming, returns the response so caller can forward the stream.
 pub async fn call_upstream(

@@ -369,6 +369,7 @@ pub struct TranslateSseStream<S, E> {
     state: StreamState,
     output_queue: Vec<Vec<u8>>,
     output_pos: usize,
+    close_after_output: bool,
     _error: std::marker::PhantomData<E>,
 }
 
@@ -382,6 +383,7 @@ impl<S, E> TranslateSseStream<S, E> {
             state: StreamState::default(),
             output_queue: Vec::new(),
             output_pos: 0,
+            close_after_output: false,
             _error: std::marker::PhantomData,
         }
     }
@@ -406,6 +408,9 @@ where
                 }
                 return Poll::Ready(Some(Ok(bytes::Bytes::from(next))));
             }
+            if this.close_after_output {
+                return Poll::Ready(None);
+            }
 
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
@@ -418,9 +423,18 @@ where
                             &mut this.state,
                         );
                         this.output_queue.extend(translated);
+                        if this.upstream_format != this.client_format
+                            && this.state.fatal_rejection.is_some()
+                        {
+                            this.close_after_output = true;
+                            break;
+                        }
                     }
                     if !this.output_queue.is_empty() {
                         continue;
+                    }
+                    if this.close_after_output {
+                        return Poll::Ready(None);
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -435,6 +449,12 @@ where
                             &mut this.state,
                         );
                         this.output_queue.extend(translated);
+                        if this.upstream_format != this.client_format
+                            && this.state.fatal_rejection.is_some()
+                        {
+                            this.close_after_output = true;
+                            break;
+                        }
                     }
                     if !this.output_queue.is_empty() {
                         continue;

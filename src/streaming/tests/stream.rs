@@ -1,4 +1,13 @@
 use super::*;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
+use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::task::{Context, Poll};
+use tokio::time::{timeout, Duration};
 
 #[test]
 fn translate_sse_event_passthrough_openai_sends_done() {
@@ -245,4 +254,64 @@ fn openai_chunk_does_not_double_prefix_existing_chatcmpl_ids() {
     };
     let chunk = openai_chunk(&state, serde_json::json!({"content":"Hi"}), None);
     assert_eq!(chunk["id"], "chatcmpl-msg123");
+}
+
+struct PendingAfterFirstChunkStream {
+    polls: Arc<AtomicUsize>,
+    emitted: bool,
+}
+
+impl Stream for PendingAfterFirstChunkStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        if !self.emitted {
+            self.emitted = true;
+            return Poll::Ready(Some(Ok(Bytes::from_static(
+                br#"data: {"id":"chatcmpl-msg123","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"candidate-0"},"finish_reason":null},{"index":1,"delta":{"content":"candidate-1"},"finish_reason":null}]}
+
+"#,
+            ))));
+        }
+        Poll::Pending
+    }
+}
+
+#[tokio::test]
+async fn translate_sse_stream_closes_promptly_after_fatal_rejection() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let inner = PendingAfterFirstChunkStream {
+        polls: polls.clone(),
+        emitted: false,
+    };
+    let mut stream = TranslateSseStream::new(
+        inner,
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+    );
+
+    let mut frames = Vec::new();
+    loop {
+        let next = timeout(Duration::from_millis(50), stream.next())
+            .await
+            .expect("stream should not hang after fatal rejection");
+        match next {
+            Some(Ok(bytes)) => frames.push(String::from_utf8(bytes.to_vec()).expect("utf8 frame")),
+            Some(Err(err)) => panic!("unexpected stream error: {err}"),
+            None => break,
+        }
+    }
+
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains("\"type\":\"response.failed\"")),
+        "frames = {frames:?}"
+    );
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        1,
+        "upstream should not be polled again after fatal rejection"
+    );
 }

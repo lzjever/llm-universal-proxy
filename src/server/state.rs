@@ -58,6 +58,7 @@ pub(super) struct RuntimeNamespaceState {
     pub(super) config: Config,
     pub(super) upstreams: BTreeMap<String, UpstreamState>,
     pub(super) client: Client,
+    pub(super) streaming_client: Client,
     pub(super) hooks: Option<HookDispatcher>,
     pub(super) debug_trace: Option<DebugTraceRecorder>,
 }
@@ -140,6 +141,7 @@ pub(super) async fn build_runtime_namespace_state(
     }
     let upstreams = resolve_upstreams(&config).await;
     let client = upstream::build_client(&config);
+    let streaming_client = upstream::build_streaming_client(&config);
     let hooks = HookDispatcher::new(&config.hooks);
     let debug_trace = DebugTraceRecorder::new(&config.debug_trace);
     Ok(RuntimeNamespaceState {
@@ -147,6 +149,7 @@ pub(super) async fn build_runtime_namespace_state(
         config,
         upstreams,
         client,
+        streaming_client,
         hooks,
         debug_trace,
     })

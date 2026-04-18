@@ -1,13 +1,16 @@
 use std::fs::{create_dir_all, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::task::{Context, Poll};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::Stream;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::config::DebugTraceConfig;
 use crate::formats::UpstreamFormat;
@@ -15,8 +18,30 @@ use crate::streaming::take_one_sse_event;
 
 #[derive(Clone)]
 pub struct DebugTraceRecorder {
-    sink: Arc<Mutex<std::fs::File>>,
+    writer: Arc<TraceWriter>,
     max_text_chars: usize,
+}
+
+struct TraceWriter {
+    sender: mpsc::SyncSender<Value>,
+    dropped_entries: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct TraceWriterOptions {
+    queue_capacity: usize,
+    #[cfg(test)]
+    start_barrier: Option<Arc<std::sync::Barrier>>,
+}
+
+impl Default for TraceWriterOptions {
+    fn default() -> Self {
+        Self {
+            queue_capacity: 1024,
+            #[cfg(test)]
+            start_barrier: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -39,22 +64,210 @@ enum TracePhase {
     Response,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum StreamOutcome {
-    Completed,
+enum TransportOutcome {
+    CompletedEof,
     ClientDisconnected,
     StreamError,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProtocolTerminalKind {
+    Success,
+    Incomplete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ProtocolTerminal {
+    kind: ProtocolTerminalKind,
+    event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incomplete_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TraceOutcome {
+    Completed,
+    Incomplete,
+    Failed,
+    ClientDisconnected,
+    StreamError,
+}
+
+fn project_trace_outcome(
+    transport_outcome: TransportOutcome,
+    summary: &ResponseSummary,
+) -> TraceOutcome {
+    if let Some(terminal) = &summary.protocol_terminal {
+        return match terminal.kind {
+            ProtocolTerminalKind::Success => TraceOutcome::Completed,
+            ProtocolTerminalKind::Incomplete => TraceOutcome::Incomplete,
+            ProtocolTerminalKind::Failed => TraceOutcome::Failed,
+        };
+    }
+    match transport_outcome {
+        TransportOutcome::CompletedEof => TraceOutcome::Completed,
+        TransportOutcome::ClientDisconnected => TraceOutcome::ClientDisconnected,
+        TransportOutcome::StreamError => TraceOutcome::StreamError,
+    }
+}
+
 #[derive(Default)]
+struct BoundedTextSummary {
+    head: String,
+    stored_chars: usize,
+    total_chars: usize,
+    max_chars: usize,
+}
+
+impl BoundedTextSummary {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            head: String::new(),
+            stored_chars: 0,
+            total_chars: 0,
+            max_chars,
+        }
+    }
+
+    fn push_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let incoming_chars = text.chars().count();
+        self.total_chars += incoming_chars;
+        if self.stored_chars >= self.max_chars {
+            return;
+        }
+        let remaining = self.max_chars.saturating_sub(self.stored_chars);
+        for ch in text.chars().take(remaining) {
+            self.head.push(ch);
+            self.stored_chars += 1;
+        }
+    }
+
+    fn render(&self) -> String {
+        if self.total_chars <= self.max_chars {
+            self.head.clone()
+        } else {
+            format!("{}…[{} chars]", self.head, self.total_chars)
+        }
+    }
+}
+
+#[derive(Default)]
+struct BoundedToolCallSummary {
+    items: Vec<Value>,
+    stored_chars: usize,
+    omitted_items: usize,
+    max_chars: usize,
+}
+
+impl BoundedToolCallSummary {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            items: Vec::new(),
+            stored_chars: 0,
+            omitted_items: 0,
+            max_chars,
+        }
+    }
+
+    fn push(&mut self, value: Value) {
+        let value = truncate_value_strings(&value, self.max_chars);
+        let serialized_len = serde_json::to_string(&value)
+            .map(|text| text.chars().count())
+            .unwrap_or(self.max_chars.saturating_add(1));
+        let budget = self.max_chars.max(1);
+        if self.stored_chars.saturating_add(serialized_len) > budget {
+            self.omitted_items = self.omitted_items.saturating_add(1);
+            return;
+        }
+        self.stored_chars += serialized_len;
+        self.items.push(value);
+    }
+
+    fn render(&self) -> Vec<Value> {
+        let mut out = self.items.clone();
+        if self.omitted_items > 0 {
+            out.push(json!({
+                "type": "truncated",
+                "omitted_items": self.omitted_items,
+            }));
+        }
+        out
+    }
+}
+
 struct ResponseSummary {
-    text: String,
-    reasoning: String,
-    tool_calls: Vec<Value>,
+    text: BoundedTextSummary,
+    reasoning: BoundedTextSummary,
+    tool_calls: BoundedToolCallSummary,
+    protocol_terminal: Option<ProtocolTerminal>,
     terminal_event: Option<String>,
     finish_reason: Option<String>,
     error: Option<Value>,
+}
+
+impl ResponseSummary {
+    fn new(max_text_chars: usize) -> Self {
+        Self {
+            text: BoundedTextSummary::new(max_text_chars),
+            reasoning: BoundedTextSummary::new(max_text_chars),
+            tool_calls: BoundedToolCallSummary::new(max_text_chars),
+            protocol_terminal: None,
+            terminal_event: None,
+            finish_reason: None,
+            error: None,
+        }
+    }
+
+    fn text_for_record(&self) -> String {
+        self.text.render()
+    }
+
+    fn reasoning_for_record(&self) -> String {
+        self.reasoning.render()
+    }
+
+    fn tool_calls_for_record(&self) -> Vec<Value> {
+        self.tool_calls.render()
+    }
+
+    fn terminal_event_for_record(&self) -> Option<&str> {
+        self.terminal_event.as_deref().or_else(|| {
+            self.protocol_terminal
+                .as_ref()
+                .map(|terminal| terminal.event_type.as_str())
+        })
+    }
+
+    fn finish_reason_for_record(&self) -> Option<&str> {
+        self.finish_reason.as_deref().or_else(|| {
+            self.protocol_terminal.as_ref().and_then(|terminal| {
+                terminal
+                    .finish_reason
+                    .as_deref()
+                    .or(terminal.incomplete_reason.as_deref())
+            })
+        })
+    }
+
+    fn error_for_record(&self) -> Option<&Value> {
+        self.error.as_ref().or_else(|| {
+            self.protocol_terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error.as_ref())
+        })
+    }
 }
 
 pub struct DebugTraceStream<S> {
@@ -69,6 +282,10 @@ pub struct DebugTraceStream<S> {
 
 impl DebugTraceRecorder {
     pub fn new(config: &DebugTraceConfig) -> Option<Self> {
+        Self::new_with_options(config, TraceWriterOptions::default())
+    }
+
+    fn new_with_options(config: &DebugTraceConfig, options: TraceWriterOptions) -> Option<Self> {
         let path = config.path.as_ref()?;
         let parent = Path::new(path).parent();
         if let Some(parent) = parent {
@@ -76,13 +293,66 @@ impl DebugTraceRecorder {
                 return None;
             }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+        let (sender, receiver) = mpsc::sync_channel(options.queue_capacity);
+        let dropped_entries = Arc::new(AtomicUsize::new(0));
+        let worker_dropped_entries = dropped_entries.clone();
+        let path = path.to_string();
+        #[cfg(test)]
+        let start_barrier = options.start_barrier.clone();
+        std::thread::Builder::new()
+            .name("debug-trace-writer".to_string())
+            .spawn(move || {
+                #[cfg(test)]
+                if let Some(barrier) = start_barrier {
+                    barrier.wait();
+                }
+                'outer: while let Ok(first) = receiver.recv() {
+                    let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) else {
+                        continue;
+                    };
+                    let mut writer = BufWriter::new(file);
+                    let mut pending = Some(first);
+                    loop {
+                        if let Some(value) = pending.take() {
+                            flush_trace_overflow_summary(&mut writer, &worker_dropped_entries);
+                            let Ok(line) = serde_json::to_vec(&value) else {
+                                continue;
+                            };
+                            let _ = writer.write_all(&line);
+                            let _ = writer.write_all(b"\n");
+                        }
+                        while let Ok(value) = receiver.try_recv() {
+                            flush_trace_overflow_summary(&mut writer, &worker_dropped_entries);
+                            let Ok(line) = serde_json::to_vec(&value) else {
+                                continue;
+                            };
+                            let _ = writer.write_all(&line);
+                            let _ = writer.write_all(b"\n");
+                        }
+                        match receiver.recv_timeout(std::time::Duration::from_millis(25)) {
+                            Ok(value) => {
+                                pending = Some(value);
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                flush_trace_overflow_summary(&mut writer, &worker_dropped_entries);
+                                let _ = writer.flush();
+                                break;
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                flush_trace_overflow_summary(&mut writer, &worker_dropped_entries);
+                                let _ = writer.flush();
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            })
             .ok()?;
         Some(Self {
-            sink: Arc::new(Mutex::new(file)),
+            writer: Arc::new(TraceWriter {
+                sender,
+                dropped_entries,
+            }),
             max_text_chars: config.max_text_chars,
         })
     }
@@ -144,7 +414,8 @@ impl DebugTraceRecorder {
             "upstream_model": ctx.upstream_model,
             "response": summarize_non_stream_response(ctx.client_format, body, self.max_text_chars),
             "http_status": status,
-            "outcome": StreamOutcome::Completed,
+            "outcome": TraceOutcome::Completed,
+            "transport_outcome": TransportOutcome::CompletedEof,
         }));
     }
 
@@ -165,7 +436,7 @@ impl DebugTraceRecorder {
             ctx,
             status,
             buffer: Vec::new(),
-            summary: ResponseSummary::default(),
+            summary: ResponseSummary::new(self.max_text_chars),
             finalized: false,
         }
     }
@@ -175,8 +446,9 @@ impl DebugTraceRecorder {
         ctx: &DebugTraceContext,
         status: u16,
         summary: &ResponseSummary,
-        outcome: StreamOutcome,
+        transport_outcome: TransportOutcome,
     ) {
+        let outcome = project_trace_outcome(transport_outcome, summary);
         self.write_entry(json!({
             "timestamp_ms": ctx.timestamp_ms,
             "request_id": ctx.request_id,
@@ -190,28 +462,56 @@ impl DebugTraceRecorder {
             "upstream_model": ctx.upstream_model,
             "http_status": status,
             "outcome": outcome,
+            "transport_outcome": transport_outcome,
+            "protocol_terminal": summary.protocol_terminal,
             "response": {
-                "terminal_event": summary.terminal_event,
-                "finish_reason": summary.finish_reason,
-                "text": truncate_text(&summary.text, self.max_text_chars),
-                "reasoning": truncate_text(&summary.reasoning, self.max_text_chars),
-                "tool_calls": summary.tool_calls,
-                "error": summary.error,
+                "terminal_event": summary.terminal_event_for_record(),
+                "finish_reason": summary.finish_reason_for_record(),
+                "text": summary.text_for_record(),
+                "reasoning": summary.reasoning_for_record(),
+                "tool_calls": summary.tool_calls_for_record(),
+                "error": summary.error_for_record(),
             }
         }));
     }
 
     fn write_entry(&self, value: Value) {
-        let Ok(mut sink) = self.sink.lock() else {
-            return;
-        };
-        let Ok(line) = serde_json::to_vec(&value) else {
-            return;
-        };
-        let _ = sink.write_all(&line);
-        let _ = sink.write_all(b"\n");
-        let _ = sink.flush();
+        match self.writer.sender.try_send(value) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.writer.dropped_entries.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                warn!("debug trace entry dropped: writer_disconnected");
+            }
+        }
     }
+}
+
+fn flush_trace_overflow_summary(
+    writer: &mut BufWriter<std::fs::File>,
+    dropped_entries: &AtomicUsize,
+) {
+    let dropped = dropped_entries.swap(0, Ordering::Relaxed);
+    if dropped == 0 {
+        return;
+    }
+    let value = json!({
+        "timestamp_ms": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        "phase": TracePhase::Response,
+        "kind": "debug_trace_overflow",
+        "overflow": {
+            "dropped_entries": dropped,
+        }
+    });
+    let Ok(line) = serde_json::to_vec(&value) else {
+        return;
+    };
+    let _ = writer.write_all(&line);
+    let _ = writer.write_all(b"\n");
 }
 
 impl<S> Stream for DebugTraceStream<S>
@@ -236,7 +536,7 @@ where
                         &this.ctx,
                         this.status,
                         &this.summary,
-                        StreamOutcome::StreamError,
+                        TransportOutcome::StreamError,
                     );
                     this.finalized = true;
                 }
@@ -251,7 +551,7 @@ where
                         &this.ctx,
                         this.status,
                         &this.summary,
-                        StreamOutcome::Completed,
+                        TransportOutcome::CompletedEof,
                     );
                     this.finalized = true;
                 }
@@ -269,10 +569,109 @@ impl<S> Drop for DebugTraceStream<S> {
                 &self.ctx,
                 self.status,
                 &self.summary,
-                StreamOutcome::ClientDisconnected,
+                TransportOutcome::ClientDisconnected,
             );
             self.finalized = true;
         }
+    }
+}
+
+fn openai_protocol_terminal(event: &Value) -> Option<ProtocolTerminal> {
+    if let Some(error) = event.get("error") {
+        return Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Failed,
+            event_type: "chat.completion.chunk".to_string(),
+            finish_reason: None,
+            incomplete_reason: None,
+            error: Some(error.clone()),
+        });
+    }
+    let choice = event
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())?;
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str)?;
+    let kind = match finish_reason {
+        "length" | "content_filter" | "pause_turn" => ProtocolTerminalKind::Incomplete,
+        "context_length_exceeded" | "tool_error" | "error" => ProtocolTerminalKind::Failed,
+        _ => ProtocolTerminalKind::Success,
+    };
+    Some(ProtocolTerminal {
+        kind,
+        event_type: "chat.completion.chunk".to_string(),
+        finish_reason: Some(finish_reason.to_string()),
+        incomplete_reason: matches!(kind, ProtocolTerminalKind::Incomplete)
+            .then_some(finish_reason.to_string()),
+        error: None,
+    })
+}
+
+fn responses_protocol_terminal(event: &Value) -> Option<ProtocolTerminal> {
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    match event_type {
+        "response.completed" => Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Success,
+            event_type: event_type.to_string(),
+            finish_reason: None,
+            incomplete_reason: None,
+            error: None,
+        }),
+        "response.incomplete" => Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Incomplete,
+            event_type: event_type.to_string(),
+            finish_reason: None,
+            incomplete_reason: event
+                .get("response")
+                .and_then(|response| response.get("incomplete_details"))
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error: None,
+        }),
+        "response.failed" => Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Failed,
+            event_type: event_type.to_string(),
+            finish_reason: None,
+            incomplete_reason: None,
+            error: event
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .cloned()
+                .filter(|error| !error.is_null()),
+        }),
+        _ => None,
+    }
+}
+
+fn anthropic_protocol_terminal(
+    event: &Value,
+    last_stop_reason: Option<&str>,
+) -> Option<ProtocolTerminal> {
+    match event.get("type").and_then(Value::as_str) {
+        Some("error") => Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Failed,
+            event_type: "error".to_string(),
+            finish_reason: None,
+            incomplete_reason: None,
+            error: event.get("error").cloned(),
+        }),
+        Some("message_stop") => {
+            let stop_reason = last_stop_reason.unwrap_or("");
+            let kind = match stop_reason {
+                "max_tokens" | "pause_turn" | "refusal" => ProtocolTerminalKind::Incomplete,
+                "model_context_window_exceeded" => ProtocolTerminalKind::Failed,
+                _ => ProtocolTerminalKind::Success,
+            };
+            Some(ProtocolTerminal {
+                kind,
+                event_type: "message_stop".to_string(),
+                finish_reason: (!stop_reason.is_empty()).then_some(stop_reason.to_string()),
+                incomplete_reason: matches!(kind, ProtocolTerminalKind::Incomplete)
+                    .then_some(stop_reason.to_string()),
+                error: None,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -581,6 +980,15 @@ fn accumulate_event(format: UpstreamFormat, event: &Value, summary: &mut Respons
 fn accumulate_openai_completion_event(event: &Value, summary: &mut ResponseSummary) {
     if event.get("_done").and_then(Value::as_bool) == Some(true) {
         summary.terminal_event = Some("done".to_string());
+        summary
+            .protocol_terminal
+            .get_or_insert_with(|| ProtocolTerminal {
+                kind: ProtocolTerminalKind::Success,
+                event_type: "done".to_string(),
+                finish_reason: Some("stop".to_string()),
+                incomplete_reason: None,
+                error: None,
+            });
         return;
     }
     let choice = event
@@ -607,7 +1015,9 @@ fn accumulate_openai_completion_event(event: &Value, summary: &mut ResponseSumma
             .and_then(|d| d.get("tool_calls"))
             .and_then(Value::as_array)
         {
-            summary.tool_calls.extend(tool_calls.iter().cloned());
+            for tool_call in tool_calls {
+                summary.tool_calls.push(tool_call.clone());
+            }
         }
         if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str) {
             summary.finish_reason = Some(finish_reason.to_string());
@@ -616,6 +1026,9 @@ fn accumulate_openai_completion_event(event: &Value, summary: &mut ResponseSumma
     }
     if let Some(error) = event.get("error") {
         summary.error = Some(error.clone());
+    }
+    if let Some(terminal) = openai_protocol_terminal(event) {
+        summary.protocol_terminal = Some(terminal);
     }
 }
 
@@ -653,6 +1066,7 @@ fn accumulate_responses_event(event: &Value, summary: &mut ResponseSummary) {
                     summary.error = Some(error.clone());
                 }
             }
+            summary.protocol_terminal = responses_protocol_terminal(event);
         }
         _ => {}
     }
@@ -693,10 +1107,14 @@ fn accumulate_claude_event(event: &Value, summary: &mut ResponseSummary) {
         }
         "message_stop" => {
             summary.terminal_event = Some("message_stop".to_string());
+            summary.protocol_terminal =
+                anthropic_protocol_terminal(event, summary.finish_reason.as_deref());
         }
         "error" => {
             summary.terminal_event = Some("error".to_string());
             summary.error = event.get("error").cloned();
+            summary.protocol_terminal =
+                anthropic_protocol_terminal(event, summary.finish_reason.as_deref());
         }
         _ => {}
     }
@@ -711,9 +1129,285 @@ fn truncate_text(text: &str, max_text_chars: usize) -> String {
     format!("{head}…[{chars} chars]")
 }
 
+fn truncate_value_strings(value: &Value, max_text_chars: usize) -> Value {
+    match value {
+        Value::String(text) => Value::String(truncate_text(text, max_text_chars)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| truncate_value_strings(item, max_text_chars))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), truncate_value_strings(value, max_text_chars)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn value_to_display_string(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_else(|_| "<unprintable>".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn success_terminal_projects_completed_outcome() {
+        let summary = ResponseSummary {
+            protocol_terminal: Some(ProtocolTerminal {
+                kind: ProtocolTerminalKind::Success,
+                event_type: "response.completed".to_string(),
+                finish_reason: Some("stop".to_string()),
+                incomplete_reason: None,
+                error: None,
+            }),
+            ..ResponseSummary::new(16)
+        };
+
+        assert!(matches!(
+            project_trace_outcome(TransportOutcome::ClientDisconnected, &summary),
+            TraceOutcome::Completed
+        ));
+    }
+
+    #[test]
+    fn failed_terminal_does_not_project_completed_outcome() {
+        let summary = ResponseSummary {
+            protocol_terminal: Some(ProtocolTerminal {
+                kind: ProtocolTerminalKind::Failed,
+                event_type: "response.failed".to_string(),
+                finish_reason: None,
+                incomplete_reason: None,
+                error: Some(json!({"code":"tool_error"})),
+            }),
+            ..ResponseSummary::new(16)
+        };
+
+        assert!(matches!(
+            project_trace_outcome(TransportOutcome::ClientDisconnected, &summary),
+            TraceOutcome::Failed
+        ));
+    }
+
+    #[test]
+    fn incomplete_terminal_does_not_project_completed_outcome() {
+        let summary = ResponseSummary {
+            protocol_terminal: Some(ProtocolTerminal {
+                kind: ProtocolTerminalKind::Incomplete,
+                event_type: "response.incomplete".to_string(),
+                finish_reason: None,
+                incomplete_reason: Some("pause_turn".to_string()),
+                error: None,
+            }),
+            ..ResponseSummary::new(16)
+        };
+
+        assert!(matches!(
+            project_trace_outcome(TransportOutcome::ClientDisconnected, &summary),
+            TraceOutcome::Incomplete
+        ));
+    }
+
+    #[test]
+    fn debug_trace_recorder_writes_via_background_writer() {
+        let path =
+            std::env::temp_dir().join(format!("debug-trace-test-{}.jsonl", uuid::Uuid::new_v4()));
+        let recorder = DebugTraceRecorder::new(&DebugTraceConfig {
+            path: Some(path.to_string_lossy().to_string()),
+            max_text_chars: 32,
+        })
+        .expect("recorder");
+
+        recorder.record_non_stream_response(
+            &DebugTraceContext {
+                request_id: "req_1".to_string(),
+                timestamp_ms: 1,
+                path: "/openai/v1/chat/completions".to_string(),
+                stream: false,
+                client_model: "gpt-4.1".to_string(),
+                upstream_name: "default".to_string(),
+                upstream_model: "gpt-4.1".to_string(),
+                client_format: UpstreamFormat::OpenAiCompletion,
+                upstream_format: UpstreamFormat::OpenAiCompletion,
+            },
+            200,
+            &json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": { "role": "assistant", "content": "hello" }
+                }]
+            }),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut contents = String::new();
+        while Instant::now() < deadline {
+            contents = fs::read_to_string(&path).unwrap_or_default();
+            if contents.contains("\"request_id\":\"req_1\"") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(contents.contains("\"request_id\":\"req_1\""), "{contents}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn debug_trace_recorder_emits_explicit_overflow_summary_when_queue_fills() {
+        let path = std::env::temp_dir().join(format!(
+            "debug-trace-burst-test-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let start_barrier = Arc::new(std::sync::Barrier::new(2));
+        let recorder = DebugTraceRecorder::new_with_options(
+            &DebugTraceConfig {
+                path: Some(path.to_string_lossy().to_string()),
+                max_text_chars: 128,
+            },
+            TraceWriterOptions {
+                queue_capacity: 1,
+                start_barrier: Some(start_barrier.clone()),
+            },
+        )
+        .expect("recorder");
+        let ctx = DebugTraceContext {
+            request_id: String::new(),
+            timestamp_ms: 1,
+            path: "/openai/v1/chat/completions".to_string(),
+            stream: false,
+            client_model: "gpt-4.1".to_string(),
+            upstream_name: "default".to_string(),
+            upstream_model: "gpt-4.1".to_string(),
+            client_format: UpstreamFormat::OpenAiCompletion,
+            upstream_format: UpstreamFormat::OpenAiCompletion,
+        };
+        let body = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "x".repeat(4096) }
+            }]
+        });
+
+        for idx in 0..5usize {
+            let mut entry_ctx = ctx.clone();
+            entry_ctx.request_id = format!("req_{idx}");
+            recorder.record_non_stream_response(&entry_ctx, 200, &body);
+        }
+        start_barrier.wait();
+        drop(recorder);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut contents = String::new();
+        while Instant::now() < deadline {
+            contents = fs::read_to_string(&path).unwrap_or_default();
+            if contents.contains("\"kind\":\"debug_trace_overflow\"")
+                && contents.contains("\"dropped_entries\":")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            contents.contains("\"kind\":\"debug_trace_overflow\""),
+            "{contents}"
+        );
+        assert!(contents.contains("\"dropped_entries\":"), "{contents}");
+        let entries: Vec<Value> = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).expect("debug trace line should parse"))
+            .collect();
+        let overflow_entry = entries
+            .iter()
+            .find(|value| value.get("kind").and_then(Value::as_str) == Some("debug_trace_overflow"))
+            .expect("overflow entry should be present");
+        let persisted_responses = entries
+            .iter()
+            .filter(|value| value.get("phase").and_then(Value::as_str) == Some("response"))
+            .filter(|value| value.get("kind").is_none())
+            .count();
+        let dropped_entries = overflow_entry
+            .get("overflow")
+            .and_then(|value| value.get("dropped_entries"))
+            .and_then(Value::as_u64)
+            .expect("overflow entry should report dropped entries");
+
+        assert_eq!(
+            persisted_responses as u64 + dropped_entries,
+            5,
+            "bounded debug trace queue should account for every attempted write via persisted entries plus explicit overflow accounting: {contents}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn response_summary_bounds_text_reasoning_and_tool_calls_during_accumulation() {
+        let mut summary = ResponseSummary::new(12);
+
+        accumulate_event(
+            UpstreamFormat::OpenAiCompletion,
+            &json!({
+                "choices": [{
+                    "delta": {
+                        "content": "hello world",
+                        "reasoning_content": "reasoning trail",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "abcdefghijklmnopqrstuvwxyz"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            &mut summary,
+        );
+        accumulate_event(
+            UpstreamFormat::OpenAiCompletion,
+            &json!({
+                "choices": [{
+                    "delta": {
+                        "content": " plus more text",
+                        "reasoning_content": " and more reasoning",
+                        "tool_calls": [{
+                            "id": "call_2",
+                            "function": {
+                                "name": "lookup_2",
+                                "arguments": "mnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            &mut summary,
+        );
+
+        let text = summary.text_for_record();
+        let reasoning = summary.reasoning_for_record();
+        let tool_calls = summary.tool_calls_for_record();
+
+        assert!(summary.text.head.chars().count() <= 12);
+        assert!(summary.reasoning.head.chars().count() <= 12);
+        assert!(text.starts_with("hello world"));
+        assert!(text.contains("chars"));
+        assert!(reasoning.starts_with("reasoning tr"));
+        assert!(reasoning.contains("chars"));
+        assert!(tool_calls.len() <= 2);
+        assert!(tool_calls
+            .iter()
+            .any(|value| { value.get("type").and_then(Value::as_str) == Some("truncated") }));
     }
 }

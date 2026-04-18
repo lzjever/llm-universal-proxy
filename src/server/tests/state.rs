@@ -52,6 +52,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
             revision: "rev-1".to_string(),
             config: config.clone(),
             client: crate::upstream::build_client(&config),
+            streaming_client: crate::upstream::build_streaming_client(&config),
             hooks: initial_hooks,
             debug_trace: None,
             upstreams,

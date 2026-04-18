@@ -507,18 +507,21 @@ pub(super) async fn handle_request_core(
         stream,
     );
     debug!("Calling upstream URL: {}", url);
+    let upstream_client = if stream {
+        &namespace_state.streaming_client
+    } else {
+        &namespace_state.client
+    };
     let res =
-        match upstream::call_upstream(&namespace_state.client, &url, &body, stream, &auth_headers)
-            .await
-        {
+        match upstream::call_upstream(upstream_client, &url, &body, stream, &auth_headers).await {
             Ok(r) => r,
             Err(e) => {
                 tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-                return streaming_error_response(
-                    client_format,
-                    StatusCode::BAD_GATEWAY,
-                    &e.to_string(),
-                );
+                return if stream {
+                    streaming_error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
+                } else {
+                    error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
+                };
             }
         };
     let preserve_native_upstream_protocol_headers = upstream_format == client_format;

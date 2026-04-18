@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,16 +31,285 @@ pub enum CredentialSource {
 #[serde(rename_all = "snake_case")]
 enum TerminationReason {
     Completed,
+    Incomplete,
+    Failed,
     ClientDisconnected,
     StreamError,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FinalizationState {
+struct LegacyFinalizationState {
     completed: bool,
     cancelled_by_client: bool,
     partial: bool,
     termination_reason: TerminationReason,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UsageHookStatus {
+    Success,
+    Incomplete,
+    Error,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TransportOutcome {
+    CompletedEof,
+    ClientDisconnected,
+    StreamError,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProtocolTerminalKind {
+    Success,
+    Incomplete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ProtocolTerminal {
+    kind: ProtocolTerminalKind,
+    event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incomplete_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamObservation {
+    transport_outcome: TransportOutcome,
+    protocol_terminal: Option<ProtocolTerminal>,
+}
+
+impl StreamObservation {
+    fn non_stream_completed() -> Self {
+        Self {
+            transport_outcome: TransportOutcome::CompletedEof,
+            protocol_terminal: None,
+        }
+    }
+
+    fn project_legacy(&self) -> LegacyFinalizationState {
+        if let Some(terminal) = &self.protocol_terminal {
+            return match terminal.kind {
+                ProtocolTerminalKind::Success => LegacyFinalizationState {
+                    completed: true,
+                    cancelled_by_client: false,
+                    partial: false,
+                    termination_reason: TerminationReason::Completed,
+                },
+                ProtocolTerminalKind::Incomplete => LegacyFinalizationState {
+                    completed: false,
+                    cancelled_by_client: false,
+                    partial: true,
+                    termination_reason: TerminationReason::Incomplete,
+                },
+                ProtocolTerminalKind::Failed => LegacyFinalizationState {
+                    completed: false,
+                    cancelled_by_client: false,
+                    partial: false,
+                    termination_reason: TerminationReason::Failed,
+                },
+            };
+        }
+
+        match self.transport_outcome {
+            TransportOutcome::CompletedEof => LegacyFinalizationState {
+                completed: true,
+                cancelled_by_client: false,
+                partial: false,
+                termination_reason: TerminationReason::Completed,
+            },
+            TransportOutcome::ClientDisconnected => LegacyFinalizationState {
+                completed: false,
+                cancelled_by_client: true,
+                partial: true,
+                termination_reason: TerminationReason::ClientDisconnected,
+            },
+            TransportOutcome::StreamError => LegacyFinalizationState {
+                completed: false,
+                cancelled_by_client: false,
+                partial: true,
+                termination_reason: TerminationReason::StreamError,
+            },
+        }
+    }
+
+    fn project_usage_status(&self, http_status: u16) -> UsageHookStatus {
+        if let Some(terminal) = &self.protocol_terminal {
+            return match terminal.kind {
+                ProtocolTerminalKind::Success => {
+                    if (200..300).contains(&http_status) {
+                        UsageHookStatus::Success
+                    } else {
+                        UsageHookStatus::Error
+                    }
+                }
+                ProtocolTerminalKind::Incomplete => UsageHookStatus::Incomplete,
+                ProtocolTerminalKind::Failed => UsageHookStatus::Error,
+            };
+        }
+
+        match self.transport_outcome {
+            TransportOutcome::CompletedEof => {
+                if (200..300).contains(&http_status) {
+                    UsageHookStatus::Success
+                } else {
+                    UsageHookStatus::Error
+                }
+            }
+            TransportOutcome::ClientDisconnected => UsageHookStatus::Cancelled,
+            TransportOutcome::StreamError => UsageHookStatus::Error,
+        }
+    }
+}
+
+fn openai_protocol_terminal(event: &Value) -> Option<ProtocolTerminal> {
+    if let Some(error) = event.get("error") {
+        return Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Failed,
+            event_type: "chat.completion.chunk".to_string(),
+            finish_reason: None,
+            incomplete_reason: None,
+            error: Some(error.clone()),
+        });
+    }
+    let choice = event
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first());
+    let finish_reason = choice
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)?;
+    let (kind, incomplete_reason) = match finish_reason {
+        "length" | "content_filter" | "pause_turn" => (
+            ProtocolTerminalKind::Incomplete,
+            Some(finish_reason.to_string()),
+        ),
+        "context_length_exceeded" | "tool_error" | "error" => (ProtocolTerminalKind::Failed, None),
+        _ => (ProtocolTerminalKind::Success, None),
+    };
+    Some(ProtocolTerminal {
+        kind,
+        event_type: "chat.completion.chunk".to_string(),
+        finish_reason: Some(finish_reason.to_string()),
+        incomplete_reason,
+        error: event.get("error").cloned(),
+    })
+}
+
+fn responses_protocol_terminal(event: &Value) -> Option<ProtocolTerminal> {
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    match event_type {
+        "response.completed" => Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Success,
+            event_type: event_type.to_string(),
+            finish_reason: None,
+            incomplete_reason: None,
+            error: None,
+        }),
+        "response.incomplete" => Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Incomplete,
+            event_type: event_type.to_string(),
+            finish_reason: None,
+            incomplete_reason: event
+                .get("response")
+                .and_then(|response| response.get("incomplete_details"))
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error: None,
+        }),
+        "response.failed" => Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Failed,
+            event_type: event_type.to_string(),
+            finish_reason: None,
+            incomplete_reason: None,
+            error: event
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .cloned()
+                .filter(|error| !error.is_null()),
+        }),
+        _ => None,
+    }
+}
+
+fn anthropic_protocol_terminal(
+    event: &Value,
+    last_stop_reason: Option<&str>,
+) -> Option<ProtocolTerminal> {
+    match event.get("type").and_then(Value::as_str) {
+        Some("error") => Some(ProtocolTerminal {
+            kind: ProtocolTerminalKind::Failed,
+            event_type: "error".to_string(),
+            finish_reason: None,
+            incomplete_reason: None,
+            error: event.get("error").cloned(),
+        }),
+        Some("message_stop") => {
+            let stop_reason = last_stop_reason.unwrap_or("");
+            let (kind, incomplete_reason, finish_reason) = match stop_reason {
+                "max_tokens" | "pause_turn" | "refusal" => (
+                    ProtocolTerminalKind::Incomplete,
+                    Some(stop_reason.to_string()),
+                    Some(stop_reason.to_string()),
+                ),
+                "model_context_window_exceeded" => (
+                    ProtocolTerminalKind::Failed,
+                    None,
+                    Some(stop_reason.to_string()),
+                ),
+                _ => (
+                    ProtocolTerminalKind::Success,
+                    None,
+                    (!stop_reason.is_empty()).then_some(stop_reason.to_string()),
+                ),
+            };
+            Some(ProtocolTerminal {
+                kind,
+                event_type: "message_stop".to_string(),
+                finish_reason,
+                incomplete_reason,
+                error: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn google_protocol_terminal(event: &Value) -> Option<ProtocolTerminal> {
+    let candidate = event
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())?;
+    let finish_reason = candidate
+        .get("finishReason")
+        .and_then(Value::as_str)
+        .map(str::to_string)?;
+    let kind = match finish_reason.as_str() {
+        "MAX_TOKENS" | "SAFETY" | "RECITATION" => ProtocolTerminalKind::Incomplete,
+        "MALFORMED_FUNCTION_CALL"
+        | "UNEXPECTED_TOOL_CALL"
+        | "TOO_MANY_TOOL_CALLS"
+        | "MISSING_THOUGHT_SIGNATURE" => ProtocolTerminalKind::Failed,
+        _ => ProtocolTerminalKind::Success,
+    };
+    Some(ProtocolTerminal {
+        kind,
+        event_type: "candidate".to_string(),
+        finish_reason: Some(finish_reason.clone()),
+        incomplete_reason: matches!(kind, ProtocolTerminalKind::Incomplete)
+            .then_some(finish_reason),
+        error: None,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -233,6 +505,83 @@ struct HookSender {
     runtime: Arc<HookRuntime>,
 }
 
+#[derive(Debug)]
+enum ExchangeResponseCapture {
+    Immediate(Value),
+    Spool(EventSpoolArtifact),
+    Unavailable { reason: String },
+}
+
+#[derive(Debug)]
+struct ExchangeHookPayload {
+    ctx: HookRequestContext,
+    status: u16,
+    response_headers: Vec<HeaderEntry>,
+    response_capture: ExchangeResponseCapture,
+    observation: StreamObservation,
+}
+
+#[derive(Debug)]
+enum ExchangeCaptureMode {
+    Spooling(EventSpoolSink),
+    Unavailable { reason: String },
+}
+
+#[derive(Debug)]
+struct EventSpoolSink {
+    format: UpstreamFormat,
+    budget_bytes: usize,
+    captured_bytes: usize,
+    dropped_event_count: usize,
+    overflow_reason: Option<String>,
+    writer: Option<SpoolWriterHandle>,
+}
+
+#[derive(Debug)]
+struct EventSpoolArtifact {
+    format: UpstreamFormat,
+    state: Option<EventSpoolArtifactState>,
+}
+
+#[derive(Debug)]
+enum EventSpoolArtifactState {
+    Complete {
+        writer: SpoolWriterHandle,
+    },
+    Truncated {
+        reason: String,
+        capture_budget_bytes: usize,
+        captured_bytes: usize,
+        dropped_event_count: usize,
+        writer: Option<SpoolWriterHandle>,
+    },
+}
+
+#[derive(Debug)]
+struct SpoolWriterHandle {
+    sender: Option<mpsc::SyncSender<Vec<u8>>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    path: Option<PathBuf>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone)]
+struct SpoolWriterOptions {
+    queue_capacity: usize,
+    #[cfg(test)]
+    start_barrier: Option<Arc<std::sync::Barrier>>,
+}
+
+impl Default for SpoolWriterOptions {
+    fn default() -> Self {
+        Self {
+            queue_capacity: 64,
+            #[cfg(test)]
+            start_barrier: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HookKind {
     Exchange,
@@ -242,12 +591,15 @@ enum HookKind {
 #[derive(Debug)]
 struct HookRuntime {
     max_pending_bytes: usize,
+    exchange_capture_budget_bytes: usize,
     pending_bytes: AtomicUsize,
     timeout: Duration,
     failure_threshold: usize,
     cooldown: Duration,
     breaker: Mutex<HookBreakerState>,
 }
+
+const DEFAULT_EXCHANGE_CAPTURE_BUDGET_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Default)]
 struct HookBreakerState {
@@ -342,6 +694,9 @@ impl HookDispatcher {
         }
         let runtime = Arc::new(HookRuntime {
             max_pending_bytes: config.max_pending_bytes,
+            exchange_capture_budget_bytes: config
+                .max_pending_bytes
+                .min(DEFAULT_EXCHANGE_CAPTURE_BUDGET_BYTES),
             pending_bytes: AtomicUsize::new(0),
             timeout: config.timeout,
             failure_threshold: config.failure_threshold,
@@ -380,29 +735,15 @@ impl HookDispatcher {
         response_body: Value,
     ) {
         let usage = NormalizedUsage::from_client_body(ctx.client_format, &response_body);
+        let observation = StreamObservation::non_stream_completed();
         self.emit_exchange(
             &ctx,
             status,
             response_headers.clone(),
-            response_body.clone(),
-            FinalizationState {
-                completed: true,
-                cancelled_by_client: false,
-                partial: false,
-                termination_reason: TerminationReason::Completed,
-            },
+            ExchangeResponseCapture::Immediate(response_body.clone()),
+            observation.clone(),
         );
-        self.emit_usage(
-            &ctx,
-            status,
-            usage,
-            FinalizationState {
-                completed: true,
-                cancelled_by_client: false,
-                partial: false,
-                termination_reason: TerminationReason::Completed,
-            },
-        );
+        self.emit_usage(&ctx, status, usage, observation);
     }
 
     pub fn wrap_stream<S>(
@@ -415,17 +756,31 @@ impl HookDispatcher {
     where
         S: Stream<Item = Result<Bytes, std::io::Error>>,
     {
-        let capture_enabled = self.runtime.can_capture_exchange();
+        let exchange_capture = if self.exchange.is_some() && self.runtime.can_capture_exchange() {
+            match EventSpoolSink::new(
+                ctx.client_format,
+                self.runtime.exchange_capture_budget_bytes,
+            ) {
+                Ok(sink) => Some(ExchangeCaptureMode::Spooling(sink)),
+                Err(reason) => Some(ExchangeCaptureMode::Unavailable { reason }),
+            }
+        } else {
+            None
+        };
+        let capture_enabled = matches!(exchange_capture, Some(ExchangeCaptureMode::Spooling(_)));
+        let observe_events = capture_enabled || self.usage.is_some();
         HookCaptureStream {
             inner,
             buffer: Vec::new(),
-            accumulator: ClientSseAccumulator::new(ctx.client_format),
+            observer: ClientSseAccumulator::new(ctx.client_format),
             dispatcher: self.clone(),
             ctx,
             status,
             response_headers,
             finalized: false,
             capture_enabled,
+            exchange_capture,
+            observe_events,
         }
     }
 
@@ -434,8 +789,8 @@ impl HookDispatcher {
         ctx: &HookRequestContext,
         status: u16,
         response_headers: Vec<HeaderEntry>,
-        response_body: Value,
-        state: FinalizationState,
+        response_capture: ExchangeResponseCapture,
+        observation: StreamObservation,
     ) {
         let Some(sender) = self.exchange.clone() else {
             return;
@@ -443,34 +798,13 @@ impl HookDispatcher {
         if !self.runtime.can_attempt(HookKind::Exchange) {
             return;
         }
-        let payload = json!({
-            "request_id": ctx.request_id,
-            "timestamp_ms": ctx.timestamp_ms,
-            "path": ctx.path,
-            "method": ctx.method,
-            "stream": ctx.stream,
-            "client_format": ctx.client_format,
-            "upstream_format": ctx.upstream_format,
-            "client_model": ctx.client_model,
-            "upstream_name": ctx.upstream_name,
-            "upstream_model": ctx.upstream_model,
-            "credential_source": ctx.credential_source,
-            "credential_fingerprint": ctx.credential_fingerprint,
-            "completed": state.completed,
-            "cancelled_by_client": state.cancelled_by_client,
-            "partial": state.partial,
-            "termination_reason": state.termination_reason,
-            "request": {
-                "headers": ctx.client_request_headers,
-                "body": ctx.client_request_body,
-            },
-            "response": {
-                "status": status,
-                "headers": response_headers,
-                "body": response_body,
-            }
+        sender.spawn_exchange_send(ExchangeHookPayload {
+            ctx: ctx.clone(),
+            status,
+            response_headers,
+            response_capture,
+            observation,
         });
-        sender.spawn_send(payload);
     }
 
     fn emit_usage(
@@ -478,7 +812,7 @@ impl HookDispatcher {
         ctx: &HookRequestContext,
         status: u16,
         usage: NormalizedUsage,
-        state: FinalizationState,
+        observation: StreamObservation,
     ) {
         let Some(sender) = self.usage.clone() else {
             return;
@@ -486,6 +820,8 @@ impl HookDispatcher {
         if !self.runtime.can_attempt(HookKind::Usage) {
             return;
         }
+        let state = observation.project_legacy();
+        let usage_status = observation.project_usage_status(status);
         let payload = json!({
             "request_id": ctx.request_id,
             "timestamp_ms": ctx.timestamp_ms,
@@ -495,13 +831,7 @@ impl HookDispatcher {
             "cancelled_by_client": state.cancelled_by_client,
             "partial": state.partial,
             "termination_reason": state.termination_reason,
-            "status": if state.cancelled_by_client {
-                "cancelled"
-            } else if (200..300).contains(&status) {
-                "success"
-            } else {
-                "error"
-            },
+            "status": usage_status,
             "http_status": status,
             "client_model": ctx.client_model,
             "upstream_name": ctx.upstream_name,
@@ -510,6 +840,8 @@ impl HookDispatcher {
             "upstream_format": ctx.upstream_format,
             "credential_source": ctx.credential_source,
             "credential_fingerprint": ctx.credential_fingerprint,
+            "transport_outcome": observation.transport_outcome,
+            "protocol_terminal": observation.protocol_terminal,
             "usage": usage,
         });
         sender.spawn_send(payload);
@@ -563,6 +895,29 @@ impl HookSender {
         });
     }
 
+    fn spawn_exchange_send(self, payload: ExchangeHookPayload) {
+        tokio::spawn(async move {
+            let runtime = self.runtime.clone();
+            let built = tokio::task::spawn_blocking(move || payload.into_json_payload()).await;
+            let Ok(Ok(payload)) = built else {
+                warn!("hook exchange payload dropped: reason=payload_build_failed");
+                return;
+            };
+            let Ok(serialized) = serde_json::to_vec(&payload) else {
+                return;
+            };
+            let payload_len = serialized.len();
+            if !runtime.try_reserve(payload_len) {
+                warn!(
+                    "hook payload dropped: kind={:?} reason=max_pending_bytes_exceeded size={}",
+                    self.kind, payload_len
+                );
+                return;
+            }
+            self.send(serialized, payload_len).await;
+        });
+    }
+
     async fn send(self, payload: Vec<u8>, payload_len: usize) {
         let mut req = self
             .client
@@ -596,6 +951,281 @@ impl HookSender {
             }
         }
         self.runtime.release(payload_len);
+    }
+}
+
+impl ExchangeHookPayload {
+    fn into_json_payload(self) -> Result<Value, String> {
+        let legacy = self.observation.project_legacy();
+        let response_body = match self.response_capture {
+            ExchangeResponseCapture::Immediate(body) => body,
+            ExchangeResponseCapture::Spool(artifact) => artifact.replay_final_response_body()?,
+            ExchangeResponseCapture::Unavailable { reason } => json!({
+                "capture_unavailable": true,
+                "reason": reason,
+            }),
+        };
+        Ok(json!({
+            "request_id": self.ctx.request_id,
+            "timestamp_ms": self.ctx.timestamp_ms,
+            "path": self.ctx.path,
+            "method": self.ctx.method,
+            "stream": self.ctx.stream,
+            "client_format": self.ctx.client_format,
+            "upstream_format": self.ctx.upstream_format,
+            "client_model": self.ctx.client_model,
+            "upstream_name": self.ctx.upstream_name,
+            "upstream_model": self.ctx.upstream_model,
+            "credential_source": self.ctx.credential_source,
+            "credential_fingerprint": self.ctx.credential_fingerprint,
+            "completed": legacy.completed,
+            "cancelled_by_client": legacy.cancelled_by_client,
+            "partial": legacy.partial,
+            "termination_reason": legacy.termination_reason,
+            "transport_outcome": self.observation.transport_outcome,
+            "protocol_terminal": self.observation.protocol_terminal,
+            "request": {
+                "headers": self.ctx.client_request_headers,
+                "body": self.ctx.client_request_body,
+            },
+            "response": {
+                "status": self.status,
+                "headers": self.response_headers,
+                "body": response_body,
+            }
+        }))
+    }
+}
+
+impl EventSpoolSink {
+    fn new(format: UpstreamFormat, budget_bytes: usize) -> Result<Self, String> {
+        Self::new_with_options(format, budget_bytes, SpoolWriterOptions::default())
+    }
+
+    fn new_with_options(
+        format: UpstreamFormat,
+        budget_bytes: usize,
+        options: SpoolWriterOptions,
+    ) -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!(
+            "llm-proxy-hook-spool-{}-{}.jsonl",
+            format!("{format:?}").to_lowercase(),
+            Uuid::new_v4()
+        ));
+        Ok(Self {
+            format,
+            budget_bytes,
+            captured_bytes: 0,
+            dropped_event_count: 0,
+            overflow_reason: None,
+            writer: Some(SpoolWriterHandle::new(path, options)?),
+        })
+    }
+
+    fn on_event(&mut self, event: &Value) -> Result<(), String> {
+        if self.overflow_reason.is_some() {
+            self.dropped_event_count = self.dropped_event_count.saturating_add(1);
+            return Ok(());
+        }
+        let mut serialized =
+            serde_json::to_vec(event).map_err(|err| format!("serialize spool event: {err}"))?;
+        serialized.push(b'\n');
+        let serialized_len = serialized.len();
+        if self.captured_bytes.saturating_add(serialized_len) > self.budget_bytes {
+            self.mark_overflow("capture_budget_exceeded");
+            return Ok(());
+        }
+        match self
+            .writer
+            .as_mut()
+            .and_then(|writer| writer.sender.as_ref())
+            .ok_or_else(|| "spool writer unavailable".to_string())?
+            .try_send(serialized)
+        {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.mark_overflow("capture_queue_overflow");
+                return Ok(());
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.mark_overflow("capture_writer_disconnected");
+                return Ok(());
+            }
+        }
+        self.captured_bytes = self.captured_bytes.saturating_add(serialized_len);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<EventSpoolArtifact, String> {
+        let state = if let Some(reason) = self.overflow_reason.take() {
+            EventSpoolArtifactState::Truncated {
+                reason,
+                capture_budget_bytes: self.budget_bytes,
+                captured_bytes: self.captured_bytes,
+                dropped_event_count: self.dropped_event_count,
+                writer: self.writer.take(),
+            }
+        } else {
+            EventSpoolArtifactState::Complete {
+                writer: self
+                    .writer
+                    .take()
+                    .ok_or_else(|| "missing spool writer".to_string())?,
+            }
+        };
+        Ok(EventSpoolArtifact {
+            format: self.format,
+            state: Some(state),
+        })
+    }
+
+    fn mark_overflow(&mut self, reason: &str) {
+        if self.overflow_reason.is_none() {
+            self.overflow_reason = Some(reason.to_string());
+            if let Some(writer) = self.writer.as_mut() {
+                writer.close_sender();
+            }
+        }
+        self.dropped_event_count = self.dropped_event_count.saturating_add(1);
+    }
+}
+
+impl EventSpoolArtifact {
+    fn replay_final_response_body(mut self) -> Result<Value, String> {
+        match self.state.take() {
+            Some(EventSpoolArtifactState::Complete { writer }) => {
+                let path = writer.finish()?;
+                let file = File::open(&path)
+                    .map_err(|err| format!("open spool artifact for replay: {err}"))?;
+                let reader = BufReader::new(file);
+                let mut accumulator = ClientSseAccumulator::new(self.format);
+                for line in reader.lines() {
+                    let line = line.map_err(|err| format!("read spool artifact line: {err}"))?;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let event: Value = serde_json::from_str(&line)
+                        .map_err(|err| format!("parse spool event: {err}"))?;
+                    accumulator.on_event(&event, true);
+                }
+                let _ = fs::remove_file(&path);
+                Ok(accumulator.final_response_body())
+            }
+            Some(EventSpoolArtifactState::Truncated {
+                reason,
+                capture_budget_bytes,
+                captured_bytes,
+                dropped_event_count,
+                writer,
+            }) => Ok(json!({
+                "capture_truncated": true,
+                "reason": reason,
+                "client_format": self.format,
+                "capture_budget_bytes": capture_budget_bytes,
+                "captured_bytes": captured_bytes,
+                "dropped_event_count": dropped_event_count,
+                "writer_completed": writer.map(|writer| writer.cleanup()).unwrap_or(true),
+            })),
+            None => Err("missing spool artifact state".to_string()),
+        }
+    }
+}
+
+impl Drop for EventSpoolArtifact {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            match state {
+                EventSpoolArtifactState::Complete { writer } => {
+                    let _ = writer.cleanup();
+                }
+                EventSpoolArtifactState::Truncated {
+                    writer: Some(writer),
+                    ..
+                } => {
+                    let _ = writer.cleanup();
+                }
+                EventSpoolArtifactState::Truncated { writer: None, .. } => {}
+            }
+        }
+    }
+}
+
+impl SpoolWriterHandle {
+    fn new(path: PathBuf, options: SpoolWriterOptions) -> Result<Self, String> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|err| format!("open spool file: {err}"))?;
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(options.queue_capacity);
+        let error = Arc::new(Mutex::new(None));
+        let worker_error = error.clone();
+        #[cfg(test)]
+        let start_barrier = options.start_barrier.clone();
+        let join = std::thread::Builder::new()
+            .name("hook-exchange-spool".to_string())
+            .spawn(move || {
+                let mut writer = BufWriter::new(file);
+                #[cfg(test)]
+                if let Some(barrier) = start_barrier {
+                    barrier.wait();
+                }
+                while let Ok(line) = receiver.recv() {
+                    if let Err(err) = writer.write_all(&line) {
+                        *worker_error.lock().unwrap() = Some(format!("write spool event: {err}"));
+                        break;
+                    }
+                }
+                let _ = writer.flush();
+            })
+            .map_err(|err| format!("spawn spool writer: {err}"))?;
+        Ok(Self {
+            sender: Some(sender),
+            join: Some(join),
+            path: Some(path),
+            error,
+        })
+    }
+
+    fn close_sender(&mut self) {
+        self.sender.take();
+    }
+
+    fn finish(mut self) -> Result<PathBuf, String> {
+        self.close_sender();
+        if let Some(join) = self.join.take() {
+            join.join()
+                .map_err(|_| "join spool writer thread".to_string())?;
+        }
+        if let Some(err) = self.error.lock().unwrap().clone() {
+            return Err(err);
+        }
+        self.path
+            .take()
+            .ok_or_else(|| "missing spool path".to_string())
+    }
+
+    fn cleanup(mut self) -> bool {
+        self.close_sender();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+        self.error.lock().unwrap().is_none()
+    }
+}
+
+impl Drop for SpoolWriterHandle {
+    fn drop(&mut self) {
+        self.close_sender();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -656,34 +1286,48 @@ pub fn sse_response_headers() -> Vec<HeaderEntry> {
 pub struct HookCaptureStream<S> {
     inner: S,
     buffer: Vec<u8>,
-    accumulator: ClientSseAccumulator,
+    observer: ClientSseAccumulator,
     dispatcher: HookDispatcher,
     ctx: HookRequestContext,
     status: u16,
     response_headers: Vec<HeaderEntry>,
     finalized: bool,
     capture_enabled: bool,
+    exchange_capture: Option<ExchangeCaptureMode>,
+    observe_events: bool,
 }
 
 impl<S> HookCaptureStream<S> {
-    fn finalize(&mut self, state: FinalizationState) {
+    fn finalize(&mut self, transport_outcome: TransportOutcome) {
         if self.finalized {
             return;
         }
         self.finalized = true;
-        let usage = self.accumulator.final_usage();
-        if self.capture_enabled {
-            let response_body = self.accumulator.final_response_body();
+        let observation = StreamObservation {
+            transport_outcome,
+            protocol_terminal: self.observer.protocol_terminal(),
+        };
+        let usage = self.observer.final_usage();
+        if let Some(capture) = self.exchange_capture.take() {
+            let response_capture = match capture {
+                ExchangeCaptureMode::Spooling(sink) => match sink.finish() {
+                    Ok(artifact) => ExchangeResponseCapture::Spool(artifact),
+                    Err(reason) => ExchangeResponseCapture::Unavailable { reason },
+                },
+                ExchangeCaptureMode::Unavailable { reason } => {
+                    ExchangeResponseCapture::Unavailable { reason }
+                }
+            };
             self.dispatcher.emit_exchange(
                 &self.ctx,
                 self.status,
                 self.response_headers.clone(),
-                response_body,
-                state,
+                response_capture,
+                observation.clone(),
             );
         }
         self.dispatcher
-            .emit_usage(&self.ctx, self.status, usage, state);
+            .emit_usage(&self.ctx, self.status, usage, observation);
     }
 }
 
@@ -697,30 +1341,29 @@ where
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
-                if this.capture_enabled {
+                if this.observe_events {
                     this.buffer.extend_from_slice(&bytes);
                     while let Some(event) = take_one_sse_event(&mut this.buffer) {
-                        this.accumulator.on_event(&event);
+                        this.observer.on_event(&event, false);
+                        if let Some(ExchangeCaptureMode::Spooling(sink)) =
+                            this.exchange_capture.as_mut()
+                        {
+                            if let Err(err) = sink.on_event(&event) {
+                                this.exchange_capture =
+                                    Some(ExchangeCaptureMode::Unavailable { reason: err });
+                                this.capture_enabled = false;
+                            }
+                        }
                     }
                 }
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(err))) => {
-                this.finalize(FinalizationState {
-                    completed: false,
-                    cancelled_by_client: false,
-                    partial: true,
-                    termination_reason: TerminationReason::StreamError,
-                });
+                this.finalize(TransportOutcome::StreamError);
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
-                this.finalize(FinalizationState {
-                    completed: true,
-                    cancelled_by_client: false,
-                    partial: false,
-                    termination_reason: TerminationReason::Completed,
-                });
+                this.finalize(TransportOutcome::CompletedEof);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -730,12 +1373,7 @@ where
 
 impl<S> Drop for HookCaptureStream<S> {
     fn drop(&mut self) {
-        self.finalize(FinalizationState {
-            completed: false,
-            cancelled_by_client: true,
-            partial: true,
-            termination_reason: TerminationReason::ClientDisconnected,
-        });
+        self.finalize(TransportOutcome::ClientDisconnected);
     }
 }
 
@@ -757,12 +1395,12 @@ impl ClientSseAccumulator {
         }
     }
 
-    fn on_event(&mut self, event: &Value) {
+    fn on_event(&mut self, event: &Value, capture_exchange: bool) {
         match self {
-            Self::OpenAiCompletion(acc) => acc.on_event(event),
-            Self::Responses(acc) => acc.on_event(event),
-            Self::Anthropic(acc) => acc.on_event(event),
-            Self::Google(acc) => acc.on_event(event),
+            Self::OpenAiCompletion(acc) => acc.on_event(event, capture_exchange),
+            Self::Responses(acc) => acc.on_event(event, capture_exchange),
+            Self::Anthropic(acc) => acc.on_event(event, capture_exchange),
+            Self::Google(acc) => acc.on_event(event, capture_exchange),
         }
     }
 
@@ -781,6 +1419,15 @@ impl ClientSseAccumulator {
             Self::Responses(acc) => acc.final_usage(),
             Self::Anthropic(acc) => acc.final_usage(),
             Self::Google(acc) => acc.final_usage(),
+        }
+    }
+
+    fn protocol_terminal(&self) -> Option<ProtocolTerminal> {
+        match self {
+            Self::OpenAiCompletion(acc) => acc.protocol_terminal(),
+            Self::Responses(acc) => acc.protocol_terminal(),
+            Self::Anthropic(acc) => acc.protocol_terminal(),
+            Self::Google(acc) => acc.protocol_terminal(),
         }
     }
 }
@@ -802,28 +1449,42 @@ struct OpenAiCompletionAccumulator {
     finish_reason: Option<String>,
     usage: Option<Value>,
     tool_calls: BTreeMap<usize, OpenAiToolCallAccumulator>,
+    protocol_terminal: Option<ProtocolTerminal>,
 }
 
 impl OpenAiCompletionAccumulator {
-    fn on_event(&mut self, event: &Value) {
+    fn on_event(&mut self, event: &Value, capture_exchange: bool) {
         if event.get("_done").and_then(Value::as_bool) == Some(true) {
+            self.protocol_terminal
+                .get_or_insert_with(|| ProtocolTerminal {
+                    kind: ProtocolTerminalKind::Success,
+                    event_type: "done".to_string(),
+                    finish_reason: Some("stop".to_string()),
+                    incomplete_reason: None,
+                    error: None,
+                });
             return;
         }
-        self.id = self.id.clone().or_else(|| {
-            event
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        });
-        self.created = self
-            .created
-            .or_else(|| event.get("created").and_then(Value::as_u64));
-        self.model = self.model.clone().or_else(|| {
-            event
-                .get("model")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        });
+        if let Some(terminal) = openai_protocol_terminal(event) {
+            self.protocol_terminal = Some(terminal);
+        }
+        if capture_exchange {
+            self.id = self.id.clone().or_else(|| {
+                event
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+            self.created = self
+                .created
+                .or_else(|| event.get("created").and_then(Value::as_u64));
+            self.model = self.model.clone().or_else(|| {
+                event
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+        }
         if let Some(usage) = event.get("usage") {
             self.usage = Some(usage.clone());
         }
@@ -836,6 +1497,9 @@ impl OpenAiCompletionAccumulator {
         };
         if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish_reason = Some(finish_reason.to_string());
+        }
+        if !capture_exchange {
+            return;
         }
         let delta = choice.get("delta").unwrap_or(&Value::Null);
         if let Some(role) = delta.get("role").and_then(Value::as_str) {
@@ -922,19 +1586,35 @@ impl OpenAiCompletionAccumulator {
             })
             .unwrap_or_default()
     }
+
+    fn protocol_terminal(&self) -> Option<ProtocolTerminal> {
+        self.protocol_terminal.clone()
+    }
 }
 
 #[derive(Debug, Default)]
 struct ResponsesAccumulator {
     final_response: Option<Value>,
     last_usage: Option<NormalizedUsage>,
+    protocol_terminal: Option<ProtocolTerminal>,
 }
 
 impl ResponsesAccumulator {
-    fn on_event(&mut self, event: &Value) {
+    fn on_event(&mut self, event: &Value, capture_exchange: bool) {
+        if let Some(terminal) = responses_protocol_terminal(event) {
+            self.protocol_terminal = Some(terminal);
+        }
         if let Some(response) = event.get("response") {
-            if event.get("type").and_then(Value::as_str) == Some("response.completed") {
-                self.final_response = Some(response.clone());
+            let terminal = matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.incomplete" | "response.failed")
+            );
+            if terminal {
+                if capture_exchange
+                    && event.get("type").and_then(Value::as_str) == Some("response.completed")
+                {
+                    self.final_response = Some(response.clone());
+                }
                 self.last_usage = Some(NormalizedUsage::from_client_body(
                     UpstreamFormat::OpenAiResponses,
                     response,
@@ -950,6 +1630,10 @@ impl ResponsesAccumulator {
     fn final_usage(&self) -> NormalizedUsage {
         self.last_usage.clone().unwrap_or_default()
     }
+
+    fn protocol_terminal(&self) -> Option<ProtocolTerminal> {
+        self.protocol_terminal.clone()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -957,6 +1641,8 @@ struct AnthropicAccumulator {
     message: Value,
     error: Option<Value>,
     usage: Option<NormalizedUsage>,
+    last_stop_reason: Option<String>,
+    protocol_terminal: Option<ProtocolTerminal>,
 }
 
 impl AnthropicAccumulator {
@@ -975,18 +1661,26 @@ impl AnthropicAccumulator {
         self.message["content"].as_array_mut().unwrap()
     }
 
-    fn on_event(&mut self, event: &Value) {
+    fn on_event(&mut self, event: &Value, capture_exchange: bool) {
         match event.get("type").and_then(Value::as_str) {
             Some("error") => {
-                self.error = Some(event.clone());
+                if capture_exchange {
+                    self.error = Some(event.clone());
+                }
             }
             Some("message_start") => {
+                if !capture_exchange {
+                    return;
+                }
                 if let Some(message) = event.get("message") {
                     self.message = message.clone();
                     self.message["content"] = Value::Array(Vec::new());
                 }
             }
             Some("content_block_start") => {
+                if !capture_exchange {
+                    return;
+                }
                 let Some(index) = event
                     .get("index")
                     .and_then(Value::as_u64)
@@ -1004,6 +1698,9 @@ impl AnthropicAccumulator {
                 content[index] = block.clone();
             }
             Some("content_block_delta") => {
+                if !capture_exchange {
+                    return;
+                }
                 let Some(index) = event
                     .get("index")
                     .and_then(Value::as_u64)
@@ -1061,10 +1758,16 @@ impl AnthropicAccumulator {
                     .and_then(|delta| delta.get("stop_reason"))
                     .and_then(Value::as_str)
                 {
+                    self.last_stop_reason = Some(stop_reason.to_string());
+                    if !capture_exchange {
+                        return;
+                    }
                     self.message["stop_reason"] = json!(stop_reason);
                 }
                 if let Some(usage) = event.get("usage") {
-                    self.message["usage"] = usage.clone();
+                    if capture_exchange {
+                        self.message["usage"] = usage.clone();
+                    }
                     self.usage = Some(NormalizedUsage::from_client_body(
                         UpstreamFormat::Anthropic,
                         &json!({ "usage": usage }),
@@ -1072,6 +1775,14 @@ impl AnthropicAccumulator {
                 }
             }
             Some("message_stop") => {
+                if !capture_exchange {
+                    if let Some(terminal) =
+                        anthropic_protocol_terminal(event, self.last_stop_reason.as_deref())
+                    {
+                        self.protocol_terminal = Some(terminal);
+                    }
+                    return;
+                }
                 if let Some(content) = self
                     .message
                     .get_mut("content")
@@ -1091,6 +1802,10 @@ impl AnthropicAccumulator {
             }
             _ => {}
         }
+        if let Some(terminal) = anthropic_protocol_terminal(event, self.last_stop_reason.as_deref())
+        {
+            self.protocol_terminal = Some(terminal);
+        }
     }
 
     fn final_body(&self) -> Value {
@@ -1100,13 +1815,21 @@ impl AnthropicAccumulator {
     fn final_usage(&self) -> NormalizedUsage {
         self.usage.clone().unwrap_or_default()
     }
+
+    fn protocol_terminal(&self) -> Option<ProtocolTerminal> {
+        self.protocol_terminal.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::stream;
+    use futures_util::task::noop_waker_ref;
     use serde_json::json;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::task::Poll;
 
     fn runtime(
         max_pending_bytes: usize,
@@ -1115,6 +1838,8 @@ mod tests {
     ) -> HookRuntime {
         HookRuntime {
             max_pending_bytes,
+            exchange_capture_budget_bytes: max_pending_bytes
+                .min(DEFAULT_EXCHANGE_CAPTURE_BUDGET_BYTES),
             pending_bytes: AtomicUsize::new(0),
             timeout: Duration::from_secs(30),
             failure_threshold,
@@ -1173,17 +1898,283 @@ mod tests {
         let stream = HookCaptureStream {
             inner: stream::pending::<Result<Bytes, std::io::Error>>(),
             buffer: Vec::new(),
-            accumulator: ClientSseAccumulator::new(UpstreamFormat::OpenAiCompletion),
+            observer: ClientSseAccumulator::new(UpstreamFormat::OpenAiCompletion),
+            exchange_capture: None,
             dispatcher,
             ctx,
             status: 200,
             response_headers: json_response_headers(),
             finalized: false,
             capture_enabled: true,
+            observe_events: true,
         };
 
         assert!(!stream.finalized);
         drop(stream);
+    }
+
+    #[test]
+    fn hook_capture_stream_tracks_usage_even_when_exchange_capture_disabled() {
+        let runtime = Arc::new(runtime(1, 3, 100));
+        runtime.pending_bytes.store(1, Ordering::Relaxed);
+        let dispatcher = HookDispatcher {
+            exchange: None,
+            usage: Some(HookSender {
+                client: reqwest::Client::new(),
+                config: HookEndpointConfig {
+                    url: "http://127.0.0.1:9/usage".to_string(),
+                    authorization: None,
+                },
+                kind: HookKind::Usage,
+                runtime: runtime.clone(),
+            }),
+            runtime,
+        };
+        let ctx = HookRequestContext {
+            request_id: "req_usage".to_string(),
+            timestamp_ms: 1,
+            path: "/openai/v1/responses".to_string(),
+            method: "POST".to_string(),
+            stream: true,
+            client_format: UpstreamFormat::OpenAiResponses,
+            upstream_format: UpstreamFormat::OpenAiResponses,
+            client_model: "gpt-4.1".to_string(),
+            upstream_name: "default".to_string(),
+            upstream_model: "gpt-4.1".to_string(),
+            credential_source: CredentialSource::Server,
+            credential_fingerprint: Some("abc".to_string()),
+            client_request_headers: vec![],
+            client_request_body: json!({"model":"gpt-4.1","stream":true}),
+        };
+        let payload = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n"
+        );
+        let inner = stream::iter(vec![Ok(Bytes::from_static(payload.as_bytes()))]);
+        let mut stream = dispatcher.wrap_stream(inner, ctx, 200, sse_response_headers());
+
+        assert!(!stream.capture_enabled);
+        assert_eq!(stream.observer.final_usage().total_tokens, None);
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        let first = Pin::new(&mut stream).poll_next(&mut cx);
+        assert!(matches!(first, Poll::Ready(Some(Ok(_)))));
+        assert_eq!(stream.observer.final_usage().input_tokens, Some(3));
+        assert_eq!(stream.observer.final_usage().output_tokens, Some(4));
+        assert_eq!(stream.observer.final_usage().total_tokens, Some(7));
+    }
+
+    #[test]
+    fn success_terminal_projects_completed_legacy_state() {
+        let legacy = StreamObservation {
+            transport_outcome: TransportOutcome::ClientDisconnected,
+            protocol_terminal: Some(ProtocolTerminal {
+                kind: ProtocolTerminalKind::Success,
+                event_type: "response.completed".to_string(),
+                finish_reason: Some("stop".to_string()),
+                incomplete_reason: None,
+                error: None,
+            }),
+        }
+        .project_legacy();
+
+        assert!(legacy.completed);
+        assert!(!legacy.cancelled_by_client);
+        assert!(!legacy.partial);
+        assert!(matches!(
+            legacy.termination_reason,
+            TerminationReason::Completed
+        ));
+    }
+
+    #[test]
+    fn failed_terminal_does_not_project_completed_legacy_state() {
+        let legacy = StreamObservation {
+            transport_outcome: TransportOutcome::ClientDisconnected,
+            protocol_terminal: Some(ProtocolTerminal {
+                kind: ProtocolTerminalKind::Failed,
+                event_type: "response.failed".to_string(),
+                finish_reason: None,
+                incomplete_reason: None,
+                error: Some(json!({"code":"context_length_exceeded"})),
+            }),
+        }
+        .project_legacy();
+
+        assert!(!legacy.completed);
+        assert!(!legacy.cancelled_by_client);
+        assert!(!legacy.partial);
+        assert!(matches!(
+            legacy.termination_reason,
+            TerminationReason::Failed
+        ));
+    }
+
+    #[test]
+    fn incomplete_terminal_does_not_project_completed_legacy_state() {
+        let legacy = StreamObservation {
+            transport_outcome: TransportOutcome::ClientDisconnected,
+            protocol_terminal: Some(ProtocolTerminal {
+                kind: ProtocolTerminalKind::Incomplete,
+                event_type: "response.incomplete".to_string(),
+                finish_reason: None,
+                incomplete_reason: Some("max_output_tokens".to_string()),
+                error: None,
+            }),
+        }
+        .project_legacy();
+
+        assert!(!legacy.completed);
+        assert!(!legacy.cancelled_by_client);
+        assert!(legacy.partial);
+        assert!(matches!(
+            legacy.termination_reason,
+            TerminationReason::Incomplete
+        ));
+    }
+
+    #[test]
+    fn usage_status_projects_protocol_terminal_over_http_success() {
+        let failed = StreamObservation {
+            transport_outcome: TransportOutcome::CompletedEof,
+            protocol_terminal: Some(ProtocolTerminal {
+                kind: ProtocolTerminalKind::Failed,
+                event_type: "response.failed".to_string(),
+                finish_reason: None,
+                incomplete_reason: None,
+                error: Some(json!({"code":"tool_error"})),
+            }),
+        };
+        let incomplete = StreamObservation {
+            transport_outcome: TransportOutcome::CompletedEof,
+            protocol_terminal: Some(ProtocolTerminal {
+                kind: ProtocolTerminalKind::Incomplete,
+                event_type: "response.incomplete".to_string(),
+                finish_reason: None,
+                incomplete_reason: Some("max_output_tokens".to_string()),
+                error: None,
+            }),
+        };
+
+        assert_eq!(failed.project_usage_status(200), UsageHookStatus::Error);
+        assert_eq!(
+            incomplete.project_usage_status(200),
+            UsageHookStatus::Incomplete
+        );
+    }
+
+    #[test]
+    fn event_spool_capture_replays_full_openai_response_body() {
+        let mut sink = EventSpoolSink::new(UpstreamFormat::OpenAiCompletion, 4096).expect("spool");
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": "hello " }
+            }]
+        }))
+        .expect("write first");
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "world" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 }
+        }))
+        .expect("write second");
+
+        let artifact = sink.finish().expect("artifact");
+        let body = artifact.replay_final_response_body().expect("replay");
+
+        assert_eq!(body["choices"][0]["message"]["content"], "hello world");
+        assert_eq!(body["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn event_spool_capture_reports_truncation_when_budget_exceeded() {
+        let mut sink = EventSpoolSink::new(UpstreamFormat::OpenAiCompletion, 64).expect("spool");
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": "hello" }
+            }]
+        }))
+        .expect("write first");
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "world" },
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("truncate");
+
+        let artifact = sink.finish().expect("artifact");
+        let body = artifact.replay_final_response_body().expect("replay");
+
+        assert_eq!(body["capture_truncated"], true);
+        assert_eq!(body["reason"], "capture_budget_exceeded");
+        assert_eq!(body["capture_budget_bytes"], 64);
+        assert!(body["captured_bytes"].as_u64().unwrap_or(0) <= 64);
+        assert!(body["dropped_event_count"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn event_spool_capture_reports_queue_overflow_without_replay() {
+        let start_barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut sink = EventSpoolSink::new_with_options(
+            UpstreamFormat::OpenAiCompletion,
+            4096,
+            SpoolWriterOptions {
+                queue_capacity: 1,
+                start_barrier: Some(start_barrier.clone()),
+            },
+        )
+        .expect("spool");
+
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": "hello " }
+            }]
+        }))
+        .expect("queue first");
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "world" },
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("overflow to truncation");
+        start_barrier.wait();
+
+        let artifact = sink.finish().expect("artifact");
+        let body = artifact.replay_final_response_body().expect("replay");
+
+        assert_eq!(body["capture_truncated"], true);
+        assert_eq!(body["reason"], "capture_queue_overflow");
+        assert!(body["dropped_event_count"].as_u64().unwrap_or(0) >= 1);
+        assert!(body.get("choices").is_none());
     }
 }
 
@@ -1191,11 +2182,12 @@ mod tests {
 struct GoogleAccumulator {
     response: Value,
     usage: Option<NormalizedUsage>,
+    protocol_terminal: Option<ProtocolTerminal>,
 }
 
 impl GoogleAccumulator {
-    fn on_event(&mut self, event: &Value) {
-        if self.response.is_null() {
+    fn on_event(&mut self, event: &Value, capture_exchange: bool) {
+        if capture_exchange && self.response.is_null() {
             self.response = json!({
                 "candidates": [{
                     "content": { "parts": [], "role": "model" }
@@ -1204,40 +2196,49 @@ impl GoogleAccumulator {
         }
         if let Some(candidates) = event.get("candidates").and_then(Value::as_array) {
             if let Some(candidate) = candidates.first() {
-                if let Some(parts) = candidate
-                    .get("content")
-                    .and_then(|c| c.get("parts"))
-                    .and_then(Value::as_array)
-                {
-                    let dest_parts = self.response["candidates"][0]["content"]["parts"]
-                        .as_array_mut()
-                        .unwrap();
-                    for part in parts {
-                        if let Some(text) = part.get("text").and_then(Value::as_str) {
-                            if let Some(last) = dest_parts.last_mut() {
-                                if last.get("text").is_some() {
-                                    let existing =
-                                        last.get("text").and_then(Value::as_str).unwrap_or("");
-                                    last["text"] = json!(format!("{}{}", existing, text));
-                                    continue;
+                if capture_exchange {
+                    if let Some(parts) = candidate
+                        .get("content")
+                        .and_then(|c| c.get("parts"))
+                        .and_then(Value::as_array)
+                    {
+                        let dest_parts = self.response["candidates"][0]["content"]["parts"]
+                            .as_array_mut()
+                            .unwrap();
+                        for part in parts {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                if let Some(last) = dest_parts.last_mut() {
+                                    if last.get("text").is_some() {
+                                        let existing =
+                                            last.get("text").and_then(Value::as_str).unwrap_or("");
+                                        last["text"] = json!(format!("{}{}", existing, text));
+                                        continue;
+                                    }
                                 }
+                                dest_parts.push(json!({ "text": text }));
+                            } else if part.get("functionCall").is_some() {
+                                dest_parts.push(part.clone());
                             }
-                            dest_parts.push(json!({ "text": text }));
-                        } else if part.get("functionCall").is_some() {
-                            dest_parts.push(part.clone());
                         }
                     }
+                    if let Some(reason) = candidate.get("finishReason") {
+                        self.response["candidates"][0]["finishReason"] = reason.clone();
+                    }
                 }
-                if let Some(reason) = candidate.get("finishReason") {
-                    self.response["candidates"][0]["finishReason"] = reason.clone();
+                if candidate.get("finishReason").is_some() {
+                    self.protocol_terminal = google_protocol_terminal(event);
                 }
             }
         }
-        if let Some(model) = event.get("modelVersion") {
-            self.response["modelVersion"] = model.clone();
+        if capture_exchange {
+            if let Some(model) = event.get("modelVersion") {
+                self.response["modelVersion"] = model.clone();
+            }
         }
         if let Some(usage) = event.get("usageMetadata") {
-            self.response["usageMetadata"] = usage.clone();
+            if capture_exchange {
+                self.response["usageMetadata"] = usage.clone();
+            }
             self.usage = Some(NormalizedUsage::from_client_body(
                 UpstreamFormat::Google,
                 &json!({ "usageMetadata": usage }),
@@ -1251,5 +2252,9 @@ impl GoogleAccumulator {
 
     fn final_usage(&self) -> NormalizedUsage {
         self.usage.clone().unwrap_or_default()
+    }
+
+    fn protocol_terminal(&self) -> Option<ProtocolTerminal> {
+        self.protocol_terminal.clone()
     }
 }

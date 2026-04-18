@@ -125,6 +125,7 @@ fn resolve_native_responses_stateful_route_or_error_rejects_multi_upstream_auto_
         config,
         upstreams,
         client: Client::new(),
+        streaming_client: Client::new(),
         hooks: None,
         debug_trace: None,
     };

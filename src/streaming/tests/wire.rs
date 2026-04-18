@@ -69,6 +69,22 @@ fn take_one_sse_event_handles_mixed_crlf_and_lf() {
 }
 
 #[test]
+fn take_one_sse_event_skips_blank_data_frames_without_treating_them_as_done() {
+    let mut buf = b"data:\n\ndata: {\"ok\":true}\n\n".to_vec();
+    let event = take_one_sse_event(&mut buf);
+    assert_eq!(event, Some(serde_json::json!({ "ok": true })));
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn take_one_sse_event_joins_multiline_data_payload() {
+    let mut buf = b"data: {\"outer\":\ndata: {\"inner\":1}}\n\n".to_vec();
+    let event = take_one_sse_event(&mut buf);
+    assert_eq!(event, Some(serde_json::json!({ "outer": { "inner": 1 } })));
+    assert!(buf.is_empty());
+}
+
+#[test]
 fn test_format_sse_data() {
     let v = serde_json::json!({ "x": 1 });
     let bytes = format_sse_data(&v);
