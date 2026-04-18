@@ -1,7 +1,9 @@
 use serde_json::Value;
 
 use super::models::{NormalizedResponseLogprobCandidate, NormalizedResponseTokenLogprob};
-use super::{responses_hosted_output_item_type, responses_portable_output_item_type};
+use super::openai_responses::{
+    responses_hosted_output_item_type, responses_portable_output_item_type,
+};
 
 pub(super) fn responses_nonportable_output_item_message(
     item: &Value,

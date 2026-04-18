@@ -12,6 +12,7 @@ use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
     SemanticToolKind, SharedControlProfile, TranslationAssessment,
 };
+use super::openai_family::extract_responses_text_content;
 use super::request_gemini::gemini_generation_config_field;
 use super::response_protocols::openai_message_reasoning_text;
 use super::tools::{
@@ -23,8 +24,7 @@ use super::{
     anthropic_nonportable_content_block_message, anthropic_protocol_uses_cache_control,
     anthropic_request_has_nonportable_thinking_provenance,
     anthropic_request_nonportable_tool_definition_message,
-    anthropic_request_tool_result_order_message, extract_responses_text_content,
-    gemini_request_nonportable_message,
+    anthropic_request_tool_result_order_message, gemini_request_nonportable_message,
 };
 
 pub(super) fn responses_stateful_request_controls_for_translate(body: &Value) -> Vec<&'static str> {
