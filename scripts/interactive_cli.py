@@ -4,40 +4,39 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import real_cli_matrix as matrix
+from real_cli_matrix import (  # noqa: E402
+    CLIENT_NAMES,
+    DEFAULT_CONFIG_SOURCE,
+    DEFAULT_ENV_FILE,
+    DEFAULT_PROXY_BINARY,
+    build_client_env,
+    build_runtime_config_text,
+    load_dotenv_file,
+    parse_proxy_source,
+    prepare_proxy_env,
+    start_proxy,
+    stop_proxy,
+    wait_for_health,
+)
 
 
-REPO_ROOT = matrix.REPO_ROOT
-DEFAULT_STATE_ROOT = REPO_ROOT / "test-reports" / "interactive-cli"
 DEFAULT_MODEL_BY_CLIENT = {
-    "codex": "minimax-anth",
-    "claude": "claude-sonnet-4-6",
+    "codex": "minimax-openai",
+    "claude": "claude-haiku-4-5",
     "gemini": "minimax-openai",
 }
-
-
-@dataclasses.dataclass
-class ClientLaunch:
-    client_name: str
-    model: str
-    proxy_base: str
-    workspace_dir: pathlib.Path
-    state_root: pathlib.Path
-    home_dir: pathlib.Path
-    env: dict[str, str]
-    command: list[str]
 
 
 def normalize_proxy_base(proxy_base: str) -> str:
@@ -51,35 +50,24 @@ def default_model_for_client(client_name: str) -> str:
         raise ValueError(f"unknown client: {client_name}") from error
 
 
-def resolve_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Start an interactive CLI session through llm-universal-proxy"
     )
-    parser.add_argument("--client", choices=matrix.CLIENT_NAMES, required=True)
-    parser.add_argument("--model", help="proxy model alias to use")
+    parser.add_argument("--client", choices=CLIENT_NAMES, required=True)
+    parser.add_argument("--model")
     parser.add_argument("--workspace", default=os.getcwd())
-    parser.add_argument(
-        "--proxy-base",
-        help="reuse an already-running proxy, for example http://127.0.0.1:18888",
-    )
-    parser.add_argument("--config-source", default=str(matrix.DEFAULT_CONFIG_SOURCE))
-    parser.add_argument("--env-file", default=str(matrix.DEFAULT_ENV_FILE))
-    parser.add_argument("--state-root", default=str(DEFAULT_STATE_ROOT))
-    parser.add_argument("--binary", default=str(matrix.DEFAULT_PROXY_BINARY))
+    parser.add_argument("--proxy-base")
+    parser.add_argument("--config-source", default=str(DEFAULT_CONFIG_SOURCE))
+    parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))
+    parser.add_argument("--binary", default=str(DEFAULT_PROXY_BINARY))
     parser.add_argument("--proxy-host", default="127.0.0.1")
     parser.add_argument(
         "--proxy-port",
         type=int,
         default=int(os.environ.get("PROXY_PORT", "18888")),
     )
-    parser.add_argument(
-        "client_args",
-        nargs=argparse.REMAINDER,
-        help="extra args for the client; use -- before them",
-    )
     args = parser.parse_args(argv)
-    if args.client_args and args.client_args[0] == "--":
-        args.client_args = args.client_args[1:]
     if not args.model:
         args.model = default_model_for_client(args.client)
     return args
@@ -95,28 +83,22 @@ def ensure_proxy_binary(proxy_binary: pathlib.Path) -> None:
         raise RuntimeError(f"missing prerequisite: {proxy_binary}")
 
 
-def resolve_client_home_dir(client_name: str, state_root: pathlib.Path) -> pathlib.Path:
-    return state_root / "homes" / client_name
-
-
-def build_interactive_client_command(
+def build_interactive_command(
     client_name: str,
-    proxy_base: str,
+    workspace: pathlib.Path,
     model: str,
-    workspace_dir: pathlib.Path,
-    extra_args: list[str] | None = None,
+    proxy_base: str,
 ) -> list[str]:
-    workspace_dir = pathlib.Path(workspace_dir).resolve()
+    workspace = pathlib.Path(workspace).resolve()
     proxy_base = normalize_proxy_base(proxy_base)
-    command: list[str]
 
     if client_name == "codex":
-        command = [
+        return [
             "codex",
-            "--model",
-            model,
             "-C",
-            str(workspace_dir),
+            str(workspace),
+            "-m",
+            model,
             "-c",
             'model_provider="proxy"',
             "-c",
@@ -124,147 +106,116 @@ def build_interactive_client_command(
             "-c",
             f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
             "-c",
-            'model_providers.proxy.env_key="OPENAI_API_KEY"',
-            "-c",
             'model_providers.proxy.wire_api="responses"',
-            "-c",
-            "model_providers.proxy.supports_websockets=false",
         ]
-    elif client_name == "claude":
-        command = [
+
+    if client_name == "claude":
+        return [
             "claude",
-            "--model",
-            model,
+            "--bare",
             "--setting-sources",
             "user",
-            "--bare",
+            "--model",
+            model,
             "--add-dir",
-            str(workspace_dir),
+            str(workspace),
         ]
-    elif client_name == "gemini":
-        command = [
+
+    if client_name == "gemini":
+        return [
             "gemini",
             "--model",
             model,
-            "--sandbox=false",
             "--include-directories",
-            str(workspace_dir),
+            str(workspace),
         ]
-    else:
-        raise ValueError(f"unknown client: {client_name}")
 
-    command.extend(extra_args or [])
-    return command
+    raise ValueError(f"unknown client: {client_name}")
 
 
-def build_client_launch(
-    client_name: str,
-    model: str,
-    proxy_base: str,
-    workspace_dir: pathlib.Path,
-    base_env: dict[str, str],
-    state_root: pathlib.Path,
-    extra_args: list[str] | None = None,
-) -> ClientLaunch:
-    state_root = pathlib.Path(state_root).resolve()
-    workspace_dir = pathlib.Path(workspace_dir).resolve()
-    home_dir = resolve_client_home_dir(client_name, state_root).resolve()
-    env = matrix.build_client_env(
-        client_name,
-        base_env,
-        normalize_proxy_base(proxy_base),
-        home_dir,
-    )
-    command = build_interactive_client_command(
-        client_name,
-        proxy_base,
-        model,
-        workspace_dir,
-        extra_args=extra_args,
-    )
-    return ClientLaunch(
-        client_name=client_name,
-        model=model,
-        proxy_base=normalize_proxy_base(proxy_base),
-        workspace_dir=workspace_dir,
-        state_root=state_root,
-        home_dir=home_dir,
+def launch_interactive_client(
+    command: list[str],
+    workspace: pathlib.Path,
+    env: dict[str, str],
+) -> int:
+    process = subprocess.Popen(
+        command,
+        cwd=str(pathlib.Path(workspace).resolve()),
         env=env,
-        command=command,
     )
+    return int(process.wait())
 
 
-def launch_client_interactive(launch: ClientLaunch) -> int:
-    completed = subprocess.run(
-        launch.command,
-        cwd=str(launch.workspace_dir),
-        env=launch.env,
-        check=False,
-    )
-    return int(completed.returncode)
-
-
-def start_proxy_for_interactive_run(
+def start_managed_proxy(
     args: argparse.Namespace,
     base_env: dict[str, str],
-) -> tuple[str, subprocess.Popen[str], pathlib.Path]:
+    runtime_root: pathlib.Path,
+) -> tuple[str, subprocess.Popen[str] | None]:
     config_source = pathlib.Path(args.config_source)
-    dotenv_env = matrix.load_dotenv_file(pathlib.Path(args.env_file))
-    parsed_source = matrix.parse_proxy_source(config_source.read_text(encoding="utf-8"))
+    dotenv_env = load_dotenv_file(pathlib.Path(args.env_file))
+    proxy_binary = pathlib.Path(args.binary)
+    ensure_proxy_binary(proxy_binary)
 
-    runs_root = pathlib.Path(args.state_root).resolve() / "runs"
-    run_dir = matrix.prepare_report_dir(runs_root)
-    trace_path = run_dir / "debug-trace.jsonl"
-    runtime_config_text = matrix.build_runtime_config_text(
+    parsed_source = parse_proxy_source(config_source.read_text(encoding="utf-8"))
+    report_dir = runtime_root / "proxy"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = report_dir / "debug-trace.jsonl"
+    runtime_config_text = build_runtime_config_text(
         parsed_source,
         dotenv_env,
         listen_host=args.proxy_host,
         listen_port=args.proxy_port,
         trace_path=trace_path,
     )
-    proxy_env = matrix.prepare_proxy_env(base_env, dotenv_env)
-    proxy_binary = pathlib.Path(args.binary)
-
-    ensure_proxy_binary(proxy_binary)
-    process, _runtime_config_path, _stdout_path, _stderr_path = matrix.start_proxy(
+    proxy_env = prepare_proxy_env(base_env, dotenv_env)
+    process, _config_path, _stdout_path, _stderr_path = start_proxy(
         proxy_binary,
         runtime_config_text,
-        run_dir,
+        report_dir,
         proxy_env,
     )
-    proxy_base = f"http://{args.proxy_host}:{args.proxy_port}"
-    return proxy_base, process, run_dir
+    return f"http://{args.proxy_host}:{args.proxy_port}", process
 
 
 def run(argv: list[str] | None = None) -> int:
-    args = resolve_cli_args(argv)
-    base_env = dict(os.environ)
+    args = parse_args(argv)
     ensure_client_binary(args.client)
 
-    proxy_process = None
-    proxy_base = normalize_proxy_base(args.proxy_base) if args.proxy_base else ""
+    workspace = pathlib.Path(args.workspace).resolve()
+    base_env = dict(os.environ)
 
-    try:
-        if proxy_base:
-            matrix.wait_for_health(proxy_base)
-        else:
-            proxy_base, proxy_process, _run_dir = start_proxy_for_interactive_run(
-                args, base_env
+    with tempfile.TemporaryDirectory(prefix=f"interactive-cli-{args.client}-") as temp_dir:
+        runtime_root = pathlib.Path(temp_dir)
+        proxy_process: subprocess.Popen[str] | None = None
+
+        try:
+            if args.proxy_base:
+                proxy_base = normalize_proxy_base(args.proxy_base)
+            else:
+                proxy_base, proxy_process = start_managed_proxy(
+                    args,
+                    base_env,
+                    runtime_root,
+                )
+
+            wait_for_health(proxy_base)
+
+            client_home = runtime_root / "homes" / args.client
+            client_env = build_client_env(
+                args.client,
+                base_env,
+                proxy_base,
+                client_home,
             )
-            matrix.wait_for_health(proxy_base)
-
-        launch = build_client_launch(
-            client_name=args.client,
-            model=args.model,
-            proxy_base=proxy_base,
-            workspace_dir=pathlib.Path(args.workspace),
-            base_env=base_env,
-            state_root=pathlib.Path(args.state_root),
-            extra_args=args.client_args,
-        )
-        return launch_client_interactive(launch)
-    finally:
-        matrix.stop_proxy(proxy_process)
+            command = build_interactive_command(
+                args.client,
+                workspace,
+                args.model,
+                proxy_base,
+            )
+            return launch_interactive_client(command, workspace, client_env)
+        finally:
+            stop_proxy(proxy_process)
 
 
 def main() -> int:

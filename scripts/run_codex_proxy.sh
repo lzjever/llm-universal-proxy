@@ -2,6 +2,4 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-exec python3 "${SCRIPT_DIR}/interactive_cli.py" --client codex "$@"
+exec python3 scripts/interactive_cli.py --client codex "$@"
