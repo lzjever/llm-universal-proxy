@@ -7,13 +7,15 @@ use super::assessment::{
     openai_normalized_logprobs_controls, request_stream_include_obfuscation,
     responses_normalized_logprobs_controls, responses_reasoning_effort, responses_text_verbosity,
 };
+use super::models::{
+    NormalizedDecodingControls, NormalizedJsonSchemaOutputShape, NormalizedOutputShape,
+    NormalizedRequestControls, NormalizedToolPolicy, SemanticToolKind,
+};
 use super::response_protocols::push_gemini_function_call_part;
 use super::{
     collapse_gemini_parts_for_openai, custom_tools_not_portable_message,
     gemini_function_response_has_nonportable_parts,
     gemini_function_response_parts_not_portable_message, semantic_tool_kind_from_value,
-    NormalizedDecodingControls, NormalizedJsonSchemaOutputShape, NormalizedOutputShape,
-    NormalizedRequestControls, NormalizedToolPolicy, SemanticToolKind,
 };
 
 pub(super) fn extract_gemini_text(content: &Value) -> String {
