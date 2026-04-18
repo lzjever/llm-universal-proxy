@@ -64,13 +64,18 @@ pub(super) fn decode_anthropic_reasoning_carrier(carrier: &str) -> Result<Vec<Va
         .get("blocks")
         .and_then(Value::as_array)
         .ok_or("carrier blocks must be an array")?;
-    if blocks.iter().any(|block| block.get("type").and_then(Value::as_str) != Some("thinking")) {
+    if blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) != Some("thinking"))
+    {
         return Err("carrier blocks must only contain Anthropic thinking blocks".to_string());
     }
     Ok(blocks.clone())
 }
 
-pub(super) fn openai_message_anthropic_reasoning_replay_blocks(message: &Value) -> Option<Vec<Value>> {
+pub(super) fn openai_message_anthropic_reasoning_replay_blocks(
+    message: &Value,
+) -> Option<Vec<Value>> {
     message
         .get(OPENAI_ANTHROPIC_REASONING_REPLAY_FIELD)
         .and_then(Value::as_array)

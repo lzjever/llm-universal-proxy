@@ -12,8 +12,8 @@ use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
     SemanticToolKind, SharedControlProfile, TranslationAssessment,
 };
-use super::openai_responses::decode_anthropic_reasoning_carrier;
 use super::openai_family::extract_responses_text_content;
+use super::openai_responses::decode_anthropic_reasoning_carrier;
 use super::request_gemini::gemini_generation_config_field;
 use super::response_protocols::openai_message_reasoning_text;
 use super::tools::{
@@ -1002,10 +1002,7 @@ pub(crate) fn assess_request_translation(
         if let Some(message) = responses_nonportable_tool_choice_message(body, upstream_format) {
             assessment.reject(message);
         }
-        if let Some(message) = responses_nonportable_input_item_message(
-            body,
-            upstream_format,
-        ) {
+        if let Some(message) = responses_nonportable_input_item_message(body, upstream_format) {
             assessment.reject(message);
         }
         if let Some(message) = responses_nonportable_tool_definition_message(

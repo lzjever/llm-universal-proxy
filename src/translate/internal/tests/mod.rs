@@ -847,7 +847,10 @@ fn translate_request_openai_same_format_minimax_normalizes_developer_role_and_ke
     .unwrap();
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[1]["reasoning_details"][0]["text"], "internal thinking");
+    assert_eq!(
+        messages[1]["reasoning_details"][0]["text"],
+        "internal thinking"
+    );
     assert_eq!(body["reasoning_split"], true);
     assert_eq!(body["stream_options"]["include_usage"], true);
 }
@@ -4830,7 +4833,10 @@ fn translate_request_responses_to_claude_replays_anthropic_omitted_reasoning_car
         .as_array()
         .expect("assistant content");
     assert_eq!(assistant_content[0]["type"], "thinking");
-    assert_eq!(assistant_content[0]["thinking"], json!({ "display": "omitted" }));
+    assert_eq!(
+        assistant_content[0]["thinking"],
+        json!({ "display": "omitted" })
+    );
     assert_eq!(assistant_content[0]["signature"], "sig_omitted");
     assert_eq!(assistant_content[1]["type"], "text");
     assert_eq!(assistant_content[1]["text"], "Visible answer");
@@ -8310,7 +8316,10 @@ fn translate_response_claude_thinking_signature_provenance_maps_to_responses_car
     let output = out["output"].as_array().expect("responses output");
     assert_eq!(output[0]["type"], "reasoning");
     assert_eq!(output[0]["summary"][0]["text"], "internal reasoning");
-    assert!(output[0]["encrypted_content"].is_string(), "output = {output:?}");
+    assert!(
+        output[0]["encrypted_content"].is_string(),
+        "output = {output:?}"
+    );
     assert_ne!(
         output[0]["encrypted_content"].as_str().unwrap_or(""),
         "",
@@ -8367,7 +8376,10 @@ fn translate_response_claude_omitted_thinking_maps_to_responses_carrier() {
     let output = out["output"].as_array().expect("responses output");
     assert_eq!(output[0]["type"], "reasoning");
     assert_eq!(output[0]["summary"], json!([]));
-    assert!(output[0]["encrypted_content"].is_string(), "output = {output:?}");
+    assert!(
+        output[0]["encrypted_content"].is_string(),
+        "output = {output:?}"
+    );
     assert_ne!(
         output[0]["encrypted_content"].as_str().unwrap_or(""),
         "",

@@ -225,13 +225,17 @@ async fn anthropic_signed_thinking_to_responses_non_streaming_returns_carrier() 
     let output = body["output"].as_array().unwrap();
     assert_eq!(output[0]["type"], "reasoning");
     assert_eq!(output[0]["summary"][0]["text"], "internal reasoning");
-    assert!(output[0]["encrypted_content"].is_string(), "body = {body:?}");
+    assert!(
+        output[0]["encrypted_content"].is_string(),
+        "body = {body:?}"
+    );
     assert_eq!(output[1]["type"], "message");
     assert_eq!(output[1]["content"][0]["text"], "Visible answer");
 }
 
 #[tokio::test]
-async fn anthropic_signed_thinking_responses_round_trip_non_streaming_replays_carrier_to_upstream() {
+async fn anthropic_signed_thinking_responses_round_trip_non_streaming_replays_carrier_to_upstream()
+{
     let (source_base, _source_mock) = spawn_anthropic_signed_thinking_mock().await;
     let source_config = proxy_config(&source_base, UpstreamFormat::Anthropic);
     let (source_proxy_base, _source_proxy) = start_proxy(source_config).await;
@@ -294,7 +298,9 @@ async fn anthropic_signed_thinking_responses_round_trip_non_streaming_replays_ca
         .expect("captured anthropic request");
     let messages = request["messages"].as_array().expect("anthropic messages");
     assert_eq!(messages[1]["role"], "assistant");
-    let assistant_content = messages[1]["content"].as_array().expect("assistant content");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
     assert_eq!(assistant_content[0]["type"], "thinking");
     assert_eq!(assistant_content[0]["thinking"], "internal reasoning");
     assert_eq!(assistant_content[0]["signature"], "sig_123");
@@ -327,7 +333,10 @@ async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_replays_c
     let output = first_body["output"].as_array().expect("responses output");
     assert_eq!(output[0]["type"], "reasoning");
     assert_eq!(output[0]["summary"], json!([]));
-    assert!(output[0]["encrypted_content"].is_string(), "body = {first_body:?}");
+    assert!(
+        output[0]["encrypted_content"].is_string(),
+        "body = {first_body:?}"
+    );
     let reasoning_item = output[0].clone();
     let message_item = output[1].clone();
 
@@ -372,9 +381,14 @@ async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_replays_c
         .expect("captured anthropic request");
     let messages = request["messages"].as_array().expect("anthropic messages");
     assert_eq!(messages[1]["role"], "assistant");
-    let assistant_content = messages[1]["content"].as_array().expect("assistant content");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
     assert_eq!(assistant_content[0]["type"], "thinking");
-    assert_eq!(assistant_content[0]["thinking"], json!({ "display": "omitted" }));
+    assert_eq!(
+        assistant_content[0]["thinking"],
+        json!({ "display": "omitted" })
+    );
     assert_eq!(assistant_content[0]["signature"], "sig_omitted");
     assert_eq!(assistant_content[1]["type"], "text");
     assert_eq!(assistant_content[1]["text"], "Visible answer");
