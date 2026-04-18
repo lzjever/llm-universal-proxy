@@ -30,7 +30,8 @@
 - **并发请求**：异步处理，高性能
 - **命名上游**：一个代理实例可同时连接多个上游
 - **本地模型别名**：可为任意上游模型暴露一个本地唯一模型名
-- **审计 Hooks**：可选异步 `exchange` / `usage` HTTP hooks，用于请求响应审计与用量统计
+- **审计 Hooks**：可选异步 `exchange` / `usage` HTTP hooks，用于用量统计和有界的 client-facing 审计导出
+- **本地 Debug Trace**：可选本地 JSONL 调试轨迹，用于按 turn 排查协议与响应问题
 - **凭证策略**：支持 fallback credential、直接配置 credential，以及强制使用服务端凭证
 - **兼容 Codex CLI**：可作为 Responses 兼容入口，前接 Anthropic 兼容上游
 - **模型统一层**：可把不同供应商的真实模型，映射成稳定的本地模型名，例如 `opus`、`sonnet`、`haiku`
@@ -44,7 +45,7 @@
 - **适合 Claude Code 风格的使用方式**：如果你希望上层工具始终使用一组固定模型名，但底层真实模型来自不同厂商，这个代理可以把这层差异收掉。
 - **适合新版 Codex CLI**：新版 Codex CLI 只支持 OpenAI Responses API，不再支持 Completions。通过这个代理，Codex 仍然可以使用 Anthropic Messages、OpenAI Chat Completions，或者其他非 Responses 兼容接口。这对接入 GLM、MiniMax、Kimi 这类 coding 能力很强的模型特别有用。
 - **跨协议统一入口**：你可以把 Anthropic 兼容、OpenAI 兼容、Gemini 风格的上游统一放到一个接口后面，而不是让每个客户端分别适配多套协议。
-- **自带可观测性和数据导出能力**：`usage` hook 可以导出用量统计；`exchange` hook 可以导出完整的 client-facing query/response pair。这样就可以把线上数据持久化，用于分析、评估、审计，或者后续模型训练流程。
+- **自带可观测性和数据导出能力**：`usage` hook 可以导出用量统计；`exchange` hook 可以导出 best-effort、受预算约束的 client-facing 捕获；`debug_trace` 则提供本地、按 turn 的轻量调试线索。这样既能做分析、评估和审计，也不会把“完整原始流式归档”强行塞进实时链路。
 
 ## 安装
 
@@ -157,6 +158,10 @@ hooks:
     url: https://example.com/hooks/usage
   exchange:
     url: https://example.com/hooks/exchange
+
+debug_trace:
+  path: /tmp/llm-proxy-debug.jsonl
+  max_text_chars: 16384
 ```
 
 说明：
@@ -167,7 +172,9 @@ hooks:
 - `credential_env` 表示“去哪个环境变量读取该上游的 fallback credential”，密钥本身不写进 YAML。
 - `credential_actual` 可用于直接在 YAML 中写 fallback credential；它与 `credential_env` 互斥。
 - `auth_policy` 支持 `client_or_fallback` 和 `force_server`。
-- hooks 是异步 best-effort 模式。通常只开 `usage` 就够；`exchange` 会在请求结束后上报完整的 client-facing request/response pair。
+- hooks 是异步 best-effort 模式。通常只开 `usage` 就够；`exchange` 会在请求结束后上报 client-facing 请求和最终响应形状，但流式 capture 是有界的，必要时会截断。
+- `debug_trace` 会把按 turn 的请求尾部增量和归一化响应摘要写入本地 JSONL，适合交互式排障，不适合长期原始流量归档。
+- 对流式响应，`debug_trace` 记录的是客户端可见结果的聚合摘要，例如文本、reasoning、tool call、terminal event、finish reason 和归一化错误，而不是原始 SSE 逐行镜像。
 
 ## Admin 控制面
 
@@ -249,6 +256,10 @@ hooks:
   exchange:
     url: https://example.com/hooks/exchange
     authorization: Bearer exchange-hook-token
+
+debug_trace:
+  path: /tmp/llm-proxy-debug.jsonl
+  max_text_chars: 16384
 ```
 
 ### 顶层字段
@@ -260,6 +271,25 @@ hooks:
 | `upstreams` | map | 是 | 无 | 命名上游配置 |
 | `model_aliases` | map | 否 | 空 | 把本地模型名映射到 `upstream:model` |
 | `hooks` | object | 否 | 关闭 | 可选的异步审计与用量导出 hooks |
+| `debug_trace` | object | 否 | 关闭 | 可选的本地 JSONL 调试轨迹，记录按 turn 的请求/响应摘要 |
+
+### `debug_trace`
+
+当你需要在本机排查客户端、代理或协议转换问题，但又不想打开完整 exchange capture 时，可以使用 `debug_trace`。
+
+```yaml
+debug_trace:
+  path: /tmp/llm-proxy-debug.jsonl
+  max_text_chars: 16384
+```
+
+设计边界：
+- request entry 只记录当前 turn 新增的输入尾部，不会每次都把完整历史对话重写一遍。
+- response entry 记录的是归一化摘要。
+  - 非流式：最终响应体的摘要。
+  - 流式：聚合后的文本、reasoning 文本、tool-call 增量、terminal event、finish reason，以及归一化错误信息。
+- 它记录的是客户端可见语义结果，不是原始 SSE 逐行日志。
+- writer 对实时请求路径保持非阻塞；如果本地写入跟不上，会写出显式 overflow 记录，而不是阻塞 teardown。
 
 ### `upstreams`
 
@@ -332,17 +362,18 @@ model_aliases:
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `max_pending_bytes` | integer | 否 | `104857600` | 所有待发送 hook payload 的内存预算上限 |
+| `max_pending_bytes` | integer | 否 | `104857600` | 待发送 hook payload 的预算上限；同时也是流式 `exchange` capture 的有界预算 |
 | `timeout_secs` | integer | 否 | `30` | hook HTTP 请求超时 |
 | `failure_threshold` | integer | 否 | `3` | 连续失败多少次后进入 cooldown |
 | `cooldown_secs` | integer | 否 | `300` | 熔断后等待多久再尝试恢复 |
 | `usage` | object | 否 | 关闭 | 用量导出 hook |
-| `exchange` | object | 否 | 关闭 | 完整 request/response 导出 hook |
+| `exchange` | object | 否 | 关闭 | 有界的 request/response 导出 hook |
 
 Hook 行为：
 - hooks 是异步、best-effort 的。
 - `usage` 通常就足够做计费或观测。
-- `exchange` 会在请求完成后导出完整的 client-facing request/response pair，包括完成后的流式结果。
+- `exchange` 会在请求完成后导出 client-facing 请求和 client-facing 响应快照。对非流式请求，通常就是最终响应体；对流式请求，则是处理后的客户端可见结果的有界 capture，而不是原始 SSE 逐行镜像。
+- 如果流式 `exchange` capture 超出预算，或者后台 capture 路径发生 overflow，hook 仍会 best-effort 送出，但 `response.body` 会变成显式的截断/不可用标记，例如 `capture_truncated` / `capture_unavailable`，而不是继续回放完整 body。
 - 当待发送 hook payload 总大小超过 `max_pending_bytes` 时，新 hook payload 会被丢弃，直到压力下降。
 - `usage` 和 `exchange` 各自有独立熔断器；连续失败到达 `failure_threshold` 后，会暂停 `cooldown_secs`。
 

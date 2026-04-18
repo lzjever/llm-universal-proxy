@@ -30,8 +30,8 @@ This is a real Codex CLI session using a local alias routed to `GLM-5-Turbo` thr
 - **Concurrent Requests**: Asynchronous handling for high performance
 - **Named Upstreams**: Route requests to multiple upstream providers from one proxy instance
 - **Local Model Aliases**: Expose one unique local model name for any upstream model
-- **Audit Hooks**: Optional async `exchange` / `usage` HTTP hooks for request-response capture and metering
-- **Local Debug Trace**: Optional JSONL trace for per-turn debugging without shipping traffic to external hooks
+- **Audit Hooks**: Optional async `exchange` / `usage` HTTP hooks for metering and bounded client-facing audit capture
+- **Local Debug Trace**: Optional local JSONL trace for per-turn debugging with normalized request/response summaries
 - **Credential Policy**: Supports fallback credentials, direct configured credentials, and force-server auth
 - **Codex CLI Friendly**: Works as a Responses-compatible endpoint in front of Anthropic-compatible upstreams
 - **Model Unification Layer**: Map models from different providers to one stable local naming scheme, such as `opus`, `sonnet`, `haiku`, or team-specific coding aliases
@@ -45,7 +45,7 @@ Important routing boundary:
 - **Useful for Claude Code style workflows**: If you want Claude-style routing semantics but your real upstreams come from different vendors, the proxy can present a consistent set of local model names while routing to whichever provider you choose underneath.
 - **Useful for modern Codex CLI**: Newer Codex CLI versions only speak the OpenAI Responses API. This proxy lets Codex use upstreams that speak Anthropic Messages, OpenAI Chat Completions, or other non-Responses-compatible APIs. That is especially useful when you want to use coding-capable providers such as GLM, MiniMax, or Kimi behind a Responses-only client.
 - **Cross-provider protocol bridge**: You can place Anthropic-compatible, OpenAI-compatible, and Gemini-style upstreams behind one consistent interface instead of teaching each client multiple protocols.
-- **Built-in observability for analysis**: `usage` hooks export metering data; `exchange` hooks export full client-facing query/response pairs. That makes it practical to persist production traffic for auditing, analytics, evaluation, or later model-training pipelines.
+- **Built-in observability for analysis**: `usage` hooks export metering data; `exchange` hooks export best-effort, bounded client-facing captures; `debug_trace` keeps a lightweight local per-turn trail for protocol troubleshooting. That gives you practical observability for auditing, analytics, and evaluation without forcing full-fidelity raw stream archival into the hot path.
 
 ## Client Namespace Map
 
@@ -236,7 +236,7 @@ Notes:
 - `credential_env` is the environment variable name holding that upstream's fallback credential. The secret stays out of the YAML file.
 - `credential_actual` can be used instead of `credential_env` when you want to place a fallback credential directly in YAML. `credential_env` and `credential_actual` are mutually exclusive.
 - `auth_policy` supports `client_or_fallback` and `force_server`.
-- Hooks are best-effort and asynchronous. `usage` is usually enough; `exchange` captures the full client-facing request/response pair after the request completes.
+- Hooks are best-effort and asynchronous. `usage` is usually enough; `exchange` captures the client-facing request plus the final client-facing response shape after completion, but streaming capture is bounded and may be truncated.
 - `debug_trace` writes a local JSONL file for debugging protocol issues. It is designed for interactive troubleshooting, not long-term traffic archival.
 - `debug_trace` records only the tail "new input" portion of each client request rather than rewriting the full accumulated conversation each turn.
 - For streaming responses, `debug_trace` records the processed client-visible result: aggregated text, reasoning text, tool-call deltas, terminal event, finish reason, and any normalized error. It does not dump raw SSE JSON lines.
@@ -353,6 +353,7 @@ Design notes:
 - The response entry records a normalized summary.
   - Non-streaming: summarized final body.
   - Streaming: aggregated text, aggregated reasoning text, tool-call deltas, terminal event such as `response.completed` or `response.failed`, and normalized error details when present.
+- The writer is intentionally non-blocking for live traffic. If the local writer falls behind, the trace emits explicit overflow records instead of blocking request teardown or trying to persist every raw event.
 - This format is meant to answer "what did the client add this turn?" and "what did the model actually send back?" without forcing you to reconstruct long raw SSE logs.
 
 ### `upstreams`
@@ -426,17 +427,18 @@ Rules:
 
 | Field | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `max_pending_bytes` | integer | No | `104857600` | Max combined in-memory bytes pending for hook delivery |
+| `max_pending_bytes` | integer | No | `104857600` | Max pending hook bytes; also the bounded capture budget for streaming `exchange` payloads |
 | `timeout_secs` | integer | No | `30` | Per-hook HTTP timeout |
 | `failure_threshold` | integer | No | `3` | Consecutive failures before a hook enters cooldown |
 | `cooldown_secs` | integer | No | `300` | Cooldown period before retrying a failed hook |
 | `usage` | object | No | disabled | Usage export hook |
-| `exchange` | object | No | disabled | Full request/response export hook |
+| `exchange` | object | No | disabled | Bounded request/response export hook |
 
 Hook behavior:
 - Hooks are asynchronous and best-effort.
 - `usage` is usually enough for billing or observability.
-- `exchange` captures the full client-facing request/response pair after completion, including completed streaming responses.
+- `exchange` captures the client-facing request plus a client-facing response snapshot after completion. For non-streaming requests that is normally the full final body; for streaming requests it is a bounded capture of the processed client-visible result rather than raw SSE lines.
+- When streaming exchange capture exceeds its budget or the background capture path overflows, the hook still completes best-effort with an explicit truncated/unavailable response marker such as `capture_truncated` / `capture_unavailable` instead of replaying the full body.
 - When pending hook payloads exceed `max_pending_bytes`, new hook payloads are dropped until pressure falls.
 - Each hook type has its own circuit breaker. After `failure_threshold` consecutive failures, that hook pauses for `cooldown_secs`.
 
