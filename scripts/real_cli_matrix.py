@@ -1063,13 +1063,14 @@ def run_matrix_case(
     report_dir: pathlib.Path,
     base_env: dict[str, str],
 ) -> dict[str, object]:
+    report_dir = report_dir.resolve()
     cases_dir = report_dir / "cases"
     workspaces_root = report_dir / "workspaces"
     cases_dir.mkdir(parents=True, exist_ok=True)
     workspaces_root.mkdir(parents=True, exist_ok=True)
 
-    workspace_dir = prepare_workspace(case, workspaces_root)
-    home_dir = resolve_client_home_dir(case, report_dir)
+    workspace_dir = prepare_workspace(case, workspaces_root).resolve()
+    home_dir = resolve_client_home_dir(case, report_dir).resolve()
     env = build_client_env(case.client_name, base_env, proxy_base, home_dir)
     command = build_client_command(
         case.client_name, proxy_base, case.lane, case.fixture, workspace_dir

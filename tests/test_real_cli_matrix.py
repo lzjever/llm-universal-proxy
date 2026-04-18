@@ -833,6 +833,47 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertNotIn(first_case.case_id, seen_homes[0])
         self.assertNotIn(second_case.case_id, seen_homes[1])
 
+    def test_run_matrix_case_normalizes_gemini_workspace_paths_when_report_dir_is_relative(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="gemini",
+            lane=make_lane(module, name="minimax-openai", proxy_model="minimax-openai"),
+        )
+        observed = {}
+
+        def fake_run(command, **kwargs):
+            include_index = command.index("--include-directories")
+            observed["include_dir"] = pathlib.Path(command[include_index + 1])
+            observed["cwd"] = pathlib.Path(kwargs["cwd"]).resolve()
+            observed["home"] = pathlib.Path(kwargs["env"]["HOME"]).resolve()
+            return subprocess.CompletedProcess(command, 0, stdout="PONG\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_cwd = os.getcwd()
+            os.chdir(temp_dir)
+            try:
+                report_dir = pathlib.Path("reports") / "run-001"
+                report_dir.mkdir(parents=True, exist_ok=True)
+                with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                    result = module.run_matrix_case(
+                        case,
+                        "http://127.0.0.1:18888",
+                        report_dir,
+                        {"PATH": os.environ.get("PATH", "")},
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(result["status"], "passed", result["message"])
+        self.assertTrue(
+            observed["include_dir"].is_absolute(),
+            f"expected absolute --include-directories path, got {observed['include_dir']}",
+        )
+        self.assertEqual(observed["include_dir"], observed["cwd"])
+        self.assertTrue(observed["home"].is_absolute())
+        self.assertIn("_runner_state", str(observed["home"]))
+
     def test_run_matrix_case_extends_only_first_gemini_bootstrap_timeout(self):
         module = load_module()
         case = make_case(
@@ -874,6 +915,46 @@ class RealCliMatrixTests(unittest.TestCase):
             observed_timeouts,
             [module.GEMINI_BOOTSTRAP_TIMEOUT_SECS, case.fixture.timeout_secs],
         )
+
+    def test_run_matrix_case_uses_absolute_workspace_paths_for_gemini(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="gemini",
+            lane=make_lane(module, name="minimax-openai", proxy_model="minimax-openai"),
+        )
+        observed = {}
+
+        def fake_run(command, **kwargs):
+            observed["command"] = command
+            observed["cwd"] = kwargs["cwd"]
+            observed["home"] = kwargs["env"]["HOME"]
+            return subprocess.CompletedProcess(command, 0, stdout="PONG\n", stderr="")
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = pathlib.Path(temp_dir)
+            os.chdir(temp_root)
+            try:
+                report_dir = pathlib.Path("reports") / "run-001"
+                report_dir.mkdir(parents=True, exist_ok=True)
+                with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                    result = module.run_matrix_case(
+                        case,
+                        "http://127.0.0.1:18888",
+                        report_dir,
+                        {"PATH": os.environ.get("PATH", "")},
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(result["status"], "passed")
+        self.assertTrue(pathlib.Path(observed["cwd"]).is_absolute())
+        self.assertTrue(pathlib.Path(observed["home"]).is_absolute())
+        include_idx = observed["command"].index("--include-directories") + 1
+        include_dir = pathlib.Path(observed["command"][include_idx])
+        self.assertTrue(include_dir.is_absolute())
+        self.assertEqual(include_dir, pathlib.Path(observed["cwd"]))
 
     def test_run_matrix_case_keeps_failures_for_enabled_optional_lane(self):
         module = load_module()
