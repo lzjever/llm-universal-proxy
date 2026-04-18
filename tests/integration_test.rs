@@ -197,6 +197,67 @@ async fn spawn_tagged_openai_responses_mock(
     (base, handle)
 }
 
+async fn spawn_headered_openai_responses_resource_mock() -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(method: Method, uri: Uri) -> Response {
+        let body = match (method.as_str(), uri.path()) {
+            ("GET", "/v1/responses/resp_123") => json!({
+                "id": "resp_123",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "output": []
+            }),
+            ("POST", "/v1/responses/resp_123/cancel") => json!({
+                "id": "resp_123",
+                "object": "response",
+                "status": "cancelled",
+                "output": []
+            }),
+            ("POST", "/v1/responses/compact") => json!({
+                "id": "resp_compacted",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "output": []
+            }),
+            _ => json!({
+                "error": {
+                    "message": format!("unexpected {} {}", method, uri.path())
+                }
+            }),
+        };
+        let status = match (method.as_str(), uri.path()) {
+            ("GET", "/v1/responses/resp_123")
+            | ("POST", "/v1/responses/resp_123/cancel")
+            | ("POST", "/v1/responses/compact") => StatusCode::OK,
+            _ => StatusCode::NOT_FOUND,
+        };
+
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .header("request-id", "req_responses_123")
+            .header("openai-processing-ms", "42")
+            .header("ratelimit-limit-requests", "99")
+            .body(Body::from(
+                serde_json::to_vec(&body).expect("serialize responses resource body"),
+            ))
+            .expect("build responses resource response")
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/responses/compact", any(handler))
+        .route("/v1/responses/:response_id", any(handler))
+        .route("/v1/responses/:response_id/cancel", any(handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
 async fn spawn_discovery_empty_mock() -> (
     String,
     tokio::task::JoinHandle<()>,
@@ -1429,6 +1490,58 @@ async fn openai_namespace_response_compact_works() {
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["id"], "resp_compacted");
     assert_eq!(body["object"], "response");
+}
+
+#[tokio::test]
+async fn openai_namespace_response_resource_routes_preserve_upstream_protocol_headers() {
+    let (mock_base, _mock) = spawn_headered_openai_responses_resource_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let responses = vec![
+        client
+            .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
+            .send()
+            .await
+            .unwrap(),
+        client
+            .post(format!("{proxy_base}/openai/v1/responses/resp_123/cancel"))
+            .send()
+            .await
+            .unwrap(),
+        client
+            .post(format!("{proxy_base}/openai/v1/responses/compact"))
+            .json(&json!({ "response_id": "resp_123" }))
+            .send()
+            .await
+            .unwrap(),
+    ];
+
+    for response in responses {
+        assert!(response.status().is_success(), "status: {}", response.status());
+        assert_eq!(
+            response
+                .headers()
+                .get("request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("req_responses_123")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("openai-processing-ms")
+                .and_then(|value| value.to_str().ok()),
+            Some("42")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("ratelimit-limit-requests")
+                .and_then(|value| value.to_str().ok()),
+            Some("99")
+        );
+    }
 }
 
 #[tokio::test]
@@ -4205,7 +4318,7 @@ async fn responses_endpoint_streaming_translates_to_anthropic_upstream() {
 }
 
 #[tokio::test]
-async fn responses_endpoint_streaming_preserves_anthropic_reasoning() {
+async fn responses_endpoint_streaming_fails_closed_for_anthropic_thinking() {
     let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -4224,15 +4337,31 @@ async fn responses_endpoint_streaming_preserves_anthropic_reasoning() {
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
     assert!(
-        body.contains("response.reasoning_summary_text.delta"),
+        body.contains("event: response.failed"),
         "body = {body}"
     );
     assert!(
-        body.contains("response.reasoning_summary_text.done"),
+        body.contains("\"type\":\"invalid_request_error\""),
         "body = {body}"
     );
-    assert!(body.contains("\"think\""), "body = {body}");
-    assert!(body.contains("response.completed"), "body = {body}");
+    assert!(
+        body.contains("Anthropic thinking blocks cannot be translated losslessly"),
+        "body = {body}"
+    );
+    assert!(
+        body.contains("\"code\":\"unsupported_anthropic_stream_event\""),
+        "body = {body}"
+    );
+    assert!(
+        !body.contains("response.reasoning_summary_text.delta"),
+        "body = {body}"
+    );
+    assert!(
+        !body.contains("response.reasoning_summary_text.done"),
+        "body = {body}"
+    );
+    assert!(!body.contains("\"think\""), "body = {body}");
+    assert!(!body.contains("response.completed"), "body = {body}");
 }
 
 #[tokio::test]

@@ -1715,6 +1715,7 @@ async fn handle_openai_responses_resource(
     };
 
     let status = response.status();
+    let upstream_response_headers = response.headers().clone();
     let bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -1733,7 +1734,7 @@ async fn handle_openai_responses_resource(
         tracker.finish_error(status.as_u16());
     }
 
-    Response::builder()
+    let mut response = Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
         .body(Body::from(bytes))
@@ -1743,7 +1744,9 @@ async fn handle_openai_responses_resource(
                 StatusCode::BAD_GATEWAY,
                 "failed to build upstream resource response",
             )
-        })
+        });
+    append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+    response
 }
 
 async fn handle_openai_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
