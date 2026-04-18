@@ -1,123 +1,245 @@
-# Project institution
+# LLM Universal Proxy - Project Map
 
-## Scope
+## Status
 
-- **In scope**: Single binary; one listen URL; **concurrent requests** (async, non-blocking); client can send any of 4 formats; **upstream format auto-discovery** (probe upstream, cache supported formats, default conversion target = most generic); **passthrough when client format is supported by upstream** (no translation; reduces errors and improves efficiency); translate only when client format not supported; streaming; request/response translation with minimal loss.
-- **Out of scope (v0)**: Auth, multiple upstreams, usage tracking, combo/fallback.
+This file is a contributor map for the current repository.
 
-## Crate layout
+It exists to answer:
 
-```
-llm-universal-proxy/
-├── Cargo.toml
-├── src/
-│   ├── main.rs          # Binary entry, runs server
-│   ├── lib.rs           # Library root, re-exports
-│   ├── config.rs        # Config and upstream format
-│   ├── discovery.rs     # (optional) Upstream format discovery; supported set + default target
-│   ├── detect.rs        # Client format detection (path + body)
-│   ├── formats.rs       # UpstreamFormat enum
-│   ├── translate.rs     # Request/response translation (pivot: OpenAI)
-│   ├── streaming.rs     # SSE chunk translation and passthrough
-│   └── server.rs        # Axum routes, handler, discovery, upstream call
-├── tests/
-│   ├── common/
-│   │   ├── mod.rs
-│   │   └── mock_upstream.rs   # Mock servers per protocol (OpenAI, Anthropic, Google, Responses)
-│   ├── detect_test.rs        # Format detection
-│   └── integration_test.rs   # Proxy + mock: passthrough, translation, streaming
-└── docs/
-    ├── DESIGN.md
-    ├── PROJECT.md (this file)
-    ├── protocol-baselines/     # Official protocol reference baselines (source + date in each file)
-    └── protocol-compatibility-matrix.md  # Field-level mapping, degradations, and unsupported cases
-        ├── README.md           # Index, source URLs, capture date
-        ├── openai-chat-completions.md
-        ├── openai-responses.md
-        ├── anthropic-messages.md
-        └── google-gemini.md
-```
+- where the real code lives
+- which modules own which runtime responsibilities
+- which tests protect which behaviors
+- which docs are normative versus descriptive
 
-## TDD approach
+Earlier versions of this file described a much smaller v0 layout. The current project is broader: namespace-scoped runtime state, split server modules, split translate/streaming trees, optional dashboard, hooks, debug trace, and dedicated runtime-chain coverage.
 
-1. **Detection**: Tests in `detect.rs` (unit) and `tests/detect_test.rs` (integration) — path and body → format.
-2. **Discovery**: Tests for probe logic and default target selection (supported set → most generic); add in `discovery.rs` or `upstream.rs` and tests.
-3. **Translation**: Tests for each direction (e.g. OpenAI ↔ Anthropic, OpenAI ↔ Responses, OpenAI ↔ Google) — request and response; add in `translate.rs` and `tests/translate_test.rs`.
-4. **Streaming**: Tests for passthrough (bytes unchanged) and for chunk conversion (upstream chunk → client chunk); add in `streaming.rs` and tests.
-5. **Server**: Integration test with mock upstream: POST with each format, assert forwarded request shape and response shape; test passthrough when client format is in supported set.
+## Source Tree
 
-We write or extend tests first, then implement to pass.
+```text
+src/
+  config.rs
+  dashboard.rs
+  debug_trace.rs
+  detect.rs
+  discovery.rs
+  formats.rs
+  hooks.rs
+  lib.rs
+  main.rs
+  telemetry.rs
+  upstream.rs
+  server/
+    admin.rs
+    errors.rs
+    headers.rs
+    models.rs
+    mod.rs
+    proxy.rs
+    responses_resources.rs
+    state.rs
+  streaming/
+    anthropic_source.rs
+    gemini_source.rs
+    mod.rs
+    openai_sink.rs
+    responses_source.rs
+    state.rs
+    stream.rs
+    wire.rs
+  translate/
+    assessment.rs
+    internal.rs
+    internal/
+    mod.rs
+    request/
+    response/
+    shared.rs
 
-## Integration tests and mock upstreams
+tests/
+  common/
+  detect_test.rs
+  integration_test.rs
+  reasoning_test.rs
+  runtime_chain_test.rs
+  test_real_cli_matrix.py
 
-- **Location**: `tests/common/mock_upstream.rs` (mock servers), `tests/integration_test.rs` (tests).
-- **Mock protocols**: Each mock implements the **official** request/response shapes for one provider:
-  - **OpenAI Chat Completions**: [platform.openai.com/docs/api-reference/chat](https://platform.openai.com/docs/api-reference/chat/create) — POST `/chat/completions`, non-streaming `ChatCompletion` JSON, streaming SSE with `data:` chunks and `[DONE]`.
-  - **Anthropic Messages**: [docs.anthropic.com/en/api/messages](https://docs.anthropic.com/en/api/messages) — POST `/messages`, non-streaming `content` array (text blocks), streaming SSE with `message_start`, `content_block_*`, `message_delta`, `message_stop`.
-  - **Google Gemini generateContent**: [ai.google.dev/api/rest/v1beta/models/generateContent](https://ai.google.dev/api/rest/v1beta/models/generateContent) — POST `/generateContent`, non-streaming `candidates` + `usageMetadata`, streaming SSE with `candidates[].content.parts`.
-  - **OpenAI Responses API**: [platform.openai.com/docs/api-reference/responses-streaming](https://platform.openai.com/docs/api-reference/responses-streaming) — POST `/responses`, non-streaming `output` array, streaming SSE with `response.created`, `response.output_text.delta`, `response.completed`.
-- **Coverage**: For each upstream format, tests exercise **passthrough** (client and upstream same format) and **translation** (client OpenAI → upstream Anthropic/Google/Responses and vice versa), both non-streaming and streaming where applicable. Health endpoint is tested. Additional tests cover errors (invalid JSON, empty body, upstream unreachable → 502, nonexistent path → 404).
+scripts/
+  real_cli_matrix.py
+  real_endpoint_matrix.py
+  test-and-report.sh
+  test_cli_clients.sh
+  test_binary_smoke.sh
+  test_compatibility.sh
 
-## Test report script
-
-- **Script:** `scripts/test-and-report.sh` — runs `cargo test --no-fail-fast` (with proxy env unset), writes full log and generates:
-  - **Markdown report:** `test-reports/report-<timestamp>.md` and `test-reports/report-latest.md` (summary table, failed test names, log tail).
-  - **JSON report:** `test-reports/report-<timestamp>.json` and `test-reports/report-latest.json` (timestamp, success, passed, failed, total, failed_tests).
-- **Make target:** `make test-report` runs the script. Use for CI or local verification with a single report artifact.
-
-## Compatibility policy
-
-- Cross-protocol translation is intentionally conservative: preserve downstream behavior first, even when the exact upstream wire shape cannot be reproduced.
-- When the proxy must drop or approximate request semantics, it should emit `x-proxy-compat-warning` response headers and matching server log warnings instead of silently pretending to provide 1:1 fidelity.
-- Field-level degradations and unsupported cases are tracked in [protocol-compatibility-matrix.md](/home/percy/works/llm-universal-proxy/docs/protocol-compatibility-matrix.md).
-
-## Codex custom-model guidance
-
-- Codex can bypass fallback model metadata for unknown custom model slugs by setting config overrides at launch time.
-- The two relevant overrides are:
-  - `model_context_window`: the model's real maximum context window, in tokens.
-  - `model_auto_compact_token_limit`: the absolute token count at which Codex should trigger auto-compaction.
-- This matters for proxy deployments because custom slugs such as `codex-anthropic` or `claude-local` are not present in Codex's built-in model registry. When that happens, Codex warns that model metadata was not found and falls back to:
-  - `context_window = 272000`
-  - `auto_compact_token_limit = None`
-  - `effective_context_window_percent = 95`
-- In fallback mode, the UI and some context calculations treat the usable window as roughly `272000 * 95% = 258400`, but auto-compaction does not trigger from that percentage alone. If `model_auto_compact_token_limit` is unset, Codex effectively uses no automatic compaction threshold.
-- Recommended launch-time override pattern:
-
-```bash
-codex resume \
-  -c 'model="codex-anthropic"' \
-  -c 'model_provider="my-proxy"' \
-  -c 'model_context_window=128000' \
-  -c 'model_auto_compact_token_limit=110000'
+docs/
+  CONSTITUTION.md
+  PRD.md
+  DESIGN.md
+  PROJECT.md
+  protocol-compatibility-matrix.md
+  protocol-baselines/
 ```
 
-- Recommended sizing rules:
-  - Set `model_context_window` to the upstream model's real published limit, not Codex's fallback `272000`.
-  - Set `model_auto_compact_token_limit` to a conservative absolute threshold below the real limit.
-  - A practical default is `85%` to `92%` of the real context window.
-  - If the upstream is known to add significant hidden prompt overhead, use the lower end of that range.
-- Example thresholds:
-  - Real window `128000` -> start with `model_auto_compact_token_limit=105000` to `115000`
-  - Real window `200000` -> start with `model_auto_compact_token_limit=170000` to `184000`
-  - Real window `256000` -> start with `model_auto_compact_token_limit=218000` to `235000`
-- If you want behavior closer to official Codex-hosted models, always set both values together. Setting only `model_context_window` improves the status display, but does not by itself define when auto-compaction starts.
+## Module Responsibilities
 
-## Rust version
+### Core runtime modules
 
-- **Edition**: 2021 (works on stable without 2024).
-- Prefer latest stable Rust; optional `rust-toolchain.toml` for 2024 when desired.
+| Path | Responsibility |
+| --- | --- |
+| `src/config.rs` | Config parsing, runtime/admin config payloads, defaults, validation |
+| `src/formats.rs` | Protocol enum definitions and shared format naming |
+| `src/detect.rs` | Client-format detection from path and request shape |
+| `src/discovery.rs` | Upstream capability probing and default-target selection |
+| `src/upstream.rs` | Reqwest client construction and upstream HTTP call helpers |
+| `src/telemetry.rs` | Request metrics and transport outcome accounting |
 
-## Cargo mirror (tuna) and proxy
+### Server tree
 
-When using the Tsinghua tuna mirror (`mirrors.tuna.tsinghua.edu.cn`) for crates and you have a global git/http proxy set:
+| Path | Responsibility |
+| --- | --- |
+| `src/server/mod.rs` | Public server facade and router assembly |
+| `src/server/state.rs` | Runtime namespace state, admin access policy, upstream resolution bootstrap |
+| `src/server/proxy.rs` | Main request execution path and streaming body orchestration |
+| `src/server/responses_resources.rs` | Native OpenAI Responses lifecycle resource handlers |
+| `src/server/models.rs` | Model list/detail handlers across protocol namespaces |
+| `src/server/headers.rs` | Auth forwarding and upstream protocol header helpers |
+| `src/server/errors.rs` | Error normalization and response shaping |
+| `src/server/admin.rs` | Admin auth middleware and namespace/state handlers |
 
-1. **Git (index fetch)** — disable proxy for the mirror host:
-   ```bash
-   git config --global http.https://mirrors.tuna.tsinghua.edu.cn.proxy ""
-   git config --global https.https://mirrors.tuna.tsinghua.edu.cn.proxy ""
-   ```
+### Translation and streaming
 
-2. **Cargo (crate downloads)** — the Makefile unsets `http_proxy`, `HTTP_PROXY`, `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY` when invoking `cargo`, so builds run without proxy. If you still see SSL errors when downloading crates, retry later or try a different network; the mirror or crate host can be flaky.
+| Path | Responsibility |
+| --- | --- |
+| `src/translate/mod.rs` | Stable translation facade |
+| `src/translate/assessment.rs` | Request-side translation decision surface |
+| `src/translate/internal/` | Provider-specific request/response logic |
+| `src/streaming/mod.rs` | Streaming facade and exports |
+| `src/streaming/stream.rs` | SSE translation wrapper and stream runtime behavior |
+| `src/streaming/wire.rs` | SSE event parsing/formatting helpers |
+| `src/streaming/*_source.rs` | Provider-specific upstream-event to internal chunk mapping |
+| `src/streaming/openai_sink.rs` | Client-facing stream emission helpers |
+| `src/streaming/state.rs` | Cross-frame stream state and fatal rejection tracking |
 
-This applies to any repo that uses `replace-with = 'tuna'` and `registry = "https://mirrors.tuna.tsinghua.edu.cn/git/crates.io-index.git"` in `~/.cargo/config.toml`.
+### Observability
+
+| Path | Responsibility |
+| --- | --- |
+| `src/hooks.rs` | Async best-effort usage/exchange hooks with bounded capture |
+| `src/debug_trace.rs` | Local JSONL debug trace with bounded writer queue |
+| `src/dashboard.rs` | Optional dashboard backed by live runtime snapshots |
+
+## Where To Start By Task
+
+### Routing, namespaces, admin writes
+
+Start in:
+
+- `src/server/mod.rs`
+- `src/server/state.rs`
+- `src/server/admin.rs`
+
+### Generic request execution or upstream call behavior
+
+Start in:
+
+- `src/server/proxy.rs`
+- `src/server/errors.rs`
+- `src/server/headers.rs`
+- `src/upstream.rs`
+
+### Stateful OpenAI Responses resource behavior
+
+Start in:
+
+- `src/server/responses_resources.rs`
+
+### Protocol portability and request/response mapping
+
+Start in:
+
+- `src/translate/assessment.rs`
+- `src/translate/mod.rs`
+- `src/translate/internal/`
+- `docs/protocol-compatibility-matrix.md`
+- `docs/protocol-baselines/`
+
+### Streaming runtime-chain and SSE handling
+
+Start in:
+
+- `src/streaming/stream.rs`
+- `src/streaming/wire.rs`
+- `src/streaming/state.rs`
+- `src/server/proxy.rs`
+
+### Hooks, debug trace, and transport/teardown observability
+
+Start in:
+
+- `src/hooks.rs`
+- `src/debug_trace.rs`
+- `tests/runtime_chain_test.rs`
+
+## Test Map
+
+| Path | Primary purpose |
+| --- | --- |
+| `tests/detect_test.rs` | Request-format detection coverage |
+| `tests/integration_test.rs` | End-to-end protocol routing, translation, models, admin, dashboard, and debug-trace integration |
+| `tests/reasoning_test.rs` | Thinking/reasoning portability and usage mapping |
+| `tests/runtime_chain_test.rs` | Cancellation propagation, teardown, namespace isolation, hooks/debug trace runtime behavior, fatal translated stream rejection |
+| `tests/common/mock_upstream.rs` | Mock upstream implementations for supported protocols |
+| `tests/test_real_cli_matrix.py` | Python tests for the real CLI matrix harness |
+
+In-module tests also matter:
+
+- `src/server/tests/` covers split server behavior in unit-style form
+- `src/streaming/tests/` covers parser and stream edge cases
+- `src/debug_trace.rs` and `src/hooks.rs` include focused observability tests
+
+## Verification Harnesses
+
+These scripts are useful, but they are not substitutes for the Rust test suite:
+
+| Path | Purpose |
+| --- | --- |
+| `scripts/real_cli_matrix.py` | Real Codex / Claude / Gemini CLI matrix through the proxy |
+| `scripts/real_endpoint_matrix.py` | Lower-level protocol/HTTP smoke without real CLI processes |
+| `scripts/test_cli_clients.sh` | Compatibility shim around `real_cli_matrix.py` |
+| `scripts/test-and-report.sh` | Local test run with report artifacts |
+
+When changing runner behavior, also update:
+
+- `tests/test_real_cli_matrix.py`
+- relevant README sections if user-facing behavior changes
+
+## Document Map
+
+| Document | Role |
+| --- | --- |
+| `docs/CONSTITUTION.md` | High-level architectural principles and invariants |
+| `docs/PRD.md` | Product and behavior requirements |
+| `docs/DESIGN.md` | Current implementation architecture snapshot |
+| `docs/PROJECT.md` | Current repository and maintenance map |
+| `docs/protocol-compatibility-matrix.md` | Field-level portability, degrade, reject policy |
+| `docs/protocol-baselines/` | Provider reference captures used for protocol work |
+
+## Maintenance Rules
+
+When the implementation changes, update the document that matches the change:
+
+- Update `docs/DESIGN.md` when the runtime architecture or major execution chain changes.
+- Update `docs/PROJECT.md` when the module tree, test map, or contributor entrypoints change.
+- Update `docs/protocol-compatibility-matrix.md` when protocol portability or downgrade behavior changes.
+- Update `README.md` / `README_CN.md` when user-visible behavior, setup, or guarantees change.
+
+## What This File Intentionally Does Not Do
+
+This file is not:
+
+- a protocol specification
+- a product roadmap
+- a changelog
+- a promise that every internal module name is stable forever
+
+It should stay short, current, and practical for contributors navigating the repo today.

@@ -1,113 +1,249 @@
-# LLM Universal Proxy — Design
+# LLM Universal Proxy - Current Design
 
-## Goal
+## Status
 
-Single-binary HTTP proxy that:
+This document describes the current implementation shape at `HEAD`.
 
-1. **Separated planes** — One data plane for client traffic (for example `http://localhost:8080/openai/v1/...`) and one admin control plane under `http://localhost:8080/admin/...`.
-2. **Four client request formats** — Clients can send requests in any of:
-   - **Google (Gemini)** — e.g. `/google/v1beta/models/:id`, `contents[]`, `generateContent`-style.
-   - **Anthropic (Claude)** — e.g. `/anthropic/v1/messages`, `messages[]` with content blocks, `system`.
-   - **OpenAI Chat Completions** — `/openai/v1/chat/completions`, `messages[]`, `stream`, `temperature`, etc.
-   - **OpenAI Responses API** — `/openai/v1/responses`, `input[]`, `instructions`.
-3. **Upstream formats** — The proxy connects to one **upstream** base URL. The upstream may support one or more of the four formats; the proxy **discovers** which formats are supported and uses the **most generic** as the default conversion target when translation is needed.
-4. **Concurrency** — The proxy must support **concurrent requests**. Handlers are async and non-blocking; Axum’s default concurrency is used; no shared mutable state that would serialize requests.
-5. **Passthrough** — If the client’s request format is **supported by the upstream**, the proxy forwards the request and response in that format (no translation). This reduces errors and improves efficiency. When the client format is not supported, the proxy translates to the default (most generic) upstream format.
-6. **Streaming** — Must support streaming (SSE) in all cases: passthrough = pipe bytes; otherwise = translate stream chunks from upstream format to client format.
-7. **Minimal loss** — When translating, preserve as much as possible: tool calls, thinking/reasoning, usage, finish reasons, and content structure.
+It is not the product-spec source of truth and it is not a protocol-fidelity contract:
 
-### Admin control plane boundary
+- Product and behavioral requirements live in [PRD.md](./PRD.md) and [CONSTITUTION.md](./CONSTITUTION.md).
+- Field-level portability, downgrade, and reject rules live in [protocol-compatibility-matrix.md](./protocol-compatibility-matrix.md) and the protocol baselines under [protocol-baselines/](./protocol-baselines/README.md).
 
-- Admin routes are independent from the data-plane router so that browser-facing data-plane middleware does not leak onto `/admin/...`.
-- The data plane keeps the permissive global CORS layer; the admin plane does not inherit that CORS layer.
-- Admin access policy is intentionally narrow:
-  - if `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is set, admin requests must present `Authorization: Bearer <token>`
-  - otherwise admin is available only to loopback clients (`127.0.0.1` / `::1`)
-- Admin writes keep the existing runtime config payload shape.
-- Admin reads use a dedicated redacted view model:
-  - upstream fallback credentials are exposed only as metadata such as `fallback_credential_env` and `fallback_credential_configured`
-  - hook authorization headers are exposed only as `authorization_configured`
-  - plaintext `fallback_credential_actual` and hook `authorization` values are never serialized in admin state responses
+Earlier versions of this document described a much smaller v0 proxy with a single upstream, a mostly single-file server, and discovery/passthrough as the dominant architectural concern. The codebase has moved well past that shape. Keeping this document as a "current architecture map" is more useful than preserving the older plan as if it were still live.
 
-### Upstream format discovery and passthrough
+## System Shape
 
-- **Discovery**: The proxy probes the upstream (e.g. per-format path or minimal request) to determine which of the four formats are supported, and caches this set (e.g. at startup or on first request, with optional TTL).
-- **Default conversion target**: Among the supported formats, the proxy chooses the **most generic** (e.g. OpenAI Chat Completions, then OpenAI Responses, then Anthropic, then Google) as the default. When the client sends a format not supported by upstream, the proxy translates request and response to this default.
-- **Passthrough when client format is supported**: If the client sends format F and the upstream supports F, the proxy does **not** translate — it forwards the request in format F and returns the response in format F. This reduces translation errors and improves efficiency.
+The current binary contains four major runtime surfaces:
 
-## Reference: 9router
+1. Data plane HTTP API for OpenAI, Anthropic, and Google/Gemini-compatible clients.
+2. Admin control plane for runtime namespace configuration and redacted state inspection.
+3. Optional local dashboard driven from live runtime snapshots and metrics.
+4. Optional observability sinks: async hooks and local debug trace.
 
-Logic is inspired by the **9router** reference project (in this workspace at `for-reference-only/9router`):
+At a high level:
 
-- **Format detection**: `open-sse/translator/formats.js`, `open-sse/services/provider.js` (`detectFormat`, `detectFormatByEndpoint`).
-- **Translation**: `open-sse/translator/index.js` — pivot via **OpenAI Chat Completions**; `translateRequest(source → openai → target)`, `translateResponse(target → openai → source)`.
-- **Streaming**: `open-sse/handlers/chatCore/streamingHandler.js` — if same format, passthrough; else SSE transform that converts chunks (target → openai → source).
-- **Request translators**: `open-sse/translator/request/*` (e.g. `openai-to-claude.js`, `openai-to-gemini.js`, `openai-responses.js`).
-- **Response translators**: `open-sse/translator/response/*` (e.g. `claude-to-openai.js`, `gemini-to-openai.js`, `openai-responses.js`).
+```text
+Client request
+  -> server router
+  -> namespace runtime state
+  -> upstream capability + model resolution
+  -> request assessment / translation if needed
+  -> upstream HTTP call
+  -> optional stream translation
+  -> optional hooks + debug trace wrappers
+  -> telemetry finalization
+  -> client response
 
-## Architecture
+Admin client
+  -> /admin router
+  -> runtime state CAS update / redacted state read
 
-```
-Client (any of 4 formats)  →  Data Plane  →  Upstream (supports one or more formats)
-Admin client               →  Admin Plane →  Runtime namespace state/config
+Dashboard
+  -> live runtime snapshot + metrics
 ```
 
-- **Detection**: From request path + body shape, infer **client format**.
-- **Config**: **Upstream URL**; optional **UPSTREAM_FORMAT** (if set, no discovery; otherwise proxy discovers supported formats).
-- **Discovery**: Proxy determines **supported upstream formats** and **default conversion target** (most generic among supported).
-- **Request path**: The data plane is namespaced by protocol (`/openai/v1/...`, `/anthropic/v1/...`, `/google/v1beta/...`). The admin plane is `/admin/...`.
+## Runtime State Model
 
-### Request flow
+The live runtime is namespace-scoped rather than process-global.
 
-1. Parse body as JSON.
-2. `client_format = detect(path, body)`.
-3. **Upstream format** = client format if client format is in **supported set**, else **default conversion target**.
-4. If client format == upstream format: **passthrough** (forward body as-is to upstream).
-5. Else: `body' = translate_request(client_format → upstream_format, body)`; send `body'` to upstream.
+- `AppState` holds:
+  - `RuntimeState` behind `Arc<RwLock<...>>`
+  - `RuntimeMetrics`
+  - resolved admin access policy
+- `RuntimeState` is a map of namespace name -> `RuntimeNamespaceState`
+- `RuntimeNamespaceState` contains:
+  - current namespace `Config`
+  - resolved `UpstreamState` map
+  - unary HTTP client
+  - streaming HTTP client
+  - optional `HookDispatcher`
+  - optional `DebugTraceRecorder`
+  - server-owned revision used by admin writes
+- `UpstreamState` tracks:
+  - configured upstream info
+  - discovered or fixed capability
+  - availability status
 
-### Response flow (non-streaming)
+This matters because:
 
-1. If passthrough: return upstream response as-is (status, headers, body).
-2. Else: read full upstream JSON, `body_out = translate_response(upstream_format → client_format, body_in)`, return `body_out`.
+- namespace-prefixed data-plane routes are first-class, not bolt-ons
+- admin writes swap live namespace config without restarting the process
+- dashboard and admin state reflect runtime state, not just startup config
 
-### Response flow (streaming)
+## Data Plane and Control Plane
 
-1. If passthrough: pipe upstream response stream to client (same Content-Type, e.g. `text/event-stream`).
-2. Else: consume upstream SSE stream; for each chunk, parse by upstream format, convert to OpenAI-style chunk, then to client format; send converted chunks to client as SSE. Maintain streaming state (e.g. message id, tool_calls map, finish_reason) for multi-chunk semantics.
+### Data plane
 
-## Format matrix
+The data plane is protocol-namespaced and also supports namespace-prefixed variants:
 
-| Client \ Upstream | Google | Anthropic | OpenAI Completion | OpenAI Responses |
-|-------------------|--------|-----------|-------------------|------------------|
-| Google            | Pass   | Trans     | Trans             | Trans            |
-| Anthropic         | Trans  | Pass      | Trans             | Trans            |
-| OpenAI Completion | Trans  | Trans     | Pass              | Trans            |
-| OpenAI Responses  | Trans  | Trans     | Trans             | Pass             |
+- `/openai/v1/...`
+- `/anthropic/v1/...`
+- `/google/v1beta/...`
+- `/namespaces/:namespace/openai/v1/...`
+- `/namespaces/:namespace/anthropic/v1/...`
+- `/namespaces/:namespace/google/v1beta/...`
 
-(Pass = passthrough; Trans = translate request + response.)
+Router assembly lives in `src/server/mod.rs`, while the behavior is split across `src/server/proxy.rs`, `src/server/responses_resources.rs`, `src/server/models.rs`, `src/server/errors.rs`, and `src/server/headers.rs`.
 
-## Pivot format
+### Admin plane
 
-Use **OpenAI Chat Completions** as the internal pivot (same as 9router):
+The admin plane is intentionally separate from the data plane:
 
-- Request: `client_format → openai_completion → upstream_format`.
-- Response: `upstream_format → openai_completion → client_format`.
+- routes live under `/admin/...`
+- auth policy is bearer-token or loopback-only, with fail-closed handling for misconfiguration
+- reads serialize redacted view models
+- writes use server-owned revision / compare-and-swap semantics
 
-This minimizes the number of translators (N formats → 2×(N-1) request/response mappers instead of N×(N-1)).
+This separation is architectural, not cosmetic: admin middleware and browser-facing data-plane behavior are intentionally not shared by accident.
 
-## Implementation notes (Rust)
+## Upstream Capability and Routing
 
-- **Single binary**: One crate, `cargo build --release` → one executable.
-- **Config**: Env or config file: `UPSTREAM_URL`, optional `UPSTREAM_FORMAT` (if set, skip discovery; else discover supported formats), `LISTEN`.
-- **HTTP**: Axum (or similar) with one POST route; path can be `/v1/chat/completions` or `/v1/responses` (path used for detection).
-- **Streaming**: Use `reqwest` with `.stream()` for upstream; `axum::response::sse` or body stream for client; transform stream in the middle when translating.
-- **TDD**: Tests first for format detection, request translation, response translation, and integration (e.g. mock upstream, assert request/response shape).
+Each upstream is either:
 
-## Out of scope (for v0)
+- fixed to a configured protocol via `fixed_upstream_format`, or
+- probed at runtime by `src/discovery.rs`
 
-- Authentication (API key injection, multiple keys).
-- Multiple upstreams / routing by model.
-- Usage/cost tracking.
-- Combo/fallback chains.
+Discovery still exists, but it is now only one part of a larger routing system. It determines:
 
-Focus: **format conversion + single upstream + streaming + passthrough**.
+- which client formats can be passed through natively
+- which fallback target format to use when translation is required
+- whether an upstream is currently usable
+
+Important caveat: discovery is a capability bootstrap signal, not a guarantee that every route or field is portable. Request-side assessment and route-specific rules still decide whether a request is allowed, warned, translated, or rejected.
+
+## Request Execution Flow
+
+Most client-facing request execution lives in `src/server/proxy.rs`.
+
+The current flow is:
+
+1. Select namespace and load its live `RuntimeNamespaceState`.
+2. Detect client format from route and request shape.
+3. Resolve the requested model to an upstream/model pair.
+4. Check upstream availability and capability.
+5. Run request-side compatibility / portability assessment.
+6. If client format is natively supported, pass through the request body.
+7. Otherwise, translate the request through the translate facade.
+8. Apply auth forwarding and configured upstream headers.
+9. Call upstream with either the unary or streaming HTTP client.
+10. Normalize non-stream responses or wrap stream responses in the runtime chain.
+
+OpenAI Responses lifecycle resources are a special case. They do not use the generic "translate anything anywhere" path. `src/server/responses_resources.rs` only proxies those resource routes when the namespace can identify a unique native OpenAI Responses upstream. The server does not invent response-session ownership state.
+
+## Translation Layer
+
+`src/translate/` is now a facade tree rather than a single implementation file:
+
+- `mod.rs` exposes the stable request/response API
+- `assessment.rs` handles request-side translation decisions
+- `internal/` contains the real protocol mapping logic
+- `request/` and `response/` are facade seams
+
+The implementation is still OpenAI-centric internally, but the important architectural fact is not "everything is a perfect pivot." The important fact is:
+
+- request-side portability is assessed before translation
+- translation is fail-closed on high-risk incompatibilities
+- field-level degradations are intentionally tracked outside this document
+
+For current compatibility rules, use the protocol matrix and baseline docs, not this file.
+
+## Streaming and Transport Lifecycle
+
+Streaming is its own subsystem under `src/streaming/`.
+
+### Translation chain
+
+When translation is needed, the server wraps the upstream byte stream with `TranslateSseStream`, which:
+
+- buffers upstream bytes
+- parses SSE events via `wire.rs`
+- translates event-by-event
+- maintains cross-frame state in `state.rs`
+- closes promptly after fatal translation rejection instead of draining upstream to EOF
+
+### Parser behavior
+
+`src/streaming/wire.rs` is intentionally tolerant of real upstream wire behavior:
+
+- supports LF and CRLF separators
+- joins multiline `data:` payloads
+- ignores blank `data:` frames instead of treating them as terminal
+
+### Runtime transport chain
+
+For translated or observed streams, the effective wrapper order is:
+
+```text
+upstream bytes stream
+  -> TranslateSseStream (if needed)
+  -> HookCaptureStream (if hooks enabled)
+  -> DebugTraceStream (if debug trace enabled)
+  -> TrackedBodyStream (telemetry / cancellation finalization)
+  -> client body
+```
+
+This order matters:
+
+- hooks and debug trace observe client-visible translated output, not raw upstream protocol bytes
+- `TrackedBodyStream` owns success/error/cancel transport finalization
+- downstream disconnect tears down the stream by dropping the wrapper chain
+
+The runtime also uses two HTTP clients per namespace:
+
+- a unary client with total upstream timeout
+- a streaming client with connect/setup timeout but no shared total-request timeout
+
+That split prevents long-lived SSE streams from inheriting unary timeout behavior.
+
+## Observability Design
+
+### Runtime metrics
+
+`src/telemetry.rs` tracks request counts and outcome finalization. This is always-on process/runtime telemetry, not a protocol log.
+
+### Hooks
+
+`src/hooks.rs` provides optional async best-effort export for:
+
+- `usage`
+- `exchange`
+
+Important current behavior:
+
+- delivery is bounded by `max_pending_bytes`
+- `exchange` capture is bounded and may be truncated
+- stream observations record both transport outcome and protocol terminal, rather than collapsing them into one bit
+- heavy replay/build work happens off the live request path
+
+This is an observability/export system, not a guarantee of lossless archival.
+
+### Debug trace
+
+`src/debug_trace.rs` provides an optional local JSONL trace for developer troubleshooting.
+
+Important current behavior:
+
+- request entries record only the new tail input for the current turn
+- response entries record normalized summaries, not raw SSE dumps
+- streaming summaries preserve terminal event / finish reason / normalized error
+- writes go through a background bounded queue
+- overflow is surfaced explicitly rather than silently pretending the trace is complete
+
+### Dashboard
+
+`src/dashboard.rs` consumes live runtime snapshots plus metrics. It is an implementation consumer of runtime state, not a second source of truth.
+
+## What This Document Does Not Define
+
+This document intentionally does not try to freeze:
+
+- every protocol field mapping
+- every portability warning string
+- every dashboard UI detail
+- every internal helper or module name
+
+Use this file to understand the current runtime architecture and where behavior lives. Use the protocol docs and tests to understand exact wire semantics.
+
+## Historical Note
+
+The older "single upstream + one server file + discovery-first proxy" design was a valid starting point, but it is now historical context only. Current contributors should treat the server tree, namespace runtime, stateful Responses routing, bounded observability pipeline, and runtime-chain tests as the real architecture.
