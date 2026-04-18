@@ -2227,19 +2227,38 @@ async fn responses_translated_allowed_degradation_emits_warning_headers() {
     assert!(
         warnings
             .iter()
-            .any(|warning| warning.contains("truncation")),
-        "warnings = {warnings:?}"
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.contains("prompt_cache_key")),
-        "warnings = {warnings:?}"
-    );
-    assert!(
-        warnings
-            .iter()
             .any(|warning| warning.contains("non-function Responses tools")),
+        "warnings = {warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn responses_store_drop_emits_warning_header_on_live_proxy_path() {
+    let (mock_base, _mock) = spawn_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "Hi",
+            "store": true,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let warnings = res
+        .headers()
+        .get_all("x-proxy-compat-warning")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    assert!(
+        warnings.iter().any(|warning| warning.contains("store")),
         "warnings = {warnings:?}"
     );
 }

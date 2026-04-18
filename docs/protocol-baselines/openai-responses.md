@@ -70,7 +70,10 @@ The captured reference also includes operational controls such as:
 - `parallel_tool_calls`
 - `max_output_tokens`
 - `max_tool_calls`
+- `temperature`
+- `top_p`
 - `truncation`
+- `stream_options.include_obfuscation`
 - `service_tier`
 - `safety_identifier`
 - `prompt`
@@ -194,6 +197,11 @@ Output shaping uses Responses-native controls:
 
 - `text`
 - `include`
+
+The captured `text` object is not just a format wrapper. It includes:
+
+- `format`
+- `verbosity`
 
 The captured `include` surface is especially important because it gates extra fields that are otherwise absent from typed items. Examples include:
 

@@ -37,7 +37,9 @@ use crate::hooks::{
 };
 use crate::streaming::{needs_stream_translation, TranslateSseStream};
 use crate::telemetry::RuntimeMetrics;
-use crate::translate::{translate_request, translate_response};
+use crate::translate::{
+    assess_request_translation, translate_request, translate_response, TranslationDecision,
+};
 use crate::upstream;
 use futures_util::StreamExt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2252,93 +2254,17 @@ fn anthropic_error_body(status: StatusCode, error: &NormalizedUpstreamError) -> 
     })
 }
 
-fn collect_request_compatibility_warnings(
-    client_format: crate::formats::UpstreamFormat,
-    upstream_format: crate::formats::UpstreamFormat,
-    body: &Value,
-) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if client_format == crate::formats::UpstreamFormat::OpenAiResponses
-        && upstream_format != crate::formats::UpstreamFormat::OpenAiResponses
-    {
-        for field in [
-            "previous_response_id",
-            "truncation",
-            "max_tool_calls",
-            "include",
-            "reasoning",
-            "prompt_cache_key",
-        ] {
-            if body.get(field).is_some() {
-                warnings.push(format!(
-                    "field `{field}` is not portable from Responses to {upstream_format} and may be dropped or degraded"
-                ));
-            }
-        }
-        if upstream_format != crate::formats::UpstreamFormat::OpenAiCompletion
-            && body.get("store").is_some()
-        {
-            warnings.push(format!(
-                "field `store` is not portable from Responses to {upstream_format} and will be dropped"
-            ));
-        }
-        if upstream_format != crate::formats::UpstreamFormat::OpenAiResponses {
-            if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-                if tools
-                    .iter()
-                    .any(|tool| tool.get("name").is_none() && tool.get("function").is_none())
-                {
-                    warnings.push(format!(
-                        "non-function Responses tools are not portable to {upstream_format} and will be dropped"
-                    ));
-                }
-            }
-        }
-    }
-    if upstream_format == crate::formats::UpstreamFormat::Anthropic
-        && body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
-    {
-        warnings.push(
-            "Anthropic does not support `parallel_tool_calls`; proxy approximates this with `disable_parallel_tool_use`".to_string(),
-        );
-    }
-    if client_format == crate::formats::UpstreamFormat::Anthropic
-        && matches!(
-            upstream_format,
-            crate::formats::UpstreamFormat::OpenAiCompletion
-                | crate::formats::UpstreamFormat::OpenAiResponses
-        )
-        && body.get("metadata").is_some()
-    {
-        warnings.push(
-            "Anthropic `metadata` is not universally supported by OpenAI-style upstreams; proxy may drop it for compatibility".to_string(),
-        );
-    }
-    warnings
-}
-
 fn classify_request_boundary(
     client_format: crate::formats::UpstreamFormat,
     upstream_format: crate::formats::UpstreamFormat,
     body: &Value,
 ) -> RequestBoundaryDecision {
-    if client_format == crate::formats::UpstreamFormat::OpenAiResponses
-        && upstream_format != crate::formats::UpstreamFormat::OpenAiResponses
-    {
-        let stateful_controls = responses_stateful_request_controls(body);
-        if !stateful_controls.is_empty() {
-            let quoted_controls = quoted_field_list(&stateful_controls);
-            return RequestBoundaryDecision::Reject(format!(
-                "Responses request controls {quoted_controls} require a native OpenAI Responses upstream and cannot be translated to {upstream_format}; the proxy does not reconstruct provider state"
-            ));
+    match assess_request_translation(client_format, upstream_format, body).decision() {
+        TranslationDecision::Allow => RequestBoundaryDecision::Allow,
+        TranslationDecision::AllowWithWarnings(warnings) => {
+            RequestBoundaryDecision::AllowWithWarnings(warnings)
         }
-    }
-
-    let warnings = collect_request_compatibility_warnings(client_format, upstream_format, body);
-    if warnings.is_empty() {
-        RequestBoundaryDecision::Allow
-    } else {
-        RequestBoundaryDecision::AllowWithWarnings(warnings)
+        TranslationDecision::Reject(message) => RequestBoundaryDecision::Reject(message),
     }
 }
 
@@ -2869,7 +2795,9 @@ fn extract_api_key_from_headers(headers: &[(String, String)]) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::post;
     use axum::http::HeaderValue;
+    use tokio::sync::Mutex;
 
     struct ScopedEnvVar {
         key: &'static str,
@@ -2957,6 +2885,95 @@ mod tests {
             hooks: None,
             debug_trace: None,
         }
+    }
+
+    async fn spawn_openai_completion_mock(
+        response_body: Value,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        #[derive(Clone)]
+        struct MockState {
+            requests: Arc<Mutex<Vec<Value>>>,
+            response_body: Value,
+        }
+
+        async fn handle_chat_completions(
+            State(state): State<MockState>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            state.requests.lock().await.push(body);
+            Json(state.response_body)
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/chat/completions", post(handle_chat_completions))
+            .with_state(MockState {
+                requests: requests.clone(),
+                response_body,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock upstream");
+        let addr = listener.local_addr().expect("mock local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        (format!("http://{addr}"), requests, server)
+    }
+
+    fn app_state_for_single_upstream(
+        api_root: String,
+        upstream_format: crate::formats::UpstreamFormat,
+    ) -> Arc<AppState> {
+        let upstream = crate::config::UpstreamConfig {
+            name: "primary".to_string(),
+            api_root,
+            fixed_upstream_format: Some(upstream_format),
+            fallback_credential_env: None,
+            fallback_credential_actual: None,
+            fallback_api_key: None,
+            auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+            upstream_headers: Vec::new(),
+        };
+        let config = crate::config::Config {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout: std::time::Duration::from_secs(30),
+            upstreams: vec![upstream.clone()],
+            model_aliases: Default::default(),
+            hooks: Default::default(),
+            debug_trace: crate::config::DebugTraceConfig::default(),
+        };
+        let runtime = RuntimeState {
+            namespaces: BTreeMap::from([(
+                DEFAULT_NAMESPACE.to_string(),
+                RuntimeNamespaceState {
+                    revision: "test-revision".to_string(),
+                    config: config.clone(),
+                    upstreams: BTreeMap::from([(
+                        upstream.name.clone(),
+                        UpstreamState {
+                            config: upstream,
+                            capability: Some(UpstreamCapability::fixed(upstream_format)),
+                            availability: UpstreamAvailability::available(),
+                        },
+                    )]),
+                    client: upstream::build_client(&config),
+                    hooks: None,
+                    debug_trace: None,
+                },
+            )]),
+        };
+
+        Arc::new(AppState {
+            runtime: Arc::new(RwLock::new(runtime)),
+            metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
+            admin_access: AdminAccess::LoopbackOnly,
+        })
     }
 
     #[test]
@@ -3251,8 +3268,7 @@ mod tests {
             crate::formats::UpstreamFormat::OpenAiResponses,
             crate::formats::UpstreamFormat::Anthropic,
             &serde_json::json!({
-                "truncation": "auto",
-                "prompt_cache_key": "cache-key",
+                "store": true,
                 "tools": [{ "type": "web_search" }]
             }),
         );
@@ -3262,34 +3278,32 @@ mod tests {
         };
         assert!(warnings
             .iter()
-            .any(|warning| warning.contains("truncation")));
-        assert!(warnings
-            .iter()
-            .any(|warning| warning.contains("prompt_cache_key")));
+            .any(|warning| warning.contains("store")));
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("non-function Responses tools")));
     }
 
     #[test]
-    fn collect_request_compatibility_warnings_flags_non_portable_responses_fields() {
-        let body = serde_json::json!({
-            "previous_response_id": "resp_1",
-            "truncation": "auto",
-            "store": true,
-            "tools": [{ "type": "web_search" }]
-        });
-        let warnings = collect_request_compatibility_warnings(
-            crate::formats::UpstreamFormat::OpenAiResponses,
-            crate::formats::UpstreamFormat::Anthropic,
-            &body,
+    fn classify_request_boundary_warns_for_gemini_top_k_drop_policy() {
+        let decision = classify_request_boundary(
+            crate::formats::UpstreamFormat::Google,
+            crate::formats::UpstreamFormat::OpenAiCompletion,
+            &serde_json::json!({
+                "contents": [{
+                    "role": "user",
+                    "parts": [{ "text": "Hi" }]
+                }],
+                "generationConfig": {
+                    "topK": 40
+                }
+            }),
         );
-        assert!(warnings.iter().any(|w| w.contains("previous_response_id")));
-        assert!(warnings.iter().any(|w| w.contains("truncation")));
-        assert!(warnings.iter().any(|w| w.contains("store")));
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("non-function Responses tools")));
+
+        let RequestBoundaryDecision::AllowWithWarnings(warnings) = decision else {
+            panic!("expected warning path, got {decision:?}");
+        };
+        assert!(warnings.iter().any(|warning| warning.contains("topK")));
     }
 
     #[test]
@@ -3312,6 +3326,138 @@ mod tests {
             .filter_map(|v| v.to_str().ok())
             .collect();
         assert_eq!(values, vec!["first warning", "second warning with newline"]);
+    }
+
+    #[tokio::test]
+    async fn live_responses_store_drop_surfaces_warning_header() {
+        let response_body = serde_json::json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "stop"
+            }]
+        });
+        let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+        let state =
+            app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+        let response = handle_request_core(
+            state,
+            DEFAULT_NAMESPACE.to_string(),
+            HeaderMap::new(),
+            "/openai/v1/responses".to_string(),
+            serde_json::json!({
+                "model": "gpt-4o-mini",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "Hi" }]
+                }],
+                "store": true,
+                "stream": false
+            }),
+            "gpt-4o-mini".to_string(),
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let warnings = response
+            .headers()
+            .get_all("x-proxy-compat-warning")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert!(
+            warnings.iter().any(|warning| warning.contains("store")),
+            "warnings = {warnings:?}"
+        );
+
+        let recorded = requests.lock().await;
+        assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+        assert!(
+            recorded[0].get("store").is_none(),
+            "translated request should drop store: {:?}",
+            recorded[0]
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn live_gemini_top_k_drop_surfaces_warning_header() {
+        let response_body = serde_json::json!({
+            "id": "chatcmpl_1",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "stop"
+            }]
+        });
+        let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+        let state =
+            app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+        let response = handle_request_core(
+            state,
+            DEFAULT_NAMESPACE.to_string(),
+            HeaderMap::new(),
+            "/google/v1beta/models/gpt-4o-mini:generateContent".to_string(),
+            serde_json::json!({
+                "contents": [{
+                    "role": "user",
+                    "parts": [{ "text": "Hi" }]
+                }],
+                "generationConfig": {
+                    "topK": 40
+                }
+            }),
+            "gpt-4o-mini".to_string(),
+            crate::formats::UpstreamFormat::Google,
+            Some(false),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let warnings = response
+            .headers()
+            .get_all("x-proxy-compat-warning")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert!(
+            warnings.iter().any(|warning| warning.contains("topK")),
+            "warnings = {warnings:?}"
+        );
+
+        let recorded = requests.lock().await;
+        assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+        assert!(
+            recorded[0]
+                .get("top_k")
+                .or_else(|| recorded[0].get("topK"))
+                .is_none(),
+            "translated request should drop topK: {:?}",
+            recorded[0]
+        );
+        assert!(
+            recorded[0]
+                .get("generationConfig")
+                .and_then(|config| config.get("topK"))
+                .is_none(),
+            "translated request should drop nested topK: {:?}",
+            recorded[0]
+        );
+
+        server.abort();
     }
 
     #[test]
