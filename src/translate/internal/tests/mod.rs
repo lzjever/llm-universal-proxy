@@ -828,6 +828,31 @@ fn translate_request_openai_same_format_normalizes_developer_role() {
 }
 
 #[test]
+fn translate_request_openai_same_format_minimax_normalizes_developer_role_and_keeps_compat_overrides(
+) {
+    let mut body = json!({
+        "model": "MiniMax-M2.7-highspeed",
+        "messages": [
+            { "role": "developer", "content": "Follow repo rules." },
+            { "role": "assistant", "content": "Hello", "reasoning_content": "internal thinking" }
+        ]
+    });
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiCompletion,
+        "MiniMax-M2.7-highspeed",
+        &mut body,
+        true,
+    )
+    .unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["reasoning_details"][0]["text"], "internal thinking");
+    assert_eq!(body["reasoning_split"], true);
+    assert_eq!(body["stream_options"]["include_usage"], true);
+}
+
+#[test]
 fn translate_request_openai_same_format_coalesces_adjacent_string_messages() {
     let mut body = json!({
         "model": "gpt-4o",
@@ -1237,7 +1262,7 @@ fn translate_request_responses_to_non_responses_rejects_item_reference_items() {
 
 #[test]
 fn translate_request_responses_to_non_responses_rejects_reasoning_encrypted_content_items() {
-    for upstream_format in [UpstreamFormat::OpenAiCompletion, UpstreamFormat::Anthropic] {
+    for upstream_format in [UpstreamFormat::OpenAiCompletion, UpstreamFormat::Google] {
         let mut body = json!({
             "model": "gpt-4o",
             "input": [{
@@ -1258,6 +1283,30 @@ fn translate_request_responses_to_non_responses_rejects_reasoning_encrypted_cont
 
         assert!(err.contains("encrypted_content"), "err = {err}");
     }
+}
+
+#[test]
+fn translate_request_responses_to_claude_rejects_unknown_reasoning_encrypted_content() {
+    let mut body = json!({
+        "model": "claude-3",
+        "input": [{
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": "thinking" }],
+            "encrypted_content": "opaque_state"
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect_err("unknown Responses reasoning carrier should fail closed for Anthropic");
+
+    assert!(err.contains("encrypted_content"), "err = {err}");
+    assert!(err.contains("Anthropic"), "err = {err}");
 }
 
 #[test]
@@ -1386,7 +1435,7 @@ fn translate_request_responses_to_openai_preserves_mid_thread_instruction_segmen
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0]["role"], "user");
     assert_eq!(messages[0]["content"], "Earlier user message");
-    assert_eq!(messages[1]["role"], "developer");
+    assert_eq!(messages[1]["role"], "system");
     assert_eq!(messages[1]["content"], "Compacted thread summary");
     assert_eq!(messages[2]["role"], "user");
     assert_eq!(messages[2]["content"], "Continue");
@@ -4623,11 +4672,7 @@ fn translate_request_claude_to_non_anthropic_rejects_thinking_signature_provenan
         }]
     });
 
-    for upstream_format in [
-        UpstreamFormat::OpenAiCompletion,
-        UpstreamFormat::OpenAiResponses,
-        UpstreamFormat::Google,
-    ] {
+    for upstream_format in [UpstreamFormat::OpenAiCompletion, UpstreamFormat::Google] {
         let mut translated = body.clone();
         let err = translate_request(
             UpstreamFormat::Anthropic,
@@ -4641,6 +4686,154 @@ fn translate_request_claude_to_non_anthropic_rejects_thinking_signature_provenan
         assert!(err.contains("thinking"), "err = {err}");
         assert!(err.contains("signature"), "err = {err}");
     }
+}
+
+#[test]
+fn translate_request_responses_to_claude_replays_anthropic_reasoning_carrier() {
+    let signed_response = json!({
+        "id": "msg_sig",
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "internal reasoning",
+                "signature": "sig_123"
+            },
+            { "type": "text", "text": "Visible answer" }
+        ],
+        "stop_reason": "end_turn",
+        "model": "claude-3"
+    });
+    let translated_response = translate_response(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &signed_response,
+    )
+    .expect("Anthropic signed thinking should translate to Responses");
+    let output = translated_response["output"]
+        .as_array()
+        .expect("responses output");
+    let reasoning_item = output
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("reasoning item")
+        .clone();
+    let message_item = output
+        .iter()
+        .find(|item| item["type"] == "message")
+        .expect("message item")
+        .clone();
+
+    let mut body = json!({
+        "model": "claude-3",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Think about it" }]
+            },
+            reasoning_item,
+            message_item,
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Continue" }]
+            }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("Responses reasoning carrier should replay to Anthropic");
+
+    let messages = body["messages"].as_array().expect("anthropic messages");
+    assert_eq!(messages[1]["role"], "assistant");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "internal reasoning");
+    assert_eq!(assistant_content[0]["signature"], "sig_123");
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "Visible answer");
+}
+
+#[test]
+fn translate_request_responses_to_claude_replays_anthropic_omitted_reasoning_carrier() {
+    let omitted_response = json!({
+        "id": "msg_omitted",
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": { "display": "omitted" },
+                "signature": "sig_omitted"
+            },
+            { "type": "text", "text": "Visible answer" }
+        ],
+        "stop_reason": "end_turn",
+        "model": "claude-3"
+    });
+    let translated_response = translate_response(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &omitted_response,
+    )
+    .expect("Anthropic omitted thinking should translate to Responses");
+    let output = translated_response["output"]
+        .as_array()
+        .expect("responses output");
+    let reasoning_item = output
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("reasoning item")
+        .clone();
+    let message_item = output
+        .iter()
+        .find(|item| item["type"] == "message")
+        .expect("message item")
+        .clone();
+
+    let mut body = json!({
+        "model": "claude-3",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Think about it" }]
+            },
+            reasoning_item,
+            message_item,
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Continue" }]
+            }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("Responses omitted carrier should replay to Anthropic");
+
+    let messages = body["messages"].as_array().expect("anthropic messages");
+    assert_eq!(messages[1]["role"], "assistant");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], json!({ "display": "omitted" }));
+    assert_eq!(assistant_content[0]["signature"], "sig_omitted");
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "Visible answer");
 }
 
 #[test]
@@ -8083,16 +8276,48 @@ fn translate_response_claude_thinking_signature_provenance_rejects_for_non_anthr
         "model": "claude-3"
     });
 
-    for client_format in [
-        UpstreamFormat::OpenAiCompletion,
-        UpstreamFormat::OpenAiResponses,
-        UpstreamFormat::Google,
-    ] {
+    for client_format in [UpstreamFormat::OpenAiCompletion, UpstreamFormat::Google] {
         let err = translate_response(UpstreamFormat::Anthropic, client_format, &body)
             .expect_err("Anthropic thinking signature provenance should fail closed");
         assert!(err.contains("thinking"), "err = {err}");
         assert!(err.contains("signature"), "err = {err}");
     }
+}
+
+#[test]
+fn translate_response_claude_thinking_signature_provenance_maps_to_responses_carrier() {
+    let body = json!({
+        "id": "msg_sig",
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "internal reasoning",
+                "signature": "sig_123"
+            },
+            { "type": "text", "text": "Visible answer" }
+        ],
+        "stop_reason": "end_turn",
+        "model": "claude-3"
+    });
+
+    let out = translate_response(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect("Anthropic signed thinking should translate to Responses");
+
+    let output = out["output"].as_array().expect("responses output");
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[0]["summary"][0]["text"], "internal reasoning");
+    assert!(output[0]["encrypted_content"].is_string(), "output = {output:?}");
+    assert_ne!(
+        output[0]["encrypted_content"].as_str().unwrap_or(""),
+        "",
+        "output = {output:?}"
+    );
+    assert_eq!(output[1]["type"], "message");
+    assert_eq!(output[1]["content"][0]["text"], "Visible answer");
 }
 
 #[test]
@@ -8108,16 +8333,48 @@ fn translate_response_claude_omitted_thinking_rejects_for_non_anthropic_clients(
         "model": "claude-3"
     });
 
-    for client_format in [
-        UpstreamFormat::OpenAiCompletion,
-        UpstreamFormat::OpenAiResponses,
-        UpstreamFormat::Google,
-    ] {
+    for client_format in [UpstreamFormat::OpenAiCompletion, UpstreamFormat::Google] {
         let err = translate_response(UpstreamFormat::Anthropic, client_format, &body)
             .expect_err("Anthropic omitted thinking should fail closed");
         assert!(err.contains("thinking"), "err = {err}");
         assert!(err.contains("Anthropic"), "err = {err}");
     }
+}
+
+#[test]
+fn translate_response_claude_omitted_thinking_maps_to_responses_carrier() {
+    let body = json!({
+        "id": "msg_omitted",
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": { "display": "omitted" },
+                "signature": "sig_123"
+            },
+            { "type": "text", "text": "Visible answer" }
+        ],
+        "stop_reason": "end_turn",
+        "model": "claude-3"
+    });
+
+    let out = translate_response(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect("Anthropic omitted thinking should translate to Responses");
+
+    let output = out["output"].as_array().expect("responses output");
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[0]["summary"], json!([]));
+    assert!(output[0]["encrypted_content"].is_string(), "output = {output:?}");
+    assert_ne!(
+        output[0]["encrypted_content"].as_str().unwrap_or(""),
+        "",
+        "output = {output:?}"
+    );
+    assert_eq!(output[1]["type"], "message");
+    assert_eq!(output[1]["content"][0]["text"], "Visible answer");
 }
 
 #[test]

@@ -91,6 +91,34 @@ pub async fn spawn_anthropic_thinking_mock() -> (String, tokio::task::JoinHandle
     (base, handle)
 }
 
+pub async fn spawn_anthropic_signed_thinking_mock() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let app = Router::new()
+        .route("/v1/messages", post(anthropic_signed_thinking_handler))
+        .route("/messages", post(anthropic_signed_thinking_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+pub async fn spawn_anthropic_omitted_thinking_mock() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let app = Router::new()
+        .route("/v1/messages", post(anthropic_omitted_thinking_handler))
+        .route("/messages", post(anthropic_omitted_thinking_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
 async fn anthropic_thinking_handler(Json(body): Json<Value>) -> Response {
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
@@ -136,6 +164,48 @@ data: {"type":"message_stop"}"#,
         });
         (StatusCode::OK, Json(resp)).into_response()
     }
+}
+
+async fn anthropic_signed_thinking_handler(Json(body): Json<Value>) -> Response {
+    let resp = serde_json::json!({
+        "id": "msg_signed_thinking",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "internal reasoning",
+                "signature": "sig_123"
+            },
+            { "type": "text", "text": "Visible answer" }
+        ],
+        "model": body.get("model").unwrap_or(&serde_json::json!("claude-3")),
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 2 }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+async fn anthropic_omitted_thinking_handler(Json(body): Json<Value>) -> Response {
+    let resp = serde_json::json!({
+        "id": "msg_omitted_thinking",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": { "display": "omitted" },
+                "signature": "sig_omitted"
+            },
+            { "type": "text", "text": "Visible answer" }
+        ],
+        "model": body.get("model").unwrap_or(&serde_json::json!("claude-3")),
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 2 }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 async fn anthropic_handler(Json(body): Json<Value>) -> Response {

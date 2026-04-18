@@ -25,8 +25,7 @@ pub fn translate_request(
     }
 
     if client_format == upstream_format {
-        if stream && (client_format != UpstreamFormat::OpenAiCompletion || !is_minimax_model(model))
-        {
+        if stream {
             normalize_openai_roles_for_compatibility(client_format, body);
         }
         if client_format == UpstreamFormat::OpenAiCompletion {
@@ -52,9 +51,7 @@ pub fn translate_request(
             }
         }
     } else {
-        if stream
-            && (upstream_format != UpstreamFormat::OpenAiCompletion || !is_minimax_model(model))
-        {
+        if stream {
             normalize_openai_roles_for_compatibility(upstream_format, body);
         }
         apply_openai_completion_compat_overrides(model, body);
@@ -275,8 +272,9 @@ use openai_family::{
     openai_response_has_assistant_audio,
 };
 use openai_responses::{
-    messages_to_responses, openai_response_to_responses, responses_response_to_openai,
-    responses_to_messages,
+    append_openai_message_anthropic_reasoning_replay_blocks, messages_to_responses,
+    openai_message_anthropic_reasoning_replay_blocks, openai_response_to_responses,
+    responses_response_to_openai, responses_to_messages,
 };
 #[cfg(test)]
 use request_gemini::convert_gemini_content_to_openai;
@@ -315,7 +313,13 @@ pub fn translate_response(
     if upstream_format == client_format {
         return Ok(body.clone());
     }
-    let openai = upstream_response_to_openai(upstream_format, body)?;
+    let openai = if upstream_format == UpstreamFormat::Anthropic
+        && client_format == UpstreamFormat::OpenAiResponses
+    {
+        claude_response_to_openai_with_reasoning_replay(body)?
+    } else {
+        upstream_response_to_openai(upstream_format, body)?
+    };
     if client_format == UpstreamFormat::OpenAiCompletion {
         return Ok(openai);
     }
@@ -764,7 +768,18 @@ fn claude_system_to_openai_content(system: &Value) -> Result<Option<Value>, Stri
 }
 
 fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
-    if anthropic_response_has_nonportable_thinking_provenance(body) {
+    claude_response_to_openai_internal(body, false)
+}
+
+fn claude_response_to_openai_with_reasoning_replay(body: &Value) -> Result<Value, String> {
+    claude_response_to_openai_internal(body, true)
+}
+
+fn claude_response_to_openai_internal(
+    body: &Value,
+    allow_reasoning_replay: bool,
+) -> Result<Value, String> {
+    if !allow_reasoning_replay && anthropic_response_has_nonportable_thinking_provenance(body) {
         return Err(anthropic_thinking_provenance_not_portable_message());
     }
     let content = body.get("content").cloned().ok_or("missing content")?;
@@ -777,6 +792,21 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
         .drain(..)
         .find(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
         .ok_or("missing assistant message")?;
+    if allow_reasoning_replay {
+        let thinking_blocks = content
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("thinking"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if anthropic_blocks_have_nonportable_thinking_provenance(&thinking_blocks) {
+            append_openai_message_anthropic_reasoning_replay_blocks(&mut message, thinking_blocks);
+        }
+    }
     let mut finish_reason = body
         .get("stop_reason")
         .and_then(Value::as_str)
@@ -1454,9 +1484,17 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Result<Option<Vec<Value>>, St
     }
     let content = msg.get("content");
     let mut blocks: Vec<Value> = vec![];
+    let replay_blocks = if role == "assistant" {
+        openai_message_anthropic_reasoning_replay_blocks(msg)
+    } else {
+        None
+    };
     if role == "assistant" {
-        if openai_message_reasoning_text(msg).is_some() {
+        if openai_message_reasoning_text(msg).is_some() && replay_blocks.is_none() {
             return Err(OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE.to_string());
+        }
+        if let Some(replay_blocks) = replay_blocks {
+            blocks.extend(replay_blocks);
         }
         if let Some(refusal) = extract_openai_refusal(msg) {
             if !refusal.is_empty() {

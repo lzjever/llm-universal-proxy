@@ -32,6 +32,69 @@ use super::tools::{
     semantic_tool_output_item_type,
 };
 
+const OPENAI_ANTHROPIC_REASONING_REPLAY_FIELD: &str = "_anthropic_reasoning_replay";
+const ANTHROPIC_REASONING_CARRIER_PREFIX: &str = "anthropic-thinking-v1:";
+
+pub(super) fn encode_anthropic_reasoning_carrier(blocks: &[Value]) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "format": "anthropic-thinking-replay",
+        "version": 1,
+        "blocks": blocks
+    });
+    let encoded = serde_json::to_vec(&payload)
+        .map(hex::encode)
+        .map_err(|err| format!("serialize Anthropic reasoning replay carrier: {err}"))?;
+    Ok(format!("{ANTHROPIC_REASONING_CARRIER_PREFIX}{encoded}"))
+}
+
+pub(super) fn decode_anthropic_reasoning_carrier(carrier: &str) -> Result<Vec<Value>, String> {
+    let encoded = carrier
+        .strip_prefix(ANTHROPIC_REASONING_CARRIER_PREFIX)
+        .ok_or("unsupported carrier prefix")?;
+    let decoded = hex::decode(encoded).map_err(|err| format!("decode carrier hex: {err}"))?;
+    let payload: Value =
+        serde_json::from_slice(&decoded).map_err(|err| format!("decode carrier json: {err}"))?;
+    if payload.get("format").and_then(Value::as_str) != Some("anthropic-thinking-replay") {
+        return Err("unsupported carrier format".to_string());
+    }
+    if payload.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err("unsupported carrier version".to_string());
+    }
+    let blocks = payload
+        .get("blocks")
+        .and_then(Value::as_array)
+        .ok_or("carrier blocks must be an array")?;
+    if blocks.iter().any(|block| block.get("type").and_then(Value::as_str) != Some("thinking")) {
+        return Err("carrier blocks must only contain Anthropic thinking blocks".to_string());
+    }
+    Ok(blocks.clone())
+}
+
+pub(super) fn openai_message_anthropic_reasoning_replay_blocks(message: &Value) -> Option<Vec<Value>> {
+    message
+        .get(OPENAI_ANTHROPIC_REASONING_REPLAY_FIELD)
+        .and_then(Value::as_array)
+        .cloned()
+}
+
+pub(super) fn append_openai_message_anthropic_reasoning_replay_blocks(
+    message: &mut Value,
+    blocks: Vec<Value>,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+    let Some(obj) = message.as_object_mut() else {
+        return;
+    };
+    let replay = obj
+        .entry(OPENAI_ANTHROPIC_REASONING_REPLAY_FIELD.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(arr) = replay.as_array_mut() {
+        arr.extend(blocks);
+    }
+}
+
 fn responses_output_audio_item_to_openai_audio(item: &Value) -> Option<Value> {
     if item.get("type").and_then(Value::as_str) != Some("output_audio") {
         return None;
@@ -288,13 +351,29 @@ pub(super) fn openai_response_to_responses(body: &Value) -> Result<Value, String
     )?;
     let message = choice.get("message").ok_or("missing message")?;
     let mut output: Vec<Value> = vec![];
+    let replay_blocks = openai_message_anthropic_reasoning_replay_blocks(message);
     if let Some(reasoning) = openai_message_reasoning_text(message) {
-        if !reasoning.is_empty() {
-            output.push(serde_json::json!({
+        if !reasoning.is_empty() || replay_blocks.is_some() {
+            let mut reasoning_item = serde_json::json!({
                 "type": "reasoning",
-                "summary": [{ "type": "summary_text", "text": reasoning }]
-            }));
+                "summary": []
+            });
+            if !reasoning.is_empty() {
+                reasoning_item["summary"] =
+                    serde_json::json!([{ "type": "summary_text", "text": reasoning }]);
+            }
+            if let Some(blocks) = replay_blocks.as_ref() {
+                reasoning_item["encrypted_content"] =
+                    Value::String(encode_anthropic_reasoning_carrier(blocks)?);
+            }
+            output.push(reasoning_item);
         }
+    } else if let Some(blocks) = replay_blocks.as_ref() {
+        output.push(serde_json::json!({
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": encode_anthropic_reasoning_carrier(blocks)?
+        }));
     }
     let audio_output = openai_assistant_audio_to_responses_output_item(message)?;
     let mut content = openai_message_to_responses_content(message, "output_text");
@@ -544,6 +623,19 @@ pub(super) fn responses_to_messages(
                             .join("")
                     })
                     .unwrap_or_default();
+                let replay_blocks = if target_format == UpstreamFormat::Anthropic {
+                    item.get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .map(decode_anthropic_reasoning_carrier)
+                        .transpose()
+                        .map_err(|err| {
+                            format!(
+                                "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: {err}"
+                            )
+                        })?
+                } else {
+                    None
+                };
                 if !summary.is_empty() {
                     if current_assistant.is_none() {
                         current_assistant = Some(serde_json::json!({
@@ -557,6 +649,17 @@ pub(super) fn responses_to_messages(
                             .and_then(Value::as_str)
                             .unwrap_or("");
                         a["reasoning_content"] = Value::String(format!("{existing}{summary}"));
+                    }
+                }
+                if let Some(blocks) = replay_blocks {
+                    if current_assistant.is_none() {
+                        current_assistant = Some(serde_json::json!({
+                            "role": "assistant",
+                            "content": null
+                        }));
+                    }
+                    if let Some(ref mut a) = current_assistant {
+                        append_openai_message_anthropic_reasoning_replay_blocks(a, blocks);
                     }
                 }
             }

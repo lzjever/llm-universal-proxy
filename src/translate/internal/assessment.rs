@@ -12,6 +12,7 @@ use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
     SemanticToolKind, SharedControlProfile, TranslationAssessment,
 };
+use super::openai_responses::decode_anthropic_reasoning_carrier;
 use super::openai_family::extract_responses_text_content;
 use super::request_gemini::gemini_generation_config_field;
 use super::response_protocols::openai_message_reasoning_text;
@@ -667,18 +668,34 @@ pub(super) fn responses_portable_input_item_type(item_type: &str) -> bool {
 
 pub(super) fn responses_nonportable_input_item_message(
     body: &Value,
-    target_label: &str,
+    target_format: UpstreamFormat,
 ) -> Option<String> {
+    let target_label = translation_target_label(target_format);
     let items = body.get("input").and_then(Value::as_array)?;
     items.iter().find_map(|item| {
         let item_type = item
             .get("type")
             .and_then(Value::as_str)
             .or_else(|| item.get("role").and_then(Value::as_str).map(|_| "message"))?;
-        if item_type == "reasoning" && item.get("encrypted_content").is_some() {
-            return Some(format!(
-                "OpenAI Responses reasoning item field `encrypted_content` cannot be faithfully translated to {target_label}"
-            ));
+        if item_type == "reasoning" {
+            if let Some(encrypted_content) = item.get("encrypted_content") {
+                if target_format != UpstreamFormat::Anthropic {
+                    return Some(format!(
+                        "OpenAI Responses reasoning item field `encrypted_content` cannot be faithfully translated to {target_label}"
+                    ));
+                }
+                let Some(carrier) = encrypted_content.as_str() else {
+                    return Some(
+                        "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: carrier must be a string"
+                            .to_string(),
+                    );
+                };
+                if let Err(err) = decode_anthropic_reasoning_carrier(carrier) {
+                    return Some(format!(
+                        "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: {err}"
+                    ));
+                }
+            }
         }
         if matches!(item_type, "function_call" | "custom_tool_call")
             && item.get("namespace").is_some()
@@ -768,7 +785,12 @@ pub(super) fn request_contains_openai_reasoning_without_provenance(
             .and_then(Value::as_array)
             .map(|items| {
                 items.iter().any(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("reasoning")
+                    (item.get("type").and_then(Value::as_str) == Some("reasoning")
+                        && item
+                            .get("encrypted_content")
+                            .and_then(Value::as_str)
+                            .map(|carrier| decode_anthropic_reasoning_carrier(carrier).is_err())
+                            .unwrap_or(true))
                         || (item.get("type").and_then(Value::as_str) == Some("message")
                             && item.get("role").and_then(Value::as_str) == Some("assistant")
                             && extract_responses_text_content(item.get("content")).is_empty()
@@ -982,7 +1004,7 @@ pub(crate) fn assess_request_translation(
         }
         if let Some(message) = responses_nonportable_input_item_message(
             body,
-            translation_target_label(upstream_format),
+            upstream_format,
         ) {
             assessment.reject(message);
         }
