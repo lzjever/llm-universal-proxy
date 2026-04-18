@@ -478,6 +478,62 @@ async fn spawn_google_prompt_feedback_mock() -> (String, tokio::task::JoinHandle
     (base, handle)
 }
 
+async fn spawn_google_debug_trace_stream_mock() -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(
+        Path(model_action): Path<String>,
+        Json(_body): Json<Value>,
+    ) -> impl IntoResponse {
+        if model_action.contains(":streamGenerateContent") {
+            let body = concat!(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[",
+                "{\"text\":\"Hi\"},",
+                "{\"functionCall\":{\"id\":\"call_1\",\"name\":\"lookup_weather\",\"args\":{\"city\":\"Tokyo\"}}}",
+                "],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"modelVersion\":\"gemini-debug-trace\"}\n\n"
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap()
+        } else {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "candidates": [{
+                        "content": {
+                            "parts": [
+                                { "text": "Hi" },
+                                {
+                                    "functionCall": {
+                                        "id": "call_1",
+                                        "name": "lookup_weather",
+                                        "args": { "city": "Tokyo" }
+                                    }
+                                }
+                            ],
+                            "role": "model"
+                        },
+                        "finishReason": "STOP"
+                    }],
+                    "modelVersion": "gemini-debug-trace"
+                })),
+            )
+                .into_response()
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1beta/models/:model_action", post(handler))
+        .route("/models/:model_action", post(handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
 async fn spawn_anthropic_context_window_mock() -> (String, tokio::task::JoinHandle<()>) {
     async fn handler(Json(body): Json<Value>) -> impl IntoResponse {
         (
@@ -4426,6 +4482,73 @@ async fn debug_trace_records_request_delta_and_stream_summary() {
         "log = {log}"
     );
     assert!(log.contains("\"text\":\"Hi\""), "log = {log}");
+
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[tokio::test]
+async fn debug_trace_records_google_stream_protocol_summary() {
+    let (mock_base, _mock) = spawn_google_debug_trace_stream_mock().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let trace_path = std::env::temp_dir().join(format!(
+        "llm-proxy-google-debug-trace-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    config.debug_trace = DebugTraceConfig {
+        path: Some(trace_path.display().to_string()),
+        max_text_chars: 256,
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "{proxy_base}/google/v1beta/models/gemini-debug:streamGenerateContent"
+        ))
+        .json(&json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{ "text": "Hi" }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("functionCall"), "body = {body}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let response_entry = loop {
+        if let Ok(contents) = std::fs::read_to_string(&trace_path) {
+            let parsed = contents
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|value| value.get("phase").and_then(Value::as_str) == Some("response"));
+            if let Some(value) = parsed {
+                break value;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for google debug trace response entry"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(response_entry["client_format"], "google");
+    assert_eq!(response_entry["response"]["terminal_event"], "candidate");
+    assert_eq!(response_entry["response"]["finish_reason"], "STOP");
+    assert_eq!(response_entry["response"]["text"], "Hi");
+    let tool_call = &response_entry["response"]["tool_calls"][0];
+    let function_call = if tool_call.get("functionCall").is_some() {
+        &tool_call["functionCall"]
+    } else {
+        tool_call
+    };
+    assert_eq!(function_call["id"], "call_1");
+    assert_eq!(function_call["name"], "lookup_weather");
+    assert_eq!(function_call["args"]["city"], "Tokyo");
 
     let _ = std::fs::remove_file(trace_path);
 }
