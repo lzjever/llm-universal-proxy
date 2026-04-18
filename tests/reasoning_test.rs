@@ -23,7 +23,10 @@ async fn assert_reasoning_to_anthropic_rejected(res: reqwest::Response) {
     if let Some(body_type) = body.get("type").and_then(Value::as_str) {
         assert_eq!(body_type, "error", "body = {body:?}");
     }
-    assert_eq!(body["error"]["type"], "invalid_request_error", "body = {body:?}");
+    assert_eq!(
+        body["error"]["type"], "invalid_request_error",
+        "body = {body:?}"
+    );
     let message = body["error"]["message"]
         .as_str()
         .expect("anthropic error message");
@@ -53,7 +56,10 @@ async fn assert_anthropic_thinking_to_openai_stream_failed_closed(
     let status = res.status();
     let body = res.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::OK, "body = {body}");
-    assert!(body.contains("\"finish_reason\":\"error\""), "body = {body}");
+    assert!(
+        body.contains("\"finish_reason\":\"error\""),
+        "body = {body}"
+    );
     assert!(
         body.contains("\"type\":\"invalid_request_error\""),
         "body = {body}"
@@ -94,7 +100,10 @@ async fn assert_anthropic_thinking_to_responses_stream_failed_closed(
         !body.contains("response.reasoning_summary_text.delta"),
         "body = {body}"
     );
-    assert!(!body.contains("response.output_text.delta"), "body = {body}");
+    assert!(
+        !body.contains("response.output_text.delta"),
+        "body = {body}"
+    );
     assert!(!body.contains("response.completed"), "body = {body}");
     assert!(!body.contains("<think>"), "body = {body}");
     body

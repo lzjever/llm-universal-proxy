@@ -1519,7 +1519,11 @@ async fn openai_namespace_response_resource_routes_preserve_upstream_protocol_he
     ];
 
     for response in responses {
-        assert!(response.status().is_success(), "status: {}", response.status());
+        assert!(
+            response.status().is_success(),
+            "status: {}",
+            response.status()
+        );
         assert_eq!(
             response
                 .headers()
@@ -4355,10 +4359,7 @@ async fn responses_endpoint_streaming_fails_closed_for_anthropic_thinking() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
-    assert!(
-        body.contains("event: response.failed"),
-        "body = {body}"
-    );
+    assert!(body.contains("event: response.failed"), "body = {body}");
     assert!(
         body.contains("\"type\":\"invalid_request_error\""),
         "body = {body}"

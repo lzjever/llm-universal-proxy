@@ -1,0 +1,2068 @@
+use serde_json::Value;
+
+use crate::formats::UpstreamFormat;
+
+use super::assessment::{
+    gemini_normalized_logprobs_controls, normalized_openai_audio_contract,
+    openai_normalized_logprobs_controls, request_stream_include_obfuscation,
+    responses_normalized_logprobs_controls, responses_reasoning_effort, responses_text_verbosity,
+};
+use super::response_protocols::push_gemini_function_call_part;
+use super::{
+    collapse_gemini_parts_for_openai, custom_tools_not_portable_message,
+    gemini_function_response_has_nonportable_parts,
+    gemini_function_response_parts_not_portable_message, semantic_tool_kind_from_value,
+    NormalizedDecodingControls, NormalizedJsonSchemaOutputShape, NormalizedOutputShape,
+    NormalizedRequestControls, NormalizedToolPolicy, SemanticToolKind,
+};
+
+pub(super) fn extract_gemini_text(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+        return parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    String::new()
+}
+
+pub(super) fn gemini_request_field<'a>(
+    value: &'a Value,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a Value> {
+    gemini_nested_field(value, camel, snake)
+}
+
+pub(super) fn gemini_request_object_field<'a>(
+    value: &'a Value,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    gemini_request_field(value, camel, snake).and_then(Value::as_object)
+}
+
+pub(super) fn gemini_request_array_field<'a>(
+    value: &'a Value,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a Vec<Value>> {
+    gemini_request_field(value, camel, snake).and_then(Value::as_array)
+}
+
+pub(super) fn gemini_request_object_field_from_object<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    value
+        .get(camel)
+        .or_else(|| value.get(snake))
+        .and_then(Value::as_object)
+}
+
+pub(super) fn gemini_request_system_instruction(body: &Value) -> Option<&Value> {
+    gemini_request_field(body, "systemInstruction", "system_instruction")
+}
+
+pub(super) fn gemini_request_generation_config(body: &Value) -> Option<&Value> {
+    gemini_request_field(body, "generationConfig", "generation_config")
+}
+
+pub(super) fn gemini_request_tools(body: &Value) -> Option<&Vec<Value>> {
+    gemini_request_array_field(body, "tools", "tools")
+}
+
+pub(super) fn gemini_request_tool_config(body: &Value) -> Option<&serde_json::Map<String, Value>> {
+    gemini_request_object_field(body, "toolConfig", "tool_config")
+}
+
+pub(super) fn gemini_request_function_calling_config_from_object(
+    tool_config: &serde_json::Map<String, Value>,
+) -> Option<&serde_json::Map<String, Value>> {
+    gemini_request_object_field_from_object(
+        tool_config,
+        "functionCallingConfig",
+        "function_calling_config",
+    )
+}
+
+pub(super) fn gemini_generation_config_field<'a>(
+    body: &'a Value,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a Value> {
+    gemini_request_generation_config(body)
+        .and_then(|generation_config| gemini_request_field(generation_config, camel, snake))
+        .filter(|value| !value.is_null())
+}
+
+pub(super) fn gemini_function_declaration_output_schema_field(
+    declaration: &Value,
+) -> Option<(&'static str, &Value)> {
+    declaration
+        .get("response")
+        .filter(|value| !value.is_null())
+        .map(|value| ("response", value))
+        .or_else(|| {
+            gemini_request_field(declaration, "responseJsonSchema", "response_json_schema")
+                .filter(|value| !value.is_null())
+                .map(|value| ("responseJsonSchema", value))
+        })
+}
+
+pub(super) fn gemini_function_output_schema_not_portable_message(
+    declaration: &Value,
+    field_name: &str,
+    target_label: &str,
+) -> String {
+    format!(
+        "Gemini FunctionDeclaration `{}` field `{field_name}` cannot be faithfully translated to {target_label}",
+        gemini_function_declaration_name(declaration)
+    )
+}
+
+pub(super) fn gemini_request_nonportable_output_shape_message(
+    body: &Value,
+    target_label: &str,
+) -> Option<String> {
+    let response_schema = gemini_generation_config_field(body, "responseSchema", "response_schema");
+    let response_json_schema =
+        gemini_generation_config_field(body, "responseJsonSchema", "response_json_schema");
+    let response_mime_type =
+        gemini_generation_config_field(body, "responseMimeType", "response_mime_type")
+            .and_then(Value::as_str);
+
+    if response_schema.is_some() {
+        return Some(format!(
+            "Gemini generationConfig.responseSchema cannot be faithfully translated to {target_label}"
+        ));
+    }
+
+    if response_json_schema.is_some() && response_mime_type != Some("application/json") {
+        return Some(format!(
+            "Gemini generationConfig.responseJsonSchema requires `responseMimeType: application/json` when translating to {target_label}"
+        ));
+    }
+
+    match response_mime_type {
+        Some("text/plain") | Some("application/json") | None => None,
+        Some("text/x.enum") => Some(format!(
+            "Gemini generationConfig.responseMimeType `text/x.enum` cannot be faithfully translated to {target_label}"
+        )),
+        Some(other) => Some(format!(
+            "Gemini generationConfig.responseMimeType `{other}` cannot be faithfully translated to {target_label}"
+        )),
+    }
+}
+
+pub(super) fn openai_response_format_json_schema(
+    container: &serde_json::Map<String, Value>,
+) -> Result<NormalizedJsonSchemaOutputShape, String> {
+    let json_schema = container
+        .get("json_schema")
+        .and_then(Value::as_object)
+        .ok_or("OpenAI response_format.type = json_schema requires a `json_schema` object")?;
+    let schema = json_schema.get("schema").cloned().ok_or(
+        "OpenAI response_format.json_schema.schema is required for structured output translation",
+    )?;
+    let name = json_schema
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("structured_output")
+        .to_string();
+    let description = json_schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let strict = json_schema.get("strict").and_then(Value::as_bool);
+    Ok(NormalizedJsonSchemaOutputShape {
+        name,
+        schema,
+        description,
+        strict,
+    })
+}
+
+pub(super) fn responses_text_format_json_schema(
+    container: &serde_json::Map<String, Value>,
+) -> Result<NormalizedJsonSchemaOutputShape, String> {
+    let schema = container
+        .get("schema")
+        .cloned()
+        .ok_or("Responses text.format.type = json_schema requires a `schema` object")?;
+    let name = container
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("structured_output")
+        .to_string();
+    let description = container
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let strict = container.get("strict").and_then(Value::as_bool);
+    Ok(NormalizedJsonSchemaOutputShape {
+        name,
+        schema,
+        description,
+        strict,
+    })
+}
+
+pub(super) fn openai_normalized_output_shape(
+    body: &Value,
+) -> Result<Option<NormalizedOutputShape>, String> {
+    let Some(response_format) = body.get("response_format").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let Some(response_format) = response_format.as_object() else {
+        return Err(
+            "OpenAI response_format must be an object when translating structured output controls"
+                .to_string(),
+        );
+    };
+    match response_format.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(Some(NormalizedOutputShape::Text)),
+        Some("json_object") => Ok(Some(NormalizedOutputShape::JsonObject)),
+        Some("json_schema") => Ok(Some(NormalizedOutputShape::JsonSchema(
+            openai_response_format_json_schema(response_format)?,
+        ))),
+        Some(other) => Err(format!(
+            "OpenAI response_format.type `{other}` cannot be faithfully translated"
+        )),
+        None => Err(
+            "OpenAI response_format.type is required when translating structured output controls"
+                .to_string(),
+        ),
+    }
+}
+
+pub(super) fn responses_normalized_output_shape(
+    body: &Value,
+) -> Result<Option<NormalizedOutputShape>, String> {
+    let Some(text) = body
+        .get("text")
+        .and_then(Value::as_object)
+        .and_then(|text| text.get("format"))
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let Some(text_format) = text.as_object() else {
+        return Err(
+            "Responses text.format must be an object when translating structured output controls"
+                .to_string(),
+        );
+    };
+    match text_format.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(Some(NormalizedOutputShape::Text)),
+        Some("json_object") => Ok(Some(NormalizedOutputShape::JsonObject)),
+        Some("json_schema") => Ok(Some(NormalizedOutputShape::JsonSchema(
+            responses_text_format_json_schema(text_format)?,
+        ))),
+        Some(other) => Err(format!(
+            "Responses text.format.type `{other}` cannot be faithfully translated"
+        )),
+        None => Err(
+            "Responses text.format.type is required when translating structured output controls"
+                .to_string(),
+        ),
+    }
+}
+
+pub(super) fn gemini_normalized_output_shape(
+    body: &Value,
+) -> Result<Option<NormalizedOutputShape>, String> {
+    let response_json_schema =
+        gemini_generation_config_field(body, "responseJsonSchema", "response_json_schema");
+    let response_schema = gemini_generation_config_field(body, "responseSchema", "response_schema");
+    let response_mime_type =
+        gemini_generation_config_field(body, "responseMimeType", "response_mime_type")
+            .and_then(Value::as_str);
+
+    if response_schema.is_some() {
+        return Err(
+            "Gemini generationConfig.responseSchema cannot be faithfully translated to non-Gemini targets"
+                .to_string(),
+        );
+    }
+
+    if response_json_schema.is_some() && response_mime_type != Some("application/json") {
+        return Err(
+            "Gemini generationConfig.responseJsonSchema requires `responseMimeType: application/json` for cross-protocol translation"
+                .to_string(),
+        );
+    }
+
+    match response_mime_type {
+        Some("text/plain") => Ok(Some(NormalizedOutputShape::Text)),
+        Some("application/json") => {
+            if let Some(schema) = response_json_schema {
+                Ok(Some(NormalizedOutputShape::JsonSchema(
+                    NormalizedJsonSchemaOutputShape {
+                        name: "gemini_response".to_string(),
+                        schema: schema.clone(),
+                        description: None,
+                        strict: None,
+                    },
+                )))
+            } else {
+                Ok(Some(NormalizedOutputShape::JsonObject))
+            }
+        }
+        Some("text/x.enum") => Err(
+            "Gemini generationConfig.responseMimeType `text/x.enum` cannot be faithfully translated to non-Gemini targets"
+                .to_string(),
+        ),
+        Some(other) => Err(format!(
+            "Gemini generationConfig.responseMimeType `{other}` cannot be faithfully translated to non-Gemini targets"
+        )),
+        None => {
+            if response_json_schema.is_some() {
+                Err(
+                    "Gemini generationConfig.responseJsonSchema requires `responseMimeType: application/json` for cross-protocol translation"
+                        .to_string(),
+                )
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+pub(super) fn openai_normalized_decoding_controls(body: &Value) -> NormalizedDecodingControls {
+    NormalizedDecodingControls {
+        stop: body.get("stop").cloned(),
+        seed: body.get("seed").cloned(),
+        presence_penalty: body.get("presence_penalty").cloned(),
+        frequency_penalty: body.get("frequency_penalty").cloned(),
+        top_k: None,
+    }
+}
+
+pub(super) fn gemini_normalized_decoding_controls(body: &Value) -> NormalizedDecodingControls {
+    NormalizedDecodingControls {
+        stop: gemini_generation_config_field(body, "stopSequences", "stop_sequences").cloned(),
+        seed: gemini_generation_config_field(body, "seed", "seed").cloned(),
+        presence_penalty: gemini_generation_config_field(
+            body,
+            "presencePenalty",
+            "presence_penalty",
+        )
+        .cloned(),
+        frequency_penalty: gemini_generation_config_field(
+            body,
+            "frequencyPenalty",
+            "frequency_penalty",
+        )
+        .cloned(),
+        top_k: gemini_generation_config_field(body, "topK", "top_k").cloned(),
+    }
+}
+
+pub(super) fn openai_function_tool_name(value: &Value) -> Option<&str> {
+    if value.get("type").and_then(Value::as_str) != Some("function") {
+        return None;
+    }
+    value
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+}
+
+pub(super) fn openai_declared_function_tools(body: &Value) -> Vec<Value> {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| openai_function_tool_name(tool).is_some())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(super) fn openai_select_function_tools_by_name(
+    tools: &[Value],
+    selected_names: &[String],
+    selector_label: &str,
+) -> Result<Vec<Value>, String> {
+    selected_names
+        .iter()
+        .map(|selected_name| {
+            tools.iter()
+                .find(|tool| openai_function_tool_name(tool) == Some(selected_name.as_str()))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "OpenAI {selector_label} selected function `{selected_name}`, but no matching declared function tool exists."
+                    )
+                })
+        })
+        .collect()
+}
+
+pub(super) fn openai_tool_choice_allowed_tools_object(
+    choice: &serde_json::Map<String, Value>,
+) -> Option<&serde_json::Map<String, Value>> {
+    choice
+        .get("allowed_tools")
+        .and_then(Value::as_object)
+        .or_else(|| {
+            if choice.get("mode").is_some() && choice.get("tools").is_some() {
+                Some(choice)
+            } else {
+                None
+            }
+        })
+}
+
+pub(super) fn openai_legacy_allowed_tool_names(body: &Value) -> Option<Vec<String>> {
+    let allowed_tool_names = body.get("allowed_tool_names")?.as_array()?;
+    if allowed_tool_names.is_empty() {
+        return None;
+    }
+    Some(
+        allowed_tool_names
+            .iter()
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .filter(|name| !name.is_empty())
+            .collect(),
+    )
+    .filter(|names: &Vec<String>| !names.is_empty())
+}
+
+pub(super) fn openai_normalized_tool_policy(
+    body: &Value,
+) -> Result<(Option<NormalizedToolPolicy>, Option<Vec<String>>), String> {
+    let declared_tools = openai_declared_function_tools(body);
+    let legacy_allowed_tool_names = openai_legacy_allowed_tool_names(body);
+    let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) else {
+        return Ok((None, None));
+    };
+
+    if let Some(choice) = tool_choice.as_str() {
+        let tool_policy = match choice {
+            "auto" => Some(NormalizedToolPolicy::Auto),
+            "none" => Some(NormalizedToolPolicy::None),
+            "required" => Some(NormalizedToolPolicy::Required),
+            _ => None,
+        };
+        let restricted_tool_names = if choice == "required" {
+            legacy_allowed_tool_names
+        } else {
+            None
+        };
+        return Ok((tool_policy, restricted_tool_names));
+    }
+
+    let Some(tool_choice) = tool_choice.as_object() else {
+        return Ok((None, None));
+    };
+    let Some(choice_type) = tool_choice.get("type").and_then(Value::as_str) else {
+        return Ok((None, None));
+    };
+
+    match choice_type {
+        "function" => {
+            let name = tool_choice
+                .get("name")
+                .or_else(|| {
+                    tool_choice
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                })
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or(
+                    "OpenAI tool_choice.type = function requires a non-empty function name."
+                        .to_string(),
+                )?;
+            Ok((
+                Some(NormalizedToolPolicy::ForcedFunction(name.to_string())),
+                None,
+            ))
+        }
+        "allowed_tools" => {
+            let allowed_tools = openai_tool_choice_allowed_tools_object(tool_choice).ok_or(
+                "OpenAI tool_choice.type = allowed_tools requires an `allowed_tools` payload."
+                    .to_string(),
+            )?;
+            let mode = allowed_tools.get("mode").and_then(Value::as_str).ok_or(
+                "OpenAI tool_choice.allowed_tools.mode is required for allowed_tools translation."
+                    .to_string(),
+            )?;
+            let selected_tools = allowed_tools.get("tools").and_then(Value::as_array).ok_or(
+                "OpenAI tool_choice.allowed_tools.tools must be an array of selected tools."
+                    .to_string(),
+            )?;
+            if selected_tools.is_empty() {
+                return Err(
+                    "OpenAI tool_choice.allowed_tools.tools cannot be empty for cross-protocol translation."
+                        .to_string(),
+                );
+            }
+
+            let mut selected_names = Vec::with_capacity(selected_tools.len());
+            for selected_tool in selected_tools {
+                match selected_tool.get("type").and_then(Value::as_str) {
+                    Some("function") => {}
+                    Some("custom") => return Ok((None, None)),
+                    _ => {
+                        return Err(
+                            "OpenAI tool_choice.allowed_tools is only portable for function/custom tools."
+                                .to_string(),
+                        )
+                    }
+                }
+                let Some(name) = openai_function_tool_name(selected_tool) else {
+                    return Err(
+                        "OpenAI tool_choice.allowed_tools function selections require non-empty function names."
+                            .to_string(),
+                    );
+                };
+                selected_names.push(name.to_string());
+            }
+
+            openai_select_function_tools_by_name(
+                &declared_tools,
+                &selected_names,
+                "tool_choice.allowed_tools",
+            )?;
+
+            let tool_policy = match mode {
+                "auto" => NormalizedToolPolicy::Auto,
+                "required" => NormalizedToolPolicy::Required,
+                other => {
+                    return Err(format!(
+                        "OpenAI tool_choice.allowed_tools.mode `{other}` is not portable."
+                    ))
+                }
+            };
+            Ok((Some(tool_policy), Some(selected_names)))
+        }
+        _ => Ok((None, None)),
+    }
+}
+
+pub(super) fn openai_normalized_request_controls(
+    body: &Value,
+) -> Result<NormalizedRequestControls, String> {
+    let (tool_policy, restricted_tool_names) = openai_normalized_tool_policy(body)?;
+    Ok(NormalizedRequestControls {
+        tool_policy,
+        restricted_tool_names,
+        output_shape: openai_normalized_output_shape(body)?,
+        decoding: openai_normalized_decoding_controls(body),
+        logprobs: openai_normalized_logprobs_controls(body),
+        metadata: body.get("metadata").cloned(),
+        user: body.get("user").cloned(),
+        service_tier: body.get("service_tier").cloned(),
+        stream_include_obfuscation: request_stream_include_obfuscation(body),
+        verbosity: body.get("verbosity").cloned(),
+        reasoning_effort: body.get("reasoning_effort").cloned(),
+        prompt_cache_key: body.get("prompt_cache_key").cloned(),
+        prompt_cache_retention: body.get("prompt_cache_retention").cloned(),
+        safety_identifier: body.get("safety_identifier").cloned(),
+        parallel_tool_calls: body.get("parallel_tool_calls").cloned(),
+        store: body.get("store").cloned(),
+    })
+}
+
+pub(super) fn responses_normalized_request_controls(
+    body: &Value,
+) -> Result<NormalizedRequestControls, String> {
+    Ok(NormalizedRequestControls {
+        output_shape: responses_normalized_output_shape(body)?,
+        logprobs: responses_normalized_logprobs_controls(body),
+        metadata: body.get("metadata").cloned(),
+        user: body.get("user").cloned(),
+        service_tier: body.get("service_tier").cloned(),
+        stream_include_obfuscation: request_stream_include_obfuscation(body),
+        verbosity: responses_text_verbosity(body),
+        reasoning_effort: responses_reasoning_effort(body),
+        prompt_cache_key: body.get("prompt_cache_key").cloned(),
+        prompt_cache_retention: body.get("prompt_cache_retention").cloned(),
+        safety_identifier: body.get("safety_identifier").cloned(),
+        parallel_tool_calls: body.get("parallel_tool_calls").cloned(),
+        store: body.get("store").cloned(),
+        ..NormalizedRequestControls::default()
+    })
+}
+
+pub(super) fn normalized_output_shape_to_openai_response_format(
+    shape: &NormalizedOutputShape,
+) -> Value {
+    match shape {
+        NormalizedOutputShape::Text => serde_json::json!({ "type": "text" }),
+        NormalizedOutputShape::JsonObject => serde_json::json!({ "type": "json_object" }),
+        NormalizedOutputShape::JsonSchema(schema) => {
+            let mut json_schema = serde_json::Map::new();
+            json_schema.insert("name".to_string(), Value::String(schema.name.clone()));
+            json_schema.insert("schema".to_string(), schema.schema.clone());
+            if let Some(description) = &schema.description {
+                json_schema.insert(
+                    "description".to_string(),
+                    Value::String(description.clone()),
+                );
+            }
+            if let Some(strict) = schema.strict {
+                json_schema.insert("strict".to_string(), Value::Bool(strict));
+            }
+            let mut response_format = serde_json::Map::new();
+            response_format.insert("type".to_string(), Value::String("json_schema".to_string()));
+            response_format.insert("json_schema".to_string(), Value::Object(json_schema));
+            Value::Object(response_format)
+        }
+    }
+}
+
+pub(super) fn normalized_output_shape_to_responses_text_format(
+    shape: &NormalizedOutputShape,
+) -> Value {
+    match shape {
+        NormalizedOutputShape::Text => serde_json::json!({ "type": "text" }),
+        NormalizedOutputShape::JsonObject => serde_json::json!({ "type": "json_object" }),
+        NormalizedOutputShape::JsonSchema(schema) => {
+            let mut text_format = serde_json::Map::new();
+            text_format.insert("type".to_string(), Value::String("json_schema".to_string()));
+            text_format.insert("name".to_string(), Value::String(schema.name.clone()));
+            text_format.insert("schema".to_string(), schema.schema.clone());
+            if let Some(description) = &schema.description {
+                text_format.insert(
+                    "description".to_string(),
+                    Value::String(description.clone()),
+                );
+            }
+            if let Some(strict) = schema.strict {
+                text_format.insert("strict".to_string(), Value::Bool(strict));
+            }
+            Value::Object(text_format)
+        }
+    }
+}
+
+pub(super) fn normalized_output_shape_to_gemini_generation_config(
+    shape: &NormalizedOutputShape,
+) -> Value {
+    match shape {
+        NormalizedOutputShape::Text => {
+            serde_json::json!({ "responseMimeType": "text/plain" })
+        }
+        NormalizedOutputShape::JsonObject => {
+            serde_json::json!({ "responseMimeType": "application/json" })
+        }
+        NormalizedOutputShape::JsonSchema(schema) => serde_json::json!({
+            "responseMimeType": "application/json",
+            "responseJsonSchema": schema.schema.clone()
+        }),
+    }
+}
+
+pub(super) fn normalized_output_shape_to_claude_output_config(
+    shape: &NormalizedOutputShape,
+) -> Result<Option<Value>, String> {
+    match shape {
+        NormalizedOutputShape::Text => Ok(None),
+        NormalizedOutputShape::JsonSchema(schema) => Ok(Some(serde_json::json!({
+            "format": {
+                "type": "json_schema",
+                "schema": schema.schema.clone()
+            }
+        }))),
+        NormalizedOutputShape::JsonObject => Err(
+            "OpenAI/Responses `json_object` structured output cannot be faithfully translated to Anthropic structured outputs"
+                .to_string(),
+        ),
+    }
+}
+
+pub(super) fn openai_stop_to_gemini_stop_sequences(stop: &Value) -> Value {
+    if stop.is_array() {
+        stop.clone()
+    } else {
+        Value::Array(vec![stop.clone()])
+    }
+}
+
+pub(super) fn openai_portable_function_tools(
+    body: &Value,
+    restricted_tool_names: Option<&[String]>,
+    selector_label: &str,
+) -> Result<Vec<Value>, String> {
+    let declared_tools = openai_declared_function_tools(body);
+    if let Some(selected_names) = restricted_tool_names {
+        openai_select_function_tools_by_name(&declared_tools, selected_names, selector_label)
+    } else {
+        Ok(declared_tools)
+    }
+}
+
+pub(super) fn gemini_tool_function_declarations(tool: &Value) -> Option<&Vec<Value>> {
+    gemini_request_array_field(tool, "functionDeclarations", "function_declarations")
+}
+
+enum GeminiFunctionSchemaSource<'a> {
+    Parameters(&'a Value),
+    ParametersJsonSchema(&'a Value),
+}
+
+impl<'a> GeminiFunctionSchemaSource<'a> {
+    fn value(&self) -> &'a Value {
+        match self {
+            Self::Parameters(schema) | Self::ParametersJsonSchema(schema) => schema,
+        }
+    }
+}
+
+pub(super) fn gemini_function_declaration_name(declaration: &Value) -> &str {
+    declaration
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("<unnamed>")
+}
+
+fn gemini_function_declaration_schema_source<'a>(
+    declaration: &'a Value,
+) -> Result<Option<GeminiFunctionSchemaSource<'a>>, String> {
+    let parameters = declaration
+        .get("parameters")
+        .filter(|value| !value.is_null());
+    let parameters_json_schema = gemini_request_field(
+        declaration,
+        "parametersJsonSchema",
+        "parameters_json_schema",
+    )
+    .filter(|value| !value.is_null());
+
+    match (parameters, parameters_json_schema) {
+        (Some(_), Some(_)) => Err(format!(
+            "Gemini FunctionDeclaration `{}` cannot specify both `parameters` and `parametersJsonSchema`; they are mutually exclusive.",
+            gemini_function_declaration_name(declaration)
+        )),
+        (Some(schema), None) => Ok(Some(GeminiFunctionSchemaSource::Parameters(schema))),
+        (None, Some(schema)) => Ok(Some(GeminiFunctionSchemaSource::ParametersJsonSchema(
+            schema,
+        ))),
+        (None, None) => Ok(None),
+    }
+}
+
+pub(super) fn gemini_openai_function_tool_from_declaration(
+    declaration: &Value,
+) -> Result<Value, String> {
+    if let Some((field_name, _)) = gemini_function_declaration_output_schema_field(declaration) {
+        return Err(gemini_function_output_schema_not_portable_message(
+            declaration,
+            field_name,
+            "non-Gemini targets",
+        ));
+    }
+
+    let mut function = serde_json::Map::new();
+    function.insert(
+        "name".to_string(),
+        declaration.get("name").cloned().unwrap_or(Value::Null),
+    );
+    function.insert(
+        "description".to_string(),
+        declaration
+            .get("description")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("")),
+    );
+    if let Some(schema_source) = gemini_function_declaration_schema_source(declaration)? {
+        function.insert("parameters".to_string(), schema_source.value().clone());
+    }
+
+    Ok(serde_json::json!({
+        "type": "function",
+        "function": Value::Object(function)
+    }))
+}
+
+pub(super) fn gemini_openai_function_tools_from_request(
+    body: &Value,
+) -> Result<Vec<Value>, String> {
+    let mut tools = Vec::new();
+    if let Some(request_tools) = gemini_request_tools(body) {
+        for tool in request_tools {
+            if let Some(declarations) = gemini_tool_function_declarations(tool) {
+                for declaration in declarations {
+                    tools.push(gemini_openai_function_tool_from_declaration(declaration)?);
+                }
+            }
+        }
+    }
+    Ok(tools)
+}
+
+pub(super) fn gemini_openai_function_tool_name(tool: &Value) -> Option<&str> {
+    tool.get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+}
+
+pub(super) fn gemini_select_openai_tools_by_name(
+    tools: &[Value],
+    allowed_names: &[String],
+) -> Result<Vec<Value>, String> {
+    allowed_names
+        .iter()
+        .map(|allowed_name| {
+            tools.iter()
+                .find(|tool| gemini_openai_function_tool_name(tool) == Some(allowed_name.as_str()))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "Gemini functionCallingConfig.allowedFunctionNames entry `{allowed_name}` has no matching function declaration."
+                    )
+                })
+        })
+        .collect()
+}
+
+pub(super) fn gemini_validated_allowed_function_names(
+    function_calling_config: &serde_json::Map<String, Value>,
+    openai_tools: &[Value],
+) -> Result<Option<Vec<String>>, String> {
+    let Some(allowed_function_names) = function_calling_config
+        .get("allowedFunctionNames")
+        .or_else(|| function_calling_config.get("allowed_function_names"))
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+
+    let Some(allowed_function_names) = allowed_function_names.as_array() else {
+        return Err(
+            "Gemini functionCallingConfig.allowedFunctionNames must be an array of non-empty strings."
+                .to_string(),
+        );
+    };
+
+    if allowed_function_names.is_empty() {
+        return Err(
+            "Gemini functionCallingConfig.allowedFunctionNames cannot be empty.".to_string(),
+        );
+    }
+
+    let mut validated_names = Vec::with_capacity(allowed_function_names.len());
+    for name in allowed_function_names {
+        let Some(name) = name.as_str() else {
+            return Err(
+                "Gemini functionCallingConfig.allowedFunctionNames must contain only non-empty strings."
+                    .to_string(),
+            );
+        };
+        if name.trim().is_empty() {
+            return Err(
+                "Gemini functionCallingConfig.allowedFunctionNames must contain only non-empty strings."
+                    .to_string(),
+            );
+        }
+        validated_names.push(name.to_string());
+    }
+
+    gemini_select_openai_tools_by_name(openai_tools, &validated_names)?;
+    Ok(Some(validated_names))
+}
+
+pub(super) fn gemini_normalized_request_controls(
+    body: &Value,
+    openai_tools: &[Value],
+) -> Result<NormalizedRequestControls, String> {
+    let mut controls = NormalizedRequestControls {
+        output_shape: gemini_normalized_output_shape(body)?,
+        decoding: gemini_normalized_decoding_controls(body),
+        logprobs: gemini_normalized_logprobs_controls(body),
+        store: body.get("store").cloned(),
+        ..NormalizedRequestControls::default()
+    };
+
+    let Some(tool_config) = gemini_request_tool_config(body) else {
+        return Ok(controls);
+    };
+    let Some(function_calling_config) =
+        gemini_request_function_calling_config_from_object(tool_config)
+    else {
+        return Ok(controls);
+    };
+
+    let mode = function_calling_config.get("mode").and_then(Value::as_str);
+    let allowed_names =
+        gemini_validated_allowed_function_names(function_calling_config, openai_tools)?;
+
+    if allowed_names.is_some() && mode != Some("ANY") {
+        return Err(
+            "Gemini functionCallingConfig.allowedFunctionNames is only portable with mode ANY."
+                .to_string(),
+        );
+    }
+
+    controls.tool_policy = match mode {
+        Some("NONE") => Some(NormalizedToolPolicy::None),
+        Some("AUTO") => Some(NormalizedToolPolicy::Auto),
+        Some("ANY") => {
+            if let Some(allowed_names) = allowed_names.as_ref() {
+                if allowed_names.len() == 1 {
+                    Some(NormalizedToolPolicy::ForcedFunction(
+                        allowed_names[0].clone(),
+                    ))
+                } else {
+                    Some(NormalizedToolPolicy::Required)
+                }
+            } else {
+                Some(NormalizedToolPolicy::Required)
+            }
+        }
+        Some("VALIDATED") => {
+            return Err(
+                "Gemini functionCallingConfig.mode = VALIDATED cannot be faithfully translated to non-Gemini targets"
+                    .to_string(),
+            )
+        }
+        Some(other) => {
+            return Err(format!(
+                "Gemini functionCallingConfig.mode = {other} cannot be faithfully translated to non-Gemini targets"
+            ))
+        }
+        None => None,
+    };
+    controls.restricted_tool_names = allowed_names;
+    Ok(controls)
+}
+
+pub(super) fn normalized_tool_policy_to_openai_tool_choice(
+    tool_policy: &NormalizedToolPolicy,
+) -> Value {
+    match tool_policy {
+        NormalizedToolPolicy::Auto => serde_json::json!("auto"),
+        NormalizedToolPolicy::None => serde_json::json!("none"),
+        NormalizedToolPolicy::Required => serde_json::json!("required"),
+        NormalizedToolPolicy::ForcedFunction(name) => serde_json::json!({
+            "type": "function",
+            "function": { "name": name }
+        }),
+    }
+}
+
+pub(super) fn gemini_to_openai(body: &mut Value) -> Result<(), String> {
+    let mut result = serde_json::json!({
+        "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
+        "messages": [],
+        "stream": body.get("stream").cloned().unwrap_or(serde_json::json!(false))
+    });
+    if let Some(gc) = gemini_request_generation_config(body) {
+        if let Some(n) = gemini_request_field(gc, "maxOutputTokens", "max_output_tokens") {
+            result["max_tokens"] = n.clone();
+        }
+        if let Some(t) = gemini_request_field(gc, "temperature", "temperature") {
+            result["temperature"] = t.clone();
+        }
+        if let Some(p) = gemini_request_field(gc, "topP", "top_p") {
+            result["top_p"] = p.clone();
+        }
+    }
+    if let Some(si) = gemini_request_system_instruction(body) {
+        let text = extract_gemini_text(si);
+        if !text.is_empty() {
+            result["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({ "role": "system", "content": text }));
+        }
+    }
+    if let Some(contents) = body.get("contents").and_then(Value::as_array) {
+        for content in contents {
+            for msg in convert_gemini_content_to_openai(content)? {
+                result["messages"].as_array_mut().unwrap().push(msg);
+            }
+        }
+    }
+    let out = gemini_openai_function_tools_from_request(body)?;
+    if !out.is_empty() {
+        result["tools"] = Value::Array(out);
+    }
+    let openai_tools = result["tools"].as_array().cloned().unwrap_or_default();
+    let controls = gemini_normalized_request_controls(body, &openai_tools)?;
+    if let Some(tool_policy) = controls.tool_policy.as_ref() {
+        result["tool_choice"] = normalized_tool_policy_to_openai_tool_choice(tool_policy);
+    }
+    if let Some(allowed_names) = controls.restricted_tool_names.as_ref() {
+        result["tools"] = Value::Array(gemini_select_openai_tools_by_name(
+            &openai_tools,
+            allowed_names,
+        )?);
+    }
+    if let Some(output_shape) = controls.output_shape.as_ref() {
+        result["response_format"] = normalized_output_shape_to_openai_response_format(output_shape);
+    }
+    if let Some(logprobs) = controls.logprobs.as_ref() {
+        if logprobs.enabled || logprobs.top_logprobs.is_some() {
+            result["logprobs"] = Value::Bool(true);
+        }
+        if let Some(top_logprobs) = logprobs.top_logprobs.as_ref() {
+            result["top_logprobs"] = top_logprobs.clone();
+        }
+    }
+    let decoding = controls.decoding;
+    if let Some(stop) = decoding.stop {
+        result["stop"] = stop;
+    }
+    if let Some(seed) = decoding.seed {
+        result["seed"] = seed;
+    }
+    if let Some(presence_penalty) = decoding.presence_penalty {
+        result["presence_penalty"] = presence_penalty;
+    }
+    if let Some(frequency_penalty) = decoding.frequency_penalty {
+        result["frequency_penalty"] = frequency_penalty;
+    }
+    if result
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.is_empty())
+    {
+        if let Some(obj) = result.as_object_mut() {
+            obj.remove("tools");
+        }
+    }
+    *body = result;
+    Ok(())
+}
+
+pub(super) fn gemini_part_field<'a>(
+    part: &'a Value,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a Value> {
+    part.get(camel).or_else(|| part.get(snake))
+}
+
+pub(super) fn gemini_nested_field<'a>(
+    value: &'a Value,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a Value> {
+    value.get(camel).or_else(|| value.get(snake))
+}
+
+pub(super) fn gemini_part_kind_label(part: &Value) -> String {
+    if part.get("text").is_some() {
+        return "text".to_string();
+    }
+    for (camel, snake, label) in [
+        ("inlineData", "inline_data", "inlineData"),
+        ("fileData", "file_data", "fileData"),
+        ("functionCall", "function_call", "functionCall"),
+        ("functionResponse", "function_response", "functionResponse"),
+    ] {
+        if part.get(camel).is_some() || part.get(snake).is_some() {
+            return label.to_string();
+        }
+    }
+    if part.get("thought").is_some() {
+        return "thought".to_string();
+    }
+    part.as_object()
+        .and_then(|obj| obj.keys().next().cloned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+pub(super) fn normalize_audio_format_from_mime(mime: &str) -> String {
+    let subtype = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .split('/')
+        .nth(1)
+        .unwrap_or("wav")
+        .trim()
+        .to_ascii_lowercase();
+    match subtype.as_str() {
+        "x-wav" => "wav".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub(super) fn openai_audio_mime_type(format: &str) -> String {
+    let normalized = format.trim().to_ascii_lowercase();
+    if normalized.contains('/') {
+        return normalized;
+    }
+    match normalized.as_str() {
+        "" => "audio/wav".to_string(),
+        "x-wav" => "audio/wav".to_string(),
+        other => format!("audio/{other}"),
+    }
+}
+
+pub(super) fn base64_data_uri_parts(value: &str) -> Option<(&str, &str)> {
+    value
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,"))
+}
+
+pub(super) enum OpenAiFileDataReference<'a> {
+    InlineData { mime_type: String, data: &'a str },
+    FileUri(&'a str),
+}
+
+pub(super) fn looks_like_uri_reference(value: &str) -> bool {
+    let Some((scheme, _)) = value.split_once("://") else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+pub(super) fn looks_like_base64_payload(value: &str) -> bool {
+    let compact = value.trim();
+    !compact.is_empty()
+        && compact
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '\r' | '\n'))
+}
+
+pub(super) fn mime_type_from_filename(filename: &str) -> Option<&'static str> {
+    let extension = filename.rsplit('.').next()?.trim().to_ascii_lowercase();
+    match extension.as_str() {
+        "pdf" => Some("application/pdf"),
+        "json" => Some("application/json"),
+        "txt" => Some("text/plain"),
+        "csv" => Some("text/csv"),
+        "md" => Some("text/markdown"),
+        "html" | "htm" => Some("text/html"),
+        "xml" => Some("application/xml"),
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "wav" => Some("audio/wav"),
+        "mp3" => Some("audio/mpeg"),
+        _ => None,
+    }
+}
+
+pub(super) fn openai_file_data_reference<'a>(
+    file_data: &'a str,
+    filename: Option<&str>,
+) -> Result<OpenAiFileDataReference<'a>, String> {
+    if let Some((mime_type, data)) = base64_data_uri_parts(file_data) {
+        return Ok(OpenAiFileDataReference::InlineData {
+            mime_type: mime_type.to_string(),
+            data,
+        });
+    }
+    if looks_like_uri_reference(file_data) {
+        return Ok(OpenAiFileDataReference::FileUri(file_data));
+    }
+    if looks_like_base64_payload(file_data) {
+        let Some(mime_type) = filename.and_then(mime_type_from_filename) else {
+            return Err(
+                "OpenAI file_data payloads need MIME or filename provenance to translate to Gemini; use a MIME-bearing data URI or include a filename with a known extension."
+                    .to_string(),
+            );
+        };
+        return Ok(OpenAiFileDataReference::InlineData {
+            mime_type: mime_type.to_string(),
+            data: file_data,
+        });
+    }
+    Err(
+        "OpenAI file_data must be a MIME-bearing data URI, a recognized fileUri-style reference, or a base64 payload with filename provenance to translate to Gemini."
+            .to_string(),
+    )
+}
+
+pub(super) fn openai_file_part_from_gemini_inline_data(mime: &str, data: &str) -> Value {
+    serde_json::json!({
+        "type": "file",
+        "file": {
+            "file_data": format!("data:{mime};base64,{data}")
+        }
+    })
+}
+
+pub(super) fn gemini_file_data_to_openai_part(file_data: &Value) -> Value {
+    let file_uri = file_data
+        .get("fileUri")
+        .or_else(|| file_data.get("file_uri"))
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let mut file = serde_json::Map::new();
+    file.insert("file_data".to_string(), file_uri);
+    if let Some(filename) = file_data
+        .get("displayName")
+        .or_else(|| file_data.get("display_name"))
+        .cloned()
+    {
+        file.insert("filename".to_string(), filename);
+    }
+    serde_json::json!({
+        "type": "file",
+        "file": Value::Object(file)
+    })
+}
+
+pub(super) fn convert_gemini_content_to_openai(content: &Value) -> Result<Vec<Value>, String> {
+    let role = content
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user");
+    let openai_role = if role == "user" { "user" } else { "assistant" };
+    let Some(parts) = content.get("parts").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut messages = Vec::new();
+    let mut openai_parts: Vec<Value> = vec![];
+    let mut tool_calls: Vec<Value> = vec![];
+    let mut reasoning_content = String::new();
+    for part in parts {
+        let mut recognized = false;
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            if role != "user" {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    reasoning_content.push_str(text);
+                }
+            }
+            continue;
+        }
+        if part.get("text").is_some() {
+            recognized = true;
+            openai_parts.push(serde_json::json!({ "type": "text", "text": part.get("text") }));
+        }
+        if let Some(inline) = gemini_part_field(part, "inlineData", "inline_data") {
+            recognized = true;
+            let mime = inline
+                .get("mimeType")
+                .or_else(|| inline.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            let data = inline.get("data").and_then(Value::as_str).unwrap_or("");
+            if mime.starts_with("image/") {
+                openai_parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", mime, data) }
+                }));
+            } else if mime.starts_with("audio/") {
+                openai_parts.push(serde_json::json!({
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": data,
+                        "format": normalize_audio_format_from_mime(mime)
+                    }
+                }));
+            } else {
+                openai_parts.push(openai_file_part_from_gemini_inline_data(mime, data));
+            }
+        }
+        if let Some(file_data) = gemini_part_field(part, "fileData", "file_data") {
+            recognized = true;
+            openai_parts.push(gemini_file_data_to_openai_part(file_data));
+        }
+        if let Some(fc) = gemini_part_field(part, "functionCall", "function_call") {
+            recognized = true;
+            let id = fc
+                .get("id")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(format!("call_{}", uuid_simple())));
+            tool_calls.push(serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": fc.get("name"),
+                    "arguments": fc.get("args").map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".into())).unwrap_or_else(|| "{}".to_string())
+                }
+            }));
+        }
+        if let Some(fr) = gemini_part_field(part, "functionResponse", "function_response") {
+            if gemini_function_response_has_nonportable_parts(fr) {
+                return Err(gemini_function_response_parts_not_portable_message(
+                    "OpenAI Chat Completions",
+                ));
+            }
+            if !openai_parts.is_empty() {
+                messages.push(serde_json::json!({
+                    "role": openai_role,
+                    "content": collapse_gemini_parts_for_openai(&openai_parts)
+                }));
+                openai_parts.clear();
+            }
+            let call_id = fr.get("id").or(fr.get("name")).cloned();
+            let resp = gemini_nested_field(fr, "response", "response");
+            let content_str = resp
+                .and_then(|r| r.get("result").cloned())
+                .or_else(|| resp.cloned())
+                .map(|v| serde_json::to_string(&v).unwrap_or_default())
+                .unwrap_or_default();
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content_str
+            }));
+            continue;
+        }
+        if !recognized {
+            return Err(format!(
+                "Gemini content part `{}` cannot be faithfully translated to OpenAI Chat Completions.",
+                gemini_part_kind_label(part)
+            ));
+        }
+    }
+    if !tool_calls.is_empty() {
+        let mut m = serde_json::json!({ "role": "assistant", "tool_calls": tool_calls });
+        if !openai_parts.is_empty() {
+            m["content"] = collapse_gemini_parts_for_openai(&openai_parts);
+        }
+        if !reasoning_content.is_empty() {
+            m["reasoning_content"] = Value::String(reasoning_content);
+        }
+        messages.push(m);
+        return Ok(messages);
+    }
+    if openai_parts.is_empty() {
+        if !reasoning_content.is_empty() {
+            messages.push(serde_json::json!({
+                "role": openai_role,
+                "content": "",
+                "reasoning_content": reasoning_content
+            }));
+        }
+        return Ok(messages);
+    }
+    let mut message = serde_json::json!({
+        "role": openai_role,
+        "content": collapse_gemini_parts_for_openai(&openai_parts)
+    });
+    if !reasoning_content.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning_content);
+    }
+    messages.push(message);
+    Ok(messages)
+}
+
+pub(super) fn uuid_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{t:x}")
+}
+
+pub(super) fn normalized_tool_policy_to_gemini_function_calling_config(
+    tool_policy: &NormalizedToolPolicy,
+) -> Value {
+    match tool_policy {
+        NormalizedToolPolicy::Auto => serde_json::json!({ "mode": "AUTO" }),
+        NormalizedToolPolicy::None => serde_json::json!({ "mode": "NONE" }),
+        NormalizedToolPolicy::Required => serde_json::json!({ "mode": "ANY" }),
+        NormalizedToolPolicy::ForcedFunction(name) => serde_json::json!({
+            "mode": "ANY",
+            "allowedFunctionNames": [name]
+        }),
+    }
+}
+
+pub(super) fn flush_pending_gemini_function_responses(
+    contents: &mut Vec<Value>,
+    pending_tool_parts: &mut Vec<(usize, Value)>,
+) {
+    if pending_tool_parts.is_empty() {
+        return;
+    }
+
+    pending_tool_parts.sort_by_key(|(sort_key, _)| *sort_key);
+    let parts = pending_tool_parts
+        .drain(..)
+        .map(|(_, part)| part)
+        .collect::<Vec<_>>();
+    contents.push(serde_json::json!({ "role": "user", "parts": parts }));
+}
+
+pub(super) fn openai_content_part_to_gemini_part(part: &Value) -> Result<Option<Value>, String> {
+    let Some(part_type) = part.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    match part_type {
+        "text" => Ok(part
+            .get("text")
+            .cloned()
+            .map(|text| serde_json::json!({ "text": text }))),
+        "image_url" => {
+            let url = part
+                .get("image_url")
+                .and_then(|image| image.get("url"))
+                .and_then(Value::as_str)
+                .or_else(|| part.get("image_url").and_then(Value::as_str))
+                .unwrap_or("");
+            let Some((mime, data)) = base64_data_uri_parts(url) else {
+                return Err(
+                    "OpenAI image_url parts require base64 data URIs to translate to Gemini; remote image URLs need explicit upload or fileUri provenance."
+                        .to_string(),
+                );
+            };
+            Ok(Some(serde_json::json!({
+                "inlineData": { "mimeType": mime, "data": data }
+            })))
+        }
+        "input_audio" => {
+            let input_audio = part.get("input_audio").unwrap_or(&Value::Null);
+            let data = input_audio
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if data.is_empty() {
+                return Err(
+                    "OpenAI input_audio parts require inline base64 audio data to translate to Gemini."
+                        .to_string(),
+                );
+            }
+            let format = input_audio
+                .get("format")
+                .and_then(Value::as_str)
+                .unwrap_or("wav");
+            Ok(Some(serde_json::json!({
+                "inlineData": {
+                    "mimeType": openai_audio_mime_type(format),
+                    "data": data
+                }
+            })))
+        }
+        "file" => {
+            let file = part
+                .get("file")
+                .and_then(Value::as_object)
+                .ok_or("OpenAI file parts require a file object to translate to Gemini.")?;
+            if let Some(file_data) = file.get("file_data").and_then(Value::as_str) {
+                return match openai_file_data_reference(
+                    file_data,
+                    file.get("filename").and_then(Value::as_str),
+                )? {
+                    OpenAiFileDataReference::InlineData { mime_type, data } => {
+                        Ok(Some(serde_json::json!({
+                            "inlineData": { "mimeType": mime_type, "data": data }
+                        })))
+                    }
+                    OpenAiFileDataReference::FileUri(file_uri) => {
+                        let mut file_data_part = serde_json::json!({
+                            "fileData": { "fileUri": file_uri }
+                        });
+                        if let Some(filename) = file.get("filename").cloned() {
+                            file_data_part["fileData"]["displayName"] = filename;
+                        }
+                        Ok(Some(file_data_part))
+                    }
+                };
+            }
+            if let Some(file_id) = file.get("file_id").and_then(Value::as_str) {
+                return Err(format!(
+                    "OpenAI file references like `{file_id}` cannot be faithfully translated to Gemini without file_data or fileUri provenance."
+                ));
+            }
+            Err("OpenAI file parts require file_data to translate to Gemini.".to_string())
+        }
+        other => Err(format!(
+            "OpenAI content part `{other}` cannot be faithfully translated to Gemini."
+        )),
+    }
+}
+
+pub(super) fn gemini_display_name_extension_for_mime_type(mime_type: &str) -> String {
+    match mime_type
+        .split(';')
+        .next()
+        .unwrap_or(mime_type)
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => "png".to_string(),
+        "image/jpeg" => "jpg".to_string(),
+        "image/webp" => "webp".to_string(),
+        "image/gif" => "gif".to_string(),
+        "audio/wav" | "audio/x-wav" => "wav".to_string(),
+        "audio/mpeg" => "mp3".to_string(),
+        "audio/mp4" => "m4a".to_string(),
+        "audio/ogg" => "ogg".to_string(),
+        "application/pdf" => "pdf".to_string(),
+        "application/json" => "json".to_string(),
+        "text/plain" => "txt".to_string(),
+        other => other.rsplit('/').next().unwrap_or("bin").to_string(),
+    }
+}
+
+pub(super) fn gemini_tool_result_display_name(
+    call_id: Option<&str>,
+    media_index: usize,
+    mime_type: &str,
+) -> String {
+    let stem = call_id
+        .filter(|value| !value.is_empty())
+        .unwrap_or("tool_result");
+    let extension = gemini_display_name_extension_for_mime_type(mime_type);
+    format!("{stem}_part_{media_index}.{extension}")
+}
+
+pub(super) fn gemini_function_response_parts_supported_for_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().contains("gemini-3")
+}
+
+pub(super) fn gemini_function_response_parts_supported_mime_type(mime_type: &str) -> bool {
+    matches!(
+        mime_type
+            .split(';')
+            .next()
+            .unwrap_or(mime_type)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/png" | "image/jpeg" | "image/webp" | "application/pdf" | "text/plain"
+    )
+}
+
+pub(super) fn ensure_gemini_function_response_part_supported(
+    target_model: &str,
+    mime_type: &str,
+) -> Result<(), String> {
+    if !gemini_function_response_parts_supported_for_model(target_model) {
+        return Err(format!(
+            "Gemini functionResponse.parts with inline media are only documented for Gemini 3 series models; target model `{target_model}` cannot be faithfully translated."
+        ));
+    }
+    if !gemini_function_response_parts_supported_mime_type(mime_type) {
+        return Err(format!(
+            "Gemini functionResponse.parts MIME `{mime_type}` is not documented as supported; only image/png, image/jpeg, image/webp, application/pdf, and text/plain are allowed."
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn gemini_tool_result_inline_part(
+    display_name: &str,
+    mime_type: &str,
+    data: &str,
+) -> Value {
+    serde_json::json!({
+        "inlineData": {
+            "displayName": display_name,
+            "mimeType": mime_type,
+            "data": data
+        }
+    })
+}
+
+pub(super) fn gemini_tool_result_media_response_item(
+    kind: &str,
+    display_name: &str,
+    mime_type: &str,
+    filename: Option<&str>,
+) -> Value {
+    let mut item = serde_json::json!({
+        "type": kind,
+        "mimeType": mime_type,
+    });
+    item[kind] = serde_json::json!({ "$ref": display_name });
+    if let Some(filename) = filename {
+        item["filename"] = Value::String(filename.to_string());
+    }
+    item
+}
+
+pub(super) fn gemini_tool_result_parse_image_data_uri(
+    url: &str,
+    part_type: &str,
+) -> Result<(String, String), String> {
+    let Some((mime_type, data)) = base64_data_uri_parts(url) else {
+        return Err(format!(
+            "Gemini tool result `{part_type}` parts require inline base64 data URIs; remote references cannot be faithfully translated to Gemini tool result parts."
+        ));
+    };
+    Ok((mime_type.to_string(), data.to_string()))
+}
+
+pub(super) fn gemini_tool_result_block_kind(block: &Value) -> Option<&str> {
+    block.get("type").and_then(Value::as_str)
+}
+
+pub(super) fn gemini_tool_result_array_media_status(blocks: &[Value]) -> Result<bool, String> {
+    let mut saw_media = false;
+    let mut saw_typed = false;
+    let mut saw_untyped = false;
+    for block in blocks {
+        let Some(kind) = gemini_tool_result_block_kind(block) else {
+            saw_untyped = true;
+            continue;
+        };
+        saw_typed = true;
+        match kind {
+            "text" | "input_text" | "output_text" | "json" => {}
+            "image_url" | "input_image" | "input_audio" | "file" | "image" => {
+                saw_media = true;
+            }
+            other => {
+                return Err(format!(
+                    "OpenAI/Responses/Anthropic tool result block `{other}` cannot be faithfully translated to Gemini."
+                ));
+            }
+        }
+    }
+    if saw_typed && saw_untyped {
+        return Err(
+            "OpenAI/Responses/Anthropic tool result arrays cannot mix typed blocks with untyped JSON values when translating to Gemini."
+                .to_string(),
+        );
+    }
+    Ok(saw_media)
+}
+
+pub(super) fn gemini_tool_result_block_to_response_and_part(
+    block: &Value,
+    call_id: Option<&str>,
+    media_index: usize,
+    target_model: &str,
+) -> Result<(Value, Option<Value>), String> {
+    let kind = gemini_tool_result_block_kind(block)
+        .ok_or("tool result typed blocks require a `type` field to translate to Gemini")?;
+    match kind {
+        "text" => Ok((
+            serde_json::json!({
+                "type": "text",
+                "text": block.get("text").cloned().unwrap_or(Value::String(String::new()))
+            }),
+            None,
+        )),
+        "input_text" | "output_text" => Ok((
+            serde_json::json!({
+                "type": "text",
+                "text": block.get("text").cloned().unwrap_or(Value::String(String::new()))
+            }),
+            None,
+        )),
+        "json" => Ok((
+            serde_json::json!({
+                "type": "json",
+                "json": block.get("json").cloned().unwrap_or(Value::Null)
+            }),
+            None,
+        )),
+        "image_url" | "input_image" => {
+            let url = block
+                .get("image_url")
+                .and_then(|image| image.get("url"))
+                .and_then(Value::as_str)
+                .or_else(|| block.get("image_url").and_then(Value::as_str))
+                .unwrap_or("");
+            let (mime_type, data) = gemini_tool_result_parse_image_data_uri(url, kind)?;
+            ensure_gemini_function_response_part_supported(target_model, &mime_type)?;
+            let display_name = gemini_tool_result_display_name(call_id, media_index, &mime_type);
+            Ok((
+                gemini_tool_result_media_response_item(
+                    "image",
+                    &display_name,
+                    &mime_type,
+                    None,
+                ),
+                Some(gemini_tool_result_inline_part(
+                    &display_name,
+                    &mime_type,
+                    &data,
+                )),
+            ))
+        }
+        "input_audio" => {
+            let input_audio = block.get("input_audio").unwrap_or(&Value::Null);
+            let data = input_audio
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if data.is_empty() {
+                return Err(
+                    "Gemini tool result `input_audio` parts require inline base64 data to translate to Gemini."
+                        .to_string(),
+                );
+            }
+            let mime_type = openai_audio_mime_type(
+                input_audio
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .unwrap_or("wav"),
+            );
+            ensure_gemini_function_response_part_supported(target_model, &mime_type)?;
+            let display_name = gemini_tool_result_display_name(call_id, media_index, &mime_type);
+            Ok((
+                gemini_tool_result_media_response_item(
+                    "audio",
+                    &display_name,
+                    &mime_type,
+                    None,
+                ),
+                Some(gemini_tool_result_inline_part(
+                    &display_name,
+                    &mime_type,
+                    data,
+                )),
+            ))
+        }
+        "file" => {
+            let file = block
+                .get("file")
+                .and_then(Value::as_object)
+                .ok_or("Gemini tool result `file` blocks require a file object.")?;
+            if let Some(file_id) = file.get("file_id").and_then(Value::as_str) {
+                return Err(format!(
+                    "Gemini tool result file_id `{file_id}` cannot be faithfully translated to Gemini without inline file bytes."
+                ));
+            }
+            let filename = file.get("filename").and_then(Value::as_str);
+            let Some(file_data) = file.get("file_data").and_then(Value::as_str) else {
+                return Err(
+                    "Gemini tool result `file` blocks require inline file_data to translate to Gemini."
+                        .to_string(),
+                );
+            };
+            let (mime_type, data) = match openai_file_data_reference(file_data, filename)? {
+                OpenAiFileDataReference::InlineData { mime_type, data } => {
+                    (mime_type, data.to_string())
+                }
+                OpenAiFileDataReference::FileUri(file_uri) => {
+                    return Err(format!(
+                        "Gemini tool result file reference `{file_uri}` cannot be faithfully translated without inline file bytes."
+                    ));
+                }
+            };
+            ensure_gemini_function_response_part_supported(target_model, &mime_type)?;
+            let display_name = gemini_tool_result_display_name(call_id, media_index, &mime_type);
+            Ok((
+                gemini_tool_result_media_response_item(
+                    "file",
+                    &display_name,
+                    &mime_type,
+                    filename,
+                ),
+                Some(gemini_tool_result_inline_part(
+                    &display_name,
+                    &mime_type,
+                    &data,
+                )),
+            ))
+        }
+        "image" => {
+            let source = block.get("source").unwrap_or(&Value::Null);
+            if source.get("type").and_then(Value::as_str) != Some("base64") {
+                return Err(
+                    "Gemini tool result `image` blocks require inline base64 image data to translate to Gemini."
+                        .to_string(),
+                );
+            }
+            let mime_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png")
+                .to_string();
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            ensure_gemini_function_response_part_supported(target_model, &mime_type)?;
+            let display_name = gemini_tool_result_display_name(call_id, media_index, &mime_type);
+            Ok((
+                gemini_tool_result_media_response_item(
+                    "image",
+                    &display_name,
+                    &mime_type,
+                    None,
+                ),
+                Some(gemini_tool_result_inline_part(
+                    &display_name,
+                    &mime_type,
+                    &data,
+                )),
+            ))
+        }
+        other => Err(format!(
+            "OpenAI/Responses/Anthropic tool result block `{other}` cannot be faithfully translated to Gemini."
+        )),
+    }
+}
+
+pub(super) fn tool_message_to_gemini_function_response(
+    msg: &Value,
+    function_name: Value,
+    target_model: &str,
+) -> Result<Value, String> {
+    if semantic_tool_kind_from_value(msg) == SemanticToolKind::OpenAiCustom {
+        return Err(custom_tools_not_portable_message(UpstreamFormat::Google));
+    }
+    let call_id = msg.get("tool_call_id").cloned();
+    let call_id_str = msg.get("tool_call_id").and_then(Value::as_str);
+    let content = msg
+        .get("content")
+        .cloned()
+        .unwrap_or(Value::String(String::new()));
+
+    let mut function_response = serde_json::json!({
+        "id": call_id,
+        "name": function_name,
+        "response": { "result": content.clone() }
+    });
+
+    let blocks = if let Some(blocks) = content.as_array() {
+        Some(blocks.to_vec())
+    } else if matches!(
+        gemini_tool_result_block_kind(&content),
+        Some(
+            "text"
+                | "input_text"
+                | "output_text"
+                | "json"
+                | "image_url"
+                | "input_image"
+                | "input_audio"
+                | "file"
+                | "image"
+        )
+    ) {
+        Some(vec![content.clone()])
+    } else {
+        None
+    };
+    let Some(blocks) = blocks else {
+        return Ok(function_response);
+    };
+    let saw_media = gemini_tool_result_array_media_status(&blocks)?;
+    if !saw_media {
+        return Ok(function_response);
+    }
+
+    let mut result_items = Vec::with_capacity(blocks.len());
+    let mut parts = Vec::new();
+    let mut media_index = 1usize;
+    for block in &blocks {
+        let (result_item, part) = gemini_tool_result_block_to_response_and_part(
+            block,
+            call_id_str,
+            media_index,
+            target_model,
+        )?;
+        result_items.push(result_item);
+        if let Some(part) = part {
+            parts.push(part);
+            media_index += 1;
+        }
+    }
+    function_response["response"]["result"] = Value::Array(result_items);
+    function_response["parts"] = Value::Array(parts);
+    Ok(function_response)
+}
+
+pub(super) fn openai_to_gemini(body: &mut Value, target_model: &str) -> Result<(), String> {
+    let controls = openai_normalized_request_controls(body)?;
+    let mut result = serde_json::json!({
+        "model": if target_model.is_empty() {
+            body.get("model").cloned().unwrap_or(serde_json::Value::Null)
+        } else {
+            Value::String(target_model.to_string())
+        },
+        "contents": [],
+        "generationConfig": {},
+        "safetySettings": []
+    });
+    if let Some(mt) = body
+        .get("max_completion_tokens")
+        .cloned()
+        .or_else(|| body.get("max_tokens").cloned())
+    {
+        result["generationConfig"]["maxOutputTokens"] = mt.clone();
+    }
+    if let Some(t) = body.get("temperature") {
+        result["generationConfig"]["temperature"] = t.clone();
+    }
+    if let Some(p) = body.get("top_p") {
+        result["generationConfig"]["topP"] = p.clone();
+    }
+    if let Some(output_shape) = controls.output_shape.as_ref() {
+        let generation_config = normalized_output_shape_to_gemini_generation_config(output_shape);
+        if let Some(generation_config) = generation_config.as_object() {
+            for (key, value) in generation_config {
+                result["generationConfig"][key] = value.clone();
+            }
+        }
+    }
+    if let Some(audio_contract) = normalized_openai_audio_contract(body)? {
+        result["generationConfig"]["responseModalities"] = Value::Array(
+            audio_contract
+                .response_modalities
+                .iter()
+                .map(|modality| Value::String(modality.to_ascii_uppercase()))
+                .collect(),
+        );
+        if let Some(voice_name) = audio_contract.voice_name {
+            result["generationConfig"]["speechConfig"] = serde_json::json!({
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {
+                        "voiceName": voice_name
+                    }
+                }
+            });
+        }
+    }
+    if let Some(logprobs) = controls.logprobs.as_ref() {
+        if logprobs.enabled || logprobs.top_logprobs.is_some() {
+            result["generationConfig"]["responseLogprobs"] = Value::Bool(true);
+        }
+        if let Some(top_logprobs) = logprobs.top_logprobs.as_ref() {
+            result["generationConfig"]["logprobs"] = top_logprobs.clone();
+        }
+    }
+    if let Some(stop) = controls.decoding.stop.as_ref() {
+        result["generationConfig"]["stopSequences"] = openai_stop_to_gemini_stop_sequences(stop);
+    }
+    if let Some(seed) = controls.decoding.seed.as_ref() {
+        result["generationConfig"]["seed"] = seed.clone();
+    }
+    if let Some(presence_penalty) = controls.decoding.presence_penalty.as_ref() {
+        result["generationConfig"]["presencePenalty"] = presence_penalty.clone();
+    }
+    if let Some(frequency_penalty) = controls.decoding.frequency_penalty.as_ref() {
+        result["generationConfig"]["frequencyPenalty"] = frequency_penalty.clone();
+    }
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("missing messages")?;
+    let mut tool_name_by_call_id = std::collections::HashMap::new();
+    let mut tool_sort_key_by_call_id = std::collections::HashMap::new();
+    let mut next_tool_sort_key = 0usize;
+    let mut contents: Vec<Value> = Vec::new();
+    let mut system_parts: Vec<Value> = Vec::new();
+    let mut pending_tool_parts: Vec<(usize, Value)> = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        if role != "tool" {
+            flush_pending_gemini_function_responses(&mut contents, &mut pending_tool_parts);
+        }
+        if role == "system" || role == "developer" {
+            system_parts.extend(openai_content_to_gemini_parts(msg.get("content"))?);
+            continue;
+        }
+        if role == "user" {
+            let parts = openai_content_to_gemini_parts(msg.get("content"))?;
+            if !parts.is_empty() {
+                contents.push(serde_json::json!({ "role": "user", "parts": parts }));
+            }
+        }
+        if role == "assistant" {
+            let mut parts = openai_content_to_gemini_parts(msg.get("content"))?;
+            if let Some(tc) = msg.get("tool_calls").and_then(Value::as_array) {
+                for (idx, t) in tc.iter().enumerate() {
+                    let name = t.get("function").and_then(|f| f.get("name")).cloned();
+                    if let (Some(id), Some(name)) =
+                        (t.get("id").and_then(Value::as_str), name.clone())
+                    {
+                        tool_name_by_call_id.insert(id.to_string(), name);
+                        tool_sort_key_by_call_id.insert(id.to_string(), next_tool_sort_key);
+                        next_tool_sort_key += 1;
+                    }
+                    push_gemini_function_call_part(&mut parts, t, idx == 0)?;
+                }
+            }
+            if !parts.is_empty() {
+                contents.push(serde_json::json!({ "role": "model", "parts": parts }));
+            }
+        }
+        if role == "tool" {
+            let call_id_str = msg.get("tool_call_id").and_then(Value::as_str);
+            let function_name = msg
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .and_then(|id| tool_name_by_call_id.get(id).cloned())
+                .or_else(|| msg.get("name").cloned())
+                .unwrap_or_else(|| msg.get("tool_call_id").cloned().unwrap_or(Value::Null));
+            let sort_key = call_id_str
+                .and_then(|id| tool_sort_key_by_call_id.get(id).copied())
+                .unwrap_or(next_tool_sort_key + pending_tool_parts.len());
+            let function_response =
+                tool_message_to_gemini_function_response(msg, function_name.clone(), target_model)?;
+            pending_tool_parts.push((
+                sort_key,
+                serde_json::json!({
+                    "functionResponse": function_response
+                }),
+            ));
+        }
+    }
+    flush_pending_gemini_function_responses(&mut contents, &mut pending_tool_parts);
+    if !system_parts.is_empty() {
+        result["systemInstruction"] = serde_json::json!({
+            "role": "user",
+            "parts": system_parts
+        });
+    }
+    result["contents"] = Value::Array(contents);
+    let portable_tools = openai_portable_function_tools(
+        body,
+        controls.restricted_tool_names.as_deref(),
+        "tool_choice.allowed_tools",
+    )?;
+    if !portable_tools.is_empty() {
+        let mut decls = vec![];
+        for t in &portable_tools {
+            if let Some(f) = t.get("function") {
+                decls.push(serde_json::json!({
+                    "name": f.get("name"),
+                    "description": f.get("description"),
+                    "parameters": f.get("parameters").unwrap_or(&serde_json::json!({ "type": "object", "properties": {} }))
+                }));
+            }
+        }
+        if !decls.is_empty() {
+            result["tools"] = serde_json::json!([{ "functionDeclarations": decls }]);
+        }
+    }
+    if let Some(tool_policy) = controls.tool_policy.as_ref() {
+        result["toolConfig"]["functionCallingConfig"] =
+            normalized_tool_policy_to_gemini_function_calling_config(tool_policy);
+    }
+    *body = result;
+    Ok(())
+}
+
+pub(super) fn openai_content_to_gemini_parts(
+    content: Option<&Value>,
+) -> Result<Vec<Value>, String> {
+    let content = match content {
+        Some(c) => c,
+        None => return Ok(vec![]),
+    };
+    if let Some(s) = content.as_str() {
+        return Ok(vec![serde_json::json!({ "text": s })]);
+    }
+    let arr = match content.as_array() {
+        Some(a) => a,
+        None => return Ok(vec![]),
+    };
+    let mut parts = vec![];
+    for c in arr {
+        if let Some(part) = openai_content_part_to_gemini_part(c)? {
+            parts.push(part);
+        }
+    }
+    Ok(parts)
+}
