@@ -12,7 +12,8 @@ use crate::formats::UpstreamFormat;
 use crate::translate::{
     anthropic_tool_use_type_for_openai_tool_call, classify_openai_finish_for_anthropic,
     classify_portable_non_success_terminal, gemini_finish_reason_to_openai,
-    responses_failed_code_to_openai_finish, AnthropicTerminal,
+    responses_failed_code_to_openai_finish, custom_tools_not_portable_message,
+    AnthropicTerminal,
     OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
 };
 
@@ -288,6 +289,117 @@ fn copy_unknown_usage_fields(
         }
         target[key] = value.clone();
     }
+}
+
+fn clone_usage_details_object_stream(details: Option<&Value>) -> Option<Value> {
+    let details = details?.as_object()?;
+    (!details.is_empty()).then(|| Value::Object(details.clone()))
+}
+
+fn gemini_usage_field_u64(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn gemini_merge_usage_metadata_into_state(state: &mut StreamState, usage_meta: &Value) {
+    let existing = state.usage.clone().unwrap_or_else(|| serde_json::json!({}));
+    let existing_prompt = gemini_usage_field_u64(&existing, "prompt_tokens");
+    let existing_completion = gemini_usage_field_u64(&existing, "completion_tokens");
+    let existing_total = gemini_usage_field_u64(&existing, "total_tokens");
+    let existing_reasoning = existing
+        .get("completion_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let existing_cached = existing
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let existing_candidates = existing_completion.saturating_sub(existing_reasoning);
+
+    let prompt_tokens = usage_meta
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .map(|value| value.max(existing_prompt))
+        .unwrap_or(existing_prompt);
+    let candidates_tokens = usage_meta
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .map(|value| value.max(existing_candidates))
+        .unwrap_or(existing_candidates);
+    let thoughts_tokens = usage_meta
+        .get("thoughtsTokenCount")
+        .and_then(Value::as_u64)
+        .map(|value| value.max(existing_reasoning))
+        .unwrap_or(existing_reasoning);
+    let completion_tokens = candidates_tokens + thoughts_tokens;
+    let total_tokens = usage_meta
+        .get("totalTokenCount")
+        .and_then(Value::as_u64)
+        .map(|value| value.max(existing_total))
+        .unwrap_or_else(|| existing_total.max(prompt_tokens + completion_tokens));
+    let cached_tokens = usage_meta
+        .get("cachedContentTokenCount")
+        .and_then(Value::as_u64)
+        .map(|value| value.max(existing_cached))
+        .unwrap_or(existing_cached);
+
+    let mut merged = existing;
+    merged["prompt_tokens"] = serde_json::json!(prompt_tokens);
+    merged["completion_tokens"] = serde_json::json!(completion_tokens);
+    merged["total_tokens"] = serde_json::json!(total_tokens);
+
+    if cached_tokens > 0 {
+        if !merged["prompt_tokens_details"].is_object() {
+            merged["prompt_tokens_details"] = serde_json::json!({});
+        }
+        merged["prompt_tokens_details"]["cached_tokens"] = serde_json::json!(cached_tokens);
+    }
+    if thoughts_tokens > 0 {
+        if !merged["completion_tokens_details"].is_object() {
+            merged["completion_tokens_details"] = serde_json::json!({});
+        }
+        merged["completion_tokens_details"]["reasoning_tokens"] =
+            serde_json::json!(thoughts_tokens);
+    }
+
+    state.usage = Some(merged);
+}
+
+fn gemini_candidate_less_partial_is_bufferable(response: &Value) -> bool {
+    response
+        .as_object()
+        .map(|obj| {
+            obj.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "responseId"
+                        | "response_id"
+                        | "modelVersion"
+                        | "model_version"
+                        | "usageMetadata"
+                        | "usage_metadata"
+                        | "createTime"
+                        | "create_time"
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn gemini_nonportable_tool_call_message(
+    tool_type: &str,
+    proxied_tool_kind: Option<&str>,
+) -> String {
+    if tool_type == "custom" {
+        return custom_tools_not_portable_message(UpstreamFormat::Google);
+    }
+    if let Some(kind) = proxied_tool_kind {
+        return format!(
+            "OpenAI proxied tool kind `{kind}` cannot be faithfully translated to Gemini."
+        );
+    }
+    "OpenAI tool call cannot be faithfully translated to Gemini.".to_string()
 }
 
 /// Extract one SSE event from buffer. Returns parsed JSON from "data: " line, or None.
@@ -894,33 +1006,18 @@ fn responses_usage_to_openai_usage_stream(usage: &Value) -> Value {
         "total_tokens": total_tokens
     });
 
-    if let Some(cached_tokens) = usage
-        .get("input_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("prompt_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64)
-        })
-    {
-        mapped["prompt_tokens_details"] = serde_json::json!({ "cached_tokens": cached_tokens });
+    if let Some(details) = clone_usage_details_object_stream(
+        usage.get("input_tokens_details")
+            .or(usage.get("prompt_tokens_details")),
+    ) {
+        mapped["prompt_tokens_details"] = details;
     }
 
-    if let Some(reasoning_tokens) = usage
-        .get("output_tokens_details")
-        .and_then(|details| details.get("reasoning_tokens"))
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("completion_tokens_details")
-                .and_then(|details| details.get("reasoning_tokens"))
-                .and_then(Value::as_u64)
-        })
-    {
-        mapped["completion_tokens_details"] =
-            serde_json::json!({ "reasoning_tokens": reasoning_tokens });
+    if let Some(details) = clone_usage_details_object_stream(
+        usage.get("output_tokens_details")
+            .or(usage.get("completion_tokens_details")),
+    ) {
+        mapped["completion_tokens_details"] = details;
     }
 
     if let Some(obj) = usage.as_object() {
@@ -964,15 +1061,13 @@ fn openai_usage_to_responses_usage_stream(usage: &Value) -> Value {
         "total_tokens": total_tokens
     });
 
-    if let Some(details) = usage.get("prompt_tokens_details") {
-        if let Some(cached) = details.get("cached_tokens").and_then(Value::as_u64) {
-            mapped["input_tokens_details"] = serde_json::json!({ "cached_tokens": cached });
-        }
+    if let Some(details) = clone_usage_details_object_stream(usage.get("prompt_tokens_details")) {
+        mapped["input_tokens_details"] = details;
     }
-    if let Some(details) = usage.get("completion_tokens_details") {
-        if let Some(reasoning) = details.get("reasoning_tokens").and_then(Value::as_u64) {
-            mapped["output_tokens_details"] = serde_json::json!({ "reasoning_tokens": reasoning });
-        }
+    if let Some(details) =
+        clone_usage_details_object_stream(usage.get("completion_tokens_details"))
+    {
+        mapped["output_tokens_details"] = details;
     }
 
     if let Some(obj) = usage.as_object() {
@@ -1148,48 +1243,7 @@ pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
     // Usage with cache token reporting
     // Reference: 9router gemini-to-openai.js - include cachedContentTokenCount as prompt_tokens_details.cached_tokens
     if let Some(usage_meta) = response.get("usageMetadata").or(event.get("usageMetadata")) {
-        let prompt_tokens = usage_meta
-            .get("promptTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let candidates_tokens = usage_meta
-            .get("candidatesTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let thoughts_tokens = usage_meta
-            .get("thoughtsTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let total_tokens = usage_meta
-            .get("totalTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let cached_tokens = usage_meta
-            .get("cachedContentTokenCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-
-        // completion_tokens = candidatesTokenCount + thoughtsTokenCount (matches 9router)
-        let completion_tokens = candidates_tokens + thoughts_tokens;
-
-        let mut usage_json = serde_json::json!({
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens
-        });
-
-        if cached_tokens > 0 {
-            usage_json["prompt_tokens_details"] = serde_json::json!({
-                "cached_tokens": cached_tokens
-            });
-        }
-        if thoughts_tokens > 0 {
-            usage_json["completion_tokens_details"] = serde_json::json!({
-                "reasoning_tokens": thoughts_tokens
-            });
-        }
-
-        state.usage = Some(usage_json);
+        gemini_merge_usage_metadata_into_state(state, usage_meta);
     }
 
     let candidates = match response.get("candidates").and_then(Value::as_array) {
@@ -1219,6 +1273,9 @@ pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                 out.push(chunk);
                 state.finish_reason = Some(finish_reason);
                 state.finish_reason_sent = true;
+                return out;
+            }
+            if gemini_candidate_less_partial_is_bufferable(response) {
                 return out;
             }
             return reject_openai_stream(
@@ -1403,6 +1460,15 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
         state.model = Some("unknown".to_string());
         emit_openai_assistant_role_if_needed(state, &mut out);
         return out;
+    }
+
+    if ty.starts_with("response.audio.") {
+        return reject_openai_stream(
+            state,
+            "invalid_request_error",
+            "unsupported_openai_responses_stream_event",
+            "OpenAI Responses audio streaming events cannot be translated losslessly.",
+        );
     }
 
     if ty == "response.output_text.delta" {
@@ -2554,14 +2620,11 @@ fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
         state.usage = Some(usage.clone());
     }
     if let Some(error) = chunk.get("error") {
-        let mut payload = serde_json::json!({ "error": error });
-        if let Some(response_id) = chunk.get("id").cloned() {
-            payload["responseId"] = response_id;
-        }
-        if let Some(model) = chunk.get("model").cloned() {
-            payload["modelVersion"] = model;
-        }
-        out.push(format_sse_data(&payload));
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Translated stream cannot be represented as Gemini SSE.");
+        mark_stream_fatal_rejection(state, message);
         return out;
     }
     let choices = match chunk.get("choices").and_then(Value::as_array) {
@@ -2579,6 +2642,19 @@ fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
 
     let model = state.model.clone().unwrap_or_else(|| "gemini".to_string());
     let mut parts: Vec<Value> = vec![];
+
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for tc in tool_calls {
+            let tool_type = openai_stream_tool_call_type(tc);
+            let proxied_tool_kind = tc.get("proxied_tool_kind").and_then(Value::as_str);
+            if tool_type != "function" || proxied_tool_kind.is_some() {
+                let message =
+                    gemini_nonportable_tool_call_message(tool_type, proxied_tool_kind);
+                mark_stream_fatal_rejection(state, message);
+                return out;
+            }
+        }
+    }
 
     if let Some(r) = openai_chunk_reasoning_delta(delta, state) {
         if !r.is_empty() {
@@ -2605,6 +2681,9 @@ fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
                     index: idx,
                     ..Default::default()
                 });
+            if tc.get("type").is_some() {
+                entry.tool_type = Some(openai_stream_tool_call_type(tc).to_string());
+            }
             if let Some(id) = tc.get("id").cloned() {
                 entry.id = Some(id);
             }
@@ -2623,6 +2702,19 @@ fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState) -> Vec<Vec
                 if !arguments.is_empty() {
                     entry.arguments.push_str(arguments);
                 }
+            }
+            if let Some(proxied_tool_kind) =
+                tc.get("proxied_tool_kind").and_then(Value::as_str)
+            {
+                entry.proxied_tool_kind = Some(proxied_tool_kind.to_string());
+            }
+            if tool_call_state_type(entry) != "function" || entry.proxied_tool_kind.is_some() {
+                let message = gemini_nonportable_tool_call_message(
+                    tool_call_state_type(entry),
+                    entry.proxied_tool_kind.as_deref(),
+                );
+                mark_stream_fatal_rejection(state, message);
+                return out;
             }
         }
     }
@@ -3316,6 +3408,7 @@ where
 mod tests {
     use super::*;
     use crate::formats::UpstreamFormat;
+    use crate::translate::translate_response;
 
     fn parse_sse_json(bytes: &[u8]) -> Value {
         let mut buf = bytes.to_vec();
@@ -3741,8 +3834,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_sse_event_anthropic_thinking_to_gemini_fails_closed_at_start_and_suppresses_followups(
-    ) {
+    fn translate_sse_event_anthropic_thinking_to_gemini_fails_closed_at_start_and_suppresses_followups() {
         let mut state = StreamState::default();
         let first = translate_sse_event(
             UpstreamFormat::Anthropic,
@@ -3783,18 +3875,10 @@ mod tests {
             .join("\n");
 
         assert!(first.is_empty(), "message_start alone should not emit Gemini content");
-        assert!(joined.contains("\"error\""), "{joined}");
+        assert!(rejected.is_empty(), "{joined}");
         assert!(
-            joined.contains("\"code\":\"unsupported_anthropic_stream_event\""),
-            "{joined}"
-        );
-        assert!(
-            joined.contains("thinking blocks cannot be translated losslessly"),
-            "{joined}"
-        );
-        assert!(
-            !joined.contains("\"thought\":true") && !joined.contains("\"text\":\"hidden\""),
-            "start-time reject must not emit Gemini thought/text output: {joined}"
+            state.fatal_rejection.is_some(),
+            "Gemini sink should reject without emitting ad-hoc error frames"
         );
         assert!(suppressed.is_empty(), "follow-up after fatal reject should be suppressed");
     }
@@ -4366,6 +4450,65 @@ mod tests {
         assert_eq!(
             chunks[0]["usage"]["completion_tokens_details"]["reasoning_tokens"],
             2
+        );
+    }
+
+    #[test]
+    fn responses_stream_usage_preserves_audio_prediction_and_unknown_detail_fields() {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_usage",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 7,
+                    "total_tokens": 18,
+                    "service_tier": "priority",
+                    "input_tokens_details": {
+                        "cached_tokens": 3,
+                        "audio_tokens": 2,
+                        "future_prompt_detail": 4
+                    },
+                    "output_tokens_details": {
+                        "reasoning_tokens": 1,
+                        "audio_tokens": 5,
+                        "accepted_prediction_tokens": 6,
+                        "rejected_prediction_tokens": 2,
+                        "future_completion_detail": 8
+                    }
+                }
+            }
+        });
+        let mut state = StreamState::default();
+        let chunks = responses_event_to_openai_chunks(&event, &mut state);
+        let finish_chunk = chunks
+            .iter()
+            .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+            .expect("finish chunk");
+
+        assert_eq!(finish_chunk["usage"]["service_tier"], "priority");
+        assert_eq!(finish_chunk["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(finish_chunk["usage"]["prompt_tokens_details"]["audio_tokens"], 2);
+        assert_eq!(
+            finish_chunk["usage"]["prompt_tokens_details"]["future_prompt_detail"],
+            4
+        );
+        assert_eq!(
+            finish_chunk["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            1
+        );
+        assert_eq!(finish_chunk["usage"]["completion_tokens_details"]["audio_tokens"], 5);
+        assert_eq!(
+            finish_chunk["usage"]["completion_tokens_details"]["accepted_prediction_tokens"],
+            6
+        );
+        assert_eq!(
+            finish_chunk["usage"]["completion_tokens_details"]["rejected_prediction_tokens"],
+            2
+        );
+        assert_eq!(
+            finish_chunk["usage"]["completion_tokens_details"]["future_completion_detail"],
+            8
         );
     }
 
@@ -5096,8 +5239,15 @@ mod tests {
     }
 
     #[test]
-    fn gemini_candidate_less_partial_rejects_instead_of_emitting_role_only_chunk() {
-        let event = serde_json::json!({
+    fn gemini_candidate_less_usage_and_metadata_only_partials_are_buffered_until_candidate_arrives()
+    {
+        let metadata_only = serde_json::json!({
+            "response": {
+                "responseId": "gem_resp_partial",
+                "modelVersion": "gemini-2.5"
+            }
+        });
+        let usage_only = serde_json::json!({
             "response": {
                 "responseId": "gem_resp_partial",
                 "modelVersion": "gemini-2.5",
@@ -5105,6 +5255,49 @@ mod tests {
                     "promptTokenCount": 3,
                     "totalTokenCount": 3
                 }
+            }
+        });
+        let candidate = serde_json::json!({
+            "response": {
+                "responseId": "gem_resp_partial",
+                "modelVersion": "gemini-2.5",
+                "candidates": [{
+                    "content": { "parts": [{ "text": "Hi" }], "role": "model" },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "candidatesTokenCount": 5,
+                    "totalTokenCount": 8
+                }
+            }
+        });
+        let mut state = StreamState::default();
+        let first = gemini_event_to_openai_chunks(&metadata_only, &mut state);
+        let second = gemini_event_to_openai_chunks(&usage_only, &mut state);
+        let third = gemini_event_to_openai_chunks(&candidate, &mut state);
+
+        assert!(first.is_empty(), "metadata-only partial should be buffered");
+        assert!(second.is_empty(), "usage-only partial should be buffered");
+        assert!(
+            third.iter().any(|chunk| chunk["choices"][0]["delta"]["content"] == "Hi"),
+            "candidate payload should still arrive after buffered partials: {third:?}"
+        );
+        let finish_chunk = third
+            .iter()
+            .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+            .expect("finish chunk");
+        assert_eq!(finish_chunk["usage"]["prompt_tokens"], 3);
+        assert_eq!(finish_chunk["usage"]["completion_tokens"], 5);
+        assert_eq!(finish_chunk["usage"]["total_tokens"], 8);
+    }
+
+    #[test]
+    fn gemini_candidate_less_unknown_payload_still_rejects() {
+        let event = serde_json::json!({
+            "response": {
+                "responseId": "gem_resp_partial",
+                "modelVersion": "gemini-2.5",
+                "unexpectedOutput": { "text": "oops" }
             }
         });
         let mut state = StreamState::default();
@@ -5116,7 +5309,6 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("candidate"));
-        assert!(chunks[0]["choices"][0]["delta"].as_object().unwrap().is_empty());
     }
 
     #[test]
@@ -5233,17 +5425,21 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                !out.is_empty(),
-                "fatal reject should emit a terminal compatibility error for {client_format:?}"
-            );
-            assert!(
                 state.fatal_rejection.is_some(),
                 "client_format = {client_format:?}, out = {joined}"
             );
-            assert!(
-                !joined.contains("candidate-0") && !joined.contains("candidate-1"),
-                "fatal reject must not leak mixed-choice content for {client_format:?}: {joined}"
-            );
+            if client_format == UpstreamFormat::Google {
+                assert!(out.is_empty(), "Gemini sink must not emit ad-hoc error frames");
+            } else {
+                assert!(
+                    !out.is_empty(),
+                    "Responses sink should surface incompatibility as response.failed"
+                );
+                assert!(
+                    !joined.contains("candidate-0") && !joined.contains("candidate-1"),
+                    "fatal reject must not leak mixed-choice content for {client_format:?}: {joined}"
+                );
+            }
         }
     }
 
@@ -5304,17 +5500,24 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                !second.is_empty(),
-                "mixed-choice rejection should emit a terminal compatibility error for {client_format:?}"
-            );
-            assert!(
                 state.fatal_rejection.is_some(),
                 "second frame should fatal reject mixed choice stream for {client_format:?}: {second_joined}"
             );
-            assert!(
-                !second_joined.contains("candidate-1"),
-                "fatal reject must not leak mixed-choice content for {client_format:?}: {second_joined}"
-            );
+            if client_format == UpstreamFormat::Google {
+                assert!(
+                    second.is_empty(),
+                    "Gemini sink must not emit ad-hoc error frames for fatal rejection"
+                );
+            } else {
+                assert!(
+                    !second.is_empty(),
+                    "Responses sink should surface incompatibility as response.failed"
+                );
+                assert!(
+                    !second_joined.contains("candidate-1"),
+                    "fatal reject must not leak mixed-choice content for {client_format:?}: {second_joined}"
+                );
+            }
             assert!(
                 third.is_empty(),
                 "follow-up after fatal reject should be suppressed for {client_format:?}"
@@ -5496,6 +5699,123 @@ mod tests {
                 .contains("inlineData"),
             "chunks = {chunks:?}"
         );
+    }
+
+    #[test]
+    fn gemini_function_response_part_rejects_instead_of_silent_drop() {
+        let mut state = StreamState::default();
+        let chunks = gemini_event_to_openai_chunks(
+            &serde_json::json!({
+                "response": {
+                    "responseId": "gem_resp_tool_result",
+                    "modelVersion": "gemini-2.5",
+                    "candidates": [{
+                        "content": {
+                            "role": "model",
+                            "parts": [{
+                                "functionResponse": {
+                                    "id": "call_1",
+                                    "name": "get_weather",
+                                    "response": {
+                                        "parts": [{
+                                            "inlineData": {
+                                                "mimeType": "image/png",
+                                                "data": "AAAA"
+                                            }
+                                        }]
+                                    }
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }),
+            &mut state,
+        );
+
+        assert_eq!(chunks.len(), 1, "chunks = {chunks:?}");
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "error");
+        assert!(
+            chunks[0]["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("functionResponse"),
+            "chunks = {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn openai_chunk_to_gemini_sse_suppresses_error_chunk_instead_of_emitting_illegal_error_frame() {
+        let mut state = StreamState::default();
+        let error_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "gpt-4o",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "unsupported_openai_stream_event",
+                "message": "OpenAI streaming response with multiple choices cannot be translated losslessly."
+            },
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "error" }]
+        });
+
+        let out = openai_chunk_to_gemini_sse(&error_chunk, &mut state);
+
+        assert!(out.is_empty(), "Gemini sink must not emit non-Gemini error frames");
+        assert!(state.fatal_rejection.is_some());
+    }
+
+    #[test]
+    fn openai_chunk_to_gemini_sse_rejects_nonportable_tool_kinds_without_emitting_function_calls() {
+        let mut state = StreamState::default();
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "custom",
+                        "proxied_tool_kind": "anthropic_server_tool_use",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": "{\"q\":\"tokyo\"}"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+
+        let out = openai_chunk_to_gemini_sse(&chunk, &mut state);
+
+        assert!(out.is_empty(), "non-portable tool kinds must not be emitted as Gemini functionCall");
+        assert!(state.fatal_rejection.is_some());
+    }
+
+    #[test]
+    fn responses_event_audio_and_transcript_events_fail_closed_instead_of_silent_drop() {
+        for event in [
+            serde_json::json!({
+                "type": "response.audio.delta",
+                "delta": "AAAA"
+            }),
+            serde_json::json!({
+                "type": "response.audio.transcript.delta",
+                "delta": "hello"
+            }),
+        ] {
+            let mut state = StreamState::default();
+            let chunks = responses_event_to_openai_chunks(&event, &mut state);
+
+            assert_eq!(chunks.len(), 1, "chunks = {chunks:?}");
+            assert_eq!(chunks[0]["choices"][0]["finish_reason"], "error");
+            assert_eq!(
+                chunks[0]["error"]["code"],
+                "unsupported_openai_responses_stream_event"
+            );
+        }
     }
 
     #[test]
@@ -6524,6 +6844,163 @@ mod tests {
         assert!(joined.contains("\"total_tokens\":25"));
         assert!(joined.contains("\"input_tokens_details\":{\"cached_tokens\":3}"));
         assert!(joined.contains("\"output_tokens_details\":{\"reasoning_tokens\":2}"));
+    }
+
+    #[test]
+    fn openai_stream_usage_to_responses_preserves_audio_prediction_and_unknown_detail_fields() {
+        let mut state = StreamState::default();
+        let finish_chunk = serde_json::json!({
+            "id": "chatcmpl-msg123",
+            "created": 123,
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 18,
+                "service_tier": "priority",
+                "prompt_tokens_details": {
+                    "cached_tokens": 3,
+                    "audio_tokens": 2,
+                    "future_prompt_detail": 4
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": 1,
+                    "audio_tokens": 5,
+                    "accepted_prediction_tokens": 6,
+                    "rejected_prediction_tokens": 2,
+                    "future_completion_detail": 8
+                }
+            },
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+
+        let out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+        let terminal = out
+            .iter()
+            .map(|bytes| parse_sse_json(bytes))
+            .find(|event| event["type"] == "response.completed")
+            .expect("responses terminal");
+
+        assert_eq!(terminal["response"]["usage"]["service_tier"], "priority");
+        assert_eq!(
+            terminal["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            3
+        );
+        assert_eq!(
+            terminal["response"]["usage"]["input_tokens_details"]["audio_tokens"],
+            2
+        );
+        assert_eq!(
+            terminal["response"]["usage"]["input_tokens_details"]["future_prompt_detail"],
+            4
+        );
+        assert_eq!(
+            terminal["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            1
+        );
+        assert_eq!(
+            terminal["response"]["usage"]["output_tokens_details"]["audio_tokens"],
+            5
+        );
+        assert_eq!(
+            terminal["response"]["usage"]["output_tokens_details"]["accepted_prediction_tokens"],
+            6
+        );
+        assert_eq!(
+            terminal["response"]["usage"]["output_tokens_details"]["rejected_prediction_tokens"],
+            2
+        );
+        assert_eq!(
+            terminal["response"]["usage"]["output_tokens_details"]["future_completion_detail"],
+            8
+        );
+    }
+
+    #[test]
+    fn stream_usage_detail_objects_match_non_stream_translation() {
+        let responses_usage = serde_json::json!({
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "total_tokens": 18,
+            "input_tokens_details": {
+                "cached_tokens": 3,
+                "audio_tokens": 2,
+                "future_prompt_detail": 4
+            },
+            "output_tokens_details": {
+                "reasoning_tokens": 1,
+                "audio_tokens": 5,
+                "accepted_prediction_tokens": 6,
+                "rejected_prediction_tokens": 2,
+                "future_completion_detail": 8
+            }
+        });
+        let openai_usage = serde_json::json!({
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "total_tokens": 18,
+            "prompt_tokens_details": {
+                "cached_tokens": 3,
+                "audio_tokens": 2,
+                "future_prompt_detail": 4
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 1,
+                "audio_tokens": 5,
+                "accepted_prediction_tokens": 6,
+                "rejected_prediction_tokens": 2,
+                "future_completion_detail": 8
+            }
+        });
+
+        let streamed_openai_usage = responses_usage_to_openai_usage_stream(&responses_usage);
+        let non_stream_openai = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &serde_json::json!({
+                "id": "resp_usage",
+                "object": "response",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Hi" }]
+                }],
+                "usage": responses_usage
+            }),
+        )
+        .expect("non-stream responses -> openai");
+        assert_eq!(
+            streamed_openai_usage["prompt_tokens_details"],
+            non_stream_openai["usage"]["prompt_tokens_details"]
+        );
+        assert_eq!(
+            streamed_openai_usage["completion_tokens_details"],
+            non_stream_openai["usage"]["completion_tokens_details"]
+        );
+
+        let streamed_responses_usage = openai_usage_to_responses_usage_stream(&openai_usage);
+        let non_stream_responses = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &serde_json::json!({
+                "id": "chatcmpl_usage",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "Hi" },
+                    "finish_reason": "stop"
+                }],
+                "usage": openai_usage
+            }),
+        )
+        .expect("non-stream openai -> responses");
+        assert_eq!(
+            streamed_responses_usage["input_tokens_details"],
+            non_stream_responses["usage"]["input_tokens_details"]
+        );
+        assert_eq!(
+            streamed_responses_usage["output_tokens_details"],
+            non_stream_responses["usage"]["output_tokens_details"]
+        );
     }
 
     #[test]

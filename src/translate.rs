@@ -154,6 +154,45 @@ fn anthropic_thinking_provenance_not_portable_message() -> String {
     "Anthropic thinking provenance (`signature` or omitted thinking) cannot be faithfully translated to non-Anthropic downstreams".to_string()
 }
 
+fn anthropic_request_tool_definition_not_portable_message(
+    detail: &str,
+    target_label: &str,
+) -> String {
+    format!(
+        "Anthropic tool definitions with {detail} cannot be faithfully translated to {target_label}"
+    )
+}
+
+fn anthropic_tool_result_order_not_portable_message(target_label: &str) -> String {
+    format!(
+        "Anthropic user turns that mix `tool_result` blocks with surrounding content cannot be faithfully translated to {target_label} without reordering blocks"
+    )
+}
+
+fn gemini_function_response_parts_not_portable_message(target_label: &str) -> String {
+    format!(
+        "Gemini functionResponse.parts cannot be faithfully translated to {target_label}"
+    )
+}
+
+fn openai_assistant_audio_not_portable_message(target_label: &str) -> String {
+    format!(
+        "OpenAI assistant audio output cannot be faithfully translated to {target_label}"
+    )
+}
+
+fn openai_assistant_audio_field_not_portable_message(field: &str, target_label: &str) -> String {
+    format!(
+        "OpenAI assistant audio field `{field}` cannot be faithfully translated to {target_label}"
+    )
+}
+
+fn responses_multiple_output_audio_items_not_portable_message(target_label: &str) -> String {
+    format!(
+        "OpenAI Responses output has multiple `output_audio` items and cannot be faithfully translated to {target_label}"
+    )
+}
+
 /// Translate response body from upstream format to client format.
 /// Converts via OpenAI pivot: upstream → openai → client when formats differ.
 pub fn translate_response(
@@ -186,6 +225,13 @@ fn upstream_response_to_openai(
 
 /// Convert OpenAI completion response to client format (Responses, Claude, Gemini).
 fn openai_response_to_client(client_format: UpstreamFormat, body: &Value) -> Result<Value, String> {
+    if matches!(client_format, UpstreamFormat::Anthropic | UpstreamFormat::Google)
+        && openai_response_has_assistant_audio(body)
+    {
+        return Err(openai_assistant_audio_not_portable_message(
+            translation_target_label(client_format),
+        ));
+    }
     match client_format {
         UpstreamFormat::OpenAiCompletion => Ok(body.clone()),
         UpstreamFormat::OpenAiResponses => openai_response_to_responses(body),
@@ -426,6 +472,23 @@ fn anthropic_block_has_cache_control(block: &Value) -> bool {
     block.get("cache_control").is_some()
 }
 
+fn anthropic_block_has_nonportable_thinking_provenance(block: &Value) -> bool {
+    if block.get("type").and_then(Value::as_str) != Some("thinking") {
+        return false;
+    }
+    block.get("signature").is_some()
+        || block
+            .get("thinking")
+            .map(|thinking| !thinking.is_string())
+            .unwrap_or(false)
+}
+
+fn anthropic_blocks_have_nonportable_thinking_provenance(blocks: &[Value]) -> bool {
+    blocks
+        .iter()
+        .any(anthropic_block_has_nonportable_thinking_provenance)
+}
+
 fn anthropic_content_block_supported(block_type: &str) -> bool {
     matches!(
         block_type,
@@ -522,6 +585,286 @@ fn anthropic_nonportable_content_block_message(
         }
     }
     None
+}
+
+fn anthropic_request_has_nonportable_thinking_provenance(body: &Value) -> bool {
+    if let Some(system) = body.get("system") {
+        match system {
+            Value::Array(blocks) if anthropic_blocks_have_nonportable_thinking_provenance(blocks) => {
+                return true;
+            }
+            Value::Object(_) if anthropic_block_has_nonportable_thinking_provenance(system) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(|blocks| anthropic_blocks_have_nonportable_thinking_provenance(blocks))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn anthropic_request_nonportable_tool_definition_message(
+    body: &Value,
+    target_label: &str,
+) -> Option<String> {
+    let tools = body.get("tools").and_then(Value::as_array)?;
+    for tool in tools {
+        for field in ["strict", "defer_loading", "allowed_callers", "input_examples"] {
+            if tool.get(field).is_some() {
+                return Some(anthropic_request_tool_definition_not_portable_message(
+                    &format!("native `{field}` metadata"),
+                    target_label,
+                ));
+            }
+        }
+        if tool.get("type").is_some() || tool.get("name").is_none() {
+            return Some(anthropic_request_tool_definition_not_portable_message(
+                "server-side or provider-native tool shapes",
+                target_label,
+            ));
+        }
+    }
+    None
+}
+
+fn gemini_function_response_has_nonportable_parts(function_response: &Value) -> bool {
+    function_response
+        .get("parts")
+        .or_else(|| {
+            gemini_nested_field(function_response, "response", "response")
+                .and_then(|response| response.get("parts"))
+        })
+        .or_else(|| {
+            gemini_nested_field(function_response, "response", "response")
+                .and_then(|response| response.get("result"))
+                .and_then(|result| result.get("parts"))
+        })
+        .map(|parts| !parts.is_null())
+        .unwrap_or(false)
+}
+
+fn gemini_request_nonportable_function_response_message(
+    body: &Value,
+    target_label: &str,
+) -> Option<String> {
+    let contents = body.get("contents").and_then(Value::as_array)?;
+    for content in contents {
+        let Some(parts) = content.get("parts").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            let Some(function_response) =
+                gemini_part_field(part, "functionResponse", "function_response")
+            else {
+                continue;
+            };
+            if gemini_function_response_has_nonportable_parts(function_response) {
+                return Some(gemini_function_response_parts_not_portable_message(
+                    target_label,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn anthropic_user_turn_requires_tool_result_reordering(blocks: &[Value]) -> bool {
+    let mut saw_tool_result = false;
+    let mut saw_non_tool_before_tool_result = false;
+    let mut saw_non_tool_after_tool_result = false;
+
+    for block in blocks {
+        let is_tool_result = block.get("type").and_then(Value::as_str) == Some("tool_result");
+        if is_tool_result {
+            if saw_non_tool_before_tool_result || saw_non_tool_after_tool_result {
+                return true;
+            }
+            saw_tool_result = true;
+        } else if saw_tool_result {
+            saw_non_tool_after_tool_result = true;
+        } else {
+            saw_non_tool_before_tool_result = true;
+        }
+    }
+
+    false
+}
+
+fn anthropic_request_tool_result_order_message(body: &Value, target_label: &str) -> Option<String> {
+    let messages = body.get("messages").and_then(Value::as_array)?;
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        let has_tool_results = blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"));
+        let has_non_tool_results = blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) != Some("tool_result"));
+        if has_tool_results
+            && has_non_tool_results
+            && anthropic_user_turn_requires_tool_result_reordering(blocks)
+        {
+            return Some(anthropic_tool_result_order_not_portable_message(
+                target_label,
+            ));
+        }
+    }
+    None
+}
+
+fn responses_output_audio_item_to_openai_audio(item: &Value) -> Option<Value> {
+    if item.get("type").and_then(Value::as_str) != Some("output_audio") {
+        return None;
+    }
+
+    let mut merged = serde_json::Map::new();
+    if let Some(audio) = item.get("audio") {
+        if let Some(audio_obj) = audio.as_object() {
+            merged.extend(audio_obj.clone());
+        } else if !audio.is_null() {
+            merged.insert("data".to_string(), audio.clone());
+        }
+    }
+    if let Some(item_obj) = item.as_object() {
+        for (key, value) in item_obj {
+            if matches!(key.as_str(), "type" | "audio") {
+                continue;
+            }
+            merged.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    if merged.is_empty() {
+        None
+    } else {
+        Some(Value::Object(merged))
+    }
+}
+
+fn responses_response_audio_to_openai_audio(body: &Value) -> Result<Option<Value>, String> {
+    let Some(output) = body.get("output").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+
+    let audio_items = output
+        .iter()
+        .filter_map(responses_output_audio_item_to_openai_audio)
+        .collect::<Vec<_>>();
+    match audio_items.len() {
+        0 => Ok(None),
+        1 => Ok(audio_items.into_iter().next()),
+        _ => Err(responses_multiple_output_audio_items_not_portable_message(
+            "OpenAI Chat Completions",
+        )),
+    }
+}
+
+fn openai_assistant_audio_to_responses_output_item(message: &Value) -> Result<Option<Value>, String> {
+    let Some(audio) = message.get("audio") else {
+        return Ok(None);
+    };
+    if audio.is_null() {
+        return Ok(None);
+    }
+    let mut item = serde_json::Map::new();
+    item.insert("type".to_string(), Value::String("output_audio".to_string()));
+    if let Some(audio_obj) = audio.as_object() {
+        for field in ["id", "expires_at"] {
+            if audio_obj.get(field).is_some() {
+                return Err(openai_assistant_audio_field_not_portable_message(
+                    field,
+                    "OpenAI Responses",
+                ));
+            }
+        }
+        if let Some(data) = audio_obj.get("data").cloned() {
+            item.insert("data".to_string(), data);
+        }
+        if let Some(transcript) = audio_obj.get("transcript").cloned() {
+            item.insert("transcript".to_string(), transcript);
+        }
+    } else {
+        item.insert("data".to_string(), audio.clone());
+    }
+    Ok(Some(Value::Object(item)))
+}
+
+fn openai_response_has_assistant_audio(body: &Value) -> bool {
+    body.get("choices")
+        .and_then(Value::as_array)
+        .map(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .get("message")
+                    .and_then(|message| message.get("audio"))
+                    .map(|audio| !audio.is_null())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn clone_usage_details_object(details: Option<&Value>) -> Option<Value> {
+    let details = details?.as_object()?;
+    (!details.is_empty()).then(|| Value::Object(details.clone()))
+}
+
+fn claude_system_to_openai_content(system: &Value) -> Result<Option<Value>, String> {
+    match system {
+        Value::String(text) => Ok((!text.is_empty()).then(|| Value::String(text.clone()))),
+        Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+                if block_type != "text" {
+                    return Err(anthropic_block_not_portable_message(
+                        block_type,
+                        "OpenAI Chat Completions",
+                    ));
+                }
+                let Some(part) = semantic_text_part_from_claude_block(block) else {
+                    continue;
+                };
+                parts.push(semantic_text_part_to_openai_value(&part));
+            }
+            if parts.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(Value::Array(parts)))
+            }
+        }
+        Value::Object(_) => {
+            let Some(block_type) = system.get("type").and_then(Value::as_str) else {
+                return Ok(None);
+            };
+            if block_type != "text" {
+                return Err(anthropic_block_not_portable_message(
+                    block_type,
+                    "OpenAI Chat Completions",
+                ));
+            }
+            Ok(semantic_text_part_from_claude_block(system)
+                .map(|part| semantic_text_part_to_openai_value(&part)))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn extract_openai_refusal(message: &Value) -> Option<String> {
@@ -889,9 +1232,32 @@ pub(crate) fn assess_request_translation(
                 "Anthropic request controls {quoted} have native provider semantics and cannot be faithfully translated to {upstream_format}"
             ));
         }
+        if anthropic_request_has_nonportable_thinking_provenance(body) {
+            assessment.reject(anthropic_thinking_provenance_not_portable_message());
+        }
+        if let Some(message) = anthropic_request_nonportable_tool_definition_message(
+            body,
+            translation_target_label(upstream_format),
+        ) {
+            assessment.reject(message);
+        }
+        if let Some(message) =
+            anthropic_request_tool_result_order_message(body, translation_target_label(upstream_format))
+        {
+            assessment.reject(message);
+        }
         if let Some(message) =
             anthropic_nonportable_content_block_message(body, translation_target_label(upstream_format))
         {
+            assessment.reject(message);
+        }
+    }
+
+    if client_format == UpstreamFormat::Google && upstream_format != UpstreamFormat::Google {
+        if let Some(message) = gemini_request_nonportable_function_response_message(
+            body,
+            translation_target_label(upstream_format),
+        ) {
             assessment.reject(message);
         }
     }
@@ -1022,20 +1388,10 @@ fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
 }
 
 fn anthropic_response_has_nonportable_thinking_provenance(body: &Value) -> bool {
-    let Some(content) = body.get("content").and_then(Value::as_array) else {
-        return false;
-    };
-
-    content.iter().any(|block| {
-        if block.get("type").and_then(Value::as_str) != Some("thinking") {
-            return false;
-        }
-        block.get("signature").is_some()
-            || block
-                .get("thinking")
-                .map(|thinking| !thinking.is_string())
-                .unwrap_or(false)
-    })
+    body.get("content")
+        .and_then(Value::as_array)
+        .map(|content| anthropic_blocks_have_nonportable_thinking_provenance(content))
+        .unwrap_or(false)
 }
 
 pub(crate) fn classify_portable_non_success_terminal(code_or_reason: Option<&str>) -> &'static str {
@@ -1497,6 +1853,7 @@ fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
         Some(o) => o,
         None => return Ok(body.clone()),
     };
+    let audio = responses_response_audio_to_openai_audio(body)?;
     let mut content_parts: Vec<Value> = vec![];
     let mut reasoning_content = String::new();
     let mut refusal = String::new();
@@ -1559,6 +1916,9 @@ fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
     if !refusal.is_empty() {
         message["refusal"] = Value::String(refusal);
     }
+    if let Some(audio) = audio {
+        message["audio"] = audio;
+    }
     if has_tool_calls {
         message["tool_calls"] = Value::Array(tool_calls);
     }
@@ -1597,6 +1957,7 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
             }));
         }
     }
+    let audio_output = openai_assistant_audio_to_responses_output_item(message)?;
     let content = openai_message_to_responses_content(message, "output_text");
     if !content.is_empty() {
         output.push(serde_json::json!({
@@ -1604,7 +1965,7 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
             "role": "assistant",
             "content": content
         }));
-    } else if message.get("tool_calls").is_none() && output.is_empty() {
+    } else if message.get("tool_calls").is_none() && output.is_empty() && audio_output.is_none() {
         output.push(serde_json::json!({
             "type": "message",
             "role": "assistant",
@@ -1615,6 +1976,9 @@ fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
         for t in tc {
             output.push(openai_tool_call_to_responses_item(t));
         }
+    }
+    if let Some(audio_output) = audio_output {
+        output.push(audio_output);
     }
     let created_at = body.get("created").cloned().unwrap_or_else(|| {
         serde_json::json!(std::time::SystemTime::now()
@@ -2454,10 +2818,12 @@ fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -
 fn responses_usage_to_openai_usage(usage: &Value) -> Value {
     let input_tokens = usage
         .get("input_tokens")
+        .or(usage.get("prompt_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let output_tokens = usage
         .get("output_tokens")
+        .or(usage.get("completion_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let total_tokens = usage
@@ -2471,17 +2837,34 @@ fn responses_usage_to_openai_usage(usage: &Value) -> Value {
         "total_tokens": total_tokens
     });
 
-    if let Some(details) = usage.get("input_tokens_details") {
-        if let Some(cached) = details.get("cached_tokens").and_then(Value::as_u64) {
-            mapped["prompt_tokens_details"] = serde_json::json!({ "cached_tokens": cached });
-        }
+    if let Some(details) = clone_usage_details_object(
+        usage.get("input_tokens_details")
+            .or(usage.get("prompt_tokens_details")),
+    ) {
+        mapped["prompt_tokens_details"] = details;
     }
-    if let Some(details) = usage.get("output_tokens_details") {
-        if let Some(reasoning) = details.get("reasoning_tokens").and_then(Value::as_u64) {
-            mapped["completion_tokens_details"] =
-                serde_json::json!({ "reasoning_tokens": reasoning });
-        }
+    if let Some(details) = clone_usage_details_object(
+        usage.get("output_tokens_details")
+            .or(usage.get("completion_tokens_details")),
+    ) {
+        mapped["completion_tokens_details"] = details;
     }
+
+    copy_remaining_usage_fields(
+        usage,
+        &mut mapped,
+        &[
+            "input_tokens",
+            "prompt_tokens",
+            "output_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "input_tokens_details",
+            "prompt_tokens_details",
+            "output_tokens_details",
+            "completion_tokens_details",
+        ],
+    );
 
     mapped
 }
@@ -2506,16 +2889,24 @@ fn openai_usage_to_responses_usage(usage: &Value) -> Value {
         "total_tokens": total_tokens
     });
 
-    if let Some(details) = usage.get("prompt_tokens_details") {
-        if let Some(cached) = details.get("cached_tokens").and_then(Value::as_u64) {
-            mapped["input_tokens_details"] = serde_json::json!({ "cached_tokens": cached });
-        }
+    if let Some(details) = clone_usage_details_object(usage.get("prompt_tokens_details")) {
+        mapped["input_tokens_details"] = details;
     }
-    if let Some(details) = usage.get("completion_tokens_details") {
-        if let Some(reasoning) = details.get("reasoning_tokens").and_then(Value::as_u64) {
-            mapped["output_tokens_details"] = serde_json::json!({ "reasoning_tokens": reasoning });
-        }
+    if let Some(details) = clone_usage_details_object(usage.get("completion_tokens_details")) {
+        mapped["output_tokens_details"] = details;
     }
+
+    copy_remaining_usage_fields(
+        usage,
+        &mut mapped,
+        &[
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "prompt_tokens_details",
+            "completion_tokens_details",
+        ],
+    );
 
     mapped
 }
@@ -2593,24 +2984,11 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
     // System: strip cache_control from blocks
     // Reference: 9router claudeHelper.js - remove all cache_control, add only to last block
     if let Some(system) = body.get("system") {
-        let text = if system.is_string() {
-            system.as_str().unwrap_or("").to_string()
-        } else if let Some(arr) = system.as_array() {
-            arr.iter()
-                .filter_map(|s| {
-                    // Strip cache_control - just extract text
-                    s.get("text").and_then(Value::as_str)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            String::new()
-        };
-        if !text.is_empty() {
+        if let Some(content) = claude_system_to_openai_content(system)? {
             result["messages"]
                 .as_array_mut()
                 .unwrap()
-                .push(serde_json::json!({ "role": "system", "content": text }));
+                .push(serde_json::json!({ "role": "system", "content": content }));
         }
     }
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
@@ -3637,6 +4015,11 @@ fn convert_gemini_content_to_openai(content: &Value) -> Result<Vec<Value>, Strin
             }));
         }
         if let Some(fr) = gemini_part_field(part, "functionResponse", "function_response") {
+            if gemini_function_response_has_nonportable_parts(fr) {
+                return Err(gemini_function_response_parts_not_portable_message(
+                    "OpenAI Chat Completions",
+                ));
+            }
             if !openai_parts.is_empty() {
                 messages.push(serde_json::json!({
                     "role": openai_role,
@@ -3878,7 +4261,7 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
     let mut tool_sort_key_by_call_id = std::collections::HashMap::new();
     let mut next_tool_sort_key = 0usize;
     let mut contents: Vec<Value> = Vec::new();
-    let mut system_segments: Vec<String> = Vec::new();
+    let mut system_parts: Vec<Value> = Vec::new();
     let mut pending_tool_parts: Vec<(usize, Value)> = Vec::new();
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -3886,10 +4269,7 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
             flush_pending_gemini_function_responses(&mut contents, &mut pending_tool_parts);
         }
         if role == "system" || role == "developer" {
-            let text = extract_text_content(msg.get("content"));
-            if !text.is_empty() {
-                system_segments.push(text);
-            }
+            system_parts.extend(openai_content_to_gemini_parts(msg.get("content"))?);
             continue;
         }
         if role == "user" {
@@ -3946,10 +4326,10 @@ fn openai_to_gemini(body: &mut Value) -> Result<(), String> {
         }
     }
     flush_pending_gemini_function_responses(&mut contents, &mut pending_tool_parts);
-    if !system_segments.is_empty() {
+    if !system_parts.is_empty() {
         result["systemInstruction"] = serde_json::json!({
             "role": "user",
-            "parts": [{ "text": system_segments.join("\n\n") }]
+            "parts": system_parts
         });
     }
     result["contents"] = Value::Array(contents);
@@ -5871,6 +6251,282 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_claude_to_non_anthropic_rejects_thinking_signature_provenance() {
+        let body = json!({
+            "model": "claude-3",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "internal reasoning",
+                    "signature": "sig_123"
+                }]
+            }]
+        });
+
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Google,
+        ] {
+            let mut translated = body.clone();
+            let err = translate_request(
+                UpstreamFormat::Anthropic,
+                upstream_format,
+                "claude-3",
+                &mut translated,
+                false,
+            )
+            .expect_err("Anthropic request thinking provenance should fail closed");
+
+            assert!(err.contains("thinking"), "err = {err}");
+            assert!(err.contains("signature"), "err = {err}");
+        }
+    }
+
+    #[test]
+    fn translate_request_claude_to_non_anthropic_rejects_omitted_thinking_history() {
+        let body = json!({
+            "model": "claude-3",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": { "display": "omitted" },
+                    "signature": "sig_123"
+                }]
+            }]
+        });
+
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Google,
+        ] {
+            let mut translated = body.clone();
+            let err = translate_request(
+                UpstreamFormat::Anthropic,
+                upstream_format,
+                "claude-3",
+                &mut translated,
+                false,
+            )
+            .expect_err("Anthropic omitted thinking should fail closed");
+
+            assert!(err.contains("thinking"), "err = {err}");
+            assert!(err.contains("Anthropic"), "err = {err}");
+        }
+    }
+
+    #[test]
+    fn translate_request_claude_to_non_anthropic_rejects_nonportable_tool_definition_metadata() {
+        let tool_cases = [
+            (
+                "strict",
+                json!({
+                    "name": "lookup_weather",
+                    "description": "Weather lookup",
+                    "input_schema": { "type": "object", "properties": {} },
+                    "strict": true
+                }),
+            ),
+            (
+                "defer_loading",
+                json!({
+                    "name": "lookup_weather",
+                    "description": "Weather lookup",
+                    "input_schema": { "type": "object", "properties": {} },
+                    "defer_loading": true
+                }),
+            ),
+            (
+                "allowed_callers",
+                json!({
+                    "name": "lookup_weather",
+                    "description": "Weather lookup",
+                    "input_schema": { "type": "object", "properties": {} },
+                    "allowed_callers": ["assistant"]
+                }),
+            ),
+            (
+                "input_examples",
+                json!({
+                    "name": "lookup_weather",
+                    "description": "Weather lookup",
+                    "input_schema": { "type": "object", "properties": {} },
+                    "input_examples": [{
+                        "city": "Tokyo"
+                    }]
+                }),
+            ),
+            (
+                "server-side",
+                json!({
+                    "type": "web_search_20250305",
+                    "name": "web_search"
+                }),
+            ),
+        ];
+
+        for (label, tool) in tool_cases {
+            for upstream_format in [
+                UpstreamFormat::OpenAiCompletion,
+                UpstreamFormat::OpenAiResponses,
+                UpstreamFormat::Google,
+            ] {
+                let mut body = json!({
+                    "model": "claude-3",
+                    "messages": [{ "role": "user", "content": "Hi" }],
+                    "tools": [tool.clone()]
+                });
+
+                let err = translate_request(
+                    UpstreamFormat::Anthropic,
+                    upstream_format,
+                    "claude-3",
+                    &mut body,
+                    false,
+                )
+                .expect_err("Anthropic tool metadata should fail closed");
+
+                assert!(err.contains("tool"), "label = {label}, err = {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn translate_request_claude_to_non_anthropic_allows_supported_tool_definition_fields() {
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Google,
+        ] {
+            let mut body = json!({
+                "model": "claude-3",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "tools": [{
+                    "name": "lookup_weather",
+                    "description": "Weather lookup",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "city": { "type": "string" }
+                        }
+                    }
+                }]
+            });
+
+            translate_request(
+                UpstreamFormat::Anthropic,
+                upstream_format,
+                "claude-3",
+                &mut body,
+                false,
+            )
+            .expect("supported Anthropic tool fields should translate");
+        }
+    }
+
+    #[test]
+    fn translate_request_claude_to_non_anthropic_rejects_user_turn_that_would_reorder_tool_results() {
+        let mut body = json!({
+            "model": "claude-3",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "lookup_weather",
+                        "input": { "city": "Tokyo" }
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "Before the result" },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "sunny"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let err = translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .expect_err("mixed user turns that reorder tool_results should fail closed");
+
+        assert!(err.contains("tool_result"), "err = {err}");
+        assert!(err.contains("order"), "err = {err}");
+    }
+
+    #[test]
+    fn translate_request_claude_to_openai_preserves_multiblock_system_without_injected_newlines() {
+        let mut body = json!({
+            "model": "claude-3",
+            "system": [
+                { "type": "text", "text": "System A" },
+                { "type": "text", "text": "System B" }
+            ],
+            "messages": [{ "role": "user", "content": "Hi" }]
+        });
+
+        translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages[0]["role"], "system");
+        let content = messages[0]["content"].as_array().expect("system parts");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "System A");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "System B");
+    }
+
+    #[test]
+    fn translate_request_claude_to_gemini_preserves_multiblock_system_without_injected_newlines() {
+        let mut body = json!({
+            "model": "claude-3",
+            "system": [
+                { "type": "text", "text": "System A" },
+                { "type": "text", "text": "System B" }
+            ],
+            "messages": [{ "role": "user", "content": "Hi" }]
+        });
+
+        translate_request(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::Google,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .unwrap();
+
+        let parts = body["systemInstruction"]["parts"]
+            .as_array()
+            .expect("system instruction parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "System A");
+        assert_eq!(parts[1]["text"], "System B");
+    }
+
+    #[test]
     fn translate_request_claude_to_openai_rejects_top_level_cache_control_cross_protocol() {
         let mut body = json!({
             "model": "claude-3",
@@ -6264,6 +6920,103 @@ mod tests {
     }
 
     #[test]
+    fn translate_request_gemini_to_non_gemini_rejects_function_response_parts() {
+        let body = json!({
+            "model": "gemini-1.5",
+            "contents": [{
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "id": "call_1",
+                        "name": "lookup_weather",
+                        "response": {
+                            "result": {
+                                "parts": [
+                                    { "text": "sunny" }
+                                ]
+                            }
+                        }
+                    }
+                }]
+            }]
+        });
+
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Anthropic,
+        ] {
+            let mut translated = body.clone();
+            let err = translate_request(
+                UpstreamFormat::Google,
+                upstream_format,
+                "gemini-1.5",
+                &mut translated,
+                false,
+            )
+            .expect_err("Gemini functionResponse.parts should fail closed");
+
+            assert!(err.contains("functionResponse"), "err = {err}");
+            assert!(err.contains("parts"), "err = {err}");
+        }
+    }
+
+    #[test]
+    fn convert_gemini_content_to_openai_rejects_function_response_result_parts_at_boundary() {
+        let content = json!({
+            "role": "user",
+            "parts": [{
+                "functionResponse": {
+                    "id": "call_1",
+                    "name": "lookup_weather",
+                    "response": {
+                        "result": {
+                            "parts": [{ "text": "sunny" }]
+                        }
+                    }
+                }
+            }]
+        });
+
+        let err = convert_gemini_content_to_openai(&content)
+            .expect_err("functionResponse.response.result.parts should fail closed at conversion");
+
+        assert!(err.contains("functionResponse"), "err = {err}");
+        assert!(err.contains("parts"), "err = {err}");
+    }
+
+    #[test]
+    fn translate_request_gemini_to_openai_allows_structured_function_response_without_parts() {
+        let mut body = json!({
+            "model": "gemini-1.5",
+            "contents": [{
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "id": "call_1",
+                        "name": "lookup_weather",
+                        "response": { "result": { "temperature": 22 } }
+                    }
+                }]
+            }]
+        });
+
+        translate_request(
+            UpstreamFormat::Google,
+            UpstreamFormat::OpenAiCompletion,
+            "gemini-1.5",
+            &mut body,
+            false,
+        )
+        .expect("structured functionResponse.response should still translate");
+
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call_1");
+    }
+
+    #[test]
     fn translate_response_same_format_passthrough() {
         let body = json!({
             "id": "x",
@@ -6631,6 +7384,62 @@ mod tests {
     }
 
     #[test]
+    fn translate_response_responses_to_openai_maps_top_level_output_audio_to_message_audio() {
+        let body = json!({
+            "id": "resp_audio",
+            "object": "response",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Hi" }]
+                },
+                {
+                    "type": "output_audio",
+                    "data": "AAAA",
+                    "transcript": "hello"
+                }
+            ]
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .expect("Responses output_audio should map to Chat assistant audio");
+
+        assert_eq!(out["choices"][0]["message"]["content"], "Hi");
+        assert_eq!(out["choices"][0]["message"]["audio"]["data"], "AAAA");
+        assert_eq!(out["choices"][0]["message"]["audio"]["transcript"], "hello");
+    }
+
+    #[test]
+    fn translate_response_responses_to_openai_accepts_legacy_nested_output_audio_shape() {
+        let body = json!({
+            "id": "resp_audio_legacy",
+            "object": "response",
+            "output": [{
+                "type": "output_audio",
+                "audio": {
+                    "data": "AAAA",
+                    "format": "wav"
+                }
+            }]
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .expect("legacy nested output_audio should still parse");
+
+        assert_eq!(out["choices"][0]["message"]["audio"]["data"], "AAAA");
+        assert_eq!(out["choices"][0]["message"]["audio"]["format"], "wav");
+    }
+
+    #[test]
     fn translate_response_responses_incomplete_to_openai_preserves_terminal_and_usage_details() {
         let body = json!({
             "id": "resp_1",
@@ -6664,6 +7473,65 @@ mod tests {
         assert_eq!(
             out["usage"]["completion_tokens_details"]["reasoning_tokens"],
             2
+        );
+    }
+
+    #[test]
+    fn translate_response_responses_to_openai_preserves_audio_prediction_and_unknown_usage_fields() {
+        let body = json!({
+            "id": "resp_usage",
+            "object": "response",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Hi" }]
+            }],
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+                "service_tier": "priority",
+                "provider_metric": 99,
+                "input_tokens_details": {
+                    "cached_tokens": 3,
+                    "audio_tokens": 2,
+                    "future_prompt_detail": 4
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": 1,
+                    "audio_tokens": 5,
+                    "accepted_prediction_tokens": 6,
+                    "rejected_prediction_tokens": 2,
+                    "future_completion_detail": 8
+                }
+            }
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(out["usage"]["service_tier"], "priority");
+        assert_eq!(out["usage"]["provider_metric"], 99);
+        assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(out["usage"]["prompt_tokens_details"]["audio_tokens"], 2);
+        assert_eq!(out["usage"]["prompt_tokens_details"]["future_prompt_detail"], 4);
+        assert_eq!(out["usage"]["completion_tokens_details"]["reasoning_tokens"], 1);
+        assert_eq!(out["usage"]["completion_tokens_details"]["audio_tokens"], 5);
+        assert_eq!(
+            out["usage"]["completion_tokens_details"]["accepted_prediction_tokens"],
+            6
+        );
+        assert_eq!(
+            out["usage"]["completion_tokens_details"]["rejected_prediction_tokens"],
+            2
+        );
+        assert_eq!(
+            out["usage"]["completion_tokens_details"]["future_completion_detail"],
+            8
         );
     }
 
@@ -6774,6 +7642,189 @@ mod tests {
         assert_eq!(out["usage"]["output_tokens"], 7);
         assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 3);
         assert_eq!(out["usage"]["output_tokens_details"]["reasoning_tokens"], 2);
+    }
+
+    #[test]
+    fn translate_response_openai_assistant_audio_maps_to_responses_output_audio() {
+        let body = json!({
+            "id": "chatcmpl_audio",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hi",
+                    "audio": {
+                        "data": "AAAA",
+                        "transcript": "hello"
+                    }
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .expect("assistant audio should map to Responses output_audio");
+
+        let output = out["output"].as_array().expect("responses output");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "Hi");
+        assert_eq!(output[1]["type"], "output_audio");
+        assert_eq!(output[1]["data"], "AAAA");
+        assert_eq!(output[1]["transcript"], "hello");
+        assert!(output[1].get("audio").is_none(), "output = {output:?}");
+    }
+
+    #[test]
+    fn translate_response_openai_assistant_audio_with_id_rejects_for_responses() {
+        let body = json!({
+            "id": "chatcmpl_audio_id",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hi",
+                    "audio": {
+                        "data": "AAAA",
+                        "transcript": "hello",
+                        "id": "aud_123"
+                    }
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let err = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .expect_err("assistant audio ids should fail closed for Responses");
+
+        assert!(err.contains("audio"), "err = {err}");
+        assert!(err.contains("id"), "err = {err}");
+    }
+
+    #[test]
+    fn translate_response_openai_assistant_audio_with_expires_at_rejects_for_responses() {
+        let body = json!({
+            "id": "chatcmpl_audio_exp",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hi",
+                    "audio": {
+                        "data": "AAAA",
+                        "transcript": "hello",
+                        "expires_at": 1234567890
+                    }
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let err = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .expect_err("assistant audio expiry should fail closed for Responses");
+
+        assert!(err.contains("audio"), "err = {err}");
+        assert!(err.contains("expires_at"), "err = {err}");
+    }
+
+    #[test]
+    fn translate_response_openai_assistant_audio_still_fails_closed_for_non_responses_targets() {
+        let body = json!({
+            "id": "chatcmpl_audio",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hi",
+                    "audio": {
+                        "data": "AAAA",
+                        "format": "wav"
+                    }
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        for client_format in [UpstreamFormat::Anthropic, UpstreamFormat::Google] {
+            let err = translate_response(UpstreamFormat::OpenAiCompletion, client_format, &body)
+                .expect_err("assistant audio should still fail closed for non-Responses sinks");
+            assert!(err.contains("audio"), "err = {err}");
+            assert!(err.contains("OpenAI"), "err = {err}");
+        }
+    }
+
+    #[test]
+    fn translate_response_openai_to_responses_preserves_audio_prediction_and_unknown_usage_fields() {
+        let body = json!({
+            "id": "chatcmpl_usage",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 18,
+                "service_tier": "priority",
+                "provider_metric": 99,
+                "prompt_tokens_details": {
+                    "cached_tokens": 3,
+                    "audio_tokens": 2,
+                    "future_prompt_detail": 4
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": 1,
+                    "audio_tokens": 5,
+                    "accepted_prediction_tokens": 6,
+                    "rejected_prediction_tokens": 2,
+                    "future_completion_detail": 8
+                }
+            }
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(out["usage"]["service_tier"], "priority");
+        assert_eq!(out["usage"]["provider_metric"], 99);
+        assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(out["usage"]["input_tokens_details"]["audio_tokens"], 2);
+        assert_eq!(out["usage"]["input_tokens_details"]["future_prompt_detail"], 4);
+        assert_eq!(out["usage"]["output_tokens_details"]["reasoning_tokens"], 1);
+        assert_eq!(out["usage"]["output_tokens_details"]["audio_tokens"], 5);
+        assert_eq!(
+            out["usage"]["output_tokens_details"]["accepted_prediction_tokens"],
+            6
+        );
+        assert_eq!(
+            out["usage"]["output_tokens_details"]["rejected_prediction_tokens"],
+            2
+        );
+        assert_eq!(
+            out["usage"]["output_tokens_details"]["future_completion_detail"],
+            8
+        );
     }
 
     #[test]
