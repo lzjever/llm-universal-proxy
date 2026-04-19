@@ -5,10 +5,14 @@ use crate::formats::UpstreamFormat;
 use super::assessment::{openai_named_tool_choice_name, shared_control_profile_for_target};
 use super::messages::{
     custom_tools_not_portable_message, openai_assistant_audio_field_not_portable_message,
+    reserved_openai_custom_bridge_prefix_message,
     responses_multiple_output_audio_items_not_portable_message, single_required_array_item,
     translation_target_label,
 };
-use super::models::{NormalizedToolPolicy, SemanticTextPart, SemanticToolKind};
+use super::models::{
+    NormalizedOpenAiFamilyToolCall, NormalizedOpenAiFamilyToolDef, NormalizedToolPolicy,
+    SemanticTextPart, SemanticToolKind,
+};
 use super::openai_family::{
     collapse_openai_text_parts, copy_remaining_usage_fields, extract_openai_refusal,
     normalized_output_shape_to_openai_response_format,
@@ -23,10 +27,11 @@ use super::response_logprobs::{
 use super::response_protocols::{openai_message_reasoning_text, responses_finish_reason_to_openai};
 use super::tools::{
     content_value_is_effectively_empty, normalized_openai_tool_definitions_from_request,
-    normalized_responses_tool_definitions_from_request, normalized_tool_definition_to_openai,
-    normalized_tool_definition_to_openai_with_custom_bridge,
+    normalized_responses_tool_call, normalized_responses_tool_definitions_from_request,
+    normalized_tool_definition_to_openai, normalized_tool_definition_to_openai_with_custom_bridge,
     normalized_tool_definition_to_responses, openai_responses_custom_tool_bridge_name,
-    openai_tool_call_to_responses_item, openai_tool_call_to_responses_item_decoding_custom_bridge,
+    openai_responses_custom_tool_bridge_prefix_is_reserved, openai_tool_call_to_responses_item,
+    openai_tool_call_to_responses_item_decoding_custom_bridge,
     openai_tool_result_content_to_responses_output, responses_item_is_tool_output,
     responses_tool_call_item_to_openai_tool_call_strict,
     responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict,
@@ -483,11 +488,83 @@ pub(super) fn openai_response_to_responses(body: &Value) -> Result<Value, String
     Ok(result)
 }
 
+fn reject_reserved_custom_bridge_name(name: &str) -> Result<(), String> {
+    if openai_responses_custom_tool_bridge_prefix_is_reserved(name) {
+        return Err(reserved_openai_custom_bridge_prefix_message(name));
+    }
+    Ok(())
+}
+
+fn validate_responses_tool_choice_for_custom_bridge(choice: &Value) -> Result<(), String> {
+    let Some(choice_obj) = choice.as_object() else {
+        return Ok(());
+    };
+
+    match choice_obj.get("type").and_then(Value::as_str) {
+        Some("function") => {
+            if let Some(name) = openai_named_tool_choice_name(choice, "function") {
+                reject_reserved_custom_bridge_name(name)?;
+            }
+        }
+        Some("allowed_tools") => {
+            let Some(selected_tools) = choice_obj
+                .get("allowed_tools")
+                .and_then(Value::as_object)
+                .and_then(|allowed_tools| allowed_tools.get("tools"))
+                .or_else(|| choice_obj.get("tools"))
+                .and_then(Value::as_array)
+            else {
+                return Ok(());
+            };
+
+            for tool in selected_tools {
+                if tool.get("type").and_then(Value::as_str) != Some("function") {
+                    continue;
+                }
+                if let Some(name) = openai_named_tool_choice_name(tool, "function") {
+                    reject_reserved_custom_bridge_name(name)?;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn validate_responses_request_for_custom_bridge(body: &Value) -> Result<(), String> {
+    for tool in normalized_responses_tool_definitions_from_request(body)? {
+        if let NormalizedOpenAiFamilyToolDef::Function(function) = tool {
+            reject_reserved_custom_bridge_name(&function.name)?;
+        }
+    }
+
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items {
+            let Some(tool_call) = normalized_responses_tool_call(item)? else {
+                continue;
+            };
+            if let NormalizedOpenAiFamilyToolCall::Function { name, .. } = tool_call {
+                reject_reserved_custom_bridge_name(&name)?;
+            }
+        }
+    }
+
+    if let Some(tool_choice) = body.get("tool_choice") {
+        validate_responses_tool_choice_for_custom_bridge(tool_choice)?;
+    }
+
+    Ok(())
+}
+
 pub(super) fn responses_to_messages(
     body: &mut Value,
     target_format: UpstreamFormat,
 ) -> Result<(), String> {
     let bridge_custom_responses_semantics = target_format == UpstreamFormat::OpenAiCompletion;
+    if bridge_custom_responses_semantics {
+        validate_responses_request_for_custom_bridge(body)?;
+    }
     let controls = responses_normalized_request_controls(body)?;
     let profile = shared_control_profile_for_target(target_format);
     let input = body.get("input").ok_or("missing input")?;

@@ -270,6 +270,10 @@ fn openai_responses_custom_tool_input_from_bridge_arguments(
         )
 }
 
+pub(crate) fn openai_responses_custom_tool_bridge_prefix_is_reserved(name: &str) -> bool {
+    openai_responses_custom_tool_name_from_bridge(name).is_some()
+}
+
 pub(crate) fn openai_tool_arguments_raw(tool_call: &Value) -> Option<&str> {
     tool_call
         .get("function")
@@ -860,16 +864,29 @@ pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge(
             proxied_tool_kind,
         } => {
             if let Some(custom_name) = openai_responses_custom_tool_name_from_bridge(&name) {
-                let mut item = serde_json::json!({
-                    "type": "custom_tool_call",
-                    "call_id": id,
-                    "name": custom_name,
-                    "input": openai_responses_custom_tool_input_from_bridge_arguments(&arguments)?
-                });
-                if let Some(proxied_tool_kind) = proxied_tool_kind {
-                    item["proxied_tool_kind"] = proxied_tool_kind;
+                match openai_responses_custom_tool_input_from_bridge_arguments(&arguments) {
+                    Ok(input) => {
+                        let mut item = serde_json::json!({
+                            "type": "custom_tool_call",
+                            "call_id": id,
+                            "name": custom_name,
+                            "input": input
+                        });
+                        if let Some(proxied_tool_kind) = proxied_tool_kind {
+                            item["proxied_tool_kind"] = proxied_tool_kind;
+                        }
+                        Ok(item)
+                    }
+                    Err(_) => Ok(normalized_tool_call_to_responses_item(
+                        NormalizedOpenAiFamilyToolCall::Function {
+                            id,
+                            name,
+                            arguments,
+                            namespace,
+                            proxied_tool_kind,
+                        },
+                    )),
                 }
-                Ok(item)
             } else {
                 Ok(normalized_tool_call_to_responses_item(
                     NormalizedOpenAiFamilyToolCall::Function {

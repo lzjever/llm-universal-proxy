@@ -69,6 +69,12 @@ pub(crate) fn custom_tools_not_portable_message(upstream_format: UpstreamFormat)
     )
 }
 
+pub(crate) fn reserved_openai_custom_bridge_prefix_message(name: &str) -> String {
+    format!(
+        "OpenAI Responses function name `{name}` uses reserved bridge prefix `__llmup_custom__`; this namespace is reserved for synthetic custom-tool bridging to OpenAI Chat Completions"
+    )
+}
+
 pub(crate) fn anthropic_thinking_provenance_not_portable_message() -> String {
     "Anthropic thinking provenance (`signature` or omitted thinking) cannot be faithfully translated to non-Anthropic downstreams".to_string()
 }

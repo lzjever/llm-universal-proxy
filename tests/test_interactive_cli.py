@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,11 @@ from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "interactive_cli.py"
+WRAPPER_PATHS = (
+    REPO_ROOT / "scripts" / "run_codex_proxy.sh",
+    REPO_ROOT / "scripts" / "run_claude_proxy.sh",
+    REPO_ROOT / "scripts" / "run_gemini_proxy.sh",
+)
 
 
 def load_module():
@@ -21,6 +27,25 @@ def load_module():
 
 
 class InteractiveCliTests(unittest.TestCase):
+    def test_wrapper_scripts_resolve_interactive_cli_relative_to_script_dir(self):
+        for wrapper_path in WRAPPER_PATHS:
+            with self.subTest(wrapper=wrapper_path.name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    completed = subprocess.run(
+                        ["bash", str(wrapper_path), "--help"],
+                        cwd=temp_dir,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    msg=completed.stderr or completed.stdout,
+                )
+                self.assertIn("interactive_cli.py", completed.stdout)
+
     def test_build_interactive_command_shapes(self):
         module = load_module()
         workspace = pathlib.Path("/tmp/workspace").resolve()

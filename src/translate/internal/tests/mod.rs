@@ -341,6 +341,52 @@ fn translate_request_responses_to_openai_bridges_custom_tool_definition_choice_a
 }
 
 #[test]
+fn translate_request_responses_to_openai_rejects_reserved_bridge_prefix_for_function_names() {
+    let cases = [
+        json!({
+            "model": "gpt-4o",
+            "input": "run this",
+            "tools": [{
+                "type": "function",
+                "name": "__llmup_custom__lookup_weather",
+                "parameters": { "type": "object", "properties": {} }
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "input": "run this",
+            "tool_choice": {
+                "type": "function",
+                "name": "__llmup_custom__lookup_weather"
+            }
+        }),
+        json!({
+            "model": "gpt-4o",
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_prefixed",
+                "name": "__llmup_custom__lookup_weather",
+                "arguments": "{\"city\":\"SF\"}"
+            }]
+        }),
+    ];
+
+    for mut body in cases {
+        let err = translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            false,
+        )
+        .expect_err("reserved bridge namespace should be rejected");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
 fn translate_request_responses_standalone_custom_tool_output_to_non_openai_rejects() {
     for upstream_format in [UpstreamFormat::Anthropic, UpstreamFormat::Google] {
         let mut body = json!({
@@ -7477,6 +7523,55 @@ fn translate_response_openai_to_responses_decodes_bridged_function_call_to_custo
             "input": exact_input
         })
     );
+}
+
+#[test]
+fn translate_response_openai_to_responses_falls_back_when_bridged_arguments_are_noncanonical() {
+    let bad_arguments = [
+        "not valid json".to_string(),
+        serde_json::to_string(&json!({ "output": "missing input" })).expect("json"),
+        serde_json::to_string(&json!({ "input": 5 })).expect("json"),
+    ];
+
+    for raw_arguments in bad_arguments {
+        let body = json!({
+            "id": "chatcmpl_tools",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_custom",
+                        "type": "function",
+                        "function": {
+                            "name": "__llmup_custom__code_exec",
+                            "arguments": raw_arguments
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .expect("noncanonical bridged args should fall back to function_call");
+
+        let output = out["output"].as_array().expect("responses output");
+        assert_eq!(
+            output[0],
+            json!({
+                "type": "function_call",
+                "call_id": "call_custom",
+                "name": "__llmup_custom__code_exec",
+                "arguments": raw_arguments
+            })
+        );
+    }
 }
 
 #[test]
