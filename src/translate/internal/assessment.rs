@@ -709,18 +709,16 @@ pub(super) fn responses_nonportable_input_item_message(
             .get("type")
             .and_then(Value::as_str)
             .or_else(|| item.get("role").and_then(Value::as_str).map(|_| "message"))?;
-        if item_type == "reasoning" {
-            if item.get("encrypted_content").is_some() {
-                match target_format {
-                    UpstreamFormat::Anthropic => {
-                        return None;
-                    }
-                    UpstreamFormat::OpenAiCompletion => {}
-                    _ => {
-                        return Some(format!(
-                            "OpenAI Responses reasoning item field `encrypted_content` cannot be faithfully translated to {target_label}"
-                        ))
-                    }
+        if item_type == "reasoning" && item.get("encrypted_content").is_some() {
+            match target_format {
+                UpstreamFormat::Anthropic => {
+                    return None;
+                }
+                UpstreamFormat::OpenAiCompletion => {}
+                _ => {
+                    return Some(format!(
+                        "OpenAI Responses reasoning item field `encrypted_content` cannot be faithfully translated to {target_label}"
+                    ))
                 }
             }
         }
@@ -1174,12 +1172,12 @@ pub(crate) fn assess_request_translation(
                 translation_target_label(upstream_format)
             ));
         }
-        if anthropic_request_has_nonportable_thinking_provenance(body) {
-            if upstream_format != UpstreamFormat::OpenAiResponses {
-                assessment.warning(anthropic_thinking_provenance_dropped_message(
-                    translation_target_label(upstream_format),
-                ));
-            }
+        if anthropic_request_has_nonportable_thinking_provenance(body)
+            && upstream_format != UpstreamFormat::OpenAiResponses
+        {
+            assessment.warning(anthropic_thinking_provenance_dropped_message(
+                translation_target_label(upstream_format),
+            ));
         }
         if let Some(message) = anthropic_request_nonportable_tool_definition_message(
             body,

@@ -260,12 +260,8 @@ fn coalesce_openai_string_messages(body: &mut Value) {
 
 fn openai_string_message_role_if_coalescible(message: &Value) -> Option<&str> {
     let role = message.get("role").and_then(Value::as_str)?;
-    if message.get("content").and_then(Value::as_str).is_none() {
-        return None;
-    }
-    let Some(object) = message.as_object() else {
-        return None;
-    };
+    message.get("content").and_then(Value::as_str)?;
+    let object = message.as_object()?;
     let has_only_role_and_content = object.keys().all(|key| key == "role" || key == "content");
     has_only_role_and_content.then_some(role)
 }

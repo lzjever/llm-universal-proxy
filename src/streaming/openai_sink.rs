@@ -1237,31 +1237,35 @@ pub(super) fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState)
     out
 }
 
+struct ResponsesToolCallEvent<'a> {
+    response_id: &'a str,
+    output_index: u64,
+    call_id: &'a str,
+    name: &'a str,
+    tool_type: &'a str,
+    proxied_tool_kind: Option<&'a str>,
+}
+
 fn emit_responses_tool_call_item_added(
     state: &mut StreamState,
-    response_id: &str,
-    output_index: u64,
-    call_id: &str,
-    name: &str,
-    tool_type: &str,
-    proxied_tool_kind: Option<&str>,
+    event: &ResponsesToolCallEvent<'_>,
     out: &mut Vec<Vec<u8>>,
 ) {
-    let payload_field = responses_tool_call_payload_field(tool_type);
+    let payload_field = responses_tool_call_payload_field(event.tool_type);
     let mut ev = serde_json::json!({
         "type": "response.output_item.added",
         "sequence_number": next_responses_seq(state),
-        "response_id": response_id,
-        "output_index": output_index,
+        "response_id": event.response_id,
+        "output_index": event.output_index,
         "item": {
-            "id": format!("fc_{}", call_id),
-            "type": responses_tool_call_item_type(tool_type),
-            "call_id": call_id,
-            "name": name,
+            "id": format!("fc_{}", event.call_id),
+            "type": responses_tool_call_item_type(event.tool_type),
+            "call_id": event.call_id,
+            "name": event.name,
         }
     });
     ev["item"][payload_field] = Value::String(String::new());
-    if let Some(proxied_tool_kind) = proxied_tool_kind {
+    if let Some(proxied_tool_kind) = event.proxied_tool_kind {
         ev["item"]["proxied_tool_kind"] = Value::String(proxied_tool_kind.to_string());
     }
     out.push(format_sse_event("response.output_item.added", &ev));
@@ -1269,33 +1273,28 @@ fn emit_responses_tool_call_item_added(
 
 fn emit_responses_tool_call_delta(
     state: &mut StreamState,
-    response_id: &str,
-    output_index: u64,
-    call_id: &str,
-    name: &str,
+    event: &ResponsesToolCallEvent<'_>,
     delta: &str,
-    tool_type: &str,
-    proxied_tool_kind: Option<&str>,
     out: &mut Vec<Vec<u8>>,
 ) {
     if delta.is_empty() {
         return;
     }
     let mut ev = serde_json::json!({
-        "type": responses_tool_call_delta_event_type(tool_type),
+        "type": responses_tool_call_delta_event_type(event.tool_type),
         "sequence_number": next_responses_seq(state),
-        "response_id": response_id,
-        "call_id": call_id,
-        "name": name,
-        "item_id": format!("fc_{}", call_id),
-        "output_index": output_index,
+        "response_id": event.response_id,
+        "call_id": event.call_id,
+        "name": event.name,
+        "item_id": format!("fc_{}", event.call_id),
+        "output_index": event.output_index,
         "delta": delta
     });
-    if let Some(proxied_tool_kind) = proxied_tool_kind {
+    if let Some(proxied_tool_kind) = event.proxied_tool_kind {
         ev["proxied_tool_kind"] = Value::String(proxied_tool_kind.to_string());
     }
     out.push(format_sse_event(
-        responses_tool_call_delta_event_type(tool_type),
+        responses_tool_call_delta_event_type(event.tool_type),
         &ev,
     ));
 }
@@ -1363,32 +1362,21 @@ fn flush_pending_responses_tool_call(
         }
 
         entry.responses_item_added = true;
-        entry.responses_item_id = Some(format!("fc_{}", call_id));
+        entry.responses_item_id = Some(format!("fc_{call_id}"));
         (call_id, name, arguments, tool_type, proxied_tool_kind)
     };
 
     let (call_id, name, arguments, tool_type, proxied_tool_kind) = resolved;
-    emit_responses_tool_call_item_added(
-        state,
+    let event = ResponsesToolCallEvent {
         response_id,
         output_index,
-        &call_id,
-        &name,
-        &tool_type,
-        proxied_tool_kind.as_deref(),
-        out,
-    );
-    emit_responses_tool_call_delta(
-        state,
-        response_id,
-        output_index,
-        &call_id,
-        &name,
-        &arguments,
-        &tool_type,
-        proxied_tool_kind.as_deref(),
-        out,
-    );
+        call_id: &call_id,
+        name: &name,
+        tool_type: &tool_type,
+        proxied_tool_kind: proxied_tool_kind.as_deref(),
+    };
+    emit_responses_tool_call_item_added(state, &event, out);
+    emit_responses_tool_call_delta(state, &event, &arguments, out);
 }
 
 pub(super) fn flush_pending_responses_tool_calls(
@@ -1699,17 +1687,15 @@ pub(super) fn openai_chunk_to_responses_sse(
                 flush_pending_responses_tool_call(state, &response_id, tc_idx, false, &mut out);
             }
             if let Some((call_id, name, args, tool_type, proxied_tool_kind)) = args_delta {
-                emit_responses_tool_call_delta(
-                    state,
-                    &response_id,
+                let event = ResponsesToolCallEvent {
+                    response_id: &response_id,
                     output_index,
-                    &call_id,
-                    &name,
-                    &args,
-                    &tool_type,
-                    proxied_tool_kind.as_deref(),
-                    &mut out,
-                );
+                    call_id: &call_id,
+                    name: &name,
+                    tool_type: &tool_type,
+                    proxied_tool_kind: proxied_tool_kind.as_deref(),
+                };
+                emit_responses_tool_call_delta(state, &event, &args, &mut out);
             }
         }
     }

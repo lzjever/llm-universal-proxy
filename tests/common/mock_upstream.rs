@@ -496,7 +496,7 @@ async fn openai_responses_reasoning_with_encrypted_carrier_handler(
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let encrypted_content = "anthropic-thinking-v1:7b22666f726d6174223a22616e7468726f7069632d7468696e6b696e672d7265706c6179222c2276657273696f6e223a312c22626c6f636b73223a5b7b2274797065223a227468696e6b696e67222c227468696e6b696e67223a227468696e6b222c227369676e6174757265223a227369675f73747265616d227d5d7d";
     if stream {
-        let events = vec![
+        let events = [
             r#"event: response.created
 data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_enc","object":"response","created_at":1,"status":"in_progress","background":false,"error":null,"output":[]}}"#
                 .to_string(),

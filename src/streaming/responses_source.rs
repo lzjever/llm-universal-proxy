@@ -156,7 +156,7 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
             state.openai_tool_call_index += 1;
             let id = call_id.unwrap_or_else(|| format!("call_{idx}"));
             let is_custom = item_ty == Some("custom_tool_call");
-            let tool_type = if is_custom { "function" } else { "function" };
+            let tool_type = "function";
             let custom_input = item.get("input").and_then(Value::as_str).unwrap_or("");
             let name = if is_custom {
                 openai_responses_custom_tool_bridge_name_stream(&raw_name)
