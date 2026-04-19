@@ -21,6 +21,20 @@ pub(super) fn unsupported_gemini_output_part_kind(part: &Value) -> Option<String
     })
 }
 
+pub(super) fn flush_pending_gemini_finish_chunk(state: &mut StreamState) -> Option<Value> {
+    let finish_reason = state.finish_reason.clone()?;
+    if state.finish_reason_sent {
+        return None;
+    }
+
+    state.finish_reason_sent = true;
+    let mut chunk = openai_chunk(state, serde_json::json!({}), Some(&finish_reason));
+    if let Some(ref usage) = state.usage {
+        chunk["usage"] = usage.clone();
+    }
+    Some(chunk)
+}
+
 pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> Vec<Value> {
     if state.fatal_rejection.is_some() {
         return vec![];
@@ -239,13 +253,7 @@ pub fn gemini_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
 
     if let Some(finish) = candidate.get("finishReason").and_then(Value::as_str) {
         let fr = gemini_finish_reason_to_openai_stream(finish, !state.openai_tool_calls.is_empty());
-        let mut chunk = openai_chunk(state, serde_json::json!({}), Some(&fr));
-        if let Some(ref u) = state.usage {
-            chunk["usage"] = u.clone();
-        }
-        out.push(chunk);
         state.finish_reason = Some(fr);
-        state.finish_reason_sent = true;
     }
     out
 }

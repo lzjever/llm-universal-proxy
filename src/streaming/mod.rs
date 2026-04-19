@@ -13,7 +13,6 @@ use crate::translate::{
     anthropic_tool_use_type_for_openai_tool_call, classify_openai_finish_for_anthropic,
     classify_portable_non_success_terminal, custom_tools_not_portable_message,
     gemini_finish_reason_to_openai, responses_failed_code_to_openai_finish, AnthropicTerminal,
-    OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
 };
 
 mod anthropic_source;

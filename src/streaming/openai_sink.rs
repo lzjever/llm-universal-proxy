@@ -23,6 +23,23 @@ pub(super) fn stop_thinking_block_claude(state: &mut StreamState, out: &mut Vec<
     state.thinking_block_started = false;
 }
 
+pub(super) fn ensure_thinking_block_claude(state: &mut StreamState, out: &mut Vec<Vec<u8>>) {
+    if state.thinking_block_started {
+        return;
+    }
+    state.thinking_block_index = state.next_block_index;
+    state.next_block_index += 1;
+    state.thinking_block_started = true;
+    out.push(format_sse_event(
+        "content_block_start",
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": state.thinking_block_index,
+            "content_block": { "type": "thinking", "thinking": "" }
+        }),
+    ));
+}
+
 pub(super) fn stop_text_block_claude(state: &mut StreamState, out: &mut Vec<Vec<u8>>) {
     if !state.text_block_started || state.text_block_closed {
         return;
@@ -640,17 +657,6 @@ pub(super) fn openai_chunk_to_claude_sse(chunk: &Value, state: &mut StreamState)
     let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
     let reasoning_delta = openai_chunk_reasoning_delta(delta, state);
 
-    if reasoning_delta
-        .as_deref()
-        .is_some_and(|reasoning| !reasoning.is_empty())
-    {
-        return reject_anthropic_stream(
-            state,
-            "invalid_request_error",
-            OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
-        );
-    }
-
     if let Some(message) =
         delta
             .get("tool_calls")
@@ -709,6 +715,19 @@ pub(super) fn openai_chunk_to_claude_sse(chunk: &Value, state: &mut StreamState)
             }
         });
         out.push(format_sse_event("message_start", &msg));
+    }
+
+    if let Some(reasoning) = reasoning_delta {
+        if !reasoning.is_empty() {
+            stop_text_block_claude(state, &mut out);
+            ensure_thinking_block_claude(state, &mut out);
+            let ev = serde_json::json!({
+                "type": "content_block_delta",
+                "index": state.thinking_block_index,
+                "delta": { "type": "thinking_delta", "thinking": reasoning }
+            });
+            out.push(format_sse_event("content_block_delta", &ev));
+        }
     }
 
     if let Some(content) = openai_chunk_content_delta(delta, state) {

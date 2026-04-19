@@ -1,3 +1,4 @@
+use super::gemini_source::*;
 use super::openai_sink::*;
 use super::state::*;
 use super::*;

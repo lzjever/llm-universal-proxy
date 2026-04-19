@@ -256,6 +256,11 @@ fn openai_chunk_does_not_double_prefix_existing_chatcmpl_ids() {
     assert_eq!(chunk["id"], "chatcmpl-msg123");
 }
 
+fn parse_sse_json_frame(bytes: &[u8]) -> Value {
+    let mut buf = bytes.to_vec();
+    take_one_sse_event(&mut buf).expect("parse sse event")
+}
+
 struct PendingAfterFirstChunkStream {
     polls: Arc<AtomicUsize>,
     emitted: bool,
@@ -313,5 +318,51 @@ async fn translate_sse_stream_closes_promptly_after_fatal_rejection() {
         polls.load(Ordering::SeqCst),
         1,
         "upstream should not be polled again after fatal rejection"
+    );
+}
+
+#[tokio::test]
+async fn translate_sse_stream_gemini_to_anthropic_defers_finish_until_stream_end() {
+    let inner = futures_util::stream::iter(vec![
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            br#"data: {"candidates":[{"content":{"parts":[{"text":"think","thought":true}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"thoughtsTokenCount":1,"totalTokenCount":3}}
+
+"#,
+        )),
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            br#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"thoughtsTokenCount":1,"totalTokenCount":4}}
+
+"#,
+        )),
+    ]);
+    let mut stream =
+        TranslateSseStream::new(inner, UpstreamFormat::Google, UpstreamFormat::Anthropic);
+
+    let mut events = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let frame = frame.expect("translated frame");
+        events.push(parse_sse_json_frame(&frame));
+    }
+
+    assert_eq!(events[0]["type"], "message_start");
+    assert_eq!(events[1]["type"], "content_block_start");
+    assert_eq!(events[1]["content_block"]["type"], "thinking");
+    assert_eq!(events[2]["type"], "content_block_delta");
+    assert_eq!(events[2]["delta"]["thinking"], "think");
+    assert_eq!(events[3]["type"], "content_block_stop");
+    assert_eq!(events[4]["type"], "content_block_start");
+    assert_eq!(events[4]["content_block"]["type"], "text");
+    assert_eq!(events[5]["type"], "content_block_delta");
+    assert_eq!(events[5]["delta"]["text"], "Hi");
+    assert_eq!(events[6]["type"], "content_block_stop");
+    assert_eq!(events[7]["type"], "message_delta");
+    assert_eq!(events[7]["delta"]["stop_reason"], "end_turn");
+    assert_eq!(events[8]["type"], "message_stop");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
+        1
     );
 }

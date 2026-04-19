@@ -395,6 +395,21 @@ where
                             break;
                         }
                     }
+                    if this.upstream_format == UpstreamFormat::Google {
+                        if let Some(chunk) = flush_pending_gemini_finish_chunk(&mut this.state) {
+                            let translated = match this.client_format {
+                                UpstreamFormat::OpenAiCompletion => vec![format_sse_data(&chunk)],
+                                UpstreamFormat::Anthropic => {
+                                    openai_chunk_to_claude_sse(&chunk, &mut this.state)
+                                }
+                                UpstreamFormat::Google => vec![format_sse_data(&chunk)],
+                                UpstreamFormat::OpenAiResponses => {
+                                    openai_chunk_to_responses_sse(&chunk, &mut this.state)
+                                }
+                            };
+                            this.output_queue.extend(translated);
+                        }
+                    }
                     if !this.output_queue.is_empty() {
                         continue;
                     }

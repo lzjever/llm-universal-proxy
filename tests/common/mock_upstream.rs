@@ -434,6 +434,27 @@ pub async fn spawn_openai_responses_reasoning_mock() -> (String, tokio::task::Jo
     (base, handle)
 }
 
+pub async fn spawn_openai_responses_reasoning_with_encrypted_carrier_mock(
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let app = Router::new()
+        .route(
+            "/v1/responses",
+            post(openai_responses_reasoning_with_encrypted_carrier_handler),
+        )
+        .route(
+            "/responses",
+            post(openai_responses_reasoning_with_encrypted_carrier_handler),
+        );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
 async fn openai_responses_reasoning_handler(Json(body): Json<Value>) -> Response {
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
@@ -462,6 +483,58 @@ data: {"type":"response.completed","sequence_number":4,"response":{"id":"resp_1"
             "output": [
                 { "id": "rs_1", "type": "reasoning", "summary": [{ "type": "summary_text", "text": "think" }] },
                 { "id": "msg_1", "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Hi" }] }
+            ],
+            "usage": { "input_tokens": 1, "output_tokens": 2, "output_tokens_details": { "reasoning_tokens": 1 } }
+        });
+        (StatusCode::OK, Json(resp)).into_response()
+    }
+}
+
+async fn openai_responses_reasoning_with_encrypted_carrier_handler(
+    Json(body): Json<Value>,
+) -> Response {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let encrypted_content = "anthropic-thinking-v1:7b22666f726d6174223a22616e7468726f7069632d7468696e6b696e672d7265706c6179222c2276657273696f6e223a312c22626c6f636b73223a5b7b2274797065223a227468696e6b696e67222c227468696e6b696e67223a227468696e6b222c227369676e6174757265223a227369675f73747265616d227d5d7d";
+    if stream {
+        let events = vec![
+            r#"event: response.created
+data: {"type":"response.created","sequence_number":1,"response":{"id":"resp_enc","object":"response","created_at":1,"status":"in_progress","background":false,"error":null,"output":[]}}"#
+                .to_string(),
+            r#"event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","sequence_number":2,"output_index":0,"summary_index":0,"delta":"think"}"#
+                .to_string(),
+            r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"output_index":1,"delta":"Hi"}"#
+                .to_string(),
+            format!(
+                "event: response.completed\ndata: {{\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{{\"id\":\"resp_enc\",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"output\":[{{\"id\":\"rs_enc\",\"type\":\"reasoning\",\"summary\":[{{\"type\":\"summary_text\",\"text\":\"think\"}}],\"encrypted_content\":\"{encrypted_content}\"}},{{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"Hi\"}}]}}],\"usage\":{{\"input_tokens\":1,\"output_tokens\":2,\"output_tokens_details\":{{\"reasoning_tokens\":1}}}}}}}}"
+            ),
+        ];
+        let body = events.join("\n\n") + "\n\n";
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    } else {
+        let resp = serde_json::json!({
+            "id": "resp_enc",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "output": [
+                {
+                    "id": "rs_enc",
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": "think" }],
+                    "encrypted_content": encrypted_content
+                },
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Hi" }]
+                }
             ],
             "usage": { "input_tokens": 1, "output_tokens": 2, "output_tokens_details": { "reasoning_tokens": 1 } }
         });

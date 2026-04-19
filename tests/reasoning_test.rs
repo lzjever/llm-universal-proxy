@@ -34,6 +34,15 @@ async fn assert_reasoning_to_anthropic_rejected(res: reqwest::Response) {
     assert!(message.contains("provenance"), "body = {body:?}");
 }
 
+fn parse_sse_payloads(body: &str) -> Vec<Value> {
+    body.split("\n\n")
+        .filter_map(|event| {
+            let data = event.lines().find_map(|line| line.strip_prefix("data: "))?;
+            serde_json::from_str::<Value>(data).ok()
+        })
+        .collect()
+}
+
 async fn assert_reasoning_to_anthropic_preserved_as_unsigned_thinking(
     res: reqwest::Response,
     expected_thinking: &str,
@@ -57,26 +66,52 @@ async fn assert_reasoning_to_anthropic_preserved_as_unsigned_thinking(
     assert_eq!(content[1]["text"], expected_text, "body = {body:?}");
     assert_eq!(body["usage"]["input_tokens"], 1, "body = {body:?}");
     assert_eq!(
-        body["usage"]["output_tokens"],
-        expected_output_tokens,
+        body["usage"]["output_tokens"], expected_output_tokens,
         "body = {body:?}"
     );
 }
 
-async fn assert_reasoning_to_anthropic_stream_rejected(res: reqwest::Response) {
+async fn assert_reasoning_to_anthropic_stream_preserved_as_unsigned_thinking(
+    res: reqwest::Response,
+    expected_thinking: &str,
+    expected_text: &str,
+) {
     let status = res.status();
     let body = res.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::OK, "body = {body}");
-    assert!(body.contains("event: error"), "body = {body}");
-    assert!(body.contains("\"type\":\"error\""), "body = {body}");
-    assert!(
-        body.contains("\"type\":\"invalid_request_error\""),
+    let events = parse_sse_payloads(&body);
+    assert_eq!(events[0]["type"], "message_start", "body = {body}");
+    assert_eq!(events[1]["type"], "content_block_start", "body = {body}");
+    assert_eq!(
+        events[1]["content_block"]["type"], "thinking",
         "body = {body}"
     );
-    assert!(body.contains("reasoning"), "body = {body}");
-    assert!(body.contains("provenance"), "body = {body}");
-    assert!(!body.contains("text_delta"), "body = {body}");
-    assert!(!body.contains("message_stop"), "body = {body}");
+    assert_eq!(events[2]["type"], "content_block_delta", "body = {body}");
+    assert_eq!(
+        events[2]["delta"]["type"], "thinking_delta",
+        "body = {body}"
+    );
+    assert_eq!(
+        events[2]["delta"]["thinking"], expected_thinking,
+        "body = {body}"
+    );
+    assert_eq!(events[3]["type"], "content_block_stop", "body = {body}");
+    assert_eq!(events[4]["type"], "content_block_start", "body = {body}");
+    assert_eq!(events[4]["content_block"]["type"], "text", "body = {body}");
+    assert_eq!(events[5]["type"], "content_block_delta", "body = {body}");
+    assert_eq!(events[5]["delta"]["type"], "text_delta", "body = {body}");
+    assert_eq!(events[5]["delta"]["text"], expected_text, "body = {body}");
+    assert_eq!(events[6]["type"], "content_block_stop", "body = {body}");
+    assert_eq!(events[7]["type"], "message_delta", "body = {body}");
+    assert_eq!(
+        events[7]["delta"]["stop_reason"], "end_turn",
+        "body = {body}"
+    );
+    assert_eq!(events[8]["type"], "message_stop", "body = {body}");
+    assert!(
+        events.iter().all(|event| event["type"] != "error"),
+        "body = {body}"
+    );
 }
 
 // ============================================================
@@ -713,7 +748,7 @@ async fn anthropic_omitted_thinking_to_openai_chat_streaming_skips_hidden_reason
 }
 
 #[tokio::test]
-async fn openai_reasoning_to_anthropic_streaming_rejects_without_provenance() {
+async fn openai_reasoning_to_anthropic_streaming_preserves_unsigned_thinking_without_provenance() {
     let (mock_base, _mock) = spawn_openai_completion_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -730,7 +765,7 @@ async fn openai_reasoning_to_anthropic_streaming_rejects_without_provenance() {
         .send()
         .await
         .unwrap();
-    assert_reasoning_to_anthropic_stream_rejected(res).await;
+    assert_reasoning_to_anthropic_stream_preserved_as_unsigned_thinking(res, "think", "Hi").await;
 }
 
 #[tokio::test]
@@ -777,7 +812,8 @@ async fn responses_reasoning_to_openai_chat_streaming() {
 }
 
 #[tokio::test]
-async fn responses_reasoning_to_anthropic_streaming_rejects_without_provenance() {
+async fn responses_reasoning_to_anthropic_streaming_preserves_unsigned_thinking_without_provenance()
+{
     let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -794,7 +830,29 @@ async fn responses_reasoning_to_anthropic_streaming_rejects_without_provenance()
         .send()
         .await
         .unwrap();
-    assert_reasoning_to_anthropic_stream_rejected(res).await;
+    assert_reasoning_to_anthropic_stream_preserved_as_unsigned_thinking(res, "think", "Hi").await;
+}
+
+#[tokio::test]
+async fn responses_reasoning_with_encrypted_carrier_to_anthropic_streaming_degrades_without_error()
+{
+    let (mock_base, _mock) = spawn_openai_responses_reasoning_with_encrypted_carrier_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "mock",
+            "max_tokens": 256,
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_reasoning_to_anthropic_stream_preserved_as_unsigned_thinking(res, "think", "Hi").await;
 }
 
 #[tokio::test]
@@ -820,7 +878,7 @@ async fn gemini_thinking_to_openai_chat_streaming() {
 }
 
 #[tokio::test]
-async fn gemini_thinking_to_anthropic_streaming_rejects_without_provenance() {
+async fn gemini_thinking_to_anthropic_streaming_preserves_unsigned_thinking_without_provenance() {
     let (mock_base, _mock) = spawn_google_thinking_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;

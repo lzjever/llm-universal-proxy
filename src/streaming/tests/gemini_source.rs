@@ -64,7 +64,10 @@ fn gemini_event_to_openai_chunks_maps_portable_finish_and_reasoning_usage() {
         }
     });
     let mut state = StreamState::default();
-    let chunks = gemini_event_to_openai_chunks(&event, &mut state);
+    let mut chunks = gemini_event_to_openai_chunks(&event, &mut state);
+    if let Some(chunk) = flush_pending_gemini_finish_chunk(&mut state) {
+        chunks.push(chunk);
+    }
     let finish_chunk = chunks
         .iter()
         .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
@@ -152,7 +155,10 @@ fn gemini_candidate_less_usage_and_metadata_only_partials_are_buffered_until_can
     let mut state = StreamState::default();
     let first = gemini_event_to_openai_chunks(&metadata_only, &mut state);
     let second = gemini_event_to_openai_chunks(&usage_only, &mut state);
-    let third = gemini_event_to_openai_chunks(&candidate, &mut state);
+    let mut third = gemini_event_to_openai_chunks(&candidate, &mut state);
+    if let Some(chunk) = flush_pending_gemini_finish_chunk(&mut state) {
+        third.push(chunk);
+    }
 
     assert!(first.is_empty(), "metadata-only partial should be buffered");
     assert!(second.is_empty(), "usage-only partial should be buffered");
