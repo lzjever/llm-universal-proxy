@@ -1,6 +1,123 @@
 use super::state::*;
 use super::*;
 
+fn raw_json_is_valid_object_anthropic_source(raw: &str) -> bool {
+    !raw.trim().is_empty()
+        && serde_json::from_str::<Value>(raw).is_ok_and(|value| value.is_object())
+}
+
+fn anthropic_tool_use_partial_replay_text(name: &str, raw: &str) -> String {
+    match raw.trim() {
+        "" => format!("Tool call `{name}` had incomplete arguments."),
+        trimmed => format!("Tool call `{name}` with partial arguments: {trimmed}"),
+    }
+}
+
+fn finalize_claude_tool_use_block(
+    state: &mut StreamState,
+    block_index: usize,
+    out: &mut Vec<Value>,
+) {
+    enum FinalizedToolUse {
+        Structured {
+            openai_index: usize,
+            id: Option<Value>,
+            name: String,
+            arguments: String,
+            proxied_tool_kind: Option<String>,
+        },
+        Text {
+            message: String,
+        },
+    }
+
+    let finalized = {
+        let Some(tool_use) = state.claude_tool_uses.get(&block_index) else {
+            return;
+        };
+        if tool_use.finalized {
+            return;
+        }
+        if tool_use.zero_arg_candidate
+            && !tool_use.saw_input_json_delta
+            && tool_use.arguments.trim().is_empty()
+        {
+            Some(FinalizedToolUse::Structured {
+                openai_index: tool_use.openai_index,
+                id: tool_use.id.clone(),
+                name: tool_use.name.clone(),
+                arguments: "{}".to_string(),
+                proxied_tool_kind: tool_use.proxied_tool_kind.clone(),
+            })
+        } else if raw_json_is_valid_object_anthropic_source(&tool_use.arguments) {
+            Some(FinalizedToolUse::Structured {
+                openai_index: tool_use.openai_index,
+                id: tool_use.id.clone(),
+                name: tool_use.name.clone(),
+                arguments: tool_use.arguments.clone(),
+                proxied_tool_kind: tool_use.proxied_tool_kind.clone(),
+            })
+        } else {
+            Some(FinalizedToolUse::Text {
+                message: anthropic_tool_use_partial_replay_text(
+                    &tool_use.name,
+                    &tool_use.arguments,
+                ),
+            })
+        }
+    };
+
+    match finalized {
+        Some(FinalizedToolUse::Structured {
+            openai_index,
+            id,
+            name,
+            arguments,
+            proxied_tool_kind,
+        }) => {
+            emit_openai_assistant_role_if_needed(state, out);
+            let mut tool_call = serde_json::json!({
+                "index": openai_index,
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            });
+            if let Some(proxied_tool_kind) = proxied_tool_kind {
+                tool_call["proxied_tool_kind"] = Value::String(proxied_tool_kind);
+            }
+            out.push(openai_chunk(
+                state,
+                serde_json::json!({ "tool_calls": [tool_call] }),
+                None,
+            ));
+            if let Some(tool_use) = state.claude_tool_uses.get_mut(&block_index) {
+                tool_use.arguments = arguments;
+                tool_use.zero_arg_candidate = false;
+                tool_use.start_arguments_emitted = true;
+                tool_use.arguments_seeded_from_start = false;
+                tool_use.finalized = true;
+            }
+        }
+        Some(FinalizedToolUse::Text { message }) => {
+            emit_openai_assistant_role_if_needed(state, out);
+            out.push(openai_chunk(
+                state,
+                serde_json::json!({ "content": message }),
+                None,
+            ));
+            if let Some(tool_use) = state.claude_tool_uses.get_mut(&block_index) {
+                tool_use.zero_arg_candidate = false;
+                tool_use.finalized = true;
+                tool_use.arguments_seeded_from_start = false;
+            }
+        }
+        None => {}
+    }
+}
+
 pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> Vec<Value> {
     if state.fatal_rejection.is_some() {
         return vec![];
@@ -81,23 +198,18 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let seeded_arguments = block
+                    let serialized_input = block
                         .get("input")
                         .filter(|input| !input.is_null())
-                        .filter(|input| !matches!(input, Value::Object(map) if map.is_empty()))
                         .and_then(|input| serde_json::to_string(input).ok())
-                        .filter(|serialized| serialized != "null" && serialized != "{}")
+                        .filter(|serialized| serialized != "null")
                         .unwrap_or_default();
-                    let mut tc = serde_json::json!({
-                        "index": tc_index,
-                        "id": block.get("id"),
-                        "type": "function",
-                        "function": { "name": name, "arguments": seeded_arguments }
-                    });
-                    if block_ty == Some("server_tool_use") {
-                        tc["proxied_tool_kind"] =
-                            Value::String("anthropic_server_tool_use".to_string());
-                    }
+                    let zero_arg_candidate = serialized_input == "{}";
+                    let seeded_arguments = if zero_arg_candidate {
+                        String::new()
+                    } else {
+                        serialized_input
+                    };
                     state.claude_blocks.insert(
                         idx,
                         ClaudeBlockState {
@@ -116,16 +228,15 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                             id: block.get("id").cloned(),
                             name: name.clone(),
                             arguments: seeded_arguments.clone(),
+                            proxied_tool_kind: (block_ty == Some("server_tool_use"))
+                                .then(|| "anthropic_server_tool_use".to_string()),
+                            zero_arg_candidate,
+                            saw_input_json_delta: false,
                             arguments_seeded_from_start: !seeded_arguments.is_empty(),
-                            start_arguments_emitted: !seeded_arguments.is_empty(),
+                            start_arguments_emitted: false,
+                            finalized: false,
                         },
                     );
-                    emit_openai_assistant_role_if_needed(state, &mut out);
-                    out.push(openai_chunk(
-                        state,
-                        serde_json::json!({ "tool_calls": [tc] }),
-                        None,
-                    ));
                 }
                 Some(other) => {
                     let message = if other == "server_tool_result" {
@@ -205,34 +316,22 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                     }
                 }
                 Some("input_json_delta") => {
+                    if let Some(tc) = idx.and_then(|i| state.claude_tool_uses.get_mut(&i)) {
+                        tc.saw_input_json_delta = true;
+                    }
                     if let Some(pj) =
                         delta.and_then(|d| d.get("partial_json").and_then(Value::as_str))
                     {
-                        let chunk_json = if let Some(tc) =
-                            idx.and_then(|i| state.claude_tool_uses.get_mut(&i))
-                        {
-                            let delta_to_emit =
-                                if tc.arguments_seeded_from_start && !tc.arguments.is_empty() {
-                                    tc.arguments = merge_seeded_tool_arguments(&tc.arguments, pj);
-                                    tc.arguments_seeded_from_start = false;
-                                    pj.to_string()
-                                } else {
-                                    tc.arguments.push_str(pj);
-                                    pj.to_string()
-                                };
-                            Some(serde_json::json!({
-                                    "tool_calls": [{
-                                        "index": tc.openai_index,
-                                        "id": tc.id,
-                                        "function": { "arguments": delta_to_emit }
-                                    }]
-                            }))
-                        } else {
-                            None
-                        };
-                        if let Some(cj) = chunk_json {
-                            emit_openai_assistant_role_if_needed(state, &mut out);
-                            out.push(openai_chunk(state, cj, None));
+                        if let Some(tc) = idx.and_then(|i| state.claude_tool_uses.get_mut(&i)) {
+                            if tc.zero_arg_candidate {
+                                tc.zero_arg_candidate = false;
+                            }
+                            if tc.arguments_seeded_from_start && !tc.arguments.is_empty() {
+                                tc.arguments = merge_seeded_tool_arguments(&tc.arguments, pj);
+                                tc.arguments_seeded_from_start = false;
+                            } else {
+                                tc.arguments.push_str(pj);
+                            }
                         }
                     }
                 }
@@ -334,31 +433,8 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                 .get("index")
                 .and_then(Value::as_u64)
                 .map(|i| i as usize);
-            let seeded_tool_chunk = if let Some(i) = idx {
-                if let Some(tc) = state.claude_tool_uses.get_mut(&i) {
-                    if tc.arguments_seeded_from_start
-                        && !tc.start_arguments_emitted
-                        && !tc.arguments.is_empty()
-                    {
-                        tc.arguments_seeded_from_start = false;
-                        Some(serde_json::json!({
-                            "tool_calls": [{
-                                "index": tc.openai_index,
-                                "id": tc.id,
-                                "function": { "arguments": tc.arguments.clone() }
-                            }]
-                        }))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(chunk_json) = seeded_tool_chunk {
-                out.push(openai_chunk(state, chunk_json, None));
+            if let Some(i) = idx {
+                finalize_claude_tool_use_block(state, i, &mut out);
             }
             if let Some(i) = idx {
                 let buffered_reasoning = state.claude_blocks.get(&i).and_then(|block_state| {
@@ -411,13 +487,34 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
         }
         Some("message_stop") => {
             if !state.finish_reason_sent {
-                let fr = state.finish_reason.clone().unwrap_or_else(|| {
-                    if state.claude_tool_uses.is_empty() {
-                        "stop".to_string()
-                    } else {
-                        "tool_calls".to_string()
-                    }
-                });
+                let pending_tool_use_indices = state
+                    .claude_tool_uses
+                    .iter()
+                    .filter_map(|(idx, tool_use)| (!tool_use.finalized).then_some(*idx))
+                    .collect::<Vec<_>>();
+                for idx in pending_tool_use_indices {
+                    finalize_claude_tool_use_block(state, idx, &mut out);
+                }
+                let has_structured_tool_use = state
+                    .claude_tool_uses
+                    .values()
+                    .any(|tool_use| tool_use.start_arguments_emitted);
+                let fr = state.finish_reason.clone().map_or_else(
+                    || {
+                        if has_structured_tool_use {
+                            "tool_calls".to_string()
+                        } else {
+                            "stop".to_string()
+                        }
+                    },
+                    |finish_reason| {
+                        if finish_reason == "tool_calls" && !has_structured_tool_use {
+                            "stop".to_string()
+                        } else {
+                            finish_reason
+                        }
+                    },
+                );
                 let mut chunk = openai_chunk(state, serde_json::json!({}), Some(&fr));
                 // Usage with cache token reporting
                 // Reference: 9router claude-to-openai.js - include cache_read_input_tokens, cache_creation_input_tokens

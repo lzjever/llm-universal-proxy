@@ -15,7 +15,7 @@ use bytes::Bytes;
 use common::*;
 use futures_util::{future::join_all, stream, StreamExt};
 use llm_universal_proxy::config::{
-    AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ModelAlias,
+    AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ModelAlias, ModelLimits,
     RuntimeConfigPayload, RuntimeHookConfig, RuntimeUpstreamConfig, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
@@ -82,6 +82,7 @@ fn named_upstream(
         fallback_api_key: fallback_api_key.map(ToString::to_string),
         auth_policy: AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
+        limits: None,
     }
 }
 
@@ -91,18 +92,31 @@ fn config_with_alias(
     alias: &str,
     upstream_model: &str,
 ) -> Config {
+    config_with_alias_limits(upstream_base, format, alias, upstream_model, None)
+}
+
+fn config_with_alias_limits(
+    upstream_base: &str,
+    format: UpstreamFormat,
+    alias: &str,
+    upstream_model: &str,
+    limits: Option<ModelLimits>,
+) -> Config {
+    let mut config = proxy_config(upstream_base, format);
+    if let Some(upstream) = config.upstreams.get_mut(0) {
+        upstream.limits = limits;
+    }
     let mut model_aliases = std::collections::BTreeMap::new();
     model_aliases.insert(
         alias.to_string(),
         ModelAlias {
             upstream_name: "default".to_string(),
             upstream_model: upstream_model.to_string(),
+            limits: None,
         },
     );
-    Config {
-        model_aliases,
-        ..proxy_config(upstream_base, format)
-    }
+    config.model_aliases = model_aliases;
+    config
 }
 
 fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
@@ -117,11 +131,96 @@ fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
             fallback_credential_actual: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            limits: None,
         }],
         model_aliases: std::collections::BTreeMap::new(),
         hooks: RuntimeHookConfig::default(),
         debug_trace: DebugTraceConfig::default(),
     }
+}
+
+#[test]
+fn yaml_config_parses_structured_model_alias_limits() {
+    let config = Config::from_yaml_str(
+        r#"
+listen: 127.0.0.1:18888
+upstreams:
+  MINIMAX-OPENAI:
+    api_root: https://api.minimaxi.com/v1
+    format: openai-completion
+    credential_actual: secret
+    auth_policy: force_server
+    limits:
+      context_window: 200000
+      max_output_tokens: 128000
+model_aliases:
+  minimax-openai:
+    target: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+    limits:
+      max_output_tokens: 64000
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.upstreams[0].limits,
+        Some(ModelLimits {
+            context_window: Some(200_000),
+            max_output_tokens: Some(128_000),
+        })
+    );
+    assert_eq!(
+        config.model_aliases["minimax-openai"].limits,
+        Some(ModelLimits {
+            context_window: None,
+            max_output_tokens: Some(64_000),
+        })
+    );
+    assert_eq!(
+        config.effective_model_limits(&config.model_aliases["minimax-openai"]),
+        Some(ModelLimits {
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
+        })
+    );
+}
+
+#[test]
+fn runtime_config_round_trip_preserves_model_alias_limits() {
+    let mut payload = demo_runtime_config("http://example.com");
+    payload.upstreams[0].limits = Some(ModelLimits {
+        context_window: Some(200_000),
+        max_output_tokens: Some(128_000),
+    });
+    payload.model_aliases.insert(
+        "minimax-anth".to_string(),
+        ModelAlias {
+            upstream_name: "default".to_string(),
+            upstream_model: "MiniMax-M2.7-highspeed".to_string(),
+            limits: Some(ModelLimits {
+                context_window: None,
+                max_output_tokens: Some(64_000),
+            }),
+        },
+    );
+
+    let config = Config::try_from(payload).unwrap();
+    let round_trip = RuntimeConfigPayload::from(&config);
+
+    assert_eq!(
+        round_trip.upstreams[0].limits,
+        Some(ModelLimits {
+            context_window: Some(200_000),
+            max_output_tokens: Some(128_000),
+        })
+    );
+    assert_eq!(
+        round_trip.model_aliases["minimax-anth"].limits,
+        Some(ModelLimits {
+            context_window: None,
+            max_output_tokens: Some(64_000),
+        })
+    );
 }
 
 fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -> Config {
@@ -137,6 +236,7 @@ fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -
             fallback_api_key: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            limits: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
@@ -397,6 +497,7 @@ fn pinned_responses_plus_auto_discovery_config(
                 fallback_api_key: None,
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                limits: None,
             },
         ],
         model_aliases: Default::default(),
@@ -606,6 +707,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
                 ("x-session-token".to_string(), "session-secret".to_string()),
                 ("x-api-key".to_string(), "api-secret".to_string()),
             ],
+            limits: None,
         }],
         model_aliases: std::collections::BTreeMap::new(),
         hooks: RuntimeHookConfig {
@@ -928,6 +1030,7 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
                         ),
                         ("x-service-apikey".to_string(), "apikey-secret".to_string()),
                     ],
+                    limits: None,
                 }],
                 model_aliases: std::collections::BTreeMap::new(),
                 hooks: RuntimeHookConfig {
@@ -1753,6 +1856,7 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
             fallback_api_key: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            limits: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
@@ -1895,6 +1999,7 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
             fallback_api_key: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            limits: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
@@ -1933,6 +2038,7 @@ async fn openai_responses_create_with_alias_routes_to_configured_upstream() {
         ModelAlias {
             upstream_name: "RESPONSES_A".to_string(),
             upstream_model: "model-a".to_string(),
+            limits: None,
         },
     );
     let config = Config {
@@ -2906,11 +3012,15 @@ async fn google_passthrough_does_not_inject_top_level_stream_field() {
 #[tokio::test]
 async fn openai_models_endpoint_lists_local_aliases() {
     let (mock_base, _mock) = spawn_openai_completion_mock().await;
-    let config = config_with_alias(
+    let config = config_with_alias_limits(
         &mock_base,
         UpstreamFormat::OpenAiCompletion,
         "sonnet",
         "gpt-4o",
+        Some(ModelLimits {
+            context_window: Some(200_000),
+            max_output_tokens: Some(128_000),
+        }),
     );
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -2925,16 +3035,28 @@ async fn openai_models_endpoint_lists_local_aliases() {
     assert_eq!(body["object"], "list");
     assert_eq!(body["data"][0]["id"], "sonnet");
     assert_eq!(body["data"][0]["proxec"]["upstream_model"], "gpt-4o");
+    assert_eq!(
+        body["data"][0]["proxec"]["limits"]["context_window"],
+        200_000
+    );
+    assert_eq!(
+        body["data"][0]["proxec"]["limits"]["max_output_tokens"],
+        128_000
+    );
 }
 
 #[tokio::test]
 async fn anthropic_models_endpoint_retrieves_local_alias() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
-    let config = config_with_alias(
+    let config = config_with_alias_limits(
         &mock_base,
         UpstreamFormat::Anthropic,
         "haiku",
         "claude-3-haiku",
+        Some(ModelLimits {
+            context_window: Some(200_000),
+            max_output_tokens: Some(128_000),
+        }),
     );
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -2948,16 +3070,22 @@ async fn anthropic_models_endpoint_retrieves_local_alias() {
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["id"], "haiku");
     assert_eq!(body["type"], "model");
+    assert_eq!(body["proxec"]["limits"]["context_window"], 200_000);
+    assert_eq!(body["proxec"]["limits"]["max_output_tokens"], 128_000);
 }
 
 #[tokio::test]
 async fn google_models_endpoint_lists_local_aliases() {
     let (mock_base, _mock) = spawn_google_mock().await;
-    let config = config_with_alias(
+    let config = config_with_alias_limits(
         &mock_base,
         UpstreamFormat::Google,
         "flash",
         "gemini-2.0-flash",
+        Some(ModelLimits {
+            context_window: Some(200_000),
+            max_output_tokens: Some(128_000),
+        }),
     );
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -2974,6 +3102,8 @@ async fn google_models_endpoint_lists_local_aliases() {
         body["models"][0]["supportedGenerationMethods"][0],
         "generateContent"
     );
+    assert_eq!(body["models"][0]["inputTokenLimit"], 200_000);
+    assert_eq!(body["models"][0]["outputTokenLimit"], 128_000);
 }
 
 #[tokio::test]
@@ -3741,6 +3871,7 @@ async fn multi_upstream_supports_local_model_alias() {
         ModelAlias {
             upstream_name: "GLM-OFFICIAL".to_string(),
             upstream_model: "GLM-5".to_string(),
+            limits: None,
         },
     );
     let config = Config {
@@ -3870,6 +4001,7 @@ async fn force_server_auth_policy_ignores_client_key() {
             fallback_api_key: Some("server-secret".to_string()),
             auth_policy: AuthPolicy::ForceServer,
             upstream_headers: Vec::new(),
+            limits: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
@@ -4172,9 +4304,18 @@ async fn hooks_capture_translated_responses_reasoning_as_thinking_for_messages_s
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
-    assert!(body.contains("\"content_block\":{\"thinking\":\"\",\"type\":\"thinking\"}"), "body = {body}");
-    assert!(body.contains("\"delta\":{\"thinking\":\"think\",\"type\":\"thinking_delta\"}"), "body = {body}");
-    assert!(body.contains("\"delta\":{\"text\":\"Hi\",\"type\":\"text_delta\"}"), "body = {body}");
+    assert!(
+        body.contains("\"content_block\":{\"thinking\":\"\",\"type\":\"thinking\"}"),
+        "body = {body}"
+    );
+    assert!(
+        body.contains("\"delta\":{\"thinking\":\"think\",\"type\":\"thinking_delta\"}"),
+        "body = {body}"
+    );
+    assert!(
+        body.contains("\"delta\":{\"text\":\"Hi\",\"type\":\"text_delta\"}"),
+        "body = {body}"
+    );
     assert!(body.contains("event: message_stop"), "body = {body}");
     assert!(!body.contains("event: error"), "body = {body}");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4185,9 +4326,17 @@ async fn hooks_capture_translated_responses_reasoning_as_thinking_for_messages_s
         .find(|payload| payload.get("request").is_some())
         .unwrap();
     assert_eq!(exchange["response"]["body"]["type"], "message");
-    assert_eq!(exchange["response"]["body"]["content"][0]["type"], "thinking");
-    assert_eq!(exchange["response"]["body"]["content"][0]["thinking"], "think");
-    assert!(exchange["response"]["body"]["content"][0].get("signature").is_none());
+    assert_eq!(
+        exchange["response"]["body"]["content"][0]["type"],
+        "thinking"
+    );
+    assert_eq!(
+        exchange["response"]["body"]["content"][0]["thinking"],
+        "think"
+    );
+    assert!(exchange["response"]["body"]["content"][0]
+        .get("signature")
+        .is_none());
     assert_eq!(exchange["response"]["body"]["content"][1]["type"], "text");
     assert_eq!(exchange["response"]["body"]["content"][1]["text"], "Hi");
 }
@@ -4638,9 +4787,18 @@ async fn messages_endpoint_preserves_responses_reasoning_as_thinking_stream() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
-    assert!(body.contains("\"content_block\":{\"thinking\":\"\",\"type\":\"thinking\"}"), "body = {body}");
-    assert!(body.contains("\"delta\":{\"thinking\":\"think\",\"type\":\"thinking_delta\"}"), "body = {body}");
-    assert!(body.contains("\"delta\":{\"text\":\"Hi\",\"type\":\"text_delta\"}"), "body = {body}");
+    assert!(
+        body.contains("\"content_block\":{\"thinking\":\"\",\"type\":\"thinking\"}"),
+        "body = {body}"
+    );
+    assert!(
+        body.contains("\"delta\":{\"thinking\":\"think\",\"type\":\"thinking_delta\"}"),
+        "body = {body}"
+    );
+    assert!(
+        body.contains("\"delta\":{\"text\":\"Hi\",\"type\":\"text_delta\"}"),
+        "body = {body}"
+    );
     assert!(body.contains("event: message_stop"), "body = {body}");
     assert!(!body.contains("event: error"), "body = {body}");
 }
@@ -4826,6 +4984,7 @@ async fn upstream_unreachable_returns_502() {
             fallback_api_key: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            limits: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),

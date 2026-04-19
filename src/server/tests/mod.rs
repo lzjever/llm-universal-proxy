@@ -65,6 +65,7 @@ pub(super) fn test_upstream_config_with_fixed_format(
         fallback_api_key: None,
         auth_policy: crate::config::AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
+        limits: None,
     }
 }
 
@@ -146,6 +147,44 @@ pub(super) async fn spawn_openai_completion_mock(
     (format!("http://{addr}"), requests, server)
 }
 
+pub(super) async fn spawn_anthropic_messages_mock(
+    response_body: Value,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    #[derive(Clone)]
+    struct MockState {
+        requests: Arc<Mutex<Vec<Value>>>,
+        response_body: Value,
+    }
+
+    async fn handle_messages(
+        State(state): State<MockState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state.requests.lock().await.push(body);
+        Json(state.response_body)
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1/messages", post(handle_messages))
+        .route("/messages", post(handle_messages))
+        .with_state(MockState {
+            requests: requests.clone(),
+            response_body,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind anthropic mock upstream");
+    let addr = listener.local_addr().expect("anthropic mock local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("anthropic mock server");
+    });
+
+    (format!("http://{addr}"), requests, server)
+}
+
 pub(super) fn app_state_for_single_upstream(
     api_root: String,
     upstream_format: crate::formats::UpstreamFormat,
@@ -171,6 +210,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         fallback_api_key: None,
         auth_policy: crate::config::AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
+        limits: None,
     };
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),

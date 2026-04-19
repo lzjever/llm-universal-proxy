@@ -161,6 +161,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
                     "Bearer upstream-secret".to_string(),
                 ),
             ],
+            limits: None,
         }],
         model_aliases: Default::default(),
         hooks: crate::config::HookConfig {

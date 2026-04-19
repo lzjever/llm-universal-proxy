@@ -2,9 +2,6 @@ use serde_json::Value;
 
 use crate::formats::UpstreamFormat;
 
-pub(crate) const OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE: &str =
-    "OpenAI reasoning cannot be replayed to Anthropic without provenance; refusing to translate reasoning as plain text";
-
 pub(crate) fn translation_target_label(format: UpstreamFormat) -> &'static str {
     match format {
         UpstreamFormat::OpenAiCompletion => "OpenAI Chat Completions",
@@ -66,6 +63,16 @@ pub(crate) fn custom_tools_not_portable_message(upstream_format: UpstreamFormat)
     format!(
         "OpenAI custom tools cannot be faithfully translated to {}; refusing to downgrade them to function tools",
         translation_target_label(upstream_format)
+    )
+}
+
+pub(crate) fn custom_tool_format_downgraded_message(
+    source_label: &str,
+    tool_name: &str,
+    target_label: &str,
+) -> String {
+    format!(
+        "{source_label} custom tool `{tool_name}` format constraints cannot be faithfully translated to {target_label}; downgrading to raw string input semantics"
     )
 }
 

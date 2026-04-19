@@ -193,6 +193,68 @@ async fn live_gemini_top_k_drop_surfaces_warning_header() {
     server.abort();
 }
 
+#[tokio::test]
+async fn live_openai_request_uses_configured_default_output_limit_for_anthropic_upstream() {
+    let response_body = serde_json::json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "Hi" }],
+        "model": "claude-3-7-sonnet",
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    });
+    let (mock_base, requests, server) = spawn_anthropic_messages_mock(response_body).await;
+    let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Anthropic);
+    {
+        let mut runtime = state.runtime.write().await;
+        let namespace = runtime
+            .namespaces
+            .get_mut(DEFAULT_NAMESPACE)
+            .expect("default namespace");
+        namespace.config.model_aliases.insert(
+            "minimax-openai".to_string(),
+            crate::config::ModelAlias {
+                upstream_name: "primary".to_string(),
+                upstream_model: "claude-3-7-sonnet".to_string(),
+                limits: Some(crate::config::ModelLimits {
+                    context_window: None,
+                    max_output_tokens: Some(128_000),
+                }),
+            },
+        );
+    }
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/chat/completions".to_string(),
+        serde_json::json!({
+            "model": "minimax-openai",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }),
+        "minimax-openai".to_string(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    assert_eq!(recorded[0]["model"], "claude-3-7-sonnet");
+    assert_eq!(
+        recorded[0]["max_tokens"],
+        128_000,
+        "configured default output limit should propagate to real Anthropic upstream body when the client omits it: {:?}",
+        recorded[0]
+    );
+
+    server.abort();
+}
+
 #[test]
 fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace() {
     let config = crate::config::Config {
@@ -208,6 +270,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
                 fallback_api_key: None,
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                limits: None,
             },
             crate::config::UpstreamConfig {
                 name: "b".to_string(),
@@ -218,6 +281,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
                 fallback_api_key: None,
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                limits: None,
             },
         ],
         model_aliases: Default::default(),
@@ -251,6 +315,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
                 fallback_api_key: None,
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                limits: None,
             },
             crate::config::UpstreamConfig {
                 name: "b".to_string(),
@@ -261,6 +326,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
                 fallback_api_key: None,
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                limits: None,
             },
         ],
         model_aliases: Default::default(),

@@ -3,10 +3,11 @@ use serde_json::Value;
 use crate::formats::UpstreamFormat;
 
 use super::messages::{
-    anthropic_thinking_provenance_dropped_message, custom_tools_not_portable_message,
-    openai_assistant_audio_history_not_portable_message, openai_request_audio_not_portable_message,
-    single_candidate_choice_contract_message, translation_target_label,
-    responses_reasoning_carrier_dropped_message, responses_reasoning_carrier_malformed_message,
+    anthropic_thinking_provenance_dropped_message, custom_tool_format_downgraded_message,
+    custom_tools_not_portable_message, openai_assistant_audio_history_not_portable_message,
+    openai_request_audio_not_portable_message, responses_reasoning_carrier_dropped_message,
+    responses_reasoning_carrier_malformed_message, single_candidate_choice_contract_message,
+    translation_target_label,
 };
 use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
@@ -15,9 +16,10 @@ use super::models::{
 use super::openai_responses::decode_anthropic_reasoning_carrier;
 use super::request_gemini::gemini_generation_config_field;
 use super::tools::{
-    normalized_responses_tool_definition, openai_tool_arguments_to_structured_value,
-    responses_tool_call_item_to_openai_tool_call, responses_tool_call_to_structured_value,
-    semantic_tool_kind_from_value,
+    normalized_responses_tool_definition, openai_custom_tool_format_supports_anthropic_bridge,
+    openai_tool_arguments_to_structured_value, responses_tool_call_item_to_openai_tool_call,
+    responses_tool_call_to_structured_value, semantic_tool_kind_from_value,
+    tool_call_is_marked_non_replayable,
 };
 use super::{
     anthropic_nonportable_content_block_message, anthropic_protocol_uses_cache_control,
@@ -573,7 +575,7 @@ pub(super) fn responses_nonportable_tool_choice_message(
     match choice_type {
         "function" => None,
         "custom" => match target_format {
-            UpstreamFormat::OpenAiCompletion => None,
+            UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic => None,
             _ => Some(format!(
                 "OpenAI Responses tool_choice.type `custom` cannot be faithfully translated to {target_label}"
             )),
@@ -582,7 +584,14 @@ pub(super) fn responses_nonportable_tool_choice_message(
             |tools| {
                 tools.iter().find_map(|tool| match tool.get("type").and_then(Value::as_str) {
                     Some("function") => None,
-                    Some("custom") if target_format == UpstreamFormat::OpenAiCompletion => None,
+                    Some("custom")
+                        if matches!(
+                            target_format,
+                            UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+                        ) =>
+                    {
+                        None
+                    }
                     Some("custom") => Some(format!(
                         "OpenAI Responses tool_choice.allowed_tools selected custom tool `{}` and cannot be faithfully translated to {target_label}",
                         tool.get("name")
@@ -637,6 +646,31 @@ pub(super) fn responses_has_warning_only_nonportable_tool_definitions(body: &Val
             })
         })
         .unwrap_or(false)
+}
+
+pub(super) fn responses_custom_tool_format_reject_message(
+    body: &Value,
+    target_format: UpstreamFormat,
+) -> Option<String> {
+    if target_format != UpstreamFormat::Anthropic {
+        return None;
+    }
+
+    let tools = body.get("tools").and_then(Value::as_array)?;
+    tools
+        .iter()
+        .find_map(|tool| match normalized_responses_tool_definition(tool) {
+            Ok(Some(NormalizedOpenAiFamilyToolDef::Custom(custom)))
+                if !openai_custom_tool_format_supports_anthropic_bridge(custom.format.as_ref()) =>
+            {
+                Some(custom_tool_format_downgraded_message(
+                    "OpenAI Responses",
+                    &custom.name,
+                    translation_target_label(target_format),
+                ))
+            }
+            _ => None,
+        })
 }
 
 pub(super) fn responses_hosted_input_item_type(item_type: &str) -> bool {
@@ -877,15 +911,16 @@ pub(super) fn request_invalid_structured_tool_arguments_message(
                         .and_then(|tool_calls| {
                             tool_calls.iter().find_map(|tool_call| {
                                 (semantic_tool_kind_from_value(tool_call)
-                                    != SemanticToolKind::OpenAiCustom)
-                                    .then(|| {
-                                        openai_tool_arguments_to_structured_value(
-                                            tool_call,
-                                            target_label,
-                                        )
-                                        .err()
-                                    })
-                                    .flatten()
+                                    != SemanticToolKind::OpenAiCustom
+                                    && !tool_call_is_marked_non_replayable(tool_call))
+                                .then(|| {
+                                    openai_tool_arguments_to_structured_value(
+                                        tool_call,
+                                        target_label,
+                                    )
+                                    .err()
+                                })
+                                .flatten()
                             })
                         })
                 })
@@ -900,12 +935,12 @@ pub(super) fn request_invalid_structured_tool_arguments_message(
                             Some("function_call") | Some("custom_tool_call")
                         )
                         .then(|| {
-                            (semantic_tool_kind_from_value(item) != SemanticToolKind::OpenAiCustom)
-                                .then(|| {
-                                    responses_tool_call_to_structured_value(item, target_label)
-                                        .err()
-                                })
-                                .flatten()
+                            (semantic_tool_kind_from_value(item) != SemanticToolKind::OpenAiCustom
+                                && !tool_call_is_marked_non_replayable(item))
+                            .then(|| {
+                                responses_tool_call_to_structured_value(item, target_label).err()
+                            })
+                            .flatten()
                         })
                         .flatten()
                     })
@@ -1004,6 +1039,9 @@ pub(crate) fn assess_request_translation(
             assessment.warning(format!(
                 "non-function Responses tools are not portable to {upstream_format} and will be dropped"
             ));
+        }
+        if let Some(message) = responses_custom_tool_format_reject_message(body, upstream_format) {
+            assessment.reject(message);
         }
     }
 
@@ -1186,10 +1224,13 @@ pub(crate) fn assess_request_translation(
         }
     }
 
+    let anthropic_custom_bridge_supported = upstream_format == UpstreamFormat::Anthropic
+        && client_format == UpstreamFormat::OpenAiResponses;
     if matches!(
         upstream_format,
         UpstreamFormat::Anthropic | UpstreamFormat::Google
     ) && request_has_custom_tools(client_format, body)
+        && !anthropic_custom_bridge_supported
     {
         assessment.reject(custom_tools_not_portable_message(upstream_format));
     }

@@ -14,6 +14,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
             fallback_api_key: None,
             auth_policy: crate::config::AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            limits: None,
         }],
         model_aliases: Default::default(),
         hooks: crate::config::HookConfig {
@@ -30,6 +31,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
         crate::config::ModelAlias {
             upstream_name: "auto".to_string(),
             upstream_model: "model-a".to_string(),
+            limits: None,
         },
     );
     let initial_hooks = crate::hooks::HookDispatcher::new(&config.hooks);
@@ -83,6 +85,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
             crate::config::ModelAlias {
                 upstream_name: "auto".to_string(),
                 upstream_model: "model-b".to_string(),
+                limits: None,
             },
         );
         namespace.upstreams.get_mut("auto").unwrap().availability =

@@ -2,13 +2,25 @@
 //!
 //! Reference: 9router open-sse/translator/index.js — source → openai → target.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::formats::UpstreamFormat;
 
 pub(crate) mod assessment;
 pub(crate) mod messages;
 pub(crate) mod models;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RequestTranslationPolicy {
+    pub(crate) max_output_tokens: Option<u64>,
+}
+
+impl RequestTranslationPolicy {
+    pub(crate) const fn is_empty(self) -> bool {
+        self.max_output_tokens.is_none()
+    }
+}
+
 /// Translate request body from client format to upstream format.
 /// If client_format == upstream_format, returns body as-is (passthrough).
 pub fn translate_request(
@@ -16,6 +28,24 @@ pub fn translate_request(
     upstream_format: UpstreamFormat,
     model: &str,
     body: &mut Value,
+    stream: bool,
+) -> Result<(), String> {
+    translate_request_with_policy(
+        client_format,
+        upstream_format,
+        model,
+        body,
+        RequestTranslationPolicy::default(),
+        stream,
+    )
+}
+
+pub fn translate_request_with_policy(
+    client_format: UpstreamFormat,
+    upstream_format: UpstreamFormat,
+    model: &str,
+    body: &mut Value,
+    policy: RequestTranslationPolicy,
     stream: bool,
 ) -> Result<(), String> {
     if let TranslationDecision::Reject(message) =
@@ -31,6 +61,7 @@ pub fn translate_request(
         if client_format == UpstreamFormat::OpenAiCompletion {
             apply_openai_completion_compat_overrides(model, body);
         }
+        apply_request_translation_policy_defaults(upstream_format, policy, body);
         return Ok(());
     }
     let translated_from_openai_completion = client_format == UpstreamFormat::OpenAiCompletion;
@@ -38,6 +69,7 @@ pub fn translate_request(
     if client_format != UpstreamFormat::OpenAiCompletion {
         client_to_openai_completion(client_format, upstream_format, body)?;
     }
+    apply_request_translation_policy_defaults(UpstreamFormat::OpenAiCompletion, policy, body);
     // Step 2: openai → upstream (if upstream is not openai)
     if upstream_format != UpstreamFormat::OpenAiCompletion {
         openai_completion_to_upstream(upstream_format, model, body)?;
@@ -56,7 +88,80 @@ pub fn translate_request(
         }
         apply_openai_completion_compat_overrides(model, body);
     }
+    apply_request_translation_policy_defaults(upstream_format, policy, body);
     Ok(())
+}
+
+fn apply_request_translation_policy_defaults(
+    target_format: UpstreamFormat,
+    policy: RequestTranslationPolicy,
+    body: &mut Value,
+) {
+    let Some(max_output_tokens) = policy.max_output_tokens else {
+        return;
+    };
+    if request_body_has_explicit_output_limit(target_format, body) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+
+    match target_format {
+        UpstreamFormat::Anthropic => {
+            obj.insert("max_tokens".to_string(), Value::from(max_output_tokens));
+        }
+        UpstreamFormat::OpenAiCompletion => {
+            obj.insert(
+                "max_completion_tokens".to_string(),
+                Value::from(max_output_tokens),
+            );
+        }
+        UpstreamFormat::OpenAiResponses => {
+            obj.insert(
+                "max_output_tokens".to_string(),
+                Value::from(max_output_tokens),
+            );
+        }
+        UpstreamFormat::Google => {
+            let generation_config = obj
+                .entry("generationConfig".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !generation_config.is_object() {
+                *generation_config = Value::Object(Map::new());
+            }
+            if let Some(generation_config_obj) = generation_config.as_object_mut() {
+                generation_config_obj.insert(
+                    "maxOutputTokens".to_string(),
+                    Value::from(max_output_tokens),
+                );
+            }
+        }
+    }
+}
+
+fn request_body_has_explicit_output_limit(target_format: UpstreamFormat, body: &Value) -> bool {
+    let Some(obj) = body.as_object() else {
+        return false;
+    };
+
+    match target_format {
+        UpstreamFormat::Anthropic => obj.get("max_tokens").is_some(),
+        UpstreamFormat::OpenAiCompletion => {
+            obj.get("max_completion_tokens").is_some() || obj.get("max_tokens").is_some()
+        }
+        UpstreamFormat::OpenAiResponses => obj.get("max_output_tokens").is_some(),
+        UpstreamFormat::Google => {
+            google_generation_config_has_output_limit(obj.get("generationConfig"))
+                || google_generation_config_has_output_limit(obj.get("generation_config"))
+        }
+    }
+}
+
+fn google_generation_config_has_output_limit(config: Option<&Value>) -> bool {
+    config.and_then(Value::as_object).is_some_and(|config| {
+        config.get("maxOutputTokens").is_some() || config.get("max_output_tokens").is_some()
+    })
 }
 
 fn apply_openai_completion_compat_overrides(model: &str, body: &mut Value) {
@@ -304,10 +409,13 @@ use response_protocols::{
     push_gemini_function_call_part,
 };
 use tools::{
-    anthropic_tool_use_type_for_openai_tool_call, openai_tool_arguments_to_structured_value,
-    semantic_text_part_from_claude_block, semantic_text_part_from_openai_part,
-    semantic_text_part_to_openai_value, semantic_tool_kind_from_value,
-    semantic_tool_result_content_from_value, semantic_tool_result_content_to_value,
+    anthropic_tool_use_type_for_openai_tool_call,
+    openai_responses_custom_tool_input_from_bridge_value,
+    openai_responses_custom_tool_name_from_bridge, openai_tool_arguments_to_structured_value,
+    openai_tool_call_partial_replay_text, semantic_text_part_from_claude_block,
+    semantic_text_part_from_openai_part, semantic_text_part_to_openai_value,
+    semantic_tool_kind_from_value, semantic_tool_result_content_from_value,
+    semantic_tool_result_content_to_value, tool_call_is_marked_non_replayable,
 };
 
 /// Translate response body from upstream format to client format.
@@ -797,10 +905,13 @@ fn claude_response_to_openai_internal(
     allow_reasoning_replay: bool,
 ) -> Result<Value, String> {
     let content = body.get("content").cloned().ok_or("missing content")?;
-    let mut converted = convert_claude_message_to_openai(&serde_json::json!({
-        "role": "assistant",
-        "content": content
-    }))?
+    let mut converted = convert_claude_message_to_openai_with_custom_bridge(
+        &serde_json::json!({
+            "role": "assistant",
+            "content": content
+        }),
+        allow_reasoning_replay,
+    )?
     .ok_or("missing content")?;
     let mut message = converted
         .drain(..)
@@ -1088,7 +1199,7 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
     }
     if let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) {
         if let Some((mapped_tool_choice, disable_parallel)) =
-            anthropic_tool_choice_to_openai(tool_choice)?
+            anthropic_tool_choice_to_openai(tool_choice, preserve_reasoning_replay)?
         {
             result["tool_choice"] = mapped_tool_choice;
             if disable_parallel {
@@ -1124,7 +1235,9 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
             let preserve_message_replay = preserve_reasoning_replay
                 && msg.get("role").and_then(Value::as_str) == Some("assistant")
                 && anthropic_blocks_have_nonportable_thinking_provenance(&thinking_blocks);
-            if let Some(mut openai_msg) = convert_claude_message_to_openai(msg)? {
+            if let Some(mut openai_msg) =
+                convert_claude_message_to_openai_with_custom_bridge(msg, preserve_reasoning_replay)?
+            {
                 if preserve_message_replay {
                     for translated_msg in openai_msg.iter_mut() {
                         if translated_msg.get("role").and_then(Value::as_str) == Some("assistant") {
@@ -1147,7 +1260,19 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
             .iter()
             .filter_map(|t| {
                 // Skip if no name (invalid tool)
-                let name = t.get("name")?;
+                let name = t.get("name").and_then(Value::as_str)?;
+                if preserve_reasoning_replay {
+                    if let Some(custom_name) = openai_responses_custom_tool_name_from_bridge(name)
+                    {
+                        return Some(serde_json::json!({
+                            "type": "custom",
+                            "custom": {
+                                "name": custom_name,
+                                "description": t.get("description")
+                            }
+                        }));
+                    }
+                }
                 Some(serde_json::json!({
                     "type": "function",
                     "function": {
@@ -1166,7 +1291,10 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
     Ok(())
 }
 
-fn anthropic_tool_choice_to_openai(tool_choice: &Value) -> Result<Option<(Value, bool)>, String> {
+fn anthropic_tool_choice_to_openai(
+    tool_choice: &Value,
+    decode_custom_bridge: bool,
+) -> Result<Option<(Value, bool)>, String> {
     let Some(tool_choice) = tool_choice.as_object() else {
         return Err(
             "Anthropic tool_choice must be an object for cross-protocol translation".to_string(),
@@ -1195,20 +1323,44 @@ fn anthropic_tool_choice_to_openai(tool_choice: &Value) -> Result<Option<(Value,
                     "Anthropic tool_choice.type = tool requires a non-empty `name` field."
                         .to_string(),
                 )?;
-            serde_json::json!({
-                "type": "function",
-                "function": { "name": name }
-            })
+            if decode_custom_bridge {
+                if let Some(custom_name) = openai_responses_custom_tool_name_from_bridge(name) {
+                    serde_json::json!({
+                        "type": "custom",
+                        "custom": { "name": custom_name }
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": { "name": name }
+                    })
+                }
+            } else {
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": name }
+                })
+            }
         }
-        other => return Err(format!(
+        other => {
+            return Err(format!(
             "Anthropic tool_choice.type `{other}` cannot be translated to OpenAI Chat Completions"
-        )),
+        ))
+        }
     };
 
     Ok(Some((mapped, disable_parallel)))
 }
 
+#[cfg(test)]
 fn convert_claude_message_to_openai(msg: &Value) -> Result<Option<Vec<Value>>, String> {
+    convert_claude_message_to_openai_with_custom_bridge(msg, false)
+}
+
+fn convert_claude_message_to_openai_with_custom_bridge(
+    msg: &Value,
+    decode_custom_bridge: bool,
+) -> Result<Option<Vec<Value>>, String> {
     let Some(role) = msg.get("role").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -1263,17 +1415,39 @@ fn convert_claude_message_to_openai(msg: &Value) -> Result<Option<Vec<Value>>, S
                     }));
                 }
             }
-            "tool_use" => tool_calls.push(serde_json::json!({
-                "id": block.get("id"),
-                "type": "function",
-                "function": {
-                    "name": block.get("name"),
-                    "arguments": block
-                        .get("input")
-                        .and_then(|input| serde_json::to_string(input).ok())
-                        .unwrap_or_else(|| "{}".to_string())
+            "tool_use" => {
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                let input = block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if decode_custom_bridge {
+                    if let Some(custom_name) = openai_responses_custom_tool_name_from_bridge(name) {
+                        if let Some(custom_input) =
+                            openai_responses_custom_tool_input_from_bridge_value(&input)
+                        {
+                            tool_calls.push(serde_json::json!({
+                                "id": block.get("id"),
+                                "type": "custom",
+                                "custom": {
+                                    "name": custom_name,
+                                    "input": custom_input
+                                }
+                            }));
+                            continue;
+                        }
+                    }
                 }
-            })),
+                tool_calls.push(serde_json::json!({
+                    "id": block.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name"),
+                        "arguments": serde_json::to_string(&input)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    }
+                }));
+            }
             "server_tool_use" => tool_calls.push(serde_json::json!({
                 "id": block.get("id"),
                 "type": "function",
@@ -1627,6 +1801,13 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Result<Option<Vec<Value>>, St
     if role == "assistant" {
         if let Some(tc) = msg.get("tool_calls").and_then(Value::as_array) {
             for t in tc {
+                if tool_call_is_marked_non_replayable(t) {
+                    blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": openai_tool_call_partial_replay_text(t)
+                    }));
+                    continue;
+                }
                 blocks.push(serde_json::json!({
                     "type": anthropic_tool_use_type_for_openai_tool_call(t)?,
                     "id": t.get("id"),

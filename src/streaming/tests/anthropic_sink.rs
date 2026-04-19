@@ -225,7 +225,55 @@ fn openai_chunk_to_claude_sse_continues_after_reasoning_into_text_and_finish() {
 }
 
 #[test]
-fn openai_chunk_to_claude_sse_rejects_custom_tool_calls_without_downgrading() {
+fn openai_chunk_to_claude_sse_translates_bridged_custom_tool_calls_without_rejection() {
+    let custom_tool_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_custom",
+                    "function": {
+                        "name": "__llmup_custom__code_exec",
+                        "arguments": "{\"input\":\"print('hi')\"}"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let finish_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 },
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+    });
+
+    let mut state = StreamState::default();
+    let joined = openai_chunk_to_claude_sse(&custom_tool_chunk, &mut state)
+        .into_iter()
+        .chain(openai_chunk_to_claude_sse(&finish_chunk, &mut state))
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(joined.contains("\"type\":\"message_start\""), "{joined}");
+    assert!(joined.contains("\"type\":\"tool_use\""), "{joined}");
+    assert!(
+        joined.contains("\"name\":\"__llmup_custom__code_exec\""),
+        "{joined}"
+    );
+    assert!(joined.contains("input_json_delta"), "{joined}");
+    assert!(
+        joined.contains("{\\\"input\\\":\\\"print('hi')\\\"}"),
+        "{joined}"
+    );
+    assert!(joined.contains("\"stop_reason\":\"tool_use\""), "{joined}");
+    assert!(!joined.contains("event: error"), "{joined}");
+}
+
+#[test]
+fn openai_chunk_to_claude_sse_still_rejects_unbridged_custom_tool_calls() {
     let custom_tool_chunk = serde_json::json!({
         "id": "chatcmpl-msg123",
         "choices": [{
@@ -244,7 +292,6 @@ fn openai_chunk_to_claude_sse_rejects_custom_tool_calls_without_downgrading() {
             "finish_reason": null
         }]
     });
-
     let mut state = StreamState::default();
     let joined = openai_chunk_to_claude_sse(&custom_tool_chunk, &mut state)
         .into_iter()
@@ -255,55 +302,8 @@ fn openai_chunk_to_claude_sse_rejects_custom_tool_calls_without_downgrading() {
     assert!(joined.contains("event: error"), "{joined}");
     assert!(joined.contains("\"type\":\"error\""), "{joined}");
     assert!(joined.contains("custom tools"), "{joined}");
-    assert!(!joined.contains("message_start"), "{joined}");
-    assert!(!joined.contains("content_block_start"), "{joined}");
     assert!(!joined.contains("tool_use"), "{joined}");
     assert!(!joined.contains("input_json_delta"), "{joined}");
-}
-
-#[test]
-fn openai_chunk_to_claude_sse_drops_followup_chunks_after_custom_tool_rejection() {
-    let custom_tool_chunk = serde_json::json!({
-        "id": "chatcmpl-msg123",
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "tool_calls": [{
-                    "index": 0,
-                    "id": "call_custom",
-                    "type": "custom",
-                    "function": {
-                        "name": "code_exec",
-                        "arguments": "print('hi')"
-                    }
-                }]
-            },
-            "finish_reason": null
-        }]
-    });
-    let content_chunk = serde_json::json!({
-        "id": "chatcmpl-msg123",
-        "choices": [{ "index": 0, "delta": { "content": "Hi" }, "finish_reason": null }]
-    });
-    let finish_chunk = serde_json::json!({
-        "id": "chatcmpl-msg123",
-        "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 },
-        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
-    });
-
-    let mut state = StreamState::default();
-    let joined = openai_chunk_to_claude_sse(&custom_tool_chunk, &mut state)
-        .into_iter()
-        .chain(openai_chunk_to_claude_sse(&content_chunk, &mut state))
-        .chain(openai_chunk_to_claude_sse(&finish_chunk, &mut state))
-        .map(|b| String::from_utf8_lossy(&b).to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert_eq!(joined.matches("event: error").count(), 1, "{joined}");
-    assert!(!joined.contains("text_delta"), "{joined}");
-    assert!(!joined.contains("message_stop"), "{joined}");
-    assert!(!joined.contains("tool_use"), "{joined}");
 }
 
 #[test]

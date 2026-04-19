@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -957,7 +957,7 @@ impl HookSender {
 impl ExchangeHookPayload {
     fn into_json_payload(self) -> Result<Value, String> {
         let legacy = self.observation.project_legacy();
-        let response_body = match self.response_capture {
+        let mut response_body = match self.response_capture {
             ExchangeResponseCapture::Immediate(body) => body,
             ExchangeResponseCapture::Spool(artifact) => artifact.replay_final_response_body()?,
             ExchangeResponseCapture::Unavailable { reason } => json!({
@@ -965,6 +965,7 @@ impl ExchangeHookPayload {
                 "reason": reason,
             }),
         };
+        strip_internal_replay_metadata(&mut response_body);
         Ok(json!({
             "request_id": self.ctx.request_id,
             "timestamp_ms": self.ctx.timestamp_ms,
@@ -1439,6 +1440,125 @@ struct OpenAiToolCallAccumulator {
     arguments: String,
 }
 
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD: &str = "_llmup_non_replayable_tool_call";
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON: &str = "incomplete_arguments";
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION: u64 = 1;
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_SIGNATURE_FIELD: &str = "sig";
+const INTERNAL_REPLAY_MARKER_KEY_ENV: &str = "LLMUP_INTERNAL_REPLAY_MARKER_KEY";
+
+fn internal_replay_marker_key() -> &'static str {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        if let Some(existing) = std::env::var(INTERNAL_REPLAY_MARKER_KEY_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            return existing;
+        }
+        let generated = Uuid::new_v4().to_string();
+        std::env::set_var(INTERNAL_REPLAY_MARKER_KEY_ENV, &generated);
+        generated
+    })
+}
+
+fn raw_json_is_valid_object(raw: &str) -> bool {
+    !raw.trim().is_empty()
+        && serde_json::from_str::<Value>(raw).is_ok_and(|value| value.is_object())
+}
+
+fn non_replayable_tool_call_signature(name: &str, raw: &str) -> String {
+    let payload = json!({
+        "v": INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION,
+        "reason": INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON,
+        "name": name,
+        "raw": raw
+    });
+    let encoded = serde_json::to_vec(&payload).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(internal_replay_marker_key().as_bytes());
+    hasher.update([0]);
+    hasher.update(encoded);
+    hex::encode(hasher.finalize())
+}
+
+fn mark_tool_call_as_non_replayable(value: &mut Value) {
+    let name = value
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let raw = value
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .or_else(|| value.get("arguments"))
+        .or_else(|| value.get("input"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD.to_string(),
+        json!({
+            "reason": INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON,
+            "v": INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION,
+            INTERNAL_NON_REPLAYABLE_TOOL_CALL_SIGNATURE_FIELD: non_replayable_tool_call_signature(&name, &raw)
+        }),
+    );
+}
+
+fn openai_tool_call_has_invalid_structured_arguments(tool_call: &Value) -> bool {
+    tool_call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .and_then(Value::as_str)
+        .map(|raw| !raw.trim().is_empty() && !raw_json_is_valid_object(raw))
+        .unwrap_or(false)
+}
+
+fn responses_tool_call_has_invalid_structured_arguments(item: &Value) -> bool {
+    item.get("arguments")
+        .or_else(|| item.get("input"))
+        .and_then(Value::as_str)
+        .map(|raw| !raw.trim().is_empty() && !raw_json_is_valid_object(raw))
+        .unwrap_or(false)
+}
+
+fn finish_reason_allows_partial_tool_calls(finish_reason: Option<&str>) -> bool {
+    matches!(finish_reason, Some("length") | Some("pause_turn"))
+}
+
+fn responses_status_allows_partial_tool_calls(response: &Value) -> bool {
+    response.get("status").and_then(Value::as_str) == Some("incomplete")
+        && matches!(
+            response
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str),
+            Some("max_output_tokens") | Some("pause_turn")
+        )
+}
+
+fn strip_internal_replay_metadata(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                strip_internal_replay_metadata(item);
+            }
+        }
+        Value::Object(object) => {
+            object.remove(INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD);
+            for item in object.values_mut() {
+                strip_internal_replay_metadata(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Default)]
 struct OpenAiCompletionAccumulator {
     id: Option<String>,
@@ -1557,6 +1677,17 @@ impl OpenAiCompletionAccumulator {
                     })
                     .collect(),
             );
+            if finish_reason_allows_partial_tool_calls(self.finish_reason.as_deref()) {
+                if let Some(tool_calls) =
+                    message.get_mut("tool_calls").and_then(Value::as_array_mut)
+                {
+                    for tool_call in tool_calls {
+                        if openai_tool_call_has_invalid_structured_arguments(tool_call) {
+                            mark_tool_call_as_non_replayable(tool_call);
+                        }
+                    }
+                }
+            }
         }
         let mut out = json!({
             "id": self.id,
@@ -1610,9 +1741,7 @@ impl ResponsesAccumulator {
                 Some("response.completed" | "response.incomplete" | "response.failed")
             );
             if terminal {
-                if capture_exchange
-                    && event.get("type").and_then(Value::as_str) == Some("response.completed")
-                {
+                if capture_exchange {
                     self.final_response = Some(response.clone());
                 }
                 self.last_usage = Some(NormalizedUsage::from_client_body(
@@ -1624,7 +1753,21 @@ impl ResponsesAccumulator {
     }
 
     fn final_body(&self) -> Value {
-        self.final_response.clone().unwrap_or_else(|| json!({}))
+        let mut response = self.final_response.clone().unwrap_or_else(|| json!({}));
+        if responses_status_allows_partial_tool_calls(&response) {
+            if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
+                for item in output {
+                    if matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("function_call") | Some("custom_tool_call")
+                    ) && responses_tool_call_has_invalid_structured_arguments(item)
+                    {
+                        mark_tool_call_as_non_replayable(item);
+                    }
+                }
+            }
+        }
+        response
     }
 
     fn final_usage(&self) -> NormalizedUsage {
@@ -2095,6 +2238,155 @@ mod tests {
 
         assert_eq!(body["choices"][0]["message"]["content"], "hello world");
         assert_eq!(body["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn event_spool_capture_marks_incomplete_openai_replayable_tool_calls() {
+        let mut sink = EventSpoolSink::new(UpstreamFormat::OpenAiCompletion, 4096).expect("spool");
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_weather",
+                            "arguments": "{\"city\":\"Tok"
+                        }
+                    }]
+                }
+            }]
+        }))
+        .expect("write first");
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "length"
+            }]
+        }))
+        .expect("write second");
+
+        let artifact = sink.finish().expect("artifact");
+        let body = artifact.replay_final_response_body().expect("replay");
+        let tool_calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .expect("tool calls");
+
+        assert_eq!(
+            tool_calls[0]["_llmup_non_replayable_tool_call"]["reason"],
+            "incomplete_arguments"
+        );
+        assert!(tool_calls[0]["_llmup_non_replayable_tool_call"]["sig"].is_string());
+    }
+
+    #[test]
+    fn event_spool_capture_marks_incomplete_responses_replayable_tool_calls() {
+        let mut sink = EventSpoolSink::new(UpstreamFormat::OpenAiResponses, 4096).expect("spool");
+        sink.on_event(&json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "status": "incomplete",
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup_weather",
+                    "arguments": "{\"city\":\"Tok"
+                }]
+            }
+        }))
+        .expect("write");
+
+        let artifact = sink.finish().expect("artifact");
+        let body = artifact.replay_final_response_body().expect("replay");
+        let output = body["output"].as_array().expect("output");
+
+        assert_eq!(
+            output[0]["_llmup_non_replayable_tool_call"]["reason"],
+            "incomplete_arguments"
+        );
+        assert!(output[0]["_llmup_non_replayable_tool_call"]["sig"].is_string());
+    }
+
+    #[test]
+    fn exchange_hook_payload_strips_internal_non_replayable_tool_call_metadata() {
+        let mut sink = EventSpoolSink::new(UpstreamFormat::OpenAiCompletion, 4096).expect("spool");
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_weather",
+                            "arguments": "{\"city\":\"Tok"
+                        }
+                    }]
+                }
+            }]
+        }))
+        .expect("write first");
+        sink.on_event(&json!({
+            "id": "chatcmpl_1",
+            "created": 7,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "length"
+            }]
+        }))
+        .expect("write second");
+
+        let payload = ExchangeHookPayload {
+            ctx: HookRequestContext {
+                request_id: "req_exchange".to_string(),
+                timestamp_ms: 7,
+                path: "/v1/chat/completions".to_string(),
+                method: "POST".to_string(),
+                stream: true,
+                client_format: UpstreamFormat::OpenAiCompletion,
+                upstream_format: UpstreamFormat::OpenAiCompletion,
+                client_model: "gpt-4.1".to_string(),
+                upstream_name: "default".to_string(),
+                upstream_model: "gpt-4.1".to_string(),
+                credential_source: CredentialSource::Server,
+                credential_fingerprint: Some("fp".to_string()),
+                client_request_headers: vec![],
+                client_request_body: json!({"model":"gpt-4.1","stream":true}),
+            },
+            status: 200,
+            response_headers: json_response_headers(),
+            response_capture: ExchangeResponseCapture::Spool(sink.finish().expect("artifact")),
+            observation: StreamObservation::non_stream_completed(),
+        }
+        .into_json_payload()
+        .expect("exchange payload");
+
+        assert!(
+            payload["response"]["body"]["choices"][0]["message"]["tool_calls"][0]
+                .get("_llmup_non_replayable_tool_call")
+                .is_none(),
+            "payload = {payload:?}"
+        );
     }
 
     #[test]

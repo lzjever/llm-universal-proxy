@@ -774,6 +774,7 @@ fn runtime_namespace_config(
             fallback_credential_actual: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: vec![("x-namespace-tag".to_string(), namespace_tag.to_string())],
+            limits: None,
         }],
         model_aliases: std::collections::BTreeMap::new(),
         hooks: RuntimeHookConfig::default(),

@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::translate_request;
 
 #[test]
 fn openai_chunk_to_responses_sse_maps_pause_turn_to_incomplete() {
@@ -157,6 +158,202 @@ fn openai_chunk_to_responses_sse_maps_length_finish_to_incomplete() {
     assert!(joined.contains("\"type\":\"response.incomplete\""));
     assert!(joined.contains("\"reason\":\"max_output_tokens\""));
     assert!(!joined.contains("\"type\":\"response.completed\""));
+}
+
+#[test]
+fn openai_chunk_to_responses_sse_marks_incomplete_partial_function_call_for_safe_anthropic_replay()
+{
+    let mut state = StreamState::default();
+    let tool_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "created": 123,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"cat > /tmp/spec.rs << 'EOF'\\nfn main() {\\n"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let finish_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "created": 123,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "length" }]
+    });
+
+    let _ = openai_chunk_to_responses_sse(&tool_chunk, &mut state);
+    let out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+    let terminal = out
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("response.incomplete"))
+        .expect("response.incomplete event");
+
+    let output = terminal["response"]["output"]
+        .as_array()
+        .expect("response output");
+    assert_eq!(output[0]["type"], "function_call");
+    assert!(
+        output[0]
+            .get("_llmup_non_replayable_tool_call")
+            .and_then(Value::as_object)
+            .is_some(),
+        "response output should carry internal non-replayable marker: {terminal:?}"
+    );
+
+    let mut replay_body = serde_json::json!({
+        "model": "claude-3",
+        "input": output.clone()
+    });
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut replay_body,
+        false,
+    )
+    .expect("marked incomplete streamed tool calls should degrade instead of failing Anthropic JSON validation");
+
+    let blocks = replay_body["messages"][0]["content"]
+        .as_array()
+        .expect("assistant blocks");
+    assert_eq!(blocks[0]["type"], "text");
+    let text = blocks[0]["text"].as_str().expect("assistant text");
+    assert!(text.contains("exec_command"), "text = {text}");
+    assert!(text.contains("cat > /tmp/spec.rs"), "text = {text}");
+}
+
+#[test]
+fn translate_sse_event_openai_done_marks_eof_truncated_function_call_for_safe_anthropic_replay() {
+    let mut state = StreamState::default();
+    let tool_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "created": 123,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"cat > /tmp/spec.rs << 'EOF'\\nfn main() {\\n"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+
+    let _ = translate_sse_event(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &tool_chunk,
+        &mut state,
+    );
+    let out = translate_sse_event(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({ "_done": true }),
+        &mut state,
+    );
+
+    let terminal = out
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("response.completed"))
+        .expect("response.completed event");
+
+    let output = terminal["response"]["output"]
+        .as_array()
+        .expect("response output");
+    assert_eq!(output[0]["type"], "function_call");
+    assert!(
+        output[0]
+            .get("_llmup_non_replayable_tool_call")
+            .and_then(Value::as_object)
+            .is_some(),
+        "response output should carry internal non-replayable marker on EOF completion: {terminal:?}"
+    );
+
+    let mut replay_body = serde_json::json!({
+        "model": "claude-3",
+        "input": output.clone()
+    });
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut replay_body,
+        false,
+    )
+    .expect("EOF-truncated streamed tool calls should degrade instead of failing Anthropic JSON validation");
+
+    let blocks = replay_body["messages"][0]["content"]
+        .as_array()
+        .expect("assistant blocks");
+    assert_eq!(blocks[0]["type"], "text");
+    let text = blocks[0]["text"].as_str().expect("assistant text");
+    assert!(text.contains("exec_command"), "text = {text}");
+    assert!(text.contains("cat > /tmp/spec.rs"), "text = {text}");
+}
+
+#[test]
+fn translate_sse_event_openai_done_keeps_complete_function_call_replayable() {
+    let mut state = StreamState::default();
+    let tool_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "created": 123,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"pwd\"}"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+
+    let _ = translate_sse_event(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &tool_chunk,
+        &mut state,
+    );
+    let out = translate_sse_event(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({ "_done": true }),
+        &mut state,
+    );
+
+    let terminal = out
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("response.completed"))
+        .expect("response.completed event");
+
+    let output = terminal["response"]["output"]
+        .as_array()
+        .expect("response output");
+    assert_eq!(output[0]["type"], "function_call");
+    assert!(
+        output[0].get("_llmup_non_replayable_tool_call").is_none(),
+        "valid JSON object arguments should remain replayable on EOF completion: {terminal:?}"
+    );
 }
 
 #[test]

@@ -106,6 +106,11 @@ pub struct ToolCallState {
     pub id: Option<Value>,
     pub name: String,
     pub arguments: String,
+    pub non_replayable_marker: Option<Value>,
+    pub bridge_custom_name: Option<String>,
+    pub bridge_decoded_input: String,
+    pub bridge_prefix_emitted: bool,
+    pub bridge_suffix_emitted: bool,
     pub tool_type: Option<String>,
     pub proxied_tool_kind: Option<String>,
     pub gemini_emitted_arguments: Option<String>,
@@ -122,8 +127,12 @@ pub struct ClaudeToolUseState {
     pub id: Option<Value>,
     pub name: String,
     pub arguments: String,
+    pub proxied_tool_kind: Option<String>,
+    pub zero_arg_candidate: bool,
+    pub saw_input_json_delta: bool,
     pub arguments_seeded_from_start: bool,
     pub start_arguments_emitted: bool,
+    pub finalized: bool,
 }
 
 pub(super) fn dedupe_tool_call_state_by_call_id(
@@ -156,6 +165,17 @@ pub(super) fn dedupe_tool_call_state_by_call_id(
             if entry.arguments.is_empty() {
                 entry.arguments = existing_entry.arguments.clone();
             }
+            if entry.non_replayable_marker.is_none() {
+                entry.non_replayable_marker = existing_entry.non_replayable_marker.clone();
+            }
+            if entry.bridge_custom_name.is_none() {
+                entry.bridge_custom_name = existing_entry.bridge_custom_name.clone();
+            }
+            if entry.bridge_decoded_input.is_empty() {
+                entry.bridge_decoded_input = existing_entry.bridge_decoded_input.clone();
+            }
+            entry.bridge_prefix_emitted |= existing_entry.bridge_prefix_emitted;
+            entry.bridge_suffix_emitted |= existing_entry.bridge_suffix_emitted;
             if entry.tool_type.is_none() {
                 entry.tool_type = existing_entry.tool_type.clone();
             }
@@ -201,6 +221,49 @@ pub(super) fn openai_stream_tool_call_type(value: &Value) -> &'static str {
         Some("custom") | Some("custom_tool_call") => "custom",
         _ => "function",
     }
+}
+
+pub(super) const OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX_STREAM: &str = "__llmup_custom__";
+
+pub(super) fn openai_responses_custom_tool_bridge_name_stream(name: &str) -> String {
+    format!("{OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX_STREAM}{name}")
+}
+
+pub(super) fn openai_responses_custom_tool_name_from_bridge_stream(name: &str) -> Option<&str> {
+    name.strip_prefix(OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX_STREAM)
+        .filter(|name| !name.is_empty())
+}
+
+pub(super) fn escape_json_string_content_stream(value: &str) -> String {
+    serde_json::to_string(value)
+        .map(|quoted| quoted[1..quoted.len().saturating_sub(1)].to_string())
+        .unwrap_or_default()
+}
+
+pub(super) fn openai_responses_custom_bridge_start_delta_stream(input: &str) -> String {
+    format!("{{\"input\":\"{}", escape_json_string_content_stream(input))
+}
+
+pub(super) fn openai_responses_custom_bridge_input_delta_stream(input: &str) -> String {
+    escape_json_string_content_stream(input)
+}
+
+pub(super) fn openai_responses_custom_bridge_done_delta_stream() -> &'static str {
+    "\"}"
+}
+
+pub(super) fn openai_responses_custom_bridge_decode_arguments_stream(
+    arguments: &str,
+) -> Option<String> {
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    object
+        .get("input")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 pub(super) fn gemini_candidate_index(candidate: &Value) -> usize {

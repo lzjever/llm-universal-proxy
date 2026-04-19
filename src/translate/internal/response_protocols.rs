@@ -5,12 +5,12 @@ use super::response_logprobs::{
     normalized_response_logprobs_from_gemini_candidate,
     normalized_response_logprobs_to_openai_values,
 };
+use super::tools::{openai_tool_call_partial_replay_text, tool_call_is_marked_non_replayable};
 use super::{
     append_openai_message_anthropic_reasoning_replay_blocks,
-    classify_portable_non_success_terminal, openai_message_to_claude_blocks,
-    openai_message_anthropic_reasoning_replay_blocks,
-    openai_tool_arguments_to_structured_value, single_optional_array_item,
-    single_required_array_item,
+    classify_portable_non_success_terminal, openai_message_anthropic_reasoning_replay_blocks,
+    openai_message_to_claude_blocks, openai_tool_arguments_to_structured_value,
+    single_optional_array_item, single_required_array_item,
 };
 
 pub(crate) fn gemini_finish_reason_to_openai(
@@ -107,8 +107,14 @@ pub(super) fn responses_finish_reason_to_openai(body: &Value, has_tool_calls: bo
 pub(super) fn push_gemini_function_call_part(
     parts: &mut Vec<Value>,
     tool_call: &Value,
-    first_in_step: bool,
+    _first_in_step: bool,
 ) -> Result<(), String> {
+    if tool_call_is_marked_non_replayable(tool_call) {
+        parts.push(serde_json::json!({
+            "text": openai_tool_call_partial_replay_text(tool_call)
+        }));
+        return Ok(());
+    }
     let args_val = openai_tool_arguments_to_structured_value(tool_call, "Gemini")?;
     let mut part = serde_json::json!({
         "functionCall": {
@@ -117,7 +123,7 @@ pub(super) fn push_gemini_function_call_part(
             "args": args_val
         }
     });
-    if first_in_step {
+    if !parts.iter().any(|part| part.get("functionCall").is_some()) {
         part["thoughtSignature"] = Value::String(GEMINI_DUMMY_THOUGHT_SIGNATURE.to_string());
     }
     parts.push(part);

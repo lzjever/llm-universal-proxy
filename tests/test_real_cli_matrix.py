@@ -3,6 +3,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,61 @@ def load_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def codex_catalog_probe(catalog_payload, timeout_secs=2):
+    if shutil.which("codex") is None:
+        raise unittest.SkipTest("codex binary is not available")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = pathlib.Path(temp_dir)
+        catalog_path = root / "catalog.json"
+        catalog_path.write_text(
+            json.dumps(catalog_payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["HOME"] = str(root / "home")
+        command = [
+            "codex",
+            "exec",
+            "reply with ok",
+            "--model",
+            "minimax-openai",
+            "--ephemeral",
+            "--json",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "-C",
+            "/tmp",
+            "-c",
+            'model_provider="proxy"',
+            "-c",
+            'model_providers.proxy.name="Proxy"',
+            "-c",
+            'model_providers.proxy.base_url="http://127.0.0.1:1/openai/v1"',
+            "-c",
+            'model_providers.proxy.wire_api="responses"',
+            "-c",
+            f'model_catalog_json="{catalog_path}"',
+            "-c",
+            'web_search="disabled"',
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                env=env,
+                input="",
+                text=True,
+                capture_output=True,
+                timeout=timeout_secs,
+            )
+            return completed.returncode, completed.stdout + completed.stderr, False
+        except subprocess.TimeoutExpired as error:
+            stdout = error.stdout.decode() if isinstance(error.stdout, bytes) else (error.stdout or "")
+            stderr = error.stderr.decode() if isinstance(error.stderr, bytes) else (error.stderr or "")
+            return 124, stdout + stderr, True
 
 
 def make_lane(
@@ -129,6 +185,52 @@ class RealCliMatrixTests(unittest.TestCase):
         )
         self.assertEqual(parsed.debug_trace["path"], "/tmp/trace.jsonl")
 
+    def test_parse_proxy_source_extracts_model_alias_limits(self):
+        module = load_module()
+
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    limits:
+                      context_window: 200000
+                      max_output_tokens: 128000
+                model_aliases:
+                  minimax-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+                    limits:
+                      max_output_tokens: 64000
+                    codex:
+                      input_modalities: ["text"]
+                      supports_search_tool: false
+                """
+            )
+        )
+
+        self.assertEqual(
+            parsed.model_aliases["minimax-openai"],
+            "MINIMAX-OPENAI:MiniMax-M2.7-highspeed",
+        )
+        self.assertEqual(parsed.upstream_limits["MINIMAX-OPENAI"].context_window, 200000)
+        self.assertEqual(parsed.upstream_limits["MINIMAX-OPENAI"].max_output_tokens, 128000)
+        self.assertEqual(
+            parsed.model_alias_configs["minimax-openai"].limits.max_output_tokens,
+            64000,
+        )
+        self.assertEqual(
+            parsed.model_alias_configs["minimax-openai"].codex_metadata.input_modalities,
+            ("text",),
+        )
+        self.assertFalse(
+            parsed.model_alias_configs["minimax-openai"].codex_metadata.supports_search_tool
+        )
+
     def test_resolve_lanes_marks_qwen_optional_when_env_missing(self):
         module = load_module()
         parsed = module.parse_proxy_source(
@@ -142,6 +244,13 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertFalse(lanes["qwen-local"].required)
         self.assertFalse(lanes["qwen-local"].enabled)
         self.assertIn("LOCAL_QWEN", lanes["qwen-local"].skip_reason)
+        self.assertEqual(lanes["minimax-openai"].limits.context_window, 200000)
+        self.assertEqual(lanes["minimax-openai"].limits.max_output_tokens, 128000)
+        self.assertEqual(
+            lanes["minimax-openai"].codex_metadata.input_modalities,
+            ("text",),
+        )
+        self.assertFalse(lanes["minimax-openai"].codex_metadata.supports_search_tool)
 
     def test_resolve_lanes_enables_qwen_when_env_present(self):
         module = load_module()
@@ -187,6 +296,159 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertIn("LOCAL-QWEN:", rendered)
         self.assertIn('qwen-local: "LOCAL-QWEN:qwen3.5-9b-awq"', rendered)
         self.assertIn("path: /tmp/cli-matrix-trace.jsonl", rendered)
+
+    def test_build_runtime_config_preserves_structured_model_alias_limits(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    limits:
+                      context_window: 200000
+                      max_output_tokens: 128000
+                model_aliases:
+                  minimax-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+                    limits:
+                      max_output_tokens: 64000
+                debug_trace:
+                  path: /tmp/trace.jsonl
+                  max_text_chars: 16384
+                """
+            )
+        )
+
+        rendered = module.build_runtime_config_text(
+            parsed,
+            {},
+            listen_host="127.0.0.1",
+            listen_port=19999,
+            trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
+        )
+
+        self.assertIn("minimax-openai:", rendered)
+        self.assertIn('target: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"', rendered)
+        self.assertIn("limits:", rendered)
+        self.assertIn("context_window: 200000", rendered)
+        self.assertIn("max_output_tokens: 64000", rendered)
+
+    def test_resolve_model_limits_inherits_upstream_defaults_and_alias_overrides(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    limits:
+                      context_window: 200000
+                      max_output_tokens: 128000
+                model_aliases:
+                  minimax-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+                    limits:
+                      max_output_tokens: 64000
+                """
+            )
+        )
+
+        limits = module.resolve_model_limits(parsed, "minimax-openai")
+
+        self.assertEqual(limits.context_window, 200000)
+        self.assertEqual(limits.max_output_tokens, 64000)
+
+    def test_resolve_model_limits_supports_direct_upstream_model_targets(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    limits:
+                      context_window: 200000
+                      max_output_tokens: 128000
+                model_aliases:
+                  minimax-openai: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+                """
+            )
+        )
+
+        limits = module.resolve_model_limits(
+            parsed, "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+        )
+
+        self.assertEqual(limits.context_window, 200000)
+        self.assertEqual(limits.max_output_tokens, 128000)
+
+    def test_resolve_codex_model_metadata_defaults_proxy_models_to_text_only_and_search_disabled(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    limits:
+                      context_window: 200000
+                model_aliases:
+                  minimax-openai: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+                """
+            )
+        )
+
+        metadata = module.resolve_codex_model_metadata(parsed, "minimax-openai")
+
+        self.assertEqual(metadata.input_modalities, ("text",))
+        self.assertFalse(metadata.supports_search_tool)
+
+    def test_resolve_codex_model_metadata_supports_upstream_defaults_and_alias_overrides(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    codex:
+                      input_modalities: ["text"]
+                      supports_search_tool: false
+                model_aliases:
+                  vision-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-Vision"
+                    codex:
+                      input_modalities: ["text", "image"]
+                      supports_search_tool: true
+                """
+            )
+        )
+
+        metadata = module.resolve_codex_model_metadata(parsed, "vision-openai")
+
+        self.assertEqual(metadata.input_modalities, ("text", "image"))
+        self.assertTrue(metadata.supports_search_tool)
 
     def test_build_runtime_config_omits_local_qwen_aliases_when_env_missing(self):
         module = load_module()
@@ -289,6 +551,285 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(gemini_env["HTTP_PROXY"], "")
         self.assertEqual(gemini_env["HTTPS_PROXY"], "")
 
+    def test_build_client_env_writes_gemini_capacity_settings(self):
+        module = load_module()
+        base_env = {"PATH": "/usr/bin", "HOME": "/home/user"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home_dir = pathlib.Path(temp_dir) / "gemini-home"
+            gemini_env = module.build_client_env(
+                "gemini",
+                base_env,
+                "http://127.0.0.1:18888",
+                home_dir,
+                model_name="minimax-openai",
+                model_limits=module.ModelLimits(
+                    context_window=200000,
+                    max_output_tokens=128000,
+                ),
+            )
+            settings_path = home_dir / ".gemini" / "settings.json"
+            self.assertTrue(settings_path.exists())
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(gemini_env["HOME"], str(home_dir))
+        self.assertEqual(settings["model"]["compressionThreshold"], 0.85)
+        self.assertEqual(
+            settings["modelConfigs"]["customOverrides"][0]["match"]["model"],
+            "minimax-openai",
+        )
+        self.assertEqual(
+            settings["modelConfigs"]["customOverrides"][0]["modelConfig"][
+                "generateContentConfig"
+            ]["maxOutputTokens"],
+            128000,
+        )
+        self.assertIn("minimax-openai", settings["modelConfigs"]["modelDefinitions"])
+
+    def test_build_client_env_preserves_explicit_rust_toolchain_homes(self):
+        module = load_module()
+        base_env = {
+            "PATH": "/usr/bin",
+            "HOME": "/home/user",
+            "CARGO_HOME": "/opt/rust/cargo-home",
+            "RUSTUP_HOME": "/opt/rust/rustup-home",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            codex_env = module.build_client_env(
+                "codex", base_env, "http://127.0.0.1:18888", root / "codex-home"
+            )
+            claude_env = module.build_client_env(
+                "claude", base_env, "http://127.0.0.1:18888", root / "claude-home"
+            )
+            gemini_env = module.build_client_env(
+                "gemini", base_env, "http://127.0.0.1:18888", root / "gemini-home"
+            )
+
+        for client_env in (codex_env, claude_env, gemini_env):
+            self.assertEqual(client_env["CARGO_HOME"], "/opt/rust/cargo-home")
+            self.assertEqual(client_env["RUSTUP_HOME"], "/opt/rust/rustup-home")
+
+    def test_build_client_env_skips_missing_host_rust_toolchain_homes(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            host_home = root / "host-home"
+            host_home.mkdir(parents=True, exist_ok=True)
+            base_env = {
+                "PATH": "/usr/bin",
+                "HOME": str(host_home),
+            }
+
+            codex_env = module.build_client_env(
+                "codex", base_env, "http://127.0.0.1:18888", root / "codex-home"
+            )
+            claude_env = module.build_client_env(
+                "claude", base_env, "http://127.0.0.1:18888", root / "claude-home"
+            )
+            gemini_env = module.build_client_env(
+                "gemini", base_env, "http://127.0.0.1:18888", root / "gemini-home"
+            )
+
+        for client_env in (codex_env, claude_env, gemini_env):
+            self.assertNotIn("CARGO_HOME", client_env)
+            self.assertNotIn("RUSTUP_HOME", client_env)
+
+    def test_build_codex_model_catalog_includes_capacity_and_structured_metadata(self):
+        module = load_module()
+
+        payload = module.build_codex_model_catalog(
+            "minimax-openai",
+            module.ModelLimits(context_window=200000, max_output_tokens=128000),
+            module.CodexModelMetadata(
+                input_modalities=("text",),
+                supports_search_tool=False,
+            ),
+        )
+
+        model_entry = payload["models"][0]
+        self.assertEqual(model_entry["slug"], "minimax-openai")
+        self.assertEqual(model_entry["display_name"], "minimax-openai")
+        self.assertIn("supported_reasoning_levels", model_entry)
+        self.assertEqual(model_entry["shell_type"], "shell_command")
+        self.assertEqual(model_entry["visibility"], "list")
+        self.assertTrue(model_entry["supported_in_api"])
+        self.assertEqual(model_entry["priority"], 0)
+        self.assertIn("base_instructions", model_entry)
+        self.assertFalse(model_entry["supports_reasoning_summaries"])
+        self.assertFalse(model_entry["support_verbosity"])
+        self.assertEqual(
+            model_entry["truncation_policy"],
+            {"mode": "bytes", "limit": 10000},
+        )
+        self.assertFalse(model_entry["supports_parallel_tool_calls"])
+        self.assertEqual(model_entry["experimental_supported_tools"], [])
+        self.assertEqual(model_entry["context_window"], 200000)
+        self.assertEqual(model_entry["auto_compact_token_limit"], 61200)
+        self.assertEqual(model_entry["input_modalities"], ["text"])
+        self.assertFalse(model_entry["supports_search_tool"])
+
+    def test_build_codex_model_catalog_keeps_85_percent_of_context_when_output_limit_missing(self):
+        module = load_module()
+
+        payload = module.build_codex_model_catalog(
+            "vision-openai",
+            module.ModelLimits(context_window=200000),
+            module.CodexModelMetadata(
+                input_modalities=("text", "image"),
+                supports_search_tool=True,
+            ),
+        )
+
+        model_entry = payload["models"][0]
+        self.assertEqual(model_entry["context_window"], 200000)
+        self.assertEqual(model_entry["auto_compact_token_limit"], 170000)
+        self.assertEqual(model_entry["input_modalities"], ["text", "image"])
+        self.assertTrue(model_entry["supports_search_tool"])
+
+    def test_build_codex_model_catalog_rejects_non_positive_input_budget(self):
+        module = load_module()
+
+        with self.assertRaisesRegex(
+            ValueError, "max_output_tokens must be less than context_window"
+        ):
+            module.build_codex_model_catalog(
+                "broken-openai",
+                module.ModelLimits(context_window=200000, max_output_tokens=200000),
+                module.CodexModelMetadata(
+                    input_modalities=("text",),
+                    supports_search_tool=False,
+                ),
+            )
+
+    def test_build_codex_model_catalog_can_emit_metadata_without_context_window(self):
+        module = load_module()
+
+        payload = module.build_codex_model_catalog(
+            "minimax-openai",
+            module.ModelLimits(max_output_tokens=128000),
+            module.CodexModelMetadata(
+                input_modalities=("text",),
+                supports_search_tool=False,
+            ),
+        )
+
+        model_entry = payload["models"][0]
+        self.assertNotIn("context_window", model_entry)
+        self.assertNotIn("auto_compact_token_limit", model_entry)
+        self.assertEqual(model_entry["input_modalities"], ["text"])
+        self.assertFalse(model_entry["supports_search_tool"])
+
+    def test_real_codex_rejects_previous_minimal_catalog_shape(self):
+        _module = load_module()
+
+        returncode, output, timed_out = codex_catalog_probe(
+            {
+                "models": [
+                    {
+                        "slug": "minimax-openai",
+                        "display_name": "minimax-openai",
+                        "context_window": 200000,
+                        "auto_compact_token_limit": 170000,
+                        "input_modalities": ["text"],
+                        "supports_search_tool": False,
+                    }
+                ]
+            }
+        )
+
+        self.assertFalse(timed_out)
+        self.assertEqual(returncode, 1)
+        self.assertIn("failed to parse model_catalog_json", output)
+        self.assertIn("as JSON", output)
+
+    def test_real_codex_accepts_generated_catalog_shape(self):
+        module = load_module()
+
+        payload = module.build_codex_model_catalog(
+            "minimax-openai",
+            module.ModelLimits(context_window=200000, max_output_tokens=128000),
+            module.CodexModelMetadata(
+                input_modalities=("text",),
+                supports_search_tool=False,
+            ),
+        )
+        returncode, output, timed_out = codex_catalog_probe(payload)
+
+        self.assertTrue(timed_out or returncode != 1, output)
+        self.assertNotIn("failed to parse model_catalog_json", output)
+        self.assertNotIn("missing field `", output)
+
+    def test_real_codex_accepts_metadata_only_catalog_shape(self):
+        module = load_module()
+
+        payload = module.build_codex_model_catalog(
+            "minimax-openai",
+            module.ModelLimits(max_output_tokens=128000),
+            module.CodexModelMetadata(
+                input_modalities=("text",),
+                supports_search_tool=False,
+            ),
+        )
+        returncode, output, timed_out = codex_catalog_probe(payload)
+
+        self.assertTrue(timed_out or returncode != 1, output)
+        self.assertNotIn("failed to parse model_catalog_json", output)
+        self.assertNotIn("missing field `", output)
+
+    def test_default_config_codex_catalog_injects_85_percent_compact_limit(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+        )
+        model_limits = module.resolve_model_limits(parsed, "minimax-openai")
+        codex_metadata = module.resolve_codex_model_metadata(parsed, "minimax-openai")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home_dir = pathlib.Path(temp_dir)
+            args = module.build_codex_catalog_args(
+                home_dir,
+                "minimax-openai",
+                model_limits,
+                codex_metadata,
+            )
+            catalog_path = home_dir / ".codex" / "catalog.json"
+            payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+
+        self.assertIn("model_catalog_json", " ".join(args))
+        self.assertIn('web_search="disabled"', " ".join(args))
+        self.assertEqual(
+            payload["models"][0]["context_window"],
+            200000,
+        )
+        self.assertEqual(
+            payload["models"][0]["auto_compact_token_limit"],
+            61200,
+        )
+        self.assertEqual(payload["models"][0]["input_modalities"], ["text"])
+        self.assertFalse(payload["models"][0]["supports_search_tool"])
+
+    def test_default_config_codex_catalog_compacts_before_observed_live_failure_tokens(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+        )
+        model_limits = module.resolve_model_limits(parsed, "minimax-openai")
+        codex_metadata = module.resolve_codex_model_metadata(parsed, "minimax-openai")
+
+        payload = module.build_codex_model_catalog(
+            "minimax-openai",
+            model_limits,
+            codex_metadata,
+        )
+
+        compact_limit = payload["models"][0]["auto_compact_token_limit"]
+        observed_live_failure_input_tokens = 133603
+        self.assertLess(compact_limit, observed_live_failure_input_tokens)
+        self.assertEqual(compact_limit, 61200)
+
     def test_build_client_command_uses_known_good_gemini_sandbox_flag_form(self):
         module = load_module()
         lane = make_lane(module, name="minimax-openai", proxy_model="minimax-openai")
@@ -304,6 +845,58 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertIn("--sandbox=false", command)
         self.assertNotIn("--sandbox", command)
+
+    def test_build_client_command_injects_codex_model_catalog_for_capacity_aware_alias(self):
+        module = load_module()
+        lane = make_lane(module, name="minimax-openai", proxy_model="minimax-openai")
+        lane.limits = module.ModelLimits(
+            context_window=200000,
+            max_output_tokens=128000,
+        )
+        lane.codex_metadata = module.CodexModelMetadata(
+            input_modalities=("text",),
+            supports_search_tool=False,
+        )
+        fixture = make_fixture(module)
+        workspace = pathlib.Path("/tmp/workspace").resolve()
+        home_dir = pathlib.Path("/tmp/codex-home").resolve()
+
+        command = module.build_client_command(
+            "codex",
+            "http://127.0.0.1:18888",
+            lane,
+            fixture,
+            workspace,
+            client_home=home_dir,
+        )
+
+        joined = " ".join(command)
+        self.assertIn("model_catalog_json", joined)
+        self.assertIn(str(home_dir / ".codex" / "catalog.json"), joined)
+        self.assertIn('web_search="disabled"', joined)
+
+    def test_build_client_command_respects_codex_metadata_search_override(self):
+        module = load_module()
+        lane = make_lane(module, name="vision-openai", proxy_model="vision-openai")
+        lane.limits = module.ModelLimits(context_window=200000)
+        lane.codex_metadata = module.CodexModelMetadata(
+            input_modalities=("text", "image"),
+            supports_search_tool=True,
+        )
+        fixture = make_fixture(module)
+
+        command = module.build_client_command(
+            "codex",
+            "http://127.0.0.1:18888",
+            lane,
+            fixture,
+            pathlib.Path("/tmp/workspace").resolve(),
+            client_home=pathlib.Path("/tmp/codex-home").resolve(),
+        )
+
+        joined = " ".join(command)
+        self.assertIn("model_catalog_json", joined)
+        self.assertNotIn('web_search="disabled"', joined)
 
     def test_prepare_proxy_env_keeps_dotenv_scoped_to_proxy_only(self):
         module = load_module()
@@ -331,6 +924,75 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(proxy_env["LOCAL_QWEN_BASE_URL"], "http://127.0.0.1:9997/v1")
         self.assertNotIn("PRESET_ENDPOINT_API_KEY", client_env)
         self.assertNotIn("LOCAL_QWEN_BASE_URL", client_env)
+
+    def test_prepare_proxy_env_persists_replay_marker_key_within_run_root(self):
+        module = load_module()
+        base_env = {"PATH": "/usr/bin", "HOME": "/home/user"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_root = pathlib.Path(temp_dir)
+            first_env = module.prepare_proxy_env(base_env, {}, runtime_root)
+            second_env = module.prepare_proxy_env(base_env, {}, runtime_root)
+            key_path = runtime_root / module.REPLAY_MARKER_KEY_FILENAME
+
+            self.assertTrue(key_path.exists())
+            self.assertEqual(
+                first_env[module.REPLAY_MARKER_KEY_ENV],
+                second_env[module.REPLAY_MARKER_KEY_ENV],
+            )
+            self.assertEqual(
+                key_path.read_text(encoding="utf-8").strip(),
+                first_env[module.REPLAY_MARKER_KEY_ENV],
+            )
+
+    def test_ensure_replay_marker_key_regenerates_blank_file(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_root = pathlib.Path(temp_dir)
+            key_path = runtime_root / module.REPLAY_MARKER_KEY_FILENAME
+            key_path.write_text("   \n", encoding="utf-8")
+
+            marker_key = module.ensure_replay_marker_key(runtime_root)
+
+            self.assertEqual(
+                key_path.read_text(encoding="utf-8").strip(),
+                marker_key,
+            )
+
+        self.assertTrue(marker_key)
+        self.assertNotEqual(marker_key, "   ")
+
+    def test_stop_proxy_uses_short_fixed_tail_wait_after_kill(self):
+        module = load_module()
+
+        class FakeProcess:
+            def __init__(self):
+                self.wait_timeouts = []
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                return None
+
+            def kill(self):
+                return None
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                if len(self.wait_timeouts) == 1:
+                    raise subprocess.TimeoutExpired(cmd="proxy", timeout=timeout)
+                return 0
+
+        process = FakeProcess()
+
+        module.stop_proxy(process, terminate_grace_secs=15)
+
+        self.assertEqual(
+            process.wait_timeouts,
+            [15, module.DEFAULT_POST_KILL_WAIT_SECS],
+        )
 
     def test_expand_matrix_respects_phase_and_skip_slow(self):
         module = load_module()
@@ -932,8 +1594,60 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(second_result["status"], "passed")
         self.assertEqual(
             observed_timeouts,
-            [module.GEMINI_BOOTSTRAP_TIMEOUT_SECS, case.fixture.timeout_secs],
+            [
+                module.DEFAULT_TIMEOUT_POLICY.gemini_bootstrap_timeout_secs,
+                module.DEFAULT_TIMEOUT_POLICY.case_timeout_floor_secs,
+            ],
         )
+
+    def test_default_timeout_policy_uses_generous_real_cli_thresholds(self):
+        module = load_module()
+
+        self.assertGreater(module.DEFAULT_TIMEOUT_POLICY.case_timeout_floor_secs, 120)
+        self.assertGreater(
+            module.DEFAULT_TIMEOUT_POLICY.long_horizon_timeout_floor_secs, 120
+        )
+        self.assertGreater(
+            module.DEFAULT_TIMEOUT_POLICY.gemini_bootstrap_timeout_secs, 120
+        )
+
+    def test_resolve_case_timeout_secs_uses_structured_floors(self):
+        module = load_module()
+        short_case = make_case(
+            module,
+            client_name="codex",
+            fixture=make_fixture(module, timeout_secs=30),
+        )
+        long_case = make_case(
+            module,
+            client_name="codex",
+            fixture=module.TaskFixture(
+                fixture_id="python_bugfix",
+                kind="long_horizon",
+                prompt="Fix calc.py",
+                verifier={"type": "contains", "value": "ok"},
+                timeout_secs=60,
+                workspace_template=None,
+            ),
+        )
+        policy = module.TimeoutPolicy(
+            proxy_health_timeout_secs=45,
+            case_timeout_floor_secs=240,
+            long_horizon_timeout_floor_secs=420,
+            gemini_bootstrap_timeout_secs=360,
+            process_terminate_grace_secs=15,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home_dir = pathlib.Path(temp_dir)
+            self.assertEqual(
+                module.resolve_case_timeout_secs(short_case, home_dir, policy),
+                240,
+            )
+            self.assertEqual(
+                module.resolve_case_timeout_secs(long_case, home_dir, policy),
+                420,
+            )
 
     def test_run_matrix_case_uses_absolute_workspace_paths_for_gemini(self):
         module = load_module()

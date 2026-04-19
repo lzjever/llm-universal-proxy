@@ -35,9 +35,10 @@ use super::tools::{
     openai_tool_result_content_to_responses_output, responses_item_is_tool_output,
     responses_tool_call_item_to_openai_tool_call_strict,
     responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict,
-    responses_tool_output_to_openai_tool_content, semantic_text_part_to_openai_value,
-    semantic_text_part_to_responses_value, semantic_tool_kind_from_value,
-    semantic_tool_output_item_type,
+    responses_tool_call_partial_replay_text, responses_tool_output_to_openai_tool_content,
+    semantic_text_part_to_openai_value, semantic_text_part_to_responses_value,
+    semantic_tool_kind_from_value, semantic_tool_output_item_type,
+    tool_call_is_marked_non_replayable,
 };
 
 const OPENAI_ANTHROPIC_REASONING_REPLAY_FIELD: &str = "_anthropic_reasoning_replay";
@@ -296,16 +297,13 @@ fn responses_response_to_openai_impl(
     } else {
         "OpenAI Chat Completions"
     };
-    if let Some(message) = output
-        .iter()
-        .find_map(|item| {
-            responses_nonportable_output_item_message(
-                item,
-                target_label,
-                allow_anthropic_reasoning_replay,
-            )
-        })
-    {
+    if let Some(message) = output.iter().find_map(|item| {
+        responses_nonportable_output_item_message(
+            item,
+            target_label,
+            allow_anthropic_reasoning_replay,
+        )
+    }) {
         return Err(message);
     }
     let audio = responses_response_audio_to_openai_audio(body)?;
@@ -629,7 +627,14 @@ pub(super) fn responses_to_messages(
     body: &mut Value,
     target_format: UpstreamFormat,
 ) -> Result<(), String> {
-    let bridge_custom_responses_semantics = target_format == UpstreamFormat::OpenAiCompletion;
+    let bridge_custom_responses_semantics = matches!(
+        target_format,
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+    );
+    let degrade_marked_tool_calls = matches!(
+        target_format,
+        UpstreamFormat::Anthropic | UpstreamFormat::Google
+    );
     if bridge_custom_responses_semantics {
         validate_responses_request_for_custom_bridge(body)?;
     }
@@ -657,6 +662,7 @@ pub(super) fn responses_to_messages(
     let mut current_assistant: Option<Value> = None;
     let mut deferred_user_after_tool_results: Option<Value> = None;
     let mut tool_kind_by_call_id = std::collections::HashMap::new();
+    let mut degraded_tool_call_name_by_call_id = std::collections::HashMap::new();
     let mut idx = 0;
     while idx < items.len() {
         let item = items[idx].clone();
@@ -682,28 +688,50 @@ pub(super) fn responses_to_messages(
                     });
                     assistant["role"] = Value::String("assistant".to_string());
                     if !refusal.is_empty() {
-                        assistant["refusal"] = Value::String(refusal);
+                        append_openai_message_text_field(assistant, "refusal", &refusal);
                     }
-                    assistant["content"] = if content_value_is_effectively_empty(&content)
-                        && assistant.get("refusal").is_some()
-                    {
-                        Value::Null
-                    } else {
-                        content
-                    };
+                    append_openai_message_content(assistant, content);
                 } else if role == "user"
-                    && items
-                        .get(idx + 1)
-                        .is_some_and(responses_item_is_tool_output)
+                    && (assistant_has_pending_tool_calls(current_assistant.as_ref())
+                        || deferred_user_after_tool_results.is_some()
+                        || items
+                            .get(idx + 1)
+                            .is_some_and(responses_item_is_tool_output))
                 {
-                    deferred_user_after_tool_results =
-                        Some(serde_json::json!({ "role": "user", "content": content }));
+                    append_deferred_user_after_tool_result_content(
+                        &mut deferred_user_after_tool_results,
+                        content,
+                    );
                 } else {
                     flush_assistant(&mut messages, &mut current_assistant);
                     messages.push(serde_json::json!({ "role": role, "content": content }));
                 }
             }
             "function_call" | "custom_tool_call" => {
+                if degrade_marked_tool_calls && tool_call_is_marked_non_replayable(&item) {
+                    let assistant = current_assistant.get_or_insert_with(|| {
+                        serde_json::json!({
+                            "role": "assistant",
+                            "content": Value::Null
+                        })
+                    });
+                    assistant["role"] = Value::String("assistant".to_string());
+                    append_assistant_text_content(
+                        assistant,
+                        &responses_tool_call_partial_replay_text(&item),
+                    );
+                    if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                        degraded_tool_call_name_by_call_id.insert(
+                            call_id.to_string(),
+                            item.get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown_tool")
+                                .to_string(),
+                        );
+                    }
+                    idx += 1;
+                    continue;
+                }
                 let tc = if bridge_custom_responses_semantics {
                     responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
                         &item,
@@ -720,8 +748,14 @@ pub(super) fn responses_to_messages(
                     continue;
                 };
                 if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
-                    tool_kind_by_call_id
-                        .insert(call_id.to_string(), semantic_tool_kind_from_value(&item));
+                    let bridged_kind = if bridge_custom_responses_semantics
+                        && semantic_tool_kind_from_value(&item) == SemanticToolKind::OpenAiCustom
+                    {
+                        SemanticToolKind::Function
+                    } else {
+                        semantic_tool_kind_from_value(&item)
+                    };
+                    tool_kind_by_call_id.insert(call_id.to_string(), bridged_kind);
                 }
                 if current_assistant.is_none() {
                     current_assistant = Some(serde_json::json!({
@@ -741,6 +775,30 @@ pub(super) fn responses_to_messages(
             }
             "function_call_output" | "custom_tool_call_output" => {
                 flush_assistant(&mut messages, &mut current_assistant);
+                if let Some(name) = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .and_then(|call_id| degraded_tool_call_name_by_call_id.remove(call_id))
+                {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": responses_tool_output_partial_replay_text(
+                            Some(&name),
+                            item.get("output")
+                        )
+                    }));
+                    let next_is_function_output = items
+                        .get(idx + 1)
+                        .is_some_and(responses_item_is_tool_output);
+                    if !next_is_function_output {
+                        flush_deferred_user_after_tool_results(
+                            &mut messages,
+                            &mut deferred_user_after_tool_results,
+                        );
+                    }
+                    idx += 1;
+                    continue;
+                }
                 let call_id = item.get("call_id").cloned();
                 let tool_kind = item
                     .get("call_id")
@@ -764,9 +822,10 @@ pub(super) fn responses_to_messages(
                     .get(idx + 1)
                     .is_some_and(responses_item_is_tool_output);
                 if !next_is_function_output {
-                    if let Some(deferred) = deferred_user_after_tool_results.take() {
-                        messages.push(deferred);
-                    }
+                    flush_deferred_user_after_tool_results(
+                        &mut messages,
+                        &mut deferred_user_after_tool_results,
+                    );
                 }
             }
             "reasoning" => {
@@ -805,10 +864,8 @@ pub(super) fn responses_to_messages(
         }
         idx += 1;
     }
-    if let Some(deferred) = deferred_user_after_tool_results.take() {
-        messages.push(deferred);
-    }
     flush_assistant(&mut messages, &mut current_assistant);
+    flush_deferred_user_after_tool_results(&mut messages, &mut deferred_user_after_tool_results);
     let max_tokens = body.get("max_output_tokens").cloned();
     let temperature = body.get("temperature").cloned();
     let top_p = body.get("top_p").cloned();
@@ -927,7 +984,7 @@ pub(super) fn responses_to_messages(
             .into_iter()
             .map(|tool| {
                 if bridge_custom_responses_semantics {
-                    normalized_tool_definition_to_openai_with_custom_bridge(&tool)
+                    normalized_tool_definition_to_openai_with_custom_bridge(&tool, target_format)
                 } else {
                     normalized_tool_definition_to_openai(&tool)
                 }
@@ -945,6 +1002,142 @@ fn flush_assistant(messages: &mut Vec<Value>, current_assistant: &mut Option<Val
     if let Some(a) = current_assistant.take() {
         messages.push(a);
     }
+}
+
+fn flush_deferred_user_after_tool_results(
+    messages: &mut Vec<Value>,
+    deferred_user_after_tool_results: &mut Option<Value>,
+) {
+    if let Some(content) = deferred_user_after_tool_results.take() {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": content
+        }));
+    }
+}
+
+fn openai_text_content_part(text: String) -> Value {
+    serde_json::json!({ "type": "text", "text": text })
+}
+
+fn openai_content_to_segment_parts(content: Value) -> Vec<Value> {
+    match content {
+        Value::Null => Vec::new(),
+        Value::String(text) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![openai_text_content_part(text)]
+            }
+        }
+        Value::Array(parts) => parts,
+        other => vec![other],
+    }
+}
+
+fn openai_segment_parts_to_content(parts: Vec<Value>) -> Value {
+    if parts.is_empty() {
+        return Value::Null;
+    }
+    if parts.len() == 1
+        && parts[0].get("type").and_then(Value::as_str) == Some("text")
+        && parts[0]
+            .get("annotations")
+            .and_then(Value::as_array)
+            .is_none_or(|annotations| annotations.is_empty())
+    {
+        return Value::String(
+            parts[0]
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    Value::Array(parts)
+}
+
+fn append_openai_message_content(message: &mut Value, content: Value) {
+    let mut new_parts = openai_content_to_segment_parts(content);
+    if new_parts.is_empty() {
+        return;
+    }
+    let existing = message.get("content").cloned().unwrap_or(Value::Null);
+    let mut combined = openai_content_to_segment_parts(existing);
+    combined.append(&mut new_parts);
+    message["content"] = openai_segment_parts_to_content(combined);
+}
+
+fn append_openai_message_text_field(message: &mut Value, field: &str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let existing = message.get(field).and_then(Value::as_str).unwrap_or("");
+    message[field] = Value::String(if existing.is_empty() {
+        text.to_string()
+    } else {
+        format!("{existing}\n\n{text}")
+    });
+}
+
+fn assistant_has_pending_tool_calls(message: Option<&Value>) -> bool {
+    message
+        .and_then(|message| message.get("tool_calls").and_then(Value::as_array))
+        .is_some_and(|tool_calls| !tool_calls.is_empty())
+}
+
+fn append_deferred_user_after_tool_result_content(
+    deferred_user_after_tool_results: &mut Option<Value>,
+    content: Value,
+) {
+    if content_value_is_effectively_empty(&content) {
+        return;
+    }
+    if deferred_user_after_tool_results.is_none() {
+        *deferred_user_after_tool_results = Some(content);
+        return;
+    }
+
+    let mut wrapper = serde_json::json!({
+        "content": deferred_user_after_tool_results.take().unwrap_or(Value::Null)
+    });
+    append_openai_message_content(&mut wrapper, content);
+    *deferred_user_after_tool_results = wrapper.get("content").cloned();
+}
+
+fn responses_tool_output_partial_replay_text(name: Option<&str>, output: Option<&Value>) -> String {
+    let name = name.unwrap_or("unknown_tool");
+    let rendered = match output {
+        None => None,
+        Some(Value::String(text)) => Some(text.trim().to_string()),
+        Some(Value::Array(items)) => {
+            let text = items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<String>()
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                serde_json::to_string(&Value::Array(items.clone())).ok()
+            } else {
+                Some(text)
+            }
+        }
+        Some(other) => serde_json::to_string(other).ok(),
+    }
+    .filter(|rendered| !rendered.is_empty());
+
+    match rendered {
+        Some(rendered) => format!("Tool result for `{name}`: {rendered}"),
+        None => format!("Tool result for `{name}` was returned."),
+    }
+}
+
+fn append_assistant_text_content(message: &mut Value, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    append_openai_message_content(message, Value::String(text.to_string()));
 }
 
 fn map_responses_content_to_openai(content: Option<Value>) -> Value {

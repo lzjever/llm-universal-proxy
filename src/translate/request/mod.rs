@@ -4,3 +4,4 @@
 //! stable outward seam without pretending there are provider implementations here yet.
 
 pub use super::internal::translate_request;
+pub(crate) use super::internal::{translate_request_with_policy, RequestTranslationPolicy};

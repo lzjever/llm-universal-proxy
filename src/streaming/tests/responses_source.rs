@@ -203,7 +203,7 @@ fn responses_completed_tool_call_event_produces_openai_tool_calls_finish() {
 }
 
 #[test]
-fn responses_custom_tool_call_events_preserve_custom_type_and_input_deltas() {
+fn responses_custom_tool_call_events_bridge_into_function_tool_calls_and_done_suffix() {
     let mut state = StreamState::default();
     let added_chunks = responses_event_to_openai_chunks(
         &serde_json::json!({
@@ -228,22 +228,35 @@ fn responses_custom_tool_call_events_preserve_custom_type_and_input_deltas() {
         }),
         &mut state,
     );
+    let done_chunks = responses_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "response.custom_tool_call_input.done",
+            "output_index": 0,
+            "item_id": "custom_item_1",
+            "input": "print('hi')"
+        }),
+        &mut state,
+    );
 
     assert_eq!(
         added_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["type"],
-        "custom"
+        "function"
+    );
+    assert_eq!(
+        added_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+        "__llmup_custom__code_exec"
     );
     assert_eq!(
         added_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
-        "print('"
-    );
-    assert_eq!(
-        delta_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["type"],
-        "custom"
+        "{\"input\":\"print('"
     );
     assert_eq!(
         delta_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
         "hi')"
+    );
+    assert_eq!(
+        done_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+        "\"}"
     );
 }
 
@@ -409,7 +422,7 @@ fn responses_stream_usage_preserves_audio_prediction_and_unknown_detail_fields()
 }
 
 #[test]
-fn translate_sse_event_responses_to_anthropic_rejects_custom_tool_call_and_suppresses_followups() {
+fn translate_sse_event_responses_to_anthropic_bridges_custom_tool_call_successfully() {
     let added_event = serde_json::json!({
         "type": "response.output_item.added",
         "output_index": 0,
@@ -426,6 +439,12 @@ fn translate_sse_event_responses_to_anthropic_rejects_custom_tool_call_and_suppr
         "output_index": 0,
         "item_id": "ctc_1",
         "delta": "hi')"
+    });
+    let done_event = serde_json::json!({
+        "type": "response.custom_tool_call_input.done",
+        "output_index": 0,
+        "item_id": "ctc_1",
+        "input": "print('hi')"
     });
     let complete_event = serde_json::json!({
         "type": "response.completed",
@@ -455,8 +474,23 @@ fn translate_sse_event_responses_to_anthropic_rejects_custom_tool_call_and_suppr
         .map(|b| String::from_utf8_lossy(&b).to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(first_joined.contains("event: error"), "{first_joined}");
-    assert!(!first_joined.contains("tool_use"), "{first_joined}");
+    assert!(
+        first_joined.contains("\"type\":\"message_start\""),
+        "{first_joined}"
+    );
+    assert!(
+        first_joined.contains("\"type\":\"tool_use\""),
+        "{first_joined}"
+    );
+    assert!(
+        first_joined.contains("\"name\":\"__llmup_custom__code_exec\""),
+        "{first_joined}"
+    );
+    assert!(
+        first_joined.contains("{\\\"input\\\":\\\"print('"),
+        "{first_joined}"
+    );
+    assert!(!first_joined.contains("event: error"), "{first_joined}");
 
     let second = translate_sse_event(
         UpstreamFormat::OpenAiResponses,
@@ -464,15 +498,178 @@ fn translate_sse_event_responses_to_anthropic_rejects_custom_tool_call_and_suppr
         &delta_event,
         &mut state,
     );
-    assert!(second.is_empty(), "{second:?}");
+    let second_joined = second
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        second_joined.contains("input_json_delta"),
+        "{second_joined}"
+    );
+    assert!(second_joined.contains("hi')"), "{second_joined}");
 
     let third = translate_sse_event(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        &done_event,
+        &mut state,
+    );
+    let third_joined = third
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(third_joined.contains("input_json_delta"), "{third_joined}");
+    assert!(third_joined.contains("\\\"}"), "{third_joined}");
+
+    let fourth = translate_sse_event(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         &complete_event,
         &mut state,
     );
-    assert!(third.is_empty(), "{third:?}");
+    let fourth_joined = fourth
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        fourth_joined.contains("\"stop_reason\":\"tool_use\""),
+        "{fourth_joined}"
+    );
+    assert!(
+        fourth_joined.contains("\"type\":\"message_stop\""),
+        "{fourth_joined}"
+    );
+}
+
+#[test]
+fn translate_sse_event_anthropic_to_responses_decodes_bridged_custom_tool_use() {
+    let mut state = StreamState::default();
+    let joined = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-test" }
+        }),
+        &mut state,
+    )
+    .into_iter()
+    .chain(translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_custom",
+                "name": "__llmup_custom__code_exec",
+                "input": { "input": "print('hi')" }
+            }
+        }),
+        &mut state,
+    ))
+    .chain(translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "tool_use" }
+        }),
+        &mut state,
+    ))
+    .chain(translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "message_stop"
+        }),
+        &mut state,
+    ))
+    .map(|b| String::from_utf8_lossy(&b).to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    assert!(joined.contains("\"type\":\"custom_tool_call\""), "{joined}");
+    assert!(
+        joined.contains("response.custom_tool_call_input.delta"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("response.custom_tool_call_input.done"),
+        "{joined}"
+    );
+    assert!(joined.contains("\"name\":\"code_exec\""), "{joined}");
+    assert!(!joined.contains("\"type\":\"function_call\""), "{joined}");
+    assert!(!joined.contains("response.failed"), "{joined}");
+}
+
+#[test]
+fn translate_sse_event_anthropic_to_responses_malformed_bridged_payload_falls_back_to_function() {
+    let mut state = StreamState::default();
+    let joined = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-test" }
+        }),
+        &mut state,
+    )
+    .into_iter()
+    .chain(translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_custom",
+                "name": "__llmup_custom__code_exec",
+                "input": { "output": "missing input" }
+            }
+        }),
+        &mut state,
+    ))
+    .chain(translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "tool_use" }
+        }),
+        &mut state,
+    ))
+    .chain(translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "message_stop"
+        }),
+        &mut state,
+    ))
+    .map(|b| String::from_utf8_lossy(&b).to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    assert!(joined.contains("\"type\":\"function_call\""), "{joined}");
+    assert!(
+        joined.contains("response.function_call_arguments.delta"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("\"name\":\"__llmup_custom__code_exec\""),
+        "{joined}"
+    );
+    assert!(
+        !joined.contains("response.custom_tool_call_input.delta"),
+        "{joined}"
+    );
+    assert!(!joined.contains("response.failed"), "{joined}");
 }
 
 #[test]

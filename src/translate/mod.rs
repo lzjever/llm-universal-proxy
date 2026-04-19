@@ -13,11 +13,11 @@ pub use request::translate_request;
 pub use response::translate_response;
 
 pub(crate) use assessment::{assess_request_translation, TranslationDecision};
+pub(crate) use request::{translate_request_with_policy, RequestTranslationPolicy};
 pub(crate) use response::{
     classify_openai_finish_for_anthropic, classify_portable_non_success_terminal,
     gemini_finish_reason_to_openai, responses_failed_code_to_openai_finish, AnthropicTerminal,
 };
 pub(crate) use shared::{
     anthropic_tool_use_type_for_openai_tool_call, custom_tools_not_portable_message,
-    OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
 };

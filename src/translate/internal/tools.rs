@@ -1,4 +1,8 @@
+use std::sync::OnceLock;
+
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::formats::UpstreamFormat;
 
@@ -239,13 +243,85 @@ pub(crate) fn openai_custom_tool_input_raw(value: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+pub(crate) fn openai_custom_tool_format_is_plain_text(format: Option<&Value>) -> bool {
+    match format {
+        None | Some(Value::Null) => true,
+        Some(Value::String(kind)) => kind == "text",
+        Some(Value::Object(object)) => {
+            object.get("type").and_then(Value::as_str) == Some("text") && object.len() == 1
+        }
+        _ => false,
+    }
+}
+
+fn openai_custom_tool_string_constraint_format_parts(
+    format: Option<&Value>,
+) -> Option<(&str, &str)> {
+    let Value::Object(object) = format? else {
+        return None;
+    };
+    if object.get("type").and_then(Value::as_str) != Some("grammar") {
+        return None;
+    }
+
+    let direct_syntax = object.get("syntax").and_then(Value::as_str);
+    let direct_definition = object.get("definition").and_then(Value::as_str);
+    if let (Some(syntax), Some(definition)) = (direct_syntax, direct_definition) {
+        let definition = definition.trim();
+        if !syntax.is_empty() && !definition.is_empty() {
+            return Some((syntax, definition));
+        }
+    }
+
+    let grammar = object.get("grammar").and_then(Value::as_object)?;
+    let syntax = grammar.get("syntax").and_then(Value::as_str)?;
+    let definition = grammar.get("definition").and_then(Value::as_str)?.trim();
+    if syntax.is_empty() || definition.is_empty() {
+        return None;
+    }
+    Some((syntax, definition))
+}
+
+pub(crate) fn openai_custom_tool_format_supports_anthropic_bridge(format: Option<&Value>) -> bool {
+    openai_custom_tool_format_is_plain_text(format)
+        || openai_custom_tool_string_constraint_format_parts(format).is_some()
+}
+
+pub(crate) fn openai_custom_tool_bridge_description_for_anthropic(
+    description: Option<&Value>,
+    format: Option<&Value>,
+) -> Option<Value> {
+    let Some((syntax, definition)) = openai_custom_tool_string_constraint_format_parts(format)
+    else {
+        return description.cloned();
+    };
+
+    let mut bridged = description
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    if !bridged.is_empty() {
+        bridged.push_str("\n\n");
+    }
+    bridged.push_str(
+        "Bridge note: Anthropic receives this tool through the canonical `{ \"input\": string }` wrapper. ",
+    );
+    bridged.push_str(
+        "The original OpenAI custom tool constrained that single string input with the following format contract. ",
+    );
+    bridged.push_str("Anthropic will not enforce it structurally, so follow it exactly.\n");
+    bridged.push_str(&format!("syntax: {syntax}\n"));
+    bridged.push_str(definition);
+    Some(Value::String(bridged))
+}
+
 pub(crate) const OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX: &str = "__llmup_custom__";
 
 pub(crate) fn openai_responses_custom_tool_bridge_name(name: &str) -> String {
     format!("{OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX}{name}")
 }
 
-fn openai_responses_custom_tool_name_from_bridge(name: &str) -> Option<&str> {
+pub(crate) fn openai_responses_custom_tool_name_from_bridge(name: &str) -> Option<&str> {
     name.strip_prefix(OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX)
         .filter(|name| !name.is_empty())
 }
@@ -255,19 +331,28 @@ pub(crate) fn openai_responses_custom_tool_bridge_arguments(input: &str) -> Resu
         .map_err(|err| format!("serialize OpenAI Responses custom tool bridge arguments: {err}"))
 }
 
-fn openai_responses_custom_tool_input_from_bridge_arguments(
+pub(crate) fn openai_responses_custom_tool_input_from_bridge_value(
+    value: &Value,
+) -> Option<String> {
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    object
+        .get("input")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+pub(crate) fn openai_responses_custom_tool_input_from_bridge_arguments(
     arguments: &str,
 ) -> Result<String, String> {
     let value: Value = serde_json::from_str(arguments)
         .map_err(|err| format!("decode OpenAI Responses custom tool bridge arguments: {err}"))?;
-    value
-        .get("input")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or(
-            "OpenAI Responses custom tool bridge arguments must contain a string `input` field."
-                .to_string(),
-        )
+    openai_responses_custom_tool_input_from_bridge_value(&value).ok_or(
+        "OpenAI Responses custom tool bridge arguments must be the canonical object `{ \"input\": string }`."
+            .to_string(),
+    )
 }
 
 pub(crate) fn openai_responses_custom_tool_bridge_prefix_is_reserved(name: &str) -> bool {
@@ -280,6 +365,133 @@ pub(crate) fn openai_tool_arguments_raw(tool_call: &Value) -> Option<&str> {
         .and_then(|function| function.get("arguments"))
         .or_else(|| tool_call.get("arguments"))
         .and_then(Value::as_str)
+}
+
+pub(crate) const INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD: &str = "_llmup_non_replayable_tool_call";
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON: &str = "incomplete_arguments";
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION: u64 = 1;
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_SIGNATURE_FIELD: &str = "sig";
+const INTERNAL_REPLAY_MARKER_KEY_ENV: &str = "LLMUP_INTERNAL_REPLAY_MARKER_KEY";
+
+fn internal_replay_marker_key() -> &'static str {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        if let Some(existing) = std::env::var(INTERNAL_REPLAY_MARKER_KEY_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            return existing;
+        }
+        let generated = Uuid::new_v4().to_string();
+        std::env::set_var(INTERNAL_REPLAY_MARKER_KEY_ENV, &generated);
+        generated
+    })
+}
+
+fn non_replayable_tool_call_name_and_raw(value: &Value) -> (Option<&str>, Option<&str>) {
+    let name = value
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| openai_custom_tool_name(value))
+        .or_else(|| value.get("name").and_then(Value::as_str));
+    let raw = openai_tool_arguments_raw(value)
+        .or_else(|| openai_custom_tool_input_raw(value))
+        .or_else(|| responses_tool_call_input_raw(value));
+    (name, raw)
+}
+
+fn non_replayable_tool_call_signature(value: &Value) -> Option<String> {
+    let (name, raw) = non_replayable_tool_call_name_and_raw(value);
+    let payload = serde_json::json!({
+        "v": INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION,
+        "reason": INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON,
+        "name": name.unwrap_or(""),
+        "raw": raw.unwrap_or("")
+    });
+    let encoded = serde_json::to_vec(&payload).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(internal_replay_marker_key().as_bytes());
+    hasher.update([0]);
+    hasher.update(encoded);
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn trusted_non_replayable_tool_call_marker(value: &Value) -> Option<Value> {
+    let marker = value
+        .get(INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD)?
+        .as_object()?;
+    if marker.get("reason").and_then(Value::as_str)
+        != Some(INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON)
+    {
+        return None;
+    }
+    if marker.get("v").and_then(Value::as_u64) != Some(INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION) {
+        return None;
+    }
+    let signature = marker
+        .get(INTERNAL_NON_REPLAYABLE_TOOL_CALL_SIGNATURE_FIELD)
+        .and_then(Value::as_str)?;
+    (Some(signature) == non_replayable_tool_call_signature(value).as_deref())
+        .then(|| Value::Object(marker.clone()))
+}
+
+fn tool_call_text_for_partial_replay(name: Option<&str>, raw: Option<&str>) -> String {
+    let name = name.unwrap_or("unknown_tool");
+    match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => format!("Tool call `{name}` with partial arguments: {raw}"),
+        None => format!("Tool call `{name}` had incomplete arguments."),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn mark_tool_call_as_non_replayable(value: &mut Value) {
+    let Some(signature) = non_replayable_tool_call_signature(value) else {
+        return;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD.to_string(),
+        serde_json::json!({
+            "reason": INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON,
+            "v": INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION,
+            INTERNAL_NON_REPLAYABLE_TOOL_CALL_SIGNATURE_FIELD: signature
+        }),
+    );
+}
+
+pub(crate) fn tool_call_is_marked_non_replayable(value: &Value) -> bool {
+    trusted_non_replayable_tool_call_marker(value).is_some()
+}
+
+pub(crate) fn copy_non_replayable_tool_call_marker(source: &Value, dest: &mut Value) {
+    let Some(marker) = trusted_non_replayable_tool_call_marker(source) else {
+        return;
+    };
+    let Some(obj) = dest.as_object_mut() else {
+        return;
+    };
+    obj.insert(INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD.to_string(), marker);
+}
+
+pub(crate) fn openai_tool_call_partial_replay_text(tool_call: &Value) -> String {
+    tool_call_text_for_partial_replay(
+        tool_call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .or_else(|| openai_custom_tool_name(tool_call)),
+        openai_tool_arguments_raw(tool_call).or_else(|| openai_custom_tool_input_raw(tool_call)),
+    )
+}
+
+pub(crate) fn responses_tool_call_partial_replay_text(item: &Value) -> String {
+    tool_call_text_for_partial_replay(
+        item.get("name").and_then(Value::as_str),
+        responses_tool_call_input_raw(item),
+    )
 }
 
 pub(crate) fn openai_function_tool_payload(
@@ -493,6 +705,7 @@ pub(crate) fn normalized_tool_definition_to_openai(
 
 pub(crate) fn normalized_tool_definition_to_openai_with_custom_bridge(
     tool: &NormalizedOpenAiFamilyToolDef,
+    target_format: UpstreamFormat,
 ) -> Result<Value, String> {
     match tool {
         NormalizedOpenAiFamilyToolDef::Custom(custom) => {
@@ -501,7 +714,15 @@ pub(crate) fn normalized_tool_definition_to_openai_with_custom_bridge(
                 "name".to_string(),
                 Value::String(openai_responses_custom_tool_bridge_name(&custom.name)),
             );
-            if let Some(description) = custom.description.clone() {
+            let description = if target_format == UpstreamFormat::Anthropic {
+                openai_custom_tool_bridge_description_for_anthropic(
+                    custom.description.as_ref(),
+                    custom.format.as_ref(),
+                )
+            } else {
+                custom.description.clone()
+            };
+            if let Some(description) = description {
                 payload.insert("description".to_string(), description);
             }
             payload.insert(
@@ -716,7 +937,11 @@ pub(crate) fn responses_tool_call_item_to_openai_tool_call(item: &Value) -> Opti
     normalized_responses_tool_call(item)
         .ok()
         .flatten()
-        .map(|tool_call| normalized_tool_call_to_openai(&tool_call))
+        .map(|tool_call| {
+            let mut tool_call = normalized_tool_call_to_openai(&tool_call);
+            copy_non_replayable_tool_call_marker(item, &mut tool_call);
+            tool_call
+        })
 }
 
 pub(crate) fn responses_tool_call_item_to_openai_tool_call_strict(
@@ -739,7 +964,11 @@ pub(crate) fn responses_tool_call_item_to_openai_tool_call_strict(
         } => Err(format!(
             "OpenAI Responses namespaced tool call `{name}` cannot be faithfully translated to {target_label}"
         )),
-        _ => Ok(Some(normalized_tool_call_to_openai(&tool_call))),
+        _ => {
+            let mut tool_call = normalized_tool_call_to_openai(&tool_call);
+            copy_non_replayable_tool_call_marker(item, &mut tool_call);
+            Ok(Some(tool_call))
+        }
     }
 }
 
@@ -783,9 +1012,14 @@ pub(crate) fn responses_tool_call_item_to_openai_tool_call_with_custom_bridge_st
             if let Some(proxied_tool_kind) = proxied_tool_kind {
                 tool_call["proxied_tool_kind"] = proxied_tool_kind;
             }
+            copy_non_replayable_tool_call_marker(item, &mut tool_call);
             Ok(Some(tool_call))
         }
-        other => Ok(Some(normalized_tool_call_to_openai(&other))),
+        other => {
+            let mut tool_call = normalized_tool_call_to_openai(&other);
+            copy_non_replayable_tool_call_marker(item, &mut tool_call);
+            Ok(Some(tool_call))
+        }
     }
 }
 
@@ -831,7 +1065,7 @@ fn normalized_tool_call_to_responses_item(call: NormalizedOpenAiFamilyToolCall) 
 }
 
 pub(crate) fn openai_tool_call_to_responses_item(tool_call: &Value) -> Value {
-    normalized_openai_tool_call(tool_call)
+    let mut item = normalized_openai_tool_call(tool_call)
         .ok()
         .flatten()
         .map(normalized_tool_call_to_responses_item)
@@ -842,7 +1076,9 @@ pub(crate) fn openai_tool_call_to_responses_item(tool_call: &Value) -> Value {
                 "name": tool_call.get("function").and_then(|f| f.get("name")),
                 "arguments": openai_tool_arguments_raw(tool_call).unwrap_or("{}")
             })
-        })
+        });
+    copy_non_replayable_tool_call_marker(tool_call, &mut item);
+    item
 }
 
 pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge(
@@ -875,20 +1111,25 @@ pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge(
                         if let Some(proxied_tool_kind) = proxied_tool_kind {
                             item["proxied_tool_kind"] = proxied_tool_kind;
                         }
+                        copy_non_replayable_tool_call_marker(tool_call, &mut item);
                         Ok(item)
                     }
-                    Err(_) => Ok(normalized_tool_call_to_responses_item(
-                        NormalizedOpenAiFamilyToolCall::Function {
-                            id,
-                            name,
-                            arguments,
-                            namespace,
-                            proxied_tool_kind,
-                        },
-                    )),
+                    Err(_) => {
+                        let mut item = normalized_tool_call_to_responses_item(
+                            NormalizedOpenAiFamilyToolCall::Function {
+                                id,
+                                name,
+                                arguments,
+                                namespace,
+                                proxied_tool_kind,
+                            },
+                        );
+                        copy_non_replayable_tool_call_marker(tool_call, &mut item);
+                        Ok(item)
+                    }
                 }
             } else {
-                Ok(normalized_tool_call_to_responses_item(
+                let mut item = normalized_tool_call_to_responses_item(
                     NormalizedOpenAiFamilyToolCall::Function {
                         id,
                         name,
@@ -896,9 +1137,15 @@ pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge(
                         namespace,
                         proxied_tool_kind,
                     },
-                ))
+                );
+                copy_non_replayable_tool_call_marker(tool_call, &mut item);
+                Ok(item)
             }
         }
-        other => Ok(normalized_tool_call_to_responses_item(other)),
+        other => {
+            let mut item = normalized_tool_call_to_responses_item(other);
+            copy_non_replayable_tool_call_marker(tool_call, &mut item);
+            Ok(item)
+        }
     }
 }

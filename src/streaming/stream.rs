@@ -98,7 +98,10 @@ pub fn translate_sse_event(
                 .message_id
                 .clone()
                 .unwrap_or_else(|| "resp_0".to_string());
-            return emit_openai_responses_terminal(state, &response_id, 0, 0);
+            let mut out = Vec::new();
+            flush_pending_responses_tool_calls(state, &response_id, true, &mut out);
+            out.extend(emit_openai_responses_terminal(state, &response_id, 0, 0));
+            return out;
         }
         return Vec::new();
     }

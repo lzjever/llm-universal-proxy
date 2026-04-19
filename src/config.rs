@@ -76,6 +76,46 @@ pub struct HookEndpointConfig {
     pub authorization: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+}
+
+impl ModelLimits {
+    pub fn merged_with(&self, overrides: Option<&ModelLimits>) -> Option<ModelLimits> {
+        let merged = ModelLimits {
+            context_window: overrides
+                .and_then(|item| item.context_window)
+                .or(self.context_window),
+            max_output_tokens: overrides
+                .and_then(|item| item.max_output_tokens)
+                .or(self.max_output_tokens),
+        };
+        if merged.context_window.is_none() && merged.max_output_tokens.is_none() {
+            None
+        } else {
+            Some(merged)
+        }
+    }
+
+    fn validate(&self, owner: &str) -> Result<(), String> {
+        if self.context_window == Some(0) {
+            return Err(format!(
+                "{owner} limits.context_window must be greater than zero"
+            ));
+        }
+        if self.max_output_tokens == Some(0) {
+            return Err(format!(
+                "{owner} limits.max_output_tokens must be greater than zero"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Runtime configuration for one named upstream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamConfig {
@@ -95,6 +135,9 @@ pub struct UpstreamConfig {
     pub auth_policy: AuthPolicy,
     /// Optional static headers to inject into every upstream request.
     pub upstream_headers: Vec<(String, String)>,
+    /// Optional default limits for models routed through this upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ModelLimits>,
 }
 
 /// One local model alias that resolves to a named upstream and upstream model.
@@ -102,6 +145,8 @@ pub struct UpstreamConfig {
 pub struct ModelAlias {
     pub upstream_name: String,
     pub upstream_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ModelLimits>,
 }
 
 /// Resolved model routing decision for one request.
@@ -178,6 +223,8 @@ pub struct RuntimeUpstreamConfig {
     pub auth_policy: AuthPolicy,
     #[serde(default)]
     pub upstream_headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub limits: Option<ModelLimits>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,6 +253,7 @@ pub struct RuntimeConfigSnapshot {
 pub struct AdminModelAliasView {
     pub upstream_name: String,
     pub upstream_model: String,
+    pub limits: Option<ModelLimits>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -246,6 +294,7 @@ pub struct AdminUpstreamConfigView {
     pub fallback_credential_configured: bool,
     pub auth_policy: AuthPolicy,
     pub upstream_headers: Vec<AdminHeaderValueView>,
+    pub limits: Option<ModelLimits>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -267,7 +316,7 @@ struct FileConfig {
     #[serde(default)]
     upstreams: BTreeMap<String, UpstreamConfigFile>,
     #[serde(default)]
-    model_aliases: BTreeMap<String, String>,
+    model_aliases: BTreeMap<String, ModelAliasFile>,
     #[serde(default)]
     hooks: HooksFileConfig,
     #[serde(default)]
@@ -299,6 +348,22 @@ struct UpstreamConfigFile {
     auth_policy: AuthPolicy,
     #[serde(default, alias = "headers", alias = "upstream_headers")]
     upstream_headers: BTreeMap<String, String>,
+    #[serde(default)]
+    limits: Option<ModelLimits>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ModelAliasFile {
+    Target(String),
+    Structured(StructuredModelAliasFile),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StructuredModelAliasFile {
+    target: String,
+    #[serde(default)]
+    limits: Option<ModelLimits>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -370,6 +435,7 @@ impl Config {
                     fallback_api_key,
                     auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers.into_iter().collect(),
+                    limits: item.limits,
                 }
             })
             .collect();
@@ -377,13 +443,18 @@ impl Config {
         let model_aliases = parsed
             .model_aliases
             .into_iter()
-            .filter_map(|(alias, target)| {
+            .filter_map(|(alias, item)| {
+                let (target, limits) = match item {
+                    ModelAliasFile::Target(target) => (target, None),
+                    ModelAliasFile::Structured(item) => (item.target, item.limits),
+                };
                 let (upstream_name, upstream_model) = target.split_once(':')?;
                 Some((
                     alias,
                     ModelAlias {
                         upstream_name: upstream_name.to_string(),
                         upstream_model: upstream_model.to_string(),
+                        limits,
                     },
                 ))
             })
@@ -475,6 +546,9 @@ impl Config {
             if !seen.insert(upstream.name.clone()) {
                 return Err(format!("duplicate upstream name `{}`", upstream.name));
             }
+            if let Some(limits) = &upstream.limits {
+                limits.validate(&format!("upstream `{}`", upstream.name))?;
+            }
         }
 
         self.validate_hook("exchange", self.hooks.exchange.as_ref())?;
@@ -505,6 +579,9 @@ impl Config {
                 return Err(format!(
                     "model alias `{alias}` must point to a non-empty upstream model"
                 ));
+            }
+            if let Some(limits) = &target.limits {
+                limits.validate(&format!("model alias `{alias}`"))?;
             }
         }
 
@@ -540,6 +617,16 @@ impl Config {
 
     pub fn upstream(&self, name: &str) -> Option<&UpstreamConfig> {
         self.upstreams.iter().find(|u| u.name == name)
+    }
+
+    pub fn effective_model_limits(&self, alias: &ModelAlias) -> Option<ModelLimits> {
+        let upstream_limits = self
+            .upstream(&alias.upstream_name)
+            .and_then(|item| item.limits.clone());
+        match upstream_limits {
+            Some(base) => base.merged_with(alias.limits.as_ref()),
+            None => alias.limits.clone(),
+        }
     }
 
     /// Resolve a client-visible model string to a named upstream and upstream model.
@@ -611,6 +698,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
                     fallback_api_key,
                     auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers,
+                    limits: item.limits,
                 }
             })
             .collect::<Vec<_>>();
@@ -657,6 +745,7 @@ impl From<&Config> for RuntimeConfigPayload {
                     fallback_credential_actual: item.fallback_credential_actual.clone(),
                     auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers.clone(),
+                    limits: item.limits.clone(),
                 })
                 .collect(),
             model_aliases: value.model_aliases.clone(),
@@ -708,6 +797,7 @@ impl From<&Config> for AdminConfigView {
                         .iter()
                         .map(|(name, value)| admin_header_view(name, value))
                         .collect(),
+                    limits: item.limits.clone(),
                 })
                 .collect(),
             model_aliases: value
@@ -719,6 +809,7 @@ impl From<&Config> for AdminConfigView {
                         AdminModelAliasView {
                             upstream_name: model.upstream_name.clone(),
                             upstream_model: model.upstream_model.clone(),
+                            limits: model.limits.clone(),
                         },
                     )
                 })
@@ -1049,6 +1140,7 @@ model_aliases:
                 fallback_api_key: None,
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                limits: None,
             }],
             ..Config::default()
         };
@@ -1082,6 +1174,7 @@ model_aliases:
                     fallback_api_key: None,
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
+                    limits: None,
                 },
                 UpstreamConfig {
                     name: "openai".to_string(),
@@ -1092,6 +1185,7 @@ model_aliases:
                     fallback_api_key: None,
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
+                    limits: None,
                 },
             ],
             ..Config::default()
@@ -1113,6 +1207,7 @@ model_aliases:
                 fallback_api_key: None,
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                limits: None,
             }],
             ..Config::default()
         };
@@ -1121,6 +1216,7 @@ model_aliases:
             ModelAlias {
                 upstream_name: "glm".to_string(),
                 upstream_model: "GLM-5".to_string(),
+                limits: None,
             },
         );
         let resolved = c.resolve_model("GLM-5").unwrap();
@@ -1140,6 +1236,7 @@ model_aliases:
                 fallback_api_key: None,
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                limits: None,
             }],
             ..Config::default()
         };
@@ -1161,6 +1258,7 @@ model_aliases:
                     fallback_api_key: None,
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
+                    limits: None,
                 },
                 UpstreamConfig {
                     name: "b".to_string(),
@@ -1171,6 +1269,7 @@ model_aliases:
                     fallback_api_key: None,
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
+                    limits: None,
                 },
             ],
             ..Config::default()
@@ -1186,6 +1285,7 @@ model_aliases:
             ModelAlias {
                 upstream_name: "missing".to_string(),
                 upstream_model: "GLM-5".to_string(),
+                limits: None,
             },
         );
         assert!(c.validate().is_err());
@@ -1329,6 +1429,7 @@ upstreams:
                     ),
                     ("x-service-apikey".to_string(), "apikey-secret".to_string()),
                 ],
+                limits: None,
             }],
             model_aliases: Default::default(),
             hooks: HookConfig {

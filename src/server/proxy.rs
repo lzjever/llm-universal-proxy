@@ -22,7 +22,8 @@ use crate::hooks::{
 };
 use crate::streaming::{needs_stream_translation, TranslateSseStream};
 use crate::translate::{
-    assess_request_translation, translate_request, translate_response, TranslationDecision,
+    assess_request_translation, translate_request_with_policy, translate_response,
+    RequestTranslationPolicy, TranslationDecision,
 };
 use crate::upstream;
 
@@ -362,6 +363,8 @@ pub(super) async fn handle_request_core(
         resolved_model.upstream_name.clone(),
         resolved_model.upstream_model.clone(),
     );
+    let request_translation_policy =
+        request_translation_policy(&namespace_state.config, &requested_model, &resolved_model);
     if !upstream_state.availability.is_available() {
         tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
         return error_response(
@@ -412,12 +415,13 @@ pub(super) async fn handle_request_core(
         );
     }
 
-    if client_format != upstream_format {
-        if let Err(e) = translate_request(
+    if client_format != upstream_format || !request_translation_policy.is_empty() {
+        if let Err(e) = translate_request_with_policy(
             client_format,
             upstream_format,
             &resolved_model.upstream_model,
             &mut body,
+            request_translation_policy,
             stream,
         ) {
             error!("Translation failed: {}", e);
@@ -743,4 +747,24 @@ fn resolve_request_model_or_error(
         client_format,
         body,
     )
+}
+
+fn request_translation_policy(
+    namespace_config: &crate::config::Config,
+    requested_model: &str,
+    resolved_model: &crate::config::ResolvedModel,
+) -> RequestTranslationPolicy {
+    let max_output_tokens = namespace_config
+        .model_aliases
+        .get(requested_model)
+        .and_then(|alias| namespace_config.effective_model_limits(alias))
+        .and_then(|limits| limits.max_output_tokens)
+        .or_else(|| {
+            namespace_config
+                .upstream(&resolved_model.upstream_name)
+                .and_then(|upstream| upstream.limits.as_ref())
+                .and_then(|limits| limits.max_output_tokens)
+        });
+
+    RequestTranslationPolicy { max_output_tokens }
 }

@@ -1,6 +1,8 @@
 use super::state::*;
 use super::wire::*;
 use super::*;
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 pub(super) fn openai_finish_reason_to_gemini_stream(finish_reason: &str) -> &'static str {
     match finish_reason {
@@ -130,6 +132,131 @@ pub(super) fn openai_chunk_annotations_delta(delta: &Value) -> Vec<Value> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+pub(super) const INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD: &str = "_llmup_non_replayable_tool_call";
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON: &str = "incomplete_arguments";
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION: u64 = 1;
+const INTERNAL_NON_REPLAYABLE_TOOL_CALL_SIGNATURE_FIELD: &str = "sig";
+const INTERNAL_REPLAY_MARKER_KEY_ENV: &str = "LLMUP_INTERNAL_REPLAY_MARKER_KEY";
+
+fn internal_replay_marker_key_stream() -> &'static str {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        if let Some(existing) = std::env::var(INTERNAL_REPLAY_MARKER_KEY_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            return existing;
+        }
+        let generated = uuid::Uuid::new_v4().to_string();
+        std::env::set_var(INTERNAL_REPLAY_MARKER_KEY_ENV, &generated);
+        generated
+    })
+}
+
+fn raw_json_is_valid_object_stream(raw: &str) -> bool {
+    !raw.trim().is_empty()
+        && serde_json::from_str::<Value>(raw).is_ok_and(|value| value.is_object())
+}
+
+pub(super) fn non_replayable_tool_call_signature_stream(name: &str, raw: &str) -> String {
+    let payload = serde_json::json!({
+        "v": INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION,
+        "reason": INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON,
+        "name": name,
+        "raw": raw
+    });
+    let encoded = serde_json::to_vec(&payload).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(internal_replay_marker_key_stream().as_bytes());
+    hasher.update([0]);
+    hasher.update(encoded);
+    hex::encode(hasher.finalize())
+}
+
+pub(super) fn signed_non_replayable_tool_call_marker_stream(name: &str, raw: &str) -> Value {
+    serde_json::json!({
+        "reason": INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON,
+        "v": INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION,
+        INTERNAL_NON_REPLAYABLE_TOOL_CALL_SIGNATURE_FIELD: non_replayable_tool_call_signature_stream(name, raw)
+    })
+}
+
+fn trusted_non_replayable_tool_call_marker_for_name_and_raw_stream(
+    name: &str,
+    raw: &str,
+    marker: &Value,
+) -> Option<Value> {
+    let marker = marker.as_object()?;
+    if marker.get("reason").and_then(Value::as_str)
+        != Some(INTERNAL_NON_REPLAYABLE_TOOL_CALL_REASON)
+    {
+        return None;
+    }
+    if marker.get("v").and_then(Value::as_u64) != Some(INTERNAL_NON_REPLAYABLE_TOOL_CALL_VERSION) {
+        return None;
+    }
+    let signature = marker
+        .get(INTERNAL_NON_REPLAYABLE_TOOL_CALL_SIGNATURE_FIELD)
+        .and_then(Value::as_str)?;
+    (signature == non_replayable_tool_call_signature_stream(name, raw))
+        .then(|| Value::Object(marker.clone()))
+}
+
+fn tool_call_partial_replay_text_stream(name: &str, raw: &str) -> String {
+    match raw.trim() {
+        "" => format!("Tool call `{name}` had incomplete arguments."),
+        trimmed => format!("Tool call `{name}` with partial arguments: {trimmed}"),
+    }
+}
+
+fn responses_stream_tool_call_should_be_marked_non_replayable(
+    tool_type: &str,
+    arguments: &str,
+    incomplete_reason: Option<&str>,
+    terminated_without_finish_reason: bool,
+) -> bool {
+    if matches!(
+        incomplete_reason,
+        Some("max_output_tokens") | Some("pause_turn")
+    ) {
+        if arguments.trim().is_empty() {
+            return false;
+        }
+        if tool_type == "custom" {
+            return true;
+        }
+        return !raw_json_is_valid_object_stream(arguments);
+    }
+
+    terminated_without_finish_reason
+        && tool_type != "custom"
+        && !raw_json_is_valid_object_stream(arguments)
+}
+
+fn maybe_mark_responses_stream_tool_call_item_non_replayable(
+    item: &mut Value,
+    name: &str,
+    tool_type: &str,
+    arguments: &str,
+    incomplete_reason: Option<&str>,
+    terminated_without_finish_reason: bool,
+) {
+    if responses_stream_tool_call_should_be_marked_non_replayable(
+        tool_type,
+        arguments,
+        incomplete_reason,
+        terminated_without_finish_reason,
+    ) {
+        let Some(object) = item.as_object_mut() else {
+            return;
+        };
+        object.insert(
+            INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD.to_string(),
+            signed_non_replayable_tool_call_marker_stream(name, arguments),
+        );
+    }
 }
 
 pub(super) fn responses_message_part_delta_event_type(
@@ -313,30 +440,29 @@ pub(super) fn emit_openai_responses_terminal(
 ) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let finish_reason = state.finish_reason.clone();
-    let Some(finish_reason) = finish_reason.as_deref() else {
-        return out;
-    };
+    let finish_reason = finish_reason.as_deref();
+    let terminated_without_finish_reason = finish_reason.is_none();
 
     let incomplete_reason = match finish_reason {
-        "length" => Some("max_output_tokens"),
-        "content_filter" => Some("content_filter"),
-        "pause_turn" => Some("pause_turn"),
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        Some("pause_turn") => Some("pause_turn"),
         _ => None,
     };
     let failed_error = match finish_reason {
-        "context_length_exceeded" => Some(serde_json::json!({
+        Some("context_length_exceeded") => Some(serde_json::json!({
             "type": "invalid_request_error",
             "code": "context_length_exceeded",
             "message": "Your input exceeds the context window of this model. Please adjust your input and try again."
         })),
-        "error" => state.openai_terminal_error.clone().or_else(|| {
+        Some("error") => state.openai_terminal_error.clone().or_else(|| {
             Some(serde_json::json!({
                 "type": "server_error",
                 "code": "error",
                 "message": "The provider returned an error."
             }))
         }),
-        "tool_error" => Some(serde_json::json!({
+        Some("tool_error") => Some(serde_json::json!({
             "type": "invalid_request_error",
             "code": "tool_error",
             "message": "The provider reported a tool or protocol error."
@@ -404,10 +530,27 @@ pub(super) fn emit_openai_responses_terminal(
     let mut tool_call_keys = state.openai_tool_calls.keys().cloned().collect::<Vec<_>>();
     tool_call_keys.sort_unstable();
     let mut completed_tool_calls = Vec::new();
+    let mut degraded_tool_call_texts = Vec::new();
     for key in tool_call_keys {
         let Some(tool_call) = state.openai_tool_calls.get_mut(&key) else {
             continue;
         };
+        if let Some(marker) = tool_call.non_replayable_marker.as_ref() {
+            if trusted_non_replayable_tool_call_marker_for_name_and_raw_stream(
+                &tool_call.name,
+                &tool_call.arguments,
+                marker,
+            )
+            .is_some()
+            {
+                tool_call.responses_done = true;
+                degraded_tool_call_texts.push(tool_call_partial_replay_text_stream(
+                    &tool_call.name,
+                    &tool_call.arguments,
+                ));
+                continue;
+            }
+        }
         if tool_call.responses_item_added && !tool_call.responses_done {
             tool_call.responses_done = true;
             let Some(call_id) = tool_call.id.as_ref().and_then(Value::as_str) else {
@@ -458,10 +601,36 @@ pub(super) fn emit_openai_responses_terminal(
         if let Some(proxied_tool_kind) = proxied_tool_kind {
             output_item_done_ev["item"]["proxied_tool_kind"] = Value::String(proxied_tool_kind);
         }
+        maybe_mark_responses_stream_tool_call_item_non_replayable(
+            &mut output_item_done_ev["item"],
+            &name,
+            &tool_type,
+            &arguments,
+            incomplete_reason,
+            terminated_without_finish_reason,
+        );
         out.push(format_sse_event(
             "response.output_item.done",
             &output_item_done_ev,
         ));
+    }
+
+    if !degraded_tool_call_texts.is_empty() {
+        let output_index = responses_message_output_index(state);
+        ensure_responses_message_item_added(state, response_id, output_index, &mut out);
+        let content_index = ensure_responses_message_part(
+            state,
+            response_id,
+            output_index,
+            ResponsesMessagePartKind::OutputText,
+            &mut out,
+        );
+        if let Some(part) = state.responses_message_parts.get_mut(content_index) {
+            if !part.text.is_empty() {
+                part.text.push_str("\n\n");
+            }
+            part.text.push_str(&degraded_tool_call_texts.join("\n\n"));
+        }
     }
 
     if state.output_item_added {
@@ -570,6 +739,17 @@ pub(super) fn emit_openai_responses_terminal(
     let mut tool_call_output = state.openai_tool_calls.values().collect::<Vec<_>>();
     tool_call_output.sort_by_key(|tc| tc.index);
     for tool_call in tool_call_output {
+        if let Some(marker) = tool_call.non_replayable_marker.as_ref() {
+            if trusted_non_replayable_tool_call_marker_for_name_and_raw_stream(
+                &tool_call.name,
+                &tool_call.arguments,
+                marker,
+            )
+            .is_some()
+            {
+                continue;
+            }
+        }
         if let Some(call_id) = tool_call.id.as_ref().and_then(Value::as_str) {
             let payload_field = responses_tool_call_payload_field(tool_call_state_type(tool_call));
             let mut item = serde_json::json!({
@@ -582,6 +762,14 @@ pub(super) fn emit_openai_responses_terminal(
             if let Some(proxied_tool_kind) = tool_call.proxied_tool_kind.clone() {
                 item["proxied_tool_kind"] = Value::String(proxied_tool_kind);
             }
+            maybe_mark_responses_stream_tool_call_item_non_replayable(
+                &mut item,
+                &tool_call.name,
+                tool_call_state_type(tool_call),
+                &tool_call.arguments,
+                incomplete_reason,
+                terminated_without_finish_reason,
+            );
             output.push(item);
         }
     }
@@ -1049,6 +1237,173 @@ pub(super) fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState)
     out
 }
 
+fn emit_responses_tool_call_item_added(
+    state: &mut StreamState,
+    response_id: &str,
+    output_index: u64,
+    call_id: &str,
+    name: &str,
+    tool_type: &str,
+    proxied_tool_kind: Option<&str>,
+    out: &mut Vec<Vec<u8>>,
+) {
+    let payload_field = responses_tool_call_payload_field(tool_type);
+    let mut ev = serde_json::json!({
+        "type": "response.output_item.added",
+        "sequence_number": next_responses_seq(state),
+        "response_id": response_id,
+        "output_index": output_index,
+        "item": {
+            "id": format!("fc_{}", call_id),
+            "type": responses_tool_call_item_type(tool_type),
+            "call_id": call_id,
+            "name": name,
+        }
+    });
+    ev["item"][payload_field] = Value::String(String::new());
+    if let Some(proxied_tool_kind) = proxied_tool_kind {
+        ev["item"]["proxied_tool_kind"] = Value::String(proxied_tool_kind.to_string());
+    }
+    out.push(format_sse_event("response.output_item.added", &ev));
+}
+
+fn emit_responses_tool_call_delta(
+    state: &mut StreamState,
+    response_id: &str,
+    output_index: u64,
+    call_id: &str,
+    name: &str,
+    delta: &str,
+    tool_type: &str,
+    proxied_tool_kind: Option<&str>,
+    out: &mut Vec<Vec<u8>>,
+) {
+    if delta.is_empty() {
+        return;
+    }
+    let mut ev = serde_json::json!({
+        "type": responses_tool_call_delta_event_type(tool_type),
+        "sequence_number": next_responses_seq(state),
+        "response_id": response_id,
+        "call_id": call_id,
+        "name": name,
+        "item_id": format!("fc_{}", call_id),
+        "output_index": output_index,
+        "delta": delta
+    });
+    if let Some(proxied_tool_kind) = proxied_tool_kind {
+        ev["proxied_tool_kind"] = Value::String(proxied_tool_kind.to_string());
+    }
+    out.push(format_sse_event(
+        responses_tool_call_delta_event_type(tool_type),
+        &ev,
+    ));
+}
+
+fn flush_pending_responses_tool_call(
+    state: &mut StreamState,
+    response_id: &str,
+    tc_idx: usize,
+    finalize: bool,
+    out: &mut Vec<Vec<u8>>,
+) {
+    let output_index = responses_tool_output_index(state, tc_idx);
+    let resolved = {
+        let Some(entry) = state.openai_tool_calls.get_mut(&tc_idx) else {
+            return;
+        };
+        if entry.responses_item_added || entry.id.is_none() {
+            return;
+        }
+        if entry
+            .non_replayable_marker
+            .as_ref()
+            .and_then(|marker| {
+                trusted_non_replayable_tool_call_marker_for_name_and_raw_stream(
+                    &entry.name,
+                    &entry.arguments,
+                    marker,
+                )
+            })
+            .is_some()
+        {
+            return;
+        }
+
+        let call_id = entry
+            .id
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mut tool_type = tool_call_state_type(entry).to_string();
+        let mut name = entry.name.clone();
+        let mut arguments = entry.arguments.clone();
+        let proxied_tool_kind = entry.proxied_tool_kind.clone();
+
+        if tool_type != "custom" && proxied_tool_kind.is_none() {
+            if let Some(custom_name) =
+                openai_responses_custom_tool_name_from_bridge_stream(&entry.name)
+            {
+                if let Some(decoded_input) =
+                    openai_responses_custom_bridge_decode_arguments_stream(&entry.arguments)
+                {
+                    tool_type = "custom".to_string();
+                    name = custom_name.to_string();
+                    arguments = decoded_input.clone();
+                    entry.tool_type = Some(tool_type.clone());
+                    entry.name = name.clone();
+                    entry.arguments = arguments.clone();
+                    entry.bridge_custom_name = Some(name.clone());
+                    entry.bridge_decoded_input = decoded_input;
+                } else if !finalize {
+                    return;
+                }
+            }
+        }
+
+        entry.responses_item_added = true;
+        entry.responses_item_id = Some(format!("fc_{}", call_id));
+        (call_id, name, arguments, tool_type, proxied_tool_kind)
+    };
+
+    let (call_id, name, arguments, tool_type, proxied_tool_kind) = resolved;
+    emit_responses_tool_call_item_added(
+        state,
+        response_id,
+        output_index,
+        &call_id,
+        &name,
+        &tool_type,
+        proxied_tool_kind.as_deref(),
+        out,
+    );
+    emit_responses_tool_call_delta(
+        state,
+        response_id,
+        output_index,
+        &call_id,
+        &name,
+        &arguments,
+        &tool_type,
+        proxied_tool_kind.as_deref(),
+        out,
+    );
+}
+
+pub(super) fn flush_pending_responses_tool_calls(
+    state: &mut StreamState,
+    response_id: &str,
+    finalize: bool,
+    out: &mut Vec<Vec<u8>>,
+) {
+    let mut tool_call_keys = state.openai_tool_calls.keys().cloned().collect::<Vec<_>>();
+    tool_call_keys.sort_unstable();
+    for key in tool_call_keys {
+        flush_pending_responses_tool_call(state, response_id, key, finalize, out);
+    }
+}
+
 pub(super) fn openai_chunk_to_responses_sse(
     chunk: &Value,
     state: &mut StreamState,
@@ -1263,8 +1618,8 @@ pub(super) fn openai_chunk_to_responses_sse(
             let tc_idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             dedupe_tool_call_state_by_call_id(&mut state.openai_tool_calls, tc_idx, tc.get("id"));
             let output_index = responses_tool_output_index(state, tc_idx);
-            let mut item_added: Option<(String, String, String, Option<String>)> = None;
             let mut args_delta: Option<(String, String, String, String, Option<String>)> = None;
+            let should_flush_pending;
             {
                 let entry =
                     state
@@ -1277,6 +1632,10 @@ pub(super) fn openai_chunk_to_responses_sse(
                 if let Some(id) = tc.get("id").cloned() {
                     entry.id = Some(id);
                 }
+                if let Some(marker) = tc.get(INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD).cloned() {
+                    entry.non_replayable_marker = Some(marker);
+                }
+                let had_item_added = entry.responses_item_added;
                 let tool_type = openai_stream_tool_call_type(tc).to_string();
                 if entry.tool_type.is_none() || tc.get("type").is_some() {
                     entry.tool_type = Some(tool_type.clone());
@@ -1295,22 +1654,6 @@ pub(super) fn openai_chunk_to_responses_sse(
                 {
                     entry.name = name.to_string();
                 }
-                if !entry.responses_item_added && entry.id.is_some() {
-                    entry.responses_item_added = true;
-                    let call_id = entry
-                        .id
-                        .as_ref()
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    entry.responses_item_id = Some(format!("fc_{call_id}"));
-                    item_added = Some((
-                        call_id,
-                        entry.name.clone(),
-                        tool_call_state_type(entry).to_string(),
-                        entry.proxied_tool_kind.clone(),
-                    ));
-                }
                 if let Some(args) = tc
                     .get("function")
                     .and_then(|f| f.get("arguments"))
@@ -1318,60 +1661,55 @@ pub(super) fn openai_chunk_to_responses_sse(
                 {
                     if !args.is_empty() {
                         entry.arguments.push_str(args);
-                        let call_id = entry
-                            .id
-                            .as_ref()
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        args_delta = Some((
-                            call_id,
-                            entry.name.clone(),
-                            args.to_string(),
-                            tool_call_state_type(entry).to_string(),
-                            entry.proxied_tool_kind.clone(),
-                        ));
+                        if had_item_added {
+                            let call_id = entry
+                                .id
+                                .as_ref()
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            args_delta = Some((
+                                call_id,
+                                entry.name.clone(),
+                                args.to_string(),
+                                tool_call_state_type(entry).to_string(),
+                                entry.proxied_tool_kind.clone(),
+                            ));
+                        }
                     }
                 }
+                let trusted_non_replayable = entry
+                    .non_replayable_marker
+                    .as_ref()
+                    .and_then(|marker| {
+                        trusted_non_replayable_tool_call_marker_for_name_and_raw_stream(
+                            &entry.name,
+                            &entry.arguments,
+                            marker,
+                        )
+                    })
+                    .is_some();
+                if trusted_non_replayable {
+                    args_delta = None;
+                }
+                should_flush_pending =
+                    !trusted_non_replayable && !entry.responses_item_added && entry.id.is_some();
             }
-            if let Some((call_id, name, tool_type, proxied_tool_kind)) = item_added {
-                let payload_field = responses_tool_call_payload_field(&tool_type);
-                let mut ev = serde_json::json!({
-                    "type": "response.output_item.added",
-                    "sequence_number": next_responses_seq(state),
-                    "response_id": response_id,
-                    "output_index": output_index,
-                    "item": {
-                        "id": format!("fc_{}", call_id),
-                        "type": responses_tool_call_item_type(&tool_type),
-                        "call_id": call_id,
-                        "name": name,
-                    }
-                });
-                ev["item"][payload_field] = Value::String(String::new());
-                if let Some(proxied_tool_kind) = proxied_tool_kind {
-                    ev["item"]["proxied_tool_kind"] = Value::String(proxied_tool_kind);
-                }
-                out.push(format_sse_event("response.output_item.added", &ev));
+            if should_flush_pending {
+                flush_pending_responses_tool_call(state, &response_id, tc_idx, false, &mut out);
             }
             if let Some((call_id, name, args, tool_type, proxied_tool_kind)) = args_delta {
-                let mut ev = serde_json::json!({
-                    "type": responses_tool_call_delta_event_type(&tool_type),
-                    "sequence_number": next_responses_seq(state),
-                    "response_id": response_id,
-                    "call_id": call_id,
-                    "name": name,
-                    "item_id": format!("fc_{}", call_id),
-                    "output_index": output_index,
-                    "delta": args
-                });
-                if let Some(proxied_tool_kind) = proxied_tool_kind {
-                    ev["proxied_tool_kind"] = Value::String(proxied_tool_kind);
-                }
-                out.push(format_sse_event(
-                    responses_tool_call_delta_event_type(&tool_type),
-                    &ev,
-                ));
+                emit_responses_tool_call_delta(
+                    state,
+                    &response_id,
+                    output_index,
+                    &call_id,
+                    &name,
+                    &args,
+                    &tool_type,
+                    proxied_tool_kind.as_deref(),
+                    &mut out,
+                );
             }
         }
     }
@@ -1384,6 +1722,7 @@ pub(super) fn openai_chunk_to_responses_sse(
         Some("context_length_exceeded") | Some("error") | Some("tool_error")
     ) {
         state.finish_reason = finish_reason.map(str::to_string);
+        flush_pending_responses_tool_calls(state, &response_id, true, &mut out);
         out.extend(emit_openai_responses_terminal(
             state,
             &response_id,
@@ -1406,6 +1745,7 @@ pub(super) fn openai_chunk_to_responses_sse(
     };
     if should_finalize_now {
         let created = chunk.get("created").and_then(Value::as_u64).unwrap_or(0);
+        flush_pending_responses_tool_calls(state, &response_id, true, &mut out);
         out.extend(emit_openai_responses_terminal(
             state,
             &response_id,

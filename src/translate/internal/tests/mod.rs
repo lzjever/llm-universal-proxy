@@ -2899,6 +2899,45 @@ fn translate_request_openai_custom_tool_to_anthropic_rejects() {
 }
 
 #[test]
+fn assess_request_translation_responses_custom_tool_to_anthropic_rejects_nonportable_format() {
+    let body = json!({
+        "model": "claude-3-7-sonnet",
+        "tools": [{
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes code",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark"
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "code_exec"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "run this" }]
+        }]
+    });
+
+    let assessment = assess_request_translation(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        &body,
+    );
+
+    let TranslationDecision::Reject(err) = assessment.decision() else {
+        panic!("expected reject policy, got {assessment:?}");
+    };
+    assert!(
+        err.contains("custom tool") && err.contains("format") && err.contains("Anthropic"),
+        "err = {err}"
+    );
+}
+
+#[test]
 fn translate_request_chat_to_gemini_rejects_audio_format_without_documented_equivalent() {
     let mut body = json!({
         "model": "gemini-2.5-flash",
@@ -3003,6 +3042,151 @@ fn translate_request_openai_to_responses_maps_max_completion_tokens_to_max_outpu
 
     assert_eq!(body["max_output_tokens"], 222);
     assert!(body.get("max_completion_tokens").is_none());
+}
+
+#[test]
+fn translate_request_openai_to_claude_uses_policy_default_max_output_tokens_when_missing() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3-7-sonnet",
+        &mut body,
+        RequestTranslationPolicy {
+            max_output_tokens: Some(128_000),
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(body["max_tokens"], 128_000);
+}
+
+#[test]
+fn translate_request_openai_to_claude_preserves_explicit_max_completion_tokens_over_policy() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "max_completion_tokens": 222
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3-7-sonnet",
+        &mut body,
+        RequestTranslationPolicy {
+            max_output_tokens: Some(128_000),
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(body["max_tokens"], 222);
+}
+
+#[test]
+fn translate_request_openai_to_claude_preserves_explicit_max_tokens_over_policy() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "max_tokens": 333
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3-7-sonnet",
+        &mut body,
+        RequestTranslationPolicy {
+            max_output_tokens: Some(128_000),
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(body["max_tokens"], 333);
+}
+
+#[test]
+fn translate_request_openai_to_responses_uses_policy_default_max_output_tokens_when_missing() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        &mut body,
+        RequestTranslationPolicy {
+            max_output_tokens: Some(128_000),
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(body["max_output_tokens"], 128_000);
+}
+
+#[test]
+fn translate_request_responses_to_openai_uses_policy_default_max_completion_tokens_when_missing() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": "Hello"
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        RequestTranslationPolicy {
+            max_output_tokens: Some(128_000),
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(body["max_completion_tokens"], 128_000);
+}
+
+#[test]
+fn translate_request_google_passthrough_preserves_explicit_snake_case_max_output_tokens_over_policy(
+) {
+    let mut body = json!({
+        "model": "gemini-1.5",
+        "contents": [{
+            "role": "user",
+            "parts": [{ "text": "Hi" }]
+        }],
+        "generation_config": {
+            "max_output_tokens": 222
+        }
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::Google,
+        UpstreamFormat::Google,
+        "gemini-1.5",
+        &mut body,
+        RequestTranslationPolicy {
+            max_output_tokens: Some(128_000),
+        },
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(body["generation_config"]["max_output_tokens"], 222);
+    assert!(
+        body.get("generationConfig").is_none(),
+        "policy should not add a second max-output field when Google request already carries explicit snake_case output limits: {body:?}"
+    );
 }
 
 #[test]
@@ -5008,6 +5192,187 @@ fn translate_request_responses_to_claude_moves_user_warning_after_tool_result() 
 }
 
 #[test]
+fn translate_request_responses_to_claude_preserves_multiple_assistant_and_deferred_user_fragments()
+{
+    let mut body = json!({
+        "model": "codex-anthropic",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Run pwd" }]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Let me check." }]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Still checking." }]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"pwd\"}"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Warning A" }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Warning B" }]
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "Done"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Final note" }]
+            }
+        ],
+        "stream": true
+    });
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "codex-anthropic",
+        &mut body,
+        true,
+    )
+    .unwrap();
+
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 4, "body = {body:?}");
+    let assistant_blocks = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_blocks[0]["type"], "text");
+    assert_eq!(assistant_blocks[0]["text"], "Let me check.");
+    assert_eq!(assistant_blocks[1]["type"], "text");
+    assert_eq!(assistant_blocks[1]["text"], "Still checking.");
+    assert_eq!(assistant_blocks[2]["type"], "tool_use");
+    assert_eq!(assistant_blocks[2]["id"], "call_1");
+
+    assert_eq!(messages[2]["role"], "user");
+    let user_blocks = messages[2]["content"].as_array().expect("user content");
+    assert_eq!(user_blocks[0]["type"], "tool_result");
+    assert_eq!(user_blocks[0]["tool_use_id"], "call_1");
+    assert_eq!(user_blocks[0]["content"], "Done");
+    assert_eq!(user_blocks[1]["type"], "text");
+    assert_eq!(user_blocks[1]["text"], "Warning A");
+    assert_eq!(user_blocks[2]["type"], "text");
+    assert_eq!(user_blocks[2]["text"], "Warning B");
+
+    assert_eq!(messages[3]["role"], "user");
+    assert_eq!(messages[3]["content"][0]["type"], "text");
+    assert_eq!(messages[3]["content"][0]["text"], "Final note");
+}
+
+#[test]
+fn translate_request_responses_custom_tool_to_claude_bridges_definition_choice_and_history() {
+    let mut body = json!({
+        "model": "claude-3-7-sonnet",
+        "tools": [{
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes code",
+            "format": {
+                "type": "text"
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "code_exec"
+        },
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Run this script" }]
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_custom",
+                "name": "code_exec",
+                "input": "print('hi')"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_custom",
+                "output": "exit 0"
+            }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3-7-sonnet",
+        &mut body,
+        false,
+    )
+    .expect("Responses custom tools should bridge to Anthropic");
+
+    let tools = body["tools"].as_array().expect("anthropic tools");
+    assert_eq!(
+        tools[0],
+        json!({
+            "name": "__llmup_custom__code_exec",
+            "description": "Executes code",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string" }
+                },
+                "required": ["input"],
+                "additionalProperties": false
+            }
+        })
+    );
+    assert_eq!(
+        body["tool_choice"],
+        json!({
+            "type": "tool",
+            "name": "__llmup_custom__code_exec"
+        })
+    );
+
+    let messages = body["messages"].as_array().expect("anthropic messages");
+    assert_eq!(messages.len(), 3, "body = {body:?}");
+    assert_eq!(messages[0]["role"], "user");
+    let assistant_blocks = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(
+        assistant_blocks[0],
+        json!({
+            "type": "tool_use",
+            "id": "call_custom",
+            "name": "__llmup_custom__code_exec",
+            "input": { "input": "print('hi')" }
+        })
+    );
+    let user_blocks = messages[2]["content"].as_array().expect("user content");
+    assert_eq!(
+        user_blocks[0],
+        json!({
+            "type": "tool_result",
+            "tool_use_id": "call_custom",
+            "content": "exit 0"
+        })
+    );
+}
+
+#[test]
 fn translate_request_claude_structured_tool_result_content_round_trips() {
     let mut body = json!({
         "model": "claude-3",
@@ -5067,6 +5432,281 @@ fn translate_request_claude_structured_tool_result_content_round_trips() {
     assert!(content[0]["content"].is_array(), "body = {body:?}");
     assert_eq!(content[0]["content"][0]["type"], "text");
     assert_eq!(content[0]["content"][1]["type"], "json");
+}
+
+#[test]
+fn translate_request_responses_string_grammar_custom_tool_to_claude_bridges_with_text_contract() {
+    let apply_patch_grammar = r#"start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF"#;
+    let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+    let mut body = json!({
+        "model": "claude-3-7-sonnet",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": apply_patch_grammar
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "apply_patch"
+        },
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_apply_patch",
+                "name": "apply_patch",
+                "input": patch_input
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_apply_patch",
+                "output": "Success. Updated the following files:\nA hello.txt\n"
+            }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3-7-sonnet",
+        &mut body,
+        false,
+    )
+    .expect("string-grammar custom tools should bridge to Anthropic");
+
+    let tools = body["tools"].as_array().expect("anthropic tools");
+    assert_eq!(tools[0]["name"], "__llmup_custom__apply_patch");
+    assert_eq!(
+        tools[0]["input_schema"],
+        json!({
+            "type": "object",
+            "properties": {
+                "input": { "type": "string" }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        })
+    );
+    let description = tools[0]["description"]
+        .as_str()
+        .expect("anthropic tool description");
+    assert!(
+        description.contains("Use the `apply_patch` tool to edit files."),
+        "description = {description}"
+    );
+    assert!(
+        description.contains("Anthropic will not enforce it structurally"),
+        "description = {description}"
+    );
+    assert!(
+        description.contains("syntax: lark"),
+        "description = {description}"
+    );
+    assert!(
+        description.contains("start: begin_patch hunk+ end_patch"),
+        "description = {description}"
+    );
+    assert_eq!(
+        body["tool_choice"],
+        json!({
+            "type": "tool",
+            "name": "__llmup_custom__apply_patch"
+        })
+    );
+
+    let messages = body["messages"].as_array().expect("anthropic messages");
+    assert_eq!(messages.len(), 3, "body = {body:?}");
+    let assistant_blocks = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(
+        assistant_blocks[0],
+        json!({
+            "type": "tool_use",
+            "id": "call_apply_patch",
+            "name": "__llmup_custom__apply_patch",
+            "input": { "input": patch_input }
+        })
+    );
+    let user_blocks = messages[2]["content"].as_array().expect("user content");
+    assert_eq!(user_blocks[0]["type"], "tool_result");
+    assert_eq!(user_blocks[0]["tool_use_id"], "call_apply_patch");
+}
+
+#[test]
+fn translate_request_claude_bridged_custom_tool_history_to_responses_restores_custom_items() {
+    let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
+    let mut body = json!({
+        "model": "gpt-5",
+        "tools": [{
+            "name": "__llmup_custom__code_exec",
+            "description": "Executes code",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "input": { "type": "string" }
+                },
+                "required": ["input"],
+                "additionalProperties": false
+            }
+        }],
+        "tool_choice": {
+            "type": "tool",
+            "name": "__llmup_custom__code_exec"
+        },
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_custom",
+                    "name": "__llmup_custom__code_exec",
+                    "input": { "input": exact_input }
+                }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_custom",
+                    "content": "exit 0"
+                }]
+            }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-5",
+        &mut body,
+        false,
+    )
+    .expect("Anthropic bridged custom-tool history should restore Responses semantics");
+
+    let tools = body["tools"].as_array().expect("responses tools");
+    assert_eq!(
+        tools[0],
+        json!({
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes code"
+        })
+    );
+    assert_eq!(
+        body["tool_choice"],
+        json!({
+            "type": "custom",
+            "name": "code_exec"
+        })
+    );
+
+    let input = body["input"].as_array().expect("responses input");
+    assert_eq!(
+        input[0],
+        json!({
+            "type": "custom_tool_call",
+            "call_id": "toolu_custom",
+            "name": "code_exec",
+            "input": exact_input
+        })
+    );
+    assert_eq!(
+        input[1],
+        json!({
+            "type": "custom_tool_call_output",
+            "call_id": "toolu_custom",
+            "output": "exit 0"
+        })
+    );
+}
+
+#[test]
+fn translate_request_claude_noncanonical_bridged_custom_tool_history_falls_back_open() {
+    let mut body = json!({
+        "model": "gpt-5",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_custom",
+                    "name": "__llmup_custom__code_exec",
+                    "input": {
+                        "input": "print('hi')",
+                        "extra": true
+                    }
+                }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_custom",
+                    "content": "exit 0"
+                }]
+            }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-5",
+        &mut body,
+        false,
+    )
+    .expect("noncanonical bridge payloads should fall back to function semantics");
+
+    let input = body["input"].as_array().expect("responses input");
+    assert_eq!(input[0]["type"], "function_call");
+    assert_eq!(input[0]["call_id"], "toolu_custom");
+    assert_eq!(input[0]["name"], "__llmup_custom__code_exec");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            input[0]["arguments"].as_str().expect("function arguments"),
+        )
+        .expect("arguments json"),
+        json!({
+            "input": "print('hi')",
+            "extra": true
+        })
+    );
+    assert_eq!(
+        input[1],
+        json!({
+            "type": "function_call_output",
+            "call_id": "toolu_custom",
+            "output": "exit 0"
+        })
+    );
 }
 
 #[test]
@@ -5823,6 +6463,112 @@ fn translate_request_openai_non_object_tool_arguments_to_gemini_rejects() {
 }
 
 #[test]
+fn translate_request_openai_marked_invalid_tool_arguments_to_claude_degrade_to_text() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "_llmup_non_replayable_tool_call": { "reason": "incomplete_arguments" },
+                "function": {
+                    "name": "lookup_weather",
+                    "arguments": "{\"city\":\"Tokyo\""
+                }
+            }]
+        }]
+    });
+    super::tools::mark_tool_call_as_non_replayable(&mut body["messages"][0]["tool_calls"][0]);
+
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("marked incomplete tool calls should degrade to text");
+
+    let blocks = body["messages"][0]["content"]
+        .as_array()
+        .expect("claude assistant blocks");
+    assert_eq!(blocks[0]["type"], "text");
+    let text = blocks[0]["text"].as_str().expect("text block");
+    assert!(text.contains("lookup_weather"), "text = {text}");
+    assert!(text.contains("{\"city\":\"Tokyo\""), "text = {text}");
+}
+
+#[test]
+fn translate_request_openai_unsigned_non_replayable_marker_to_claude_still_fails_closed() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "_llmup_non_replayable_tool_call": { "reason": "incomplete_arguments" },
+                "function": {
+                    "name": "lookup_weather",
+                    "arguments": "{\"city\":\"Tokyo\""
+                }
+            }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect_err("unsigned replay marker must not bypass structured-args validation");
+
+    assert!(err.contains("arguments"), "err = {err}");
+    assert!(err.contains("JSON"), "err = {err}");
+}
+
+#[test]
+fn translate_request_openai_marked_invalid_tool_arguments_to_gemini_degrade_to_text() {
+    let mut body = json!({
+        "model": "gemini-2.5-flash",
+        "messages": [{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "_llmup_non_replayable_tool_call": { "reason": "incomplete_arguments" },
+                "function": {
+                    "name": "lookup_weather",
+                    "arguments": "{\"city\":\"Tokyo\""
+                }
+            }]
+        }]
+    });
+    super::tools::mark_tool_call_as_non_replayable(&mut body["messages"][0]["tool_calls"][0]);
+
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Google,
+        "gemini-2.5-flash",
+        &mut body,
+        false,
+    )
+    .expect("marked incomplete tool calls should degrade to text");
+
+    let parts = body["contents"][0]["parts"]
+        .as_array()
+        .expect("gemini parts");
+    assert_eq!(
+        parts[0]["text"],
+        "Tool call `lookup_weather` with partial arguments: {\"city\":\"Tokyo\""
+    );
+    assert!(parts[0].get("functionCall").is_none(), "body = {body:?}");
+}
+
+#[test]
 fn translate_request_claude_to_openai_collapses_text_blocks_to_string() {
     let mut body = json!({
         "model": "claude-3",
@@ -6299,6 +7045,228 @@ fn translate_request_responses_to_gemini_keeps_json_tool_results_on_response_res
     let function_response = &body["contents"][1]["parts"][0]["functionResponse"];
     assert_eq!(function_response["response"]["result"]["temperature"], 22);
     assert!(function_response.get("parts").is_none(), "body = {body:?}");
+}
+
+#[test]
+fn translate_request_responses_marked_invalid_tool_arguments_to_claude_degrade_to_text() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "lookup_weather",
+            "arguments": "{\"city\":\"Tokyo\"",
+            "_llmup_non_replayable_tool_call": { "reason": "incomplete_arguments" }
+        }]
+    });
+    super::tools::mark_tool_call_as_non_replayable(&mut body["input"][0]);
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("marked incomplete responses tool calls should degrade to text");
+
+    let blocks = body["messages"][0]["content"]
+        .as_array()
+        .expect("claude assistant blocks");
+    assert_eq!(blocks[0]["type"], "text");
+    let text = blocks[0]["text"].as_str().expect("text block");
+    assert!(text.contains("lookup_weather"), "text = {text}");
+    assert!(text.contains("{\"city\":\"Tokyo\""), "text = {text}");
+}
+
+#[test]
+fn translate_request_responses_marked_custom_tool_call_output_to_claude_degrades_to_user_text() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Apply this patch" }]
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Add File: hello.txt\n+hello\n"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_patch",
+                "output": "Success. Updated the following files:\nA hello.txt\n"
+            }
+        ]
+    });
+    super::tools::mark_tool_call_as_non_replayable(&mut body["input"][1]);
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("marked tool call outputs should degrade to user text instead of failing");
+
+    let messages = body["messages"].as_array().expect("claude messages");
+    assert_eq!(messages.len(), 3, "body = {body:?}");
+    let assistant_blocks = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_blocks[0]["type"], "text");
+    let assistant_text = assistant_blocks[0]["text"]
+        .as_str()
+        .expect("assistant text");
+    assert!(
+        assistant_text.contains("apply_patch"),
+        "text = {assistant_text}"
+    );
+
+    let user_blocks = messages[2]["content"].as_array().expect("user content");
+    assert_eq!(user_blocks.len(), 1, "body = {body:?}");
+    assert_eq!(user_blocks[0]["type"], "text");
+    let user_text = user_blocks[0]["text"].as_str().expect("user text");
+    assert!(user_text.contains("apply_patch"), "text = {user_text}");
+    assert!(
+        user_text.contains("Updated the following files"),
+        "text = {user_text}"
+    );
+}
+
+#[test]
+fn translate_request_responses_marked_function_tool_call_output_to_claude_degrades_to_user_text() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Check weather" }]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_weather",
+                "name": "lookup_weather",
+                "arguments": "{\"city\":\"Tokyo\""
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_weather",
+                "output": { "temperature": 22, "unit": "C" }
+            }
+        ]
+    });
+    super::tools::mark_tool_call_as_non_replayable(&mut body["input"][1]);
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("marked function tool outputs should degrade to user text");
+
+    let messages = body["messages"].as_array().expect("claude messages");
+    assert_eq!(messages.len(), 3, "body = {body:?}");
+    let user_blocks = messages[2]["content"].as_array().expect("user content");
+    assert_eq!(user_blocks.len(), 1, "body = {body:?}");
+    assert_eq!(user_blocks[0]["type"], "text");
+    let user_text = user_blocks[0]["text"].as_str().expect("user text");
+    assert!(user_text.contains("lookup_weather"), "text = {user_text}");
+    assert!(
+        user_text.contains("\"temperature\":22"),
+        "text = {user_text}"
+    );
+}
+
+#[test]
+fn translate_request_responses_unsigned_non_replayable_marker_to_claude_still_fails_closed() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "lookup_weather",
+            "arguments": "{\"city\":\"Tokyo\"",
+            "_llmup_non_replayable_tool_call": { "reason": "incomplete_arguments" }
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect_err("unsigned replay marker must not bypass structured-args validation");
+
+    assert!(err.contains("arguments"), "err = {err}");
+    assert!(err.contains("JSON"), "err = {err}");
+}
+
+#[test]
+fn translate_request_responses_marked_invalid_tool_arguments_to_gemini_degrade_to_text() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "lookup_weather",
+            "arguments": "{\"city\":\"Tokyo\"",
+            "_llmup_non_replayable_tool_call": { "reason": "incomplete_arguments" }
+        }]
+    });
+    super::tools::mark_tool_call_as_non_replayable(&mut body["input"][0]);
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Google,
+        "gemini-2.5-flash",
+        &mut body,
+        false,
+    )
+    .expect("marked incomplete responses tool calls should degrade to text");
+
+    let parts = body["contents"][0]["parts"]
+        .as_array()
+        .expect("gemini parts");
+    assert_eq!(
+        parts[0]["text"],
+        "Tool call `lookup_weather` with partial arguments: {\"city\":\"Tokyo\""
+    );
+    assert!(parts[0].get("functionCall").is_none(), "body = {body:?}");
+}
+
+#[test]
+fn translate_request_responses_unmarked_invalid_tool_arguments_to_claude_still_fail_closed() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "lookup_weather",
+            "arguments": "{\"city\":\"Tokyo\""
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect_err("unmarked malformed responses tool calls should fail closed");
+
+    assert!(err.contains("arguments"), "err = {err}");
+    assert!(err.contains("JSON"), "err = {err}");
 }
 
 #[test]
@@ -6991,8 +7959,8 @@ fn translate_response_openai_to_claude_preserves_unprovenanced_reasoning_as_unsi
 }
 
 #[test]
-fn translate_response_openai_to_claude_preserves_unsigned_thinking_and_tool_use_without_provenance(
-) {
+fn translate_response_openai_to_claude_preserves_unsigned_thinking_and_tool_use_without_provenance()
+{
     let body = json!({
         "id": "chatcmpl-1",
         "model": "minimax-openai",
@@ -7026,7 +7994,10 @@ fn translate_response_openai_to_claude_preserves_unsigned_thinking_and_tool_use_
     let content = out["content"].as_array().expect("anthropic content");
     assert_eq!(content.len(), 3);
     assert_eq!(content[0]["type"], "thinking");
-    assert_eq!(content[0]["thinking"], "use python to inspect the traceback");
+    assert_eq!(
+        content[0]["thinking"],
+        "use python to inspect the traceback"
+    );
     assert!(content[0].get("signature").is_none());
     assert_eq!(content[1]["type"], "text");
     assert_eq!(content[1]["text"], "Calling tool.");
@@ -7997,13 +8968,11 @@ fn translate_response_responses_nonportable_output_items_fail_closed_for_non_res
 
 #[test]
 fn translate_response_responses_reasoning_encrypted_content_preserves_carrier_for_anthropic() {
-    let encrypted_content = super::openai_responses::encode_anthropic_reasoning_carrier(&[
-        json!({
-            "type": "thinking",
-            "thinking": "Private reasoning.",
-            "signature": "sig_opaque"
-        }),
-    ])
+    let encrypted_content = super::openai_responses::encode_anthropic_reasoning_carrier(&[json!({
+        "type": "thinking",
+        "thinking": "Private reasoning.",
+        "signature": "sig_opaque"
+    })])
     .expect("carrier should encode");
     let body = json!({
         "id": "resp_reasoning_encrypted",
@@ -8020,8 +8989,12 @@ fn translate_response_responses_reasoning_encrypted_content_preserves_carrier_fo
         }]
     });
 
-    let out = translate_response(UpstreamFormat::OpenAiResponses, UpstreamFormat::Anthropic, &body)
-        .expect("Anthropic clients should preserve reasoning carrier");
+    let out = translate_response(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        &body,
+    )
+    .expect("Anthropic clients should preserve reasoning carrier");
     let content = out["content"].as_array().expect("anthropic content");
     assert_eq!(content.len(), 1);
     assert_eq!(content[0]["type"], "thinking");
@@ -8032,13 +9005,11 @@ fn translate_response_responses_reasoning_encrypted_content_preserves_carrier_fo
 #[test]
 fn translate_response_responses_reasoning_encrypted_content_still_fails_closed_for_non_anthropic_clients(
 ) {
-    let encrypted_content = super::openai_responses::encode_anthropic_reasoning_carrier(&[
-        json!({
-            "type": "thinking",
-            "thinking": "Private reasoning.",
-            "signature": "sig_opaque"
-        }),
-    ])
+    let encrypted_content = super::openai_responses::encode_anthropic_reasoning_carrier(&[json!({
+        "type": "thinking",
+        "thinking": "Private reasoning.",
+        "signature": "sig_opaque"
+    })])
     .expect("carrier should encode");
     let body = json!({
         "id": "resp_reasoning_encrypted",
@@ -8187,6 +9158,7 @@ fn translate_response_openai_to_responses_falls_back_when_bridged_arguments_are_
         "not valid json".to_string(),
         serde_json::to_string(&json!({ "output": "missing input" })).expect("json"),
         serde_json::to_string(&json!({ "input": 5 })).expect("json"),
+        serde_json::to_string(&json!({ "input": "print('hi')", "extra": true })).expect("json"),
     ];
 
     for raw_arguments in bad_arguments {
@@ -9255,6 +10227,40 @@ fn translate_response_claude_thinking_signature_provenance_maps_to_responses_car
     );
     assert_eq!(output[1]["type"], "message");
     assert_eq!(output[1]["content"][0]["text"], "Visible answer");
+}
+
+#[test]
+fn translate_response_claude_bridged_tool_use_restores_responses_custom_tool_call() {
+    let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
+    let body = json!({
+        "id": "msg_custom_tool",
+        "content": [{
+            "type": "tool_use",
+            "id": "toolu_custom",
+            "name": "__llmup_custom__code_exec",
+            "input": { "input": exact_input }
+        }],
+        "stop_reason": "tool_use",
+        "model": "claude-3"
+    });
+
+    let out = translate_response(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect("Anthropic bridged tool_use should restore Responses custom tool calls");
+
+    let output = out["output"].as_array().expect("responses output");
+    assert_eq!(
+        output[0],
+        json!({
+            "type": "custom_tool_call",
+            "call_id": "toolu_custom",
+            "name": "code_exec",
+            "input": exact_input
+        })
+    );
 }
 
 #[test]

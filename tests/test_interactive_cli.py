@@ -57,6 +57,8 @@ class InteractiveCliTests(unittest.TestCase):
                 workspace,
                 "minimax-openai",
                 proxy_base,
+                client_home=pathlib.Path("/tmp/codex-home"),
+                model_limits=None,
             ),
             [
                 "codex",
@@ -80,6 +82,8 @@ class InteractiveCliTests(unittest.TestCase):
                 workspace,
                 "claude-haiku-4-5",
                 proxy_base,
+                client_home=None,
+                model_limits=None,
             ),
             [
                 "claude",
@@ -98,6 +102,8 @@ class InteractiveCliTests(unittest.TestCase):
                 workspace,
                 "minimax-openai",
                 proxy_base,
+                client_home=None,
+                model_limits=None,
             ),
             [
                 "gemini",
@@ -107,6 +113,32 @@ class InteractiveCliTests(unittest.TestCase):
                 str(workspace),
             ],
         )
+
+    def test_build_interactive_command_injects_codex_catalog_when_limits_exist(self):
+        module = load_module()
+        workspace = pathlib.Path("/tmp/workspace").resolve()
+        client_home = pathlib.Path("/tmp/codex-home").resolve()
+
+        command = module.build_interactive_command(
+            "codex",
+            workspace,
+            "minimax-openai",
+            "http://127.0.0.1:18888",
+            client_home=client_home,
+            model_limits=module.ModelLimits(
+                context_window=200000,
+                max_output_tokens=128000,
+            ),
+            codex_metadata=module.CodexModelMetadata(
+                input_modalities=("text",),
+                supports_search_tool=False,
+            ),
+        )
+
+        joined = " ".join(command)
+        self.assertIn("model_catalog_json", joined)
+        self.assertIn(str(client_home / ".codex" / "catalog.json"), joined)
+        self.assertIn('web_search="disabled"', joined)
 
     def test_run_with_proxy_base_does_not_call_start_proxy(self):
         module = load_module()
@@ -131,14 +163,19 @@ class InteractiveCliTests(unittest.TestCase):
                         temp_dir,
                         "--proxy-base",
                         "http://127.0.0.1:18888/",
+                        "--proxy-health-timeout-secs",
+                        "55",
                     ]
                 )
 
         self.assertEqual(exit_code, 0)
         start_proxy.assert_not_called()
-        wait_for_health.assert_called_once_with("http://127.0.0.1:18888")
-        stop_proxy.assert_called_once_with(None)
+        wait_for_health.assert_called_once_with("http://127.0.0.1:18888", timeout_secs=55)
+        stop_proxy.assert_called_once_with(None, terminate_grace_secs=15)
         launch_args = launch_client.call_args.args
+        parsed_source = module.parse_proxy_source(
+            pathlib.Path(module.DEFAULT_CONFIG_SOURCE).read_text(encoding="utf-8")
+        )
         self.assertEqual(
             launch_args[0],
             module.build_interactive_command(
@@ -146,6 +183,11 @@ class InteractiveCliTests(unittest.TestCase):
                 pathlib.Path(temp_dir).resolve(),
                 "minimax-openai",
                 "http://127.0.0.1:18888",
+                client_home=pathlib.Path(launch_args[2]["HOME"]),
+                model_limits=module.resolve_model_limits(parsed_source, "minimax-openai"),
+                codex_metadata=module.resolve_codex_model_metadata(
+                    parsed_source, "minimax-openai"
+                ),
             ),
         )
 
@@ -184,13 +226,32 @@ class InteractiveCliTests(unittest.TestCase):
                         "claude",
                         "--workspace",
                         temp_dir,
+                        "--proxy-health-timeout-secs",
+                        "65",
                     ]
                 )
 
         self.assertEqual(exit_code, 0)
         start_proxy.assert_called_once()
-        wait_for_health.assert_called_once_with("http://127.0.0.1:18888")
-        stop_proxy.assert_called_once_with(fake_process)
+        wait_for_health.assert_called_once_with("http://127.0.0.1:18888", timeout_secs=65)
+        stop_proxy.assert_called_once_with(fake_process, terminate_grace_secs=15)
+
+    def test_parse_args_exposes_structured_timeout_policy(self):
+        module = load_module()
+
+        args = module.parse_args(
+            [
+                "--client",
+                "gemini",
+                "--proxy-health-timeout-secs",
+                "75",
+                "--process-stop-grace-secs",
+                "18",
+            ]
+        )
+
+        self.assertEqual(args.proxy_health_timeout_secs, 75)
+        self.assertEqual(args.process_stop_grace_secs, 18)
 
     def test_build_client_env_keeps_home_and_client_state_out_of_real_home(self):
         module = load_module()
@@ -239,6 +300,45 @@ class InteractiveCliTests(unittest.TestCase):
             "TMPDIR",
         ):
             self.assertFalse(gemini_env[key].startswith("/home/real-user"))
+
+    def test_build_client_env_reuses_host_rust_toolchain_homes_for_all_clients(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            host_home = root / "host-home"
+            cargo_home = host_home / ".cargo"
+            rustup_home = host_home / ".rustup"
+            cargo_home.mkdir(parents=True, exist_ok=True)
+            rustup_home.mkdir(parents=True, exist_ok=True)
+            base_env = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(host_home),
+            }
+
+            codex_env = module.build_client_env(
+                "codex",
+                base_env,
+                "http://127.0.0.1:18888",
+                root / "codex-home",
+            )
+            claude_env = module.build_client_env(
+                "claude",
+                base_env,
+                "http://127.0.0.1:18888",
+                root / "claude-home",
+            )
+            gemini_env = module.build_client_env(
+                "gemini",
+                base_env,
+                "http://127.0.0.1:18888",
+                root / "gemini-home",
+            )
+
+            for client_env in (codex_env, claude_env, gemini_env):
+                self.assertEqual(client_env["CARGO_HOME"], str(cargo_home))
+                self.assertEqual(client_env["RUSTUP_HOME"], str(rustup_home))
+                self.assertNotEqual(client_env["HOME"], str(host_home))
 
 
 if __name__ == "__main__":

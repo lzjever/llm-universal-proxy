@@ -27,6 +27,7 @@ pub fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
             fallback_api_key: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            limits: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),

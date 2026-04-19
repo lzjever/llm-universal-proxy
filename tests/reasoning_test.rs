@@ -384,8 +384,8 @@ async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_replays_c
 }
 
 #[tokio::test]
-async fn openai_reasoning_to_anthropic_non_streaming_preserves_unsigned_thinking_without_provenance()
-{
+async fn openai_reasoning_to_anthropic_non_streaming_preserves_unsigned_thinking_without_provenance(
+) {
     let (mock_base, _mock) = spawn_openai_completion_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -488,8 +488,8 @@ async fn responses_reasoning_to_openai_chat_non_streaming() {
 }
 
 #[tokio::test]
-async fn responses_reasoning_to_anthropic_non_streaming_preserves_unsigned_thinking_without_provenance()
-{
+async fn responses_reasoning_to_anthropic_non_streaming_preserves_unsigned_thinking_without_provenance(
+) {
     let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;

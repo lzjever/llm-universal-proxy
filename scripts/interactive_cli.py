@@ -18,16 +18,23 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from real_cli_matrix import (  # noqa: E402
     CLIENT_NAMES,
+    CodexModelMetadata,
     DEFAULT_CONFIG_SOURCE,
     DEFAULT_ENV_FILE,
     DEFAULT_PROXY_BINARY,
+    ModelLimits,
+    add_timeout_policy_args,
     build_client_env,
+    build_codex_catalog_args,
     build_runtime_config_text,
     load_dotenv_file,
     parse_proxy_source,
     prepare_proxy_env,
+    resolve_codex_model_metadata,
+    resolve_model_limits,
     start_proxy,
     stop_proxy,
+    timeout_policy_from_args,
     wait_for_health,
 )
 
@@ -67,6 +74,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("PROXY_PORT", "18888")),
     )
+    add_timeout_policy_args(parser, include_case_thresholds=False)
     args = parser.parse_args(argv)
     if not args.model:
         args.model = default_model_for_client(args.client)
@@ -88,12 +96,16 @@ def build_interactive_command(
     workspace: pathlib.Path,
     model: str,
     proxy_base: str,
+    *,
+    client_home: pathlib.Path | None = None,
+    model_limits: ModelLimits | None = None,
+    codex_metadata: CodexModelMetadata | None = None,
 ) -> list[str]:
     workspace = pathlib.Path(workspace).resolve()
     proxy_base = normalize_proxy_base(proxy_base)
 
     if client_name == "codex":
-        return [
+        command = [
             "codex",
             "-C",
             str(workspace),
@@ -108,6 +120,12 @@ def build_interactive_command(
             "-c",
             'model_providers.proxy.wire_api="responses"',
         ]
+        command.extend(
+            build_codex_catalog_args(
+                client_home, model, model_limits, codex_metadata
+            )
+        )
+        return command
 
     if client_name == "claude":
         return [
@@ -167,7 +185,7 @@ def start_managed_proxy(
         listen_port=args.proxy_port,
         trace_path=trace_path,
     )
-    proxy_env = prepare_proxy_env(base_env, dotenv_env)
+    proxy_env = prepare_proxy_env(base_env, dotenv_env, runtime_root)
     process, _config_path, _stdout_path, _stderr_path = start_proxy(
         proxy_binary,
         runtime_config_text,
@@ -179,9 +197,11 @@ def start_managed_proxy(
 
 def run(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    timeout_policy = timeout_policy_from_args(args)
     ensure_client_binary(args.client)
 
     workspace = pathlib.Path(args.workspace).resolve()
+    config_source = pathlib.Path(args.config_source)
     base_env = dict(os.environ)
 
     with tempfile.TemporaryDirectory(prefix=f"interactive-cli-{args.client}-") as temp_dir:
@@ -189,6 +209,9 @@ def run(argv: list[str] | None = None) -> int:
         proxy_process: subprocess.Popen[str] | None = None
 
         try:
+            parsed_source = parse_proxy_source(config_source.read_text(encoding="utf-8"))
+            model_limits = resolve_model_limits(parsed_source, args.model)
+            codex_metadata = resolve_codex_model_metadata(parsed_source, args.model)
             if args.proxy_base:
                 proxy_base = normalize_proxy_base(args.proxy_base)
             else:
@@ -198,7 +221,9 @@ def run(argv: list[str] | None = None) -> int:
                     runtime_root,
                 )
 
-            wait_for_health(proxy_base)
+            wait_for_health(
+                proxy_base, timeout_secs=timeout_policy.proxy_health_timeout_secs
+            )
 
             client_home = runtime_root / "homes" / args.client
             client_env = build_client_env(
@@ -206,16 +231,24 @@ def run(argv: list[str] | None = None) -> int:
                 base_env,
                 proxy_base,
                 client_home,
+                model_name=args.model,
+                model_limits=model_limits,
             )
             command = build_interactive_command(
                 args.client,
                 workspace,
                 args.model,
                 proxy_base,
+                client_home=client_home,
+                model_limits=model_limits,
+                codex_metadata=codex_metadata,
             )
             return launch_interactive_client(command, workspace, client_env)
         finally:
-            stop_proxy(proxy_process)
+            stop_proxy(
+                proxy_process,
+                terminate_grace_secs=timeout_policy.process_terminate_grace_secs,
+            )
 
 
 def main() -> int:

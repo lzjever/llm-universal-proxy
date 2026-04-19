@@ -203,28 +203,30 @@ fn configured_aliases(config: &Config) -> Vec<(&String, &crate::config::ModelAli
     config.model_aliases.iter().collect()
 }
 
+fn effective_limits(
+    config: &Config,
+    target: &crate::config::ModelAlias,
+) -> Option<crate::config::ModelLimits> {
+    config.effective_model_limits(target)
+}
+
 fn openai_model_list(config: &Config) -> Value {
     serde_json::json!({
         "object": "list",
         "data": configured_aliases(config)
             .into_iter()
-            .map(|(alias, target)| serde_json::json!({
-                "id": alias,
-                "object": "model",
-                "created": 0,
-                "owned_by": "proxec",
-                "proxec": {
-                    "upstream_name": target.upstream_name,
-                    "upstream_model": target.upstream_model,
-                }
-            }))
+            .map(|(alias, target)| openai_model_value(config, alias, target))
             .collect::<Vec<_>>()
     })
 }
 
 fn openai_model_object(config: &Config, id: &str) -> Option<Value> {
     let target = config.model_aliases.get(id)?;
-    Some(serde_json::json!({
+    Some(openai_model_value(config, id, target))
+}
+
+fn openai_model_value(config: &Config, id: &str, target: &crate::config::ModelAlias) -> Value {
+    serde_json::json!({
         "id": id,
         "object": "model",
         "created": 0,
@@ -232,14 +234,15 @@ fn openai_model_object(config: &Config, id: &str) -> Option<Value> {
         "proxec": {
             "upstream_name": target.upstream_name,
             "upstream_model": target.upstream_model,
+            "limits": effective_limits(config, target),
         }
-    }))
+    })
 }
 
 fn anthropic_model_list(config: &Config) -> Value {
     let data = configured_aliases(config)
         .into_iter()
-        .map(|(alias, target)| anthropic_model_value(alias, target))
+        .map(|(alias, target)| anthropic_model_value(config, alias, target))
         .collect::<Vec<_>>();
     let first_id = data
         .first()
@@ -263,10 +266,10 @@ fn anthropic_model_list(config: &Config) -> Value {
 
 fn anthropic_model_object(config: &Config, id: &str) -> Option<Value> {
     let target = config.model_aliases.get(id)?;
-    Some(anthropic_model_value(id, target))
+    Some(anthropic_model_value(config, id, target))
 }
 
-fn anthropic_model_value(id: &str, target: &crate::config::ModelAlias) -> Value {
+fn anthropic_model_value(config: &Config, id: &str, target: &crate::config::ModelAlias) -> Value {
     serde_json::json!({
         "id": id,
         "type": "model",
@@ -275,6 +278,7 @@ fn anthropic_model_value(id: &str, target: &crate::config::ModelAlias) -> Value 
         "proxec": {
             "upstream_name": target.upstream_name,
             "upstream_model": target.upstream_model,
+            "limits": effective_limits(config, target),
         }
     })
 }
@@ -283,26 +287,32 @@ fn google_model_list(config: &Config) -> Value {
     serde_json::json!({
         "models": configured_aliases(config)
             .into_iter()
-            .map(|(alias, target)| google_model_value(alias, target))
+            .map(|(alias, target)| google_model_value(config, alias, target))
             .collect::<Vec<_>>()
     })
 }
 
 fn google_model_object(config: &Config, id: &str) -> Option<Value> {
     let target = config.model_aliases.get(id)?;
-    Some(google_model_value(id, target))
+    Some(google_model_value(config, id, target))
 }
 
-fn google_model_value(id: &str, target: &crate::config::ModelAlias) -> Value {
+fn google_model_value(config: &Config, id: &str, target: &crate::config::ModelAlias) -> Value {
+    let limits = effective_limits(config, target);
     serde_json::json!({
         "name": format!("models/{}", id),
         "baseModelId": id,
         "version": "proxec",
         "displayName": id,
         "description": format!("proxec alias -> {}:{}", target.upstream_name, target.upstream_model),
-        "inputTokenLimit": 0,
-        "outputTokenLimit": 0,
+        "inputTokenLimit": limits.as_ref().and_then(|item| item.context_window).unwrap_or(0),
+        "outputTokenLimit": limits.as_ref().and_then(|item| item.max_output_tokens).unwrap_or(0),
         "supportedGenerationMethods": ["generateContent"],
-        "thinking": false
+        "thinking": false,
+        "proxec": {
+            "upstream_name": target.upstream_name,
+            "upstream_model": target.upstream_model,
+            "limits": limits,
+        }
     })
 }
