@@ -4397,7 +4397,7 @@ async fn responses_endpoint_streaming_translates_to_anthropic_upstream() {
 }
 
 #[tokio::test]
-async fn responses_endpoint_streaming_fails_closed_for_anthropic_thinking() {
+async fn responses_endpoint_streaming_preserves_plain_anthropic_thinking() {
     let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -4415,29 +4415,72 @@ async fn responses_endpoint_streaming_fails_closed_for_anthropic_thinking() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
-    assert!(body.contains("event: response.failed"), "body = {body}");
+    assert!(body.contains("event: response.reasoning_summary_text.delta"), "body = {body}");
     assert!(
-        body.contains("\"type\":\"invalid_request_error\""),
+        body.contains("\"delta\":\"think\""),
         "body = {body}"
     );
-    assert!(
-        body.contains("Anthropic thinking blocks cannot be translated losslessly"),
-        "body = {body}"
+    assert!(body.contains("response.reasoning_summary_text.done"), "body = {body}");
+    assert!(body.contains("response.completed"), "body = {body}");
+    assert!(!body.contains("response.failed"), "body = {body}");
+}
+
+#[tokio::test]
+async fn codex_minimax_anth_streaming_plain_thinking_succeeds() {
+    let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::Anthropic,
+        "minimax-anth",
+        "MiniMax-M2.7-highspeed",
     );
-    assert!(
-        body.contains("\"code\":\"unsupported_anthropic_stream_event\""),
-        "body = {body}"
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "minimax-anth",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("reasoning_content"), "body = {body}");
+    assert!(body.contains("\"content\":\"Hi\""), "body = {body}");
+    assert!(!body.contains("\"finish_reason\":\"error\""), "body = {body}");
+}
+
+#[tokio::test]
+async fn gemini_minimax_anth_streaming_plain_thinking_succeeds() {
+    let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::Anthropic,
+        "minimax-anth",
+        "MiniMax-M2.7-highspeed",
     );
-    assert!(
-        !body.contains("response.reasoning_summary_text.delta"),
-        "body = {body}"
-    );
-    assert!(
-        !body.contains("response.reasoning_summary_text.done"),
-        "body = {body}"
-    );
-    assert!(!body.contains("\"think\""), "body = {body}");
-    assert!(!body.contains("response.completed"), "body = {body}");
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "{proxy_base}/google/v1beta/models/minimax-anth:streamGenerateContent"
+        ))
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body = res.text().await.unwrap();
+    assert!(body.contains("\"thought\":true"), "body = {body}");
+    assert!(body.contains("\"text\":\"think\""), "body = {body}");
+    assert!(body.contains("\"text\":\"Hi\""), "body = {body}");
 }
 
 #[tokio::test]

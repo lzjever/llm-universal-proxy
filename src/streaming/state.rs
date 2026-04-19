@@ -16,6 +16,7 @@ pub(super) enum ClaudeBlockKind {
 #[derive(Debug, Clone, Default)]
 pub(super) struct ClaudeBlockState {
     pub(super) kind: Option<ClaudeBlockKind>,
+    pub(super) thinking: String,
     pub(super) signature: Option<String>,
     pub(super) annotations: Vec<Value>,
     pub(super) omitted: bool,

@@ -577,7 +577,7 @@ async fn spawn_namespaced_openai_echo_mock(
     (base, handle, captured)
 }
 
-async fn spawn_prompt_fatal_anthropic_thinking_mock() -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_prompt_fatal_anthropic_omitted_thinking_mock() -> (String, tokio::task::JoinHandle<()>) {
     async fn handler(Json(body): Json<Value>) -> Response {
         let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         if !stream {
@@ -589,7 +589,7 @@ async fn spawn_prompt_fatal_anthropic_thinking_mock() -> (String, tokio::task::J
                     "role": "assistant",
                     "model": "claude-3",
                     "content": [
-                        { "type": "thinking", "thinking": "think" },
+                        { "type": "thinking", "thinking": { "display": "omitted" }, "signature": "sig_omitted" },
                         { "type": "text", "text": "Hi" }
                     ],
                     "stop_reason": "end_turn",
@@ -612,7 +612,7 @@ async fn spawn_prompt_fatal_anthropic_thinking_mock() -> (String, tokio::task::J
                 Duration::ZERO,
                 concat!(
                     "event: content_block_start\n",
-                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"ponder\"}}\n\n"
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":{\"display\":\"omitted\"},\"signature\":\"sig_omitted\"}}\n\n"
                 ),
             ),
         ]);
@@ -984,7 +984,7 @@ async fn concurrent_live_requests_keep_namespaces_and_sessions_isolated() {
 
 #[tokio::test]
 async fn fatal_translated_stream_rejection_returns_prompt_failure_and_finishes() {
-    let (mock_base, _mock) = spawn_prompt_fatal_anthropic_thinking_mock().await;
+    let (mock_base, _mock) = spawn_prompt_fatal_anthropic_omitted_thinking_mock().await;
     let config = common::proxy_helpers::proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -1020,7 +1020,7 @@ async fn fatal_translated_stream_rejection_returns_prompt_failure_and_finishes()
     );
     assert!(body.contains("event: response.failed"), "body = {body}");
     assert!(
-        body.contains("Anthropic thinking blocks cannot be translated losslessly"),
+        body.contains("Anthropic omitted thinking blocks cannot be translated losslessly"),
         "body = {body}"
     );
     assert!(!body.contains("response.completed"), "body = {body}");

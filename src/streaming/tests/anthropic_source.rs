@@ -15,7 +15,7 @@ fn claude_message_start_produces_openai_chunk() {
 }
 
 #[test]
-fn claude_thinking_delta_produces_openai_reasoning_chunk() {
+fn claude_plain_thinking_is_buffered_until_block_stop() {
     let mut state = StreamState::default();
     let _ = claude_event_to_openai_chunks(
         &serde_json::json!({
@@ -32,7 +32,7 @@ fn claude_thinking_delta_produces_openai_reasoning_chunk() {
         }),
         &mut state,
     );
-    let chunks = claude_event_to_openai_chunks(
+    let delta_chunks = claude_event_to_openai_chunks(
         &serde_json::json!({
             "type": "content_block_delta",
             "index": 0,
@@ -40,7 +40,16 @@ fn claude_thinking_delta_produces_openai_reasoning_chunk() {
         }),
         &mut state,
     );
-    assert!(chunks
+    assert!(delta_chunks.is_empty(), "delta_chunks = {delta_chunks:?}");
+
+    let stop_chunks = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+        &mut state,
+    );
+    assert!(stop_chunks
         .iter()
         .any(|chunk| chunk["choices"][0]["delta"]["reasoning_content"] == "think"));
 }
@@ -142,8 +151,7 @@ fn claude_unknown_typed_delta_still_fails_closed() {
 }
 
 #[test]
-fn translate_sse_event_anthropic_thinking_to_openai_fails_closed_at_start_and_suppresses_followups()
-{
+fn translate_sse_event_anthropic_plain_thinking_to_openai_buffers_until_stop_and_continues() {
     let mut state = StreamState::default();
     let first = translate_sse_event(
         UpstreamFormat::Anthropic,
@@ -181,13 +189,40 @@ fn translate_sse_event_anthropic_thinking_to_openai_fails_closed_at_start_and_su
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiCompletion,
         &serde_json::json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": { "type": "signature_delta", "signature": "sig_123" }
+            "type": "content_block_stop",
+            "index": 0
         }),
         &mut state,
     );
-    let joined = second
+    let fifth = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "text",
+                "text": ""
+            }
+        }),
+        &mut state,
+    );
+    let sixth = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": { "type": "text_delta", "text": "Hi" }
+        }),
+        &mut state,
+    );
+    let fourth_joined = fourth
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sixth_joined = sixth
         .iter()
         .map(|bytes| String::from_utf8_lossy(bytes).to_string())
         .collect::<Vec<_>>()
@@ -197,28 +232,19 @@ fn translate_sse_event_anthropic_thinking_to_openai_fails_closed_at_start_and_su
         !first.is_empty(),
         "message_start should still initialize stream"
     );
-    assert!(joined.contains("\"finish_reason\":\"error\""), "{joined}");
+    assert!(second.is_empty(), "second = {second:?}");
+    assert!(third.is_empty(), "third = {third:?}");
+    assert!(fifth.is_empty(), "fifth = {fifth:?}");
     assert!(
-        joined.contains("thinking blocks cannot be translated losslessly"),
-        "{joined}"
+        fourth_joined.contains("reasoning_content"),
+        "fourth_joined = {fourth_joined}"
     );
-    assert!(
-        third.is_empty(),
-        "follow-up after fatal reject should be suppressed"
-    );
-    assert!(
-        fourth.is_empty(),
-        "follow-up after fatal reject should be suppressed"
-    );
-    assert!(
-        !joined.contains("reasoning_content"),
-        "start-time reject must not leak reasoning_content: {joined}"
-    );
+    assert!(sixth_joined.contains("\"content\":\"Hi\""), "{sixth_joined}");
+    assert!(state.fatal_rejection.is_none(), "state = {state:?}");
 }
 
 #[test]
-fn translate_sse_event_anthropic_thinking_to_responses_fails_closed_at_start_and_suppresses_followups(
-) {
+fn translate_sse_event_anthropic_plain_thinking_to_responses_buffers_until_stop_and_continues() {
     let mut state = StreamState::default();
     let _ = translate_sse_event(
         UpstreamFormat::Anthropic,
@@ -229,7 +255,7 @@ fn translate_sse_event_anthropic_thinking_to_responses_fails_closed_at_start_and
         }),
         &mut state,
     );
-    let rejected = translate_sse_event(
+    let started = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
         &serde_json::json!({
@@ -242,7 +268,7 @@ fn translate_sse_event_anthropic_thinking_to_responses_fails_closed_at_start_and
         }),
         &mut state,
     );
-    let suppressed_reasoning = translate_sse_event(
+    let buffered_reasoning = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
         &serde_json::json!({
@@ -252,17 +278,17 @@ fn translate_sse_event_anthropic_thinking_to_responses_fails_closed_at_start_and
         }),
         &mut state,
     );
-    let suppressed_signature = translate_sse_event(
+    let reasoning_done = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
         &serde_json::json!({
             "type": "content_block_delta",
             "index": 0,
-            "delta": { "type": "signature_delta", "signature": "sig_123" }
+            "delta": { "type": "thinking_delta", "thinking": "hidden" }
         }),
         &mut state,
     );
-    let suppressed_stop = translate_sse_event(
+    let flushed_reasoning = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
         &serde_json::json!({
@@ -271,45 +297,28 @@ fn translate_sse_event_anthropic_thinking_to_responses_fails_closed_at_start_and
         }),
         &mut state,
     );
-    let joined = rejected
+    let joined = flushed_reasoning
         .iter()
         .map(|bytes| String::from_utf8_lossy(bytes).to_string())
         .collect::<Vec<_>>()
         .join("\n");
 
     assert!(
-        joined.contains("\"type\":\"response.failed\""),
+        joined.contains("response.reasoning_summary_text.delta"),
         "joined = {joined}"
     );
     assert!(
-        joined.contains("\"code\":\"unsupported_anthropic_stream_event\""),
+        joined.contains("\"delta\":\"ponderhiddenhidden\""),
         "joined = {joined}"
     );
-    assert!(
-        joined.contains("thinking blocks cannot be translated losslessly"),
-        "joined = {joined}"
-    );
-    assert!(
-        !joined.contains("response.reasoning_"),
-        "start-time reject must not emit reasoning lifecycle events: {joined}"
-    );
-    assert!(
-        suppressed_reasoning.is_empty(),
-        "follow-up after fatal reject should be suppressed"
-    );
-    assert!(
-        suppressed_signature.is_empty(),
-        "follow-up after fatal reject should be suppressed"
-    );
-    assert!(
-        suppressed_stop.is_empty(),
-        "follow-up after fatal reject should be suppressed"
-    );
+    assert!(started.is_empty(), "started = {started:?}");
+    assert!(buffered_reasoning.is_empty(), "buffered_reasoning = {buffered_reasoning:?}");
+    assert!(reasoning_done.is_empty(), "reasoning_done = {reasoning_done:?}");
+    assert!(state.fatal_rejection.is_none(), "state = {state:?}");
 }
 
 #[test]
-fn translate_sse_event_anthropic_thinking_to_gemini_fails_closed_at_start_and_suppresses_followups()
-{
+fn translate_sse_event_anthropic_plain_thinking_to_gemini_buffers_until_stop_and_continues() {
     let mut state = StreamState::default();
     let first = translate_sse_event(
         UpstreamFormat::Anthropic,
@@ -320,7 +329,7 @@ fn translate_sse_event_anthropic_thinking_to_gemini_fails_closed_at_start_and_su
         }),
         &mut state,
     );
-    let rejected = translate_sse_event(
+    let started = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::Google,
         &serde_json::json!({
@@ -333,7 +342,7 @@ fn translate_sse_event_anthropic_thinking_to_gemini_fails_closed_at_start_and_su
         }),
         &mut state,
     );
-    let suppressed = translate_sse_event(
+    let buffered = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::Google,
         &serde_json::json!({
@@ -343,7 +352,16 @@ fn translate_sse_event_anthropic_thinking_to_gemini_fails_closed_at_start_and_su
         }),
         &mut state,
     );
-    let joined = rejected
+    let flushed = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Google,
+        &serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+        &mut state,
+    );
+    let joined = flushed
         .iter()
         .map(|bytes| String::from_utf8_lossy(bytes).to_string())
         .collect::<Vec<_>>()
@@ -353,15 +371,68 @@ fn translate_sse_event_anthropic_thinking_to_gemini_fails_closed_at_start_and_su
         first.is_empty(),
         "message_start alone should not emit Gemini content"
     );
-    assert!(rejected.is_empty(), "{joined}");
-    assert!(
-        state.fatal_rejection.is_some(),
-        "Gemini sink should reject without emitting ad-hoc error frames"
+    assert!(started.is_empty(), "started = {started:?}");
+    assert!(buffered.is_empty(), "buffered = {buffered:?}");
+    assert!(!flushed.is_empty(), "{joined}");
+    assert!(joined.contains("\"thought\":true"), "{joined}");
+    assert!(state.fatal_rejection.is_none(), "state = {state:?}");
+}
+
+#[test]
+fn translate_sse_event_anthropic_signature_delta_to_openai_fails_closed_before_releasing_reasoning() {
+    let mut state = StreamState::default();
+    let _ = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-3" }
+        }),
+        &mut state,
     );
-    assert!(
-        suppressed.is_empty(),
-        "follow-up after fatal reject should be suppressed"
+    let _ = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "thinking",
+                "thinking": ""
+            }
+        }),
+        &mut state,
     );
+    let buffered = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "thinking_delta", "thinking": "hidden" }
+        }),
+        &mut state,
+    );
+    let rejected = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "signature_delta", "signature": "sig_123" }
+        }),
+        &mut state,
+    );
+    let joined = rejected
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(buffered.is_empty(), "buffered = {buffered:?}");
+    assert!(joined.contains("\"finish_reason\":\"error\""), "{joined}");
+    assert!(joined.contains("signature provenance"), "{joined}");
+    assert!(!joined.contains("reasoning_content"), "{joined}");
 }
 
 #[test]

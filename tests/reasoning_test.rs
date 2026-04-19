@@ -50,65 +50,6 @@ async fn assert_reasoning_to_anthropic_stream_rejected(res: reqwest::Response) {
     assert!(!body.contains("message_stop"), "body = {body}");
 }
 
-async fn assert_anthropic_thinking_to_openai_stream_failed_closed(
-    res: reqwest::Response,
-) -> String {
-    let status = res.status();
-    let body = res.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::OK, "body = {body}");
-    assert!(
-        body.contains("\"finish_reason\":\"error\""),
-        "body = {body}"
-    );
-    assert!(
-        body.contains("\"type\":\"invalid_request_error\""),
-        "body = {body}"
-    );
-    assert!(
-        body.contains("\"code\":\"unsupported_anthropic_stream_event\""),
-        "body = {body}"
-    );
-    assert!(
-        body.contains("Anthropic thinking blocks cannot be translated losslessly."),
-        "body = {body}"
-    );
-    assert!(!body.contains("reasoning_content"), "body = {body}");
-    assert!(!body.contains("<think>"), "body = {body}");
-    body
-}
-
-async fn assert_anthropic_thinking_to_responses_stream_failed_closed(
-    res: reqwest::Response,
-) -> String {
-    let status = res.status();
-    let body = res.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::OK, "body = {body}");
-    assert!(body.contains("event: response.failed"), "body = {body}");
-    assert!(
-        body.contains("\"type\":\"invalid_request_error\""),
-        "body = {body}"
-    );
-    assert!(
-        body.contains("\"code\":\"unsupported_anthropic_stream_event\""),
-        "body = {body}"
-    );
-    assert!(
-        body.contains("Anthropic thinking blocks cannot be translated losslessly."),
-        "body = {body}"
-    );
-    assert!(
-        !body.contains("response.reasoning_summary_text.delta"),
-        "body = {body}"
-    );
-    assert!(
-        !body.contains("response.output_text.delta"),
-        "body = {body}"
-    );
-    assert!(!body.contains("response.completed"), "body = {body}");
-    assert!(!body.contains("<think>"), "body = {body}");
-    body
-}
-
 // ============================================================
 // A. Non-Streaming Cross-Format Reasoning
 // ============================================================
@@ -627,7 +568,7 @@ async fn gemini_thinking_to_responses_non_streaming() {
 // ============================================================
 
 #[tokio::test]
-async fn anthropic_thinking_to_openai_chat_streaming_fails_closed() {
+async fn anthropic_thinking_to_openai_chat_streaming() {
     let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -643,11 +584,15 @@ async fn anthropic_thinking_to_openai_chat_streaming_fails_closed() {
         .send()
         .await
         .unwrap();
-    assert_anthropic_thinking_to_openai_stream_failed_closed(res).await;
+    assert!(res.status().is_success());
+    let text = res.text().await.unwrap();
+    assert!(text.contains("reasoning_content"), "body = {text}");
+    assert!(text.contains("\"content\":\"Hi\""), "body = {text}");
+    assert!(!text.contains("\"finish_reason\":\"error\""), "body = {text}");
 }
 
 #[tokio::test]
-async fn anthropic_thinking_to_responses_streaming_fails_closed() {
+async fn anthropic_thinking_to_responses_streaming() {
     let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -659,7 +604,15 @@ async fn anthropic_thinking_to_responses_streaming_fails_closed() {
         .send()
         .await
         .unwrap();
-    assert_anthropic_thinking_to_responses_stream_failed_closed(res).await;
+    assert!(res.status().is_success());
+    let text = res.text().await.unwrap();
+    assert!(
+        text.contains("response.reasoning_summary_text.delta"),
+        "body = {text}"
+    );
+    assert!(text.contains("response.output_text.delta"), "body = {text}");
+    assert!(text.contains("response.completed"), "body = {text}");
+    assert!(!text.contains("response.failed"), "body = {text}");
 }
 
 #[tokio::test]
@@ -812,6 +765,28 @@ async fn gemini_thinking_to_responses_streaming() {
     );
 }
 
+#[tokio::test]
+async fn anthropic_thinking_to_gemini_streaming() {
+    let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "{proxy_base}/google/v1beta/models/test:streamGenerateContent"
+        ))
+        .json(&json!({ "contents": [{ "parts": [{ "text": "Hi" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let text = res.text().await.unwrap();
+    assert!(text.contains("\"thought\":true"), "body = {text}");
+    assert!(text.contains("\"text\":\"think\""), "body = {text}");
+    assert!(text.contains("\"text\":\"Hi\""), "body = {text}");
+}
+
 // ============================================================
 // C. Thinking + Tool Use Combined
 // ============================================================
@@ -888,7 +863,7 @@ async fn anthropic_thinking_with_tools_to_responses_non_streaming() {
 }
 
 #[tokio::test]
-async fn anthropic_thinking_with_tools_to_openai_streaming_fails_closed() {
+async fn anthropic_thinking_with_tools_to_openai_streaming() {
     let (mock_base, _mock) = spawn_anthropic_thinking_with_tools_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -905,9 +880,12 @@ async fn anthropic_thinking_with_tools_to_openai_streaming_fails_closed() {
         .send()
         .await
         .unwrap();
-    let text = assert_anthropic_thinking_to_openai_stream_failed_closed(res).await;
-    assert!(!text.contains("tool_calls"), "body = {text}");
-    assert!(!text.contains("get_weather"), "body = {text}");
+    assert!(res.status().is_success());
+    let text = res.text().await.unwrap();
+    assert!(text.contains("reasoning_content"), "body = {text}");
+    assert!(text.contains("tool_calls"), "body = {text}");
+    assert!(text.contains("get_weather"), "body = {text}");
+    assert!(!text.contains("\"finish_reason\":\"error\""), "body = {text}");
 }
 
 // ============================================================

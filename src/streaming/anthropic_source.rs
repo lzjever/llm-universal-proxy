@@ -41,6 +41,10 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                     state.text_block_started = true;
                 }
                 Some("thinking") => {
+                    let seeded_thinking = block
+                        .and_then(|b| b.get("thinking").and_then(Value::as_str))
+                        .unwrap_or("")
+                        .to_string();
                     let omitted = block
                         .and_then(|b| {
                             b.get("thinking")
@@ -53,6 +57,7 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                         idx,
                         ClaudeBlockState {
                             kind: Some(ClaudeBlockKind::Thinking),
+                            thinking: seeded_thinking,
                             omitted,
                             ..Default::default()
                         },
@@ -165,18 +170,33 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                     }
                 }
                 Some("thinking_delta") => {
+                    let Some(block_index) = idx else {
+                        return reject_openai_stream(
+                            state,
+                            "invalid_request_error",
+                            "unsupported_anthropic_stream_event",
+                            "Anthropic thinking_delta is missing a block index.",
+                        );
+                    };
+                    let Some(block_state) = state.claude_blocks.get_mut(&block_index) else {
+                        return reject_openai_stream(
+                            state,
+                            "invalid_request_error",
+                            "unsupported_anthropic_stream_event",
+                            "Anthropic thinking_delta referenced an unknown block.",
+                        );
+                    };
+                    if block_state.kind != Some(ClaudeBlockKind::Thinking) {
+                        return reject_openai_stream(
+                            state,
+                            "invalid_request_error",
+                            "unsupported_anthropic_stream_event",
+                            "Anthropic thinking_delta is only valid for thinking blocks.",
+                        );
+                    };
                     if let Some(t) = delta.and_then(|d| d.get("thinking").and_then(Value::as_str)) {
-                        let omitted = idx
-                            .and_then(|block_index| state.claude_blocks.get(&block_index))
-                            .map(|block| block.omitted)
-                            .unwrap_or(false);
-                        if !t.is_empty() && !omitted {
-                            emit_openai_assistant_role_if_needed(state, &mut out);
-                            out.push(openai_chunk(
-                                state,
-                                serde_json::json!({ "reasoning_content": t }),
-                                None,
-                            ));
+                        if !t.is_empty() {
+                            block_state.thinking.push_str(t);
                         }
                     }
                 }
@@ -337,6 +357,24 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                 out.push(openai_chunk(state, chunk_json, None));
             }
             if let Some(i) = idx {
+                let buffered_reasoning = state.claude_blocks.get(&i).and_then(|block_state| {
+                    if block_state.kind == Some(ClaudeBlockKind::Thinking) {
+                        (!block_state.omitted
+                            && block_state.signature.is_none()
+                            && !block_state.thinking.is_empty())
+                        .then(|| block_state.thinking.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(reasoning) = buffered_reasoning {
+                    emit_openai_assistant_role_if_needed(state, &mut out);
+                    out.push(openai_chunk(
+                        state,
+                        serde_json::json!({ "reasoning_content": reasoning }),
+                        None,
+                    ));
+                }
                 if let Some(block_state) = state.claude_blocks.get(&i) {
                     if block_state.kind == Some(ClaudeBlockKind::Thinking) {
                         state

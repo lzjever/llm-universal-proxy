@@ -95,11 +95,13 @@ pub(super) fn anthropic_stream_incompatibility_for_non_anthropic_sink(
                 .or_else(|| content_block.get("display"))
                 .and_then(Value::as_str)
                 == Some("omitted");
-            Some(if omitted {
-                "Anthropic omitted thinking blocks cannot be translated losslessly."
+            if omitted {
+                Some("Anthropic omitted thinking blocks cannot be translated losslessly.")
+            } else if content_block.get("signature").is_some() {
+                Some("Anthropic thinking signature provenance cannot be translated losslessly.")
             } else {
-                "Anthropic thinking blocks cannot be translated losslessly."
-            })
+                None
+            }
         }
         Some("content_block_delta") => (event
             .get("delta")
