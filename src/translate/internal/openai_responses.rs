@@ -276,13 +276,35 @@ fn openai_message_to_responses_content(msg: &Value, content_type: &str) -> Vec<V
 }
 
 pub(super) fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
+    responses_response_to_openai_impl(body, false)
+}
+
+pub(super) fn responses_response_to_openai_for_anthropic(body: &Value) -> Result<Value, String> {
+    responses_response_to_openai_impl(body, true)
+}
+
+fn responses_response_to_openai_impl(
+    body: &Value,
+    allow_anthropic_reasoning_replay: bool,
+) -> Result<Value, String> {
     let output = match body.get("output").and_then(Value::as_array) {
         Some(o) => o,
         None => return Ok(body.clone()),
     };
+    let target_label = if allow_anthropic_reasoning_replay {
+        "Anthropic"
+    } else {
+        "OpenAI Chat Completions"
+    };
     if let Some(message) = output
         .iter()
-        .find_map(|item| responses_nonportable_output_item_message(item, "OpenAI Chat Completions"))
+        .find_map(|item| {
+            responses_nonportable_output_item_message(
+                item,
+                target_label,
+                allow_anthropic_reasoning_replay,
+            )
+        })
     {
         return Err(message);
     }
@@ -291,6 +313,7 @@ pub(super) fn responses_response_to_openai(body: &Value) -> Result<Value, String
     let mut content_logprobs: Vec<Value> = vec![];
     let mut saw_content_logprobs = false;
     let mut reasoning_content = String::new();
+    let mut anthropic_reasoning_replay_blocks: Vec<Value> = vec![];
     let mut refusal = String::new();
     let mut tool_calls: Vec<Value> = vec![];
     for item in output {
@@ -340,11 +363,22 @@ pub(super) fn responses_response_to_openai(body: &Value) -> Result<Value, String
                     }
                 }
             }
+            if allow_anthropic_reasoning_replay {
+                if let Some(blocks) = responses_reasoning_replay_blocks_for_anthropic(item) {
+                    anthropic_reasoning_replay_blocks.extend(blocks);
+                }
+            }
         }
     }
     let mut message = serde_json::json!({ "role": "assistant" });
     if !reasoning_content.is_empty() {
         message["reasoning_content"] = Value::String(reasoning_content);
+    }
+    if !anthropic_reasoning_replay_blocks.is_empty() {
+        append_openai_message_anthropic_reasoning_replay_blocks(
+            &mut message,
+            anthropic_reasoning_replay_blocks,
+        );
     }
     let has_tool_calls = !tool_calls.is_empty();
     if !content_parts.is_empty() {

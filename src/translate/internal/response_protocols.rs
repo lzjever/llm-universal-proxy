@@ -6,6 +6,7 @@ use super::response_logprobs::{
     normalized_response_logprobs_to_openai_values,
 };
 use super::{
+    append_openai_message_anthropic_reasoning_replay_blocks,
     classify_portable_non_success_terminal, openai_message_to_claude_blocks,
     openai_message_anthropic_reasoning_replay_blocks,
     openai_tool_arguments_to_structured_value, single_optional_array_item,
@@ -319,19 +320,25 @@ pub(super) fn normalize_openai_completion_response(body: &Value) -> Value {
     out
 }
 
-fn sanitize_openai_message_for_claude_response(message: &Value) -> Value {
-    let mut sanitized = message.clone();
-    if openai_message_reasoning_text(message).is_none()
-        || openai_message_anthropic_reasoning_replay_blocks(message).is_some()
-    {
-        return sanitized;
+fn prepare_openai_message_for_claude_response(message: &Value) -> Value {
+    let mut prepared = message.clone();
+    if openai_message_anthropic_reasoning_replay_blocks(message).is_some() {
+        return prepared;
     }
-    let Some(obj) = sanitized.as_object_mut() else {
-        return sanitized;
+    let Some(reasoning) = openai_message_reasoning_text(message) else {
+        return prepared;
     };
-    obj.remove("reasoning_content");
-    obj.remove("reasoning_details");
-    sanitized
+    if reasoning.is_empty() {
+        return prepared;
+    }
+    append_openai_message_anthropic_reasoning_replay_blocks(
+        &mut prepared,
+        vec![serde_json::json!({
+            "type": "thinking",
+            "thinking": reasoning
+        })],
+    );
+    prepared
 }
 
 pub(super) fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
@@ -344,8 +351,8 @@ pub(super) fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
         "choices",
     )?;
     let message = choice.get("message").ok_or("missing message")?;
-    let sanitized_message = sanitize_openai_message_for_claude_response(message);
-    let content = openai_message_to_claude_blocks(&sanitized_message)?
+    let prepared_message = prepare_openai_message_for_claude_response(message);
+    let content = openai_message_to_claude_blocks(&prepared_message)?
         .unwrap_or_else(|| vec![serde_json::json!({ "type": "text", "text": "" })]);
     let finish = choice
         .get("finish_reason")

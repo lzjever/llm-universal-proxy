@@ -6868,7 +6868,7 @@ fn translate_response_openai_to_claude_has_content_array() {
 }
 
 #[test]
-fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_visible_answer() {
+fn translate_response_openai_to_claude_preserves_unprovenanced_reasoning_as_unsigned_thinking() {
     let body = json!({
         "id": "chatcmpl-1",
         "model": "minimax-openai",
@@ -6892,13 +6892,17 @@ fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_v
     assert_eq!(out["type"], "message");
     assert_eq!(out["stop_reason"], "end_turn");
     let content = out["content"].as_array().expect("anthropic content");
-    assert_eq!(content.len(), 1);
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "PONG");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "private chain of thought");
+    assert!(content[0].get("signature").is_none());
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "PONG");
 }
 
 #[test]
-fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_tool_use() {
+fn translate_response_openai_to_claude_preserves_unsigned_thinking_and_tool_use_without_provenance(
+) {
     let body = json!({
         "id": "chatcmpl-1",
         "model": "minimax-openai",
@@ -6930,13 +6934,16 @@ fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_t
     assert_eq!(out["type"], "message");
     assert_eq!(out["stop_reason"], "tool_use");
     let content = out["content"].as_array().expect("anthropic content");
-    assert_eq!(content.len(), 2);
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "Calling tool.");
-    assert_eq!(content[1]["type"], "tool_use");
-    assert_eq!(content[1]["id"], "call_1");
-    assert_eq!(content[1]["name"], "run_python");
-    assert_eq!(content[1]["input"]["file"], "bug.py");
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "use python to inspect the traceback");
+    assert!(content[0].get("signature").is_none());
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "Calling tool.");
+    assert_eq!(content[2]["type"], "tool_use");
+    assert_eq!(content[2]["id"], "call_1");
+    assert_eq!(content[2]["name"], "run_python");
+    assert_eq!(content[2]["input"]["file"], "bug.py");
 }
 
 #[test]
@@ -7899,8 +7906,15 @@ fn translate_response_responses_nonportable_output_items_fail_closed_for_non_res
 }
 
 #[test]
-fn translate_response_responses_reasoning_encrypted_content_fails_closed_for_non_responses_clients()
-{
+fn translate_response_responses_reasoning_encrypted_content_preserves_carrier_for_anthropic() {
+    let encrypted_content = super::openai_responses::encode_anthropic_reasoning_carrier(&[
+        json!({
+            "type": "thinking",
+            "thinking": "Private reasoning.",
+            "signature": "sig_opaque"
+        }),
+    ])
+    .expect("carrier should encode");
     let body = json!({
         "id": "resp_reasoning_encrypted",
         "object": "response",
@@ -7912,17 +7926,48 @@ fn translate_response_responses_reasoning_encrypted_content_fails_closed_for_non
                 "type": "summary_text",
                 "text": "Private reasoning."
             }],
-            "encrypted_content": "opaque_state"
+            "encrypted_content": encrypted_content
         }]
     });
 
-    for client_format in [
-        UpstreamFormat::OpenAiCompletion,
-        UpstreamFormat::Anthropic,
-        UpstreamFormat::Google,
-    ] {
+    let out = translate_response(UpstreamFormat::OpenAiResponses, UpstreamFormat::Anthropic, &body)
+        .expect("Anthropic clients should preserve reasoning carrier");
+    let content = out["content"].as_array().expect("anthropic content");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "Private reasoning.");
+    assert_eq!(content[0]["signature"], "sig_opaque");
+}
+
+#[test]
+fn translate_response_responses_reasoning_encrypted_content_still_fails_closed_for_non_anthropic_clients(
+) {
+    let encrypted_content = super::openai_responses::encode_anthropic_reasoning_carrier(&[
+        json!({
+            "type": "thinking",
+            "thinking": "Private reasoning.",
+            "signature": "sig_opaque"
+        }),
+    ])
+    .expect("carrier should encode");
+    let body = json!({
+        "id": "resp_reasoning_encrypted",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "output": [{
+            "type": "reasoning",
+            "summary": [{
+                "type": "summary_text",
+                "text": "Private reasoning."
+            }],
+            "encrypted_content": encrypted_content
+        }]
+    });
+
+    for client_format in [UpstreamFormat::OpenAiCompletion, UpstreamFormat::Google] {
         let err = translate_response(UpstreamFormat::OpenAiResponses, client_format, &body)
-            .expect_err("encrypted reasoning should fail closed on non-Responses clients");
+            .expect_err("encrypted reasoning should still fail closed for non-Anthropic clients");
         assert!(err.contains("encrypted_content"), "err = {err}");
     }
 }

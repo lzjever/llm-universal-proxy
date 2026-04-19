@@ -8,12 +8,17 @@ use super::openai_responses::{
 pub(super) fn responses_nonportable_output_item_message(
     item: &Value,
     target_label: &str,
+    allow_reasoning_encrypted_content: bool,
 ) -> Option<String> {
     let item_type = item.get("type").and_then(Value::as_str)?;
     match item_type {
-        "reasoning" if item.get("encrypted_content").is_some() => Some(format!(
+        "reasoning"
+            if item.get("encrypted_content").is_some() && !allow_reasoning_encrypted_content =>
+        {
+            Some(format!(
             "OpenAI Responses reasoning output item field `encrypted_content` cannot be faithfully translated to {target_label}"
-        )),
+        ))
+        }
         "function_call_output" | "custom_tool_call_output" => Some(format!(
             "OpenAI Responses output item `{item_type}` cannot be faithfully translated to {target_label}"
         )),

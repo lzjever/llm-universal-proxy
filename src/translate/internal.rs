@@ -281,7 +281,8 @@ use openai_family::{
 use openai_responses::{
     append_openai_message_anthropic_reasoning_replay_blocks, messages_to_responses,
     openai_message_anthropic_reasoning_replay_blocks, openai_response_to_responses,
-    responses_response_to_openai, responses_to_messages,
+    responses_response_to_openai, responses_response_to_openai_for_anthropic,
+    responses_to_messages,
 };
 #[cfg(test)]
 use request_gemini::convert_gemini_content_to_openai;
@@ -324,6 +325,10 @@ pub fn translate_response(
         && client_format == UpstreamFormat::OpenAiResponses
     {
         claude_response_to_openai_with_reasoning_replay(body)?
+    } else if upstream_format == UpstreamFormat::OpenAiResponses
+        && client_format == UpstreamFormat::Anthropic
+    {
+        responses_response_to_openai_for_anthropic(body)?
     } else {
         upstream_response_to_openai(upstream_format, body)?
     };
