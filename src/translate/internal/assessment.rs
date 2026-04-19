@@ -7,7 +7,6 @@ use super::messages::{
     openai_assistant_audio_history_not_portable_message, openai_request_audio_not_portable_message,
     single_candidate_choice_contract_message, translation_target_label,
     responses_reasoning_carrier_dropped_message, responses_reasoning_carrier_malformed_message,
-    OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
 };
 use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
@@ -15,7 +14,6 @@ use super::models::{
 };
 use super::openai_responses::decode_anthropic_reasoning_carrier;
 use super::request_gemini::gemini_generation_config_field;
-use super::response_protocols::openai_message_reasoning_text;
 use super::tools::{
     normalized_responses_tool_definition, openai_tool_arguments_to_structured_value,
     responses_tool_call_item_to_openai_tool_call, responses_tool_call_to_structured_value,
@@ -793,26 +791,6 @@ pub(super) fn cross_protocol_requested_choice_count_message(
     ))
 }
 
-pub(super) fn request_contains_openai_reasoning_without_provenance(
-    client_format: UpstreamFormat,
-    body: &Value,
-) -> bool {
-    match client_format {
-        UpstreamFormat::OpenAiCompletion => body
-            .get("messages")
-            .and_then(Value::as_array)
-            .map(|messages| {
-                messages.iter().any(|message| {
-                    message.get("role").and_then(Value::as_str) == Some("assistant")
-                        && openai_message_reasoning_text(message).is_some()
-                })
-            })
-            .unwrap_or(false),
-        UpstreamFormat::OpenAiResponses => false,
-        _ => false,
-    }
-}
-
 pub(super) fn request_has_custom_tools(client_format: UpstreamFormat, body: &Value) -> bool {
     match client_format {
         UpstreamFormat::OpenAiCompletion => {
@@ -1206,12 +1184,6 @@ pub(crate) fn assess_request_translation(
                 translation_target_label(upstream_format)
             ));
         }
-    }
-
-    if upstream_format == UpstreamFormat::Anthropic
-        && request_contains_openai_reasoning_without_provenance(client_format, body)
-    {
-        assessment.reject(OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE);
     }
 
     if matches!(

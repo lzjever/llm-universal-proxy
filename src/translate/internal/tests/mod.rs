@@ -1705,8 +1705,7 @@ fn translate_request_openai_to_claude_has_system_and_messages() {
 }
 
 #[test]
-fn translate_request_openai_to_claude_rejects_reasoning_without_provenance_before_mutating_blocks_or_cache_control(
-) {
+fn translate_request_openai_to_claude_preserves_unsigned_thinking_without_replay_provenance() {
     let mut body = json!({
         "model": "claude-3",
         "messages": [
@@ -1724,37 +1723,105 @@ fn translate_request_openai_to_claude_rejects_reasoning_without_provenance_befor
         &mut body,
         false,
     )
-    .expect_err("reasoning replay to claude should fail closed");
+    .expect("reasoning text should degrade to unsigned Anthropic thinking");
 
-    assert_eq!(
-        body["messages"][0]["reasoning_content"],
-        "private reasoning"
-    );
-    assert_eq!(body["messages"][0]["content"], "Visible answer");
-    assert!(body["messages"][0].get("cache_control").is_none());
+    let messages = body["messages"].as_array().expect("anthropic messages");
+    assert_eq!(messages.len(), 1, "messages = {messages:?}");
+    let assistant_content = messages[0]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "private reasoning");
+    assert!(assistant_content[0].get("signature").is_none());
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "Visible answer");
+    assert!(assistant_content[0].get("cache_control").is_none());
 }
 
 #[test]
-fn translate_request_openai_reasoning_to_claude_rejects_without_replay_provenance() {
+fn translate_request_openai_reasoning_and_tool_calls_to_claude_preserves_unsigned_thinking_without_replay_provenance(
+) {
     let mut body = json!({
         "model": "claude-3",
         "messages": [{
             "role": "assistant",
             "reasoning_content": "internal chain of thought",
-            "content": "Visible answer"
+            "content": "Calling tool.",
+            "tool_calls": [{
+                "id": "call_lookup",
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": "{\"city\":\"Tokyo\"}"
+                }
+            }]
         }]
     });
 
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect_err("reasoning replay to claude should fail closed");
+    .expect("reasoning text should preserve tool semantics on Anthropic");
 
-    assert_eq!(err, OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE);
+    let messages = body["messages"].as_array().expect("anthropic messages");
+    let assistant_content = messages[0]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(
+        assistant_content[0]["thinking"],
+        "internal chain of thought"
+    );
+    assert!(assistant_content[0].get("signature").is_none());
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "Calling tool.");
+    assert_eq!(assistant_content[2]["type"], "tool_use");
+    assert_eq!(assistant_content[2]["id"], "call_lookup");
+    assert_eq!(assistant_content[2]["name"], "lookup");
+    assert_eq!(assistant_content[2]["input"]["city"], "Tokyo");
+}
+
+#[test]
+fn translate_request_gemini_to_claude_preserves_thought_history_as_unsigned_thinking() {
+    let mut body = json!({
+        "model": "claude-3",
+        "contents": [
+            { "role": "user", "parts": [{ "text": "Think about 2+2" }] },
+            {
+                "role": "model",
+                "parts": [
+                    { "thought": true, "text": "2+2 equals 4" },
+                    { "text": "The answer is 4" }
+                ]
+            },
+            { "role": "user", "parts": [{ "text": "Now what about 3+3?" }] }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::Google,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("Gemini thought history should preserve unsigned Anthropic thinking");
+
+    let messages = body["messages"].as_array().expect("anthropic messages");
+    assert_eq!(messages.len(), 3, "messages = {messages:?}");
+    assert_eq!(messages[1]["role"], "assistant");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "2+2 equals 4");
+    assert!(assistant_content[0].get("signature").is_none());
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "The answer is 4");
 }
 
 #[test]
@@ -4168,6 +4235,29 @@ fn assess_request_translation_gemini_to_anthropic_warns_on_dropped_logprobs_cont
         "warnings = {warnings:?}"
     );
     assert!(joined.contains("logprobs"), "warnings = {warnings:?}");
+}
+
+#[test]
+fn assess_request_translation_openai_to_anthropic_reasoning_without_replay_provenance_is_not_rejected(
+) {
+    let body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "assistant",
+            "reasoning_content": "internal reasoning",
+            "content": "Visible answer"
+        }]
+    });
+
+    let assessment = assess_request_translation(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        &body,
+    );
+    assert!(
+        !matches!(assessment.decision(), TranslationDecision::Reject(_)),
+        "assessment = {assessment:?}"
+    );
 }
 
 #[test]

@@ -16,24 +16,6 @@ use reqwest::Client;
 use serde_json::json;
 use serde_json::Value;
 
-async fn assert_reasoning_to_anthropic_rejected(res: reqwest::Response) {
-    let status = res.status();
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body = {body:?}");
-    if let Some(body_type) = body.get("type").and_then(Value::as_str) {
-        assert_eq!(body_type, "error", "body = {body:?}");
-    }
-    assert_eq!(
-        body["error"]["type"], "invalid_request_error",
-        "body = {body:?}"
-    );
-    let message = body["error"]["message"]
-        .as_str()
-        .expect("anthropic error message");
-    assert!(message.contains("reasoning"), "body = {body:?}");
-    assert!(message.contains("provenance"), "body = {body:?}");
-}
-
 fn parse_sse_payloads(body: &str) -> Vec<Value> {
     body.split("\n\n")
         .filter_map(|event| {
@@ -895,7 +877,7 @@ async fn gemini_thinking_to_anthropic_streaming_preserves_unsigned_thinking_with
         .send()
         .await
         .unwrap();
-    assert_reasoning_to_anthropic_stream_rejected(res).await;
+    assert_reasoning_to_anthropic_stream_preserved_as_unsigned_thinking(res, "think", "Hi").await;
 }
 
 #[tokio::test]
@@ -1086,7 +1068,7 @@ async fn multi_turn_anthropic_thinking_preserved_in_history() {
 }
 
 #[tokio::test]
-async fn multi_turn_openai_reasoning_in_history_to_claude_rejects_without_provenance() {
+async fn multi_turn_openai_reasoning_in_history_to_claude_preserves_unsigned_thinking() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -1106,12 +1088,18 @@ async fn multi_turn_openai_reasoning_in_history_to_claude_rejects_without_proven
         .send()
         .await
         .unwrap();
-    assert_reasoning_to_anthropic_rejected(res).await;
+    assert!(
+        res.status().is_success(),
+        "status: {status}",
+        status = res.status()
+    );
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "Hi");
 }
 
 #[tokio::test]
-async fn multi_turn_openai_reasoning_to_claude_does_not_replay_blocks_without_provenance() {
-    let (mock_base, _mock, captured) = spawn_capture_anthropic_mock().await;
+async fn multi_turn_openai_reasoning_to_claude_replays_as_unsigned_thinking_without_provenance() {
+    let (mock_base, _mock, mut captured) = spawn_capture_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -1130,11 +1118,72 @@ async fn multi_turn_openai_reasoning_to_claude_does_not_replay_blocks_without_pr
         .send()
         .await
         .unwrap();
-    assert_reasoning_to_anthropic_rejected(res).await;
-    assert!(
-        captured.borrow().is_none(),
-        "request should be rejected before contacting Anthropic upstream"
-    );
+    assert!(res.status().is_success(), "status: {}", res.status());
+
+    captured.changed().await.unwrap();
+    let request = captured
+        .borrow()
+        .clone()
+        .expect("captured anthropic request");
+    let messages = request["messages"].as_array().expect("anthropic messages");
+    assert_eq!(messages[1]["role"], "assistant");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "2+2 equals 4");
+    assert!(assistant_content[0].get("signature").is_none());
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "The answer is 4");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["text"], "Now what about 3+3?");
+}
+
+#[tokio::test]
+async fn multi_turn_gemini_thought_in_history_to_claude_preserves_unsigned_thinking() {
+    let (mock_base, _mock, mut captured) = spawn_capture_anthropic_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!(
+            "{proxy_base}/google/v1beta/models/test:generateContent"
+        ))
+        .json(&json!({
+            "model": "claude-3",
+            "contents": [
+                { "role": "user", "parts": [{ "text": "Think about 2+2" }] },
+                {
+                    "role": "model",
+                    "parts": [
+                        { "thought": true, "text": "2+2 equals 4" },
+                        { "text": "The answer is 4" }
+                    ]
+                },
+                { "role": "user", "parts": [{ "text": "Now what about 3+3?" }] }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+
+    captured.changed().await.unwrap();
+    let request = captured
+        .borrow()
+        .clone()
+        .expect("captured anthropic request");
+    let messages = request["messages"].as_array().expect("anthropic messages");
+    assert_eq!(messages[1]["role"], "assistant");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "2+2 equals 4");
+    assert!(assistant_content[0].get("signature").is_none());
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "The answer is 4");
 }
 
 #[tokio::test]

@@ -1,7 +1,6 @@
 use super::{
     can_attach_cache_control_to_content_block, convert_claude_message_to_openai,
     openai_message_to_claude_blocks, openai_to_claude,
-    OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
 };
 use serde_json::json;
 
@@ -33,7 +32,8 @@ fn assistant_string_content_preserves_tool_calls_for_claude() {
 }
 
 #[test]
-fn assistant_reasoning_content_without_provenance_is_rejected_for_claude_blocks() {
+fn assistant_reasoning_content_without_provenance_is_preserved_as_unsigned_thinking_for_claude_blocks(
+) {
     let msg = json!({
         "role": "assistant",
         "reasoning_content": "I should call a tool.",
@@ -50,9 +50,16 @@ fn assistant_reasoning_content_without_provenance_is_rejected_for_claude_blocks(
         ]
     });
 
-    let err = openai_message_to_claude_blocks(&msg)
-        .expect_err("reasoning without provenance should fail closed");
-    assert_eq!(err, OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE);
+    let blocks = openai_message_to_claude_blocks(&msg)
+        .expect("reasoning without provenance should still translate")
+        .expect("assistant blocks");
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert_eq!(blocks[0]["thinking"], "I should call a tool.");
+    assert!(blocks[0].get("signature").is_none());
+    assert_eq!(blocks[1]["type"], "text");
+    assert_eq!(blocks[1]["text"], "Let me check that.");
+    assert_eq!(blocks[2]["type"], "tool_use");
+    assert_eq!(blocks[2]["id"], "call_123");
 }
 
 #[test]

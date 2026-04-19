@@ -270,7 +270,6 @@ use messages::{
     gemini_function_response_parts_not_portable_message,
     openai_assistant_audio_not_portable_message, single_optional_array_item,
     single_required_array_item, translation_target_label,
-    OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
 };
 use models::{NormalizedToolPolicy, SemanticToolKind, TranslationDecision};
 use openai_family::{
@@ -1570,17 +1569,16 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Result<Option<Vec<Value>>, St
     }
     let content = msg.get("content");
     let mut blocks: Vec<Value> = vec![];
-    let replay_blocks = if role == "assistant" {
-        openai_message_anthropic_reasoning_replay_blocks(msg)
-    } else {
-        None
-    };
     if role == "assistant" {
-        if openai_message_reasoning_text(msg).is_some() && replay_blocks.is_none() {
-            return Err(OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE.to_string());
-        }
-        if let Some(replay_blocks) = replay_blocks {
+        if let Some(replay_blocks) = openai_message_anthropic_reasoning_replay_blocks(msg) {
             blocks.extend(replay_blocks);
+        } else if let Some(reasoning) = openai_message_reasoning_text(msg) {
+            if !reasoning.is_empty() {
+                blocks.push(serde_json::json!({
+                    "type": "thinking",
+                    "thinking": reasoning
+                }));
+            }
         }
         if let Some(refusal) = extract_openai_refusal(msg) {
             if !refusal.is_empty() {
