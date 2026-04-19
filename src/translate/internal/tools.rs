@@ -467,13 +467,12 @@ pub(crate) fn tool_call_is_marked_non_replayable(value: &Value) -> bool {
 }
 
 pub(crate) fn copy_non_replayable_tool_call_marker(source: &Value, dest: &mut Value) {
-    let Some(marker) = trusted_non_replayable_tool_call_marker(source) else {
+    if trusted_non_replayable_tool_call_marker(source).is_none() {
         return;
-    };
-    let Some(obj) = dest.as_object_mut() else {
-        return;
-    };
-    obj.insert(INTERNAL_NON_REPLAYABLE_TOOL_CALL_FIELD.to_string(), marker);
+    }
+    // The signature is bound to the current tool-call shape, so bridge rewrites
+    // must re-attest the destination instead of copying the source marker verbatim.
+    mark_tool_call_as_non_replayable(dest);
 }
 
 pub(crate) fn openai_tool_call_partial_replay_text(tool_call: &Value) -> String {

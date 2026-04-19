@@ -5710,6 +5710,114 @@ fn translate_request_claude_noncanonical_bridged_custom_tool_history_falls_back_
 }
 
 #[test]
+fn responses_custom_tool_bridge_re_attests_non_replayable_marker_for_openai_tool_call() {
+    let mut item = json!({
+        "type": "custom_tool_call",
+        "call_id": "call_apply_patch",
+        "name": "apply_patch",
+        "input": "*** Begin Patch\n*** Add File: hello.txt\n+hello\n"
+    });
+    super::tools::mark_tool_call_as_non_replayable(&mut item);
+
+    let tool_call =
+        super::tools::responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
+            &item,
+            "Anthropic",
+        )
+        .expect("bridge should succeed")
+        .expect("tool call");
+
+    assert_eq!(tool_call["type"], "function");
+    assert_eq!(tool_call["function"]["name"], "__llmup_custom__apply_patch");
+    assert_eq!(
+        tool_call["function"]["arguments"],
+        "{\"input\":\"*** Begin Patch\\n*** Add File: hello.txt\\n+hello\\n\"}"
+    );
+    assert!(
+        super::tools::tool_call_is_marked_non_replayable(&tool_call),
+        "bridged tool call should keep a trusted replay marker, tool_call = {tool_call:?}"
+    );
+}
+
+#[test]
+fn responses_custom_tool_bridge_round_trip_preserves_trusted_non_replayable_marker() {
+    let mut item = json!({
+        "type": "custom_tool_call",
+        "call_id": "call_apply_patch",
+        "name": "apply_patch",
+        "input": "*** Begin Patch\n*** Add File: hello.txt\n+hello\n"
+    });
+    super::tools::mark_tool_call_as_non_replayable(&mut item);
+
+    let tool_call =
+        super::tools::responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
+            &item,
+            "Anthropic",
+        )
+        .expect("bridge should succeed")
+        .expect("tool call");
+
+    let round_tripped =
+        super::tools::openai_tool_call_to_responses_item_decoding_custom_bridge(&tool_call)
+            .expect("decode bridge back to custom tool");
+
+    assert_eq!(round_tripped["type"], "custom_tool_call");
+    assert_eq!(round_tripped["call_id"], "call_apply_patch");
+    assert_eq!(round_tripped["name"], "apply_patch");
+    assert_eq!(
+        round_tripped["input"],
+        "*** Begin Patch\n*** Add File: hello.txt\n+hello\n"
+    );
+    assert!(
+        super::tools::tool_call_is_marked_non_replayable(&round_tripped),
+        "round-tripped custom tool call should keep a trusted replay marker, item = {round_tripped:?}"
+    );
+}
+
+#[test]
+fn translate_request_openai_bridged_marked_custom_tool_call_to_claude_degrades_to_text() {
+    let mut responses_item = json!({
+        "type": "custom_tool_call",
+        "call_id": "call_apply_patch",
+        "name": "apply_patch",
+        "input": "*** Begin Patch\n*** Add File: hello.txt\n+hello\n"
+    });
+    super::tools::mark_tool_call_as_non_replayable(&mut responses_item);
+    let bridged_tool_call =
+        super::tools::responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
+            &responses_item,
+            "Anthropic",
+        )
+        .expect("bridge should succeed")
+        .expect("tool call");
+
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "assistant",
+            "tool_calls": [bridged_tool_call]
+        }]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("trusted bridged marker should degrade instead of replaying as structured tool use");
+
+    let blocks = body["messages"][0]["content"]
+        .as_array()
+        .expect("claude assistant blocks");
+    assert_eq!(blocks[0]["type"], "text", "body = {body:?}");
+    let text = blocks[0]["text"].as_str().expect("text block");
+    assert!(text.contains("apply_patch"), "text = {text}");
+    assert!(text.contains("*** Begin Patch"), "text = {text}");
+}
+
+#[test]
 fn translate_request_claude_to_openai_omitted_stream_defaults_false() {
     let mut body = json!({
         "model": "claude-3",
