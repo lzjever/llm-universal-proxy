@@ -4518,6 +4518,69 @@ fn assess_request_translation_responses_to_non_responses_warns_on_context_manage
 }
 
 #[test]
+fn assess_request_translation_claude_to_openai_warns_on_dropped_thinking_context_management_and_cache_controls(
+) {
+    let body = json!({
+        "model": "claude-3",
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": 2048
+        },
+        "context_management": {
+            "type": "auto"
+        },
+        "cache_control": {
+            "type": "ephemeral"
+        },
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "Hi",
+                "cache_control": { "type": "ephemeral" }
+            }]
+        }]
+    });
+
+    let assessment = assess_request_translation(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &body,
+    );
+    let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
+        panic!("expected warning policy, got {assessment:?}");
+    };
+    let joined = warnings.join("\n");
+    assert!(joined.contains("thinking"), "warnings = {warnings:?}");
+    assert!(
+        joined.contains("context_management"),
+        "warnings = {warnings:?}"
+    );
+    assert!(joined.contains("cache_control"), "warnings = {warnings:?}");
+}
+
+#[test]
+fn assess_request_translation_claude_to_openai_still_rejects_container_state_surface() {
+    let body = json!({
+        "model": "claude-3",
+        "container": {
+            "id": "container_123"
+        },
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+
+    let assessment = assess_request_translation(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &body,
+    );
+    let TranslationDecision::Reject(message) = assessment.decision() else {
+        panic!("expected reject policy, got {assessment:?}");
+    };
+    assert!(message.contains("container"), "message = {message}");
+}
+
+#[test]
 fn assess_request_translation_responses_to_openai_warns_on_truly_dropped_controls() {
     let body = json!({
         "model": "gpt-4o",
@@ -5242,23 +5305,55 @@ fn translate_request_claude_to_gemini_preserves_multiblock_system_without_inject
 }
 
 #[test]
-fn translate_request_claude_to_openai_rejects_top_level_cache_control_cross_protocol() {
+fn translate_request_claude_to_openai_drops_warning_only_request_controls_on_openai_completion_lane(
+) {
     let mut body = json!({
         "model": "claude-3",
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": 2048
+        },
+        "context_management": {
+            "type": "auto"
+        },
         "cache_control": { "type": "ephemeral" },
-        "messages": [{ "role": "user", "content": "Hi" }]
+        "system": [{
+            "type": "text",
+            "text": "System policy",
+            "cache_control": { "type": "ephemeral" }
+        }],
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "Hi",
+                "cache_control": { "type": "ephemeral" }
+            }]
+        }]
     });
 
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiCompletion,
         "claude-3",
         &mut body,
         false,
     )
-    .expect_err("top-level cache_control should fail closed");
+    .expect("warning-only Anthropic controls should be dropped for OpenAI completion lane");
 
-    assert!(err.contains("cache_control"), "err = {err}");
+    assert!(body.get("thinking").is_none(), "body = {body:?}");
+    assert!(body.get("context_management").is_none(), "body = {body:?}");
+    assert!(body.get("cache_control").is_none(), "body = {body:?}");
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 2, "messages = {messages:?}");
+    assert_eq!(messages[0]["role"], "system");
+    let system_parts = messages[0]["content"].as_array().expect("system parts");
+    assert_eq!(system_parts.len(), 1, "system_parts = {system_parts:?}");
+    assert_eq!(system_parts[0]["type"], "text");
+    assert_eq!(system_parts[0]["text"], "System policy");
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "Hi");
 }
 
 #[test]

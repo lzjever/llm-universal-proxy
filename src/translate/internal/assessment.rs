@@ -962,22 +962,29 @@ pub(super) fn request_invalid_structured_tool_arguments_message(
     }
 }
 
-pub(super) fn anthropic_cross_protocol_control_names(body: &Value) -> Vec<&'static str> {
+pub(super) fn anthropic_warning_only_request_controls_for_translate(
+    body: &Value,
+) -> Vec<&'static str> {
     let mut controls = Vec::new();
-    for field in [
-        "thinking",
-        "top_k",
-        "service_tier",
-        "container",
-        "context_management",
-        "tool_choice",
-    ] {
+    for field in ["thinking", "top_k", "service_tier", "context_management"] {
         if body.get(field).is_some() {
             controls.push(field);
         }
     }
     if anthropic_protocol_uses_cache_control(body) {
         controls.push("cache_control");
+    }
+    controls
+}
+
+pub(super) fn anthropic_nonportable_request_controls_for_translate(
+    body: &Value,
+) -> Vec<&'static str> {
+    let mut controls = Vec::new();
+    for field in ["container", "tool_choice"] {
+        if body.get(field).is_some() {
+            controls.push(field);
+        }
     }
     controls
 }
@@ -1152,15 +1159,28 @@ pub(crate) fn assess_request_translation(
     }
 
     if client_format == UpstreamFormat::Anthropic && upstream_format != UpstreamFormat::Anthropic {
-        let controls = anthropic_cross_protocol_control_names(body);
-        if !controls.is_empty() {
-            let quoted = controls
+        let reject_controls = anthropic_nonportable_request_controls_for_translate(body);
+        if !reject_controls.is_empty() {
+            let quoted = reject_controls
                 .iter()
                 .map(|field| format!("`{field}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
             assessment.reject(format!(
-                "Anthropic request controls {quoted} have native provider semantics and cannot be faithfully translated to {upstream_format}"
+                "Anthropic request controls {quoted} require native provider semantics and cannot be faithfully translated to {}",
+                translation_target_label(upstream_format)
+            ));
+        }
+        let warning_controls = anthropic_warning_only_request_controls_for_translate(body);
+        if !warning_controls.is_empty() {
+            let quoted = warning_controls
+                .iter()
+                .map(|field| format!("`{field}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assessment.warning(format!(
+                "Anthropic request controls {quoted} are not portable to {} and will be dropped",
+                translation_target_label(upstream_format)
             ));
         }
         if anthropic_request_has_nonportable_thinking_provenance(body) {
