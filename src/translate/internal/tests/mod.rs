@@ -4581,6 +4581,30 @@ fn assess_request_translation_claude_to_openai_still_rejects_container_state_sur
 }
 
 #[test]
+fn assess_request_translation_claude_to_openai_allows_mappable_tool_choice() {
+    let body = json!({
+        "model": "claude-3",
+        "tool_choice": {
+            "type": "tool",
+            "name": "lookup",
+            "disable_parallel_tool_use": true
+        },
+        "tools": [{
+            "name": "lookup",
+            "input_schema": { "type": "object", "properties": {} }
+        }],
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+
+    let assessment = assess_request_translation(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &body,
+    );
+    assert_eq!(assessment.decision(), TranslationDecision::Allow);
+}
+
+#[test]
 fn assess_request_translation_responses_to_openai_warns_on_truly_dropped_controls() {
     let body = json!({
         "model": "gpt-4o",
@@ -5354,6 +5378,36 @@ fn translate_request_claude_to_openai_drops_warning_only_request_controls_on_ope
     assert_eq!(system_parts[0]["text"], "System policy");
     assert_eq!(messages[1]["role"], "user");
     assert_eq!(messages[1]["content"], "Hi");
+}
+
+#[test]
+fn translate_request_claude_to_openai_maps_tool_choice_and_parallel_calls() {
+    let mut body = json!({
+        "model": "claude-3",
+        "tool_choice": {
+            "type": "tool",
+            "name": "lookup",
+            "disable_parallel_tool_use": true
+        },
+        "tools": [{
+            "name": "lookup",
+            "input_schema": { "type": "object", "properties": {} }
+        }],
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+
+    translate_request(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("Anthropic tool_choice should map to OpenAI tool controls");
+
+    assert_eq!(body["tool_choice"]["type"], "function");
+    assert_eq!(body["tool_choice"]["function"]["name"], "lookup");
+    assert_eq!(body["parallel_tool_calls"], false);
 }
 
 #[test]

@@ -981,7 +981,7 @@ pub(super) fn anthropic_nonportable_request_controls_for_translate(
     body: &Value,
 ) -> Vec<&'static str> {
     let mut controls = Vec::new();
-    for field in ["container", "tool_choice"] {
+    for field in ["container"] {
         if body.get(field).is_some() {
             controls.push(field);
         }

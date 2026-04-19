@@ -1087,6 +1087,16 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
             stop_sequences.clone()
         };
     }
+    if let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) {
+        if let Some((mapped_tool_choice, disable_parallel)) =
+            anthropic_tool_choice_to_openai(tool_choice)?
+        {
+            result["tool_choice"] = mapped_tool_choice;
+            if disable_parallel {
+                result["parallel_tool_calls"] = Value::Bool(false);
+            }
+        }
+    }
     // System: strip cache_control from blocks
     // Reference: 9router claudeHelper.js - remove all cache_control, add only to last block
     if let Some(system) = body.get("system") {
@@ -1129,6 +1139,50 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
     }
     *body = result;
     Ok(())
+}
+
+fn anthropic_tool_choice_to_openai(tool_choice: &Value) -> Result<Option<(Value, bool)>, String> {
+    let Some(tool_choice) = tool_choice.as_object() else {
+        return Err(
+            "Anthropic tool_choice must be an object for cross-protocol translation".to_string(),
+        );
+    };
+    let Some(choice_type) = tool_choice.get("type").and_then(Value::as_str) else {
+        return Err(
+            "Anthropic tool_choice.type is required for cross-protocol translation".to_string(),
+        );
+    };
+    let disable_parallel = tool_choice
+        .get("disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mapped = match choice_type {
+        "auto" => Value::String("auto".to_string()),
+        "none" => Value::String("none".to_string()),
+        "any" => Value::String("required".to_string()),
+        "tool" => {
+            let name = tool_choice
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or(
+                    "Anthropic tool_choice.type = tool requires a non-empty `name` field."
+                        .to_string(),
+                )?;
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": name }
+            })
+        }
+        other => {
+            return Err(format!(
+                "Anthropic tool_choice.type `{other}` cannot be translated to OpenAI Chat Completions"
+            ))
+        }
+    };
+
+    Ok(Some((mapped, disable_parallel)))
 }
 
 fn convert_claude_message_to_openai(msg: &Value) -> Result<Option<Vec<Value>>, String> {
