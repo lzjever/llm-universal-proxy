@@ -62,9 +62,9 @@ Use the namespace that matches the client protocol instead of the upstream vendo
 When Codex uses a proxy-backed local alias that is not present in Codex's built-in model catalog, Codex falls back to unknown-model metadata. That fallback is not good enough for serious manual testing of custom proxy-backed coding models.
 
 Important practical consequence:
-- Bare `codex` with only `model_provider`, `base_url`, and `wire_api="responses"` can miss `apply_patch`, use the wrong compact threshold, and treat a text-only proxy-backed model as image-capable.
+- Bare `codex` with only `model_provider`, `base_url`, and `wire_api="responses"` can miss `apply_patch`, use the wrong compact threshold, and treat a text-only proxy-backed model as image-capable, which leaves `view_image` enabled when it should be off.
 
-Prefer the wrapper flow in [Recommended Manual Interactive Testing](#recommended-manual-interactive-testing). The wrapper scripts generate a temporary `model_catalog_json` from your proxy source config and pass it to Codex automatically.
+Prefer the wrapper flow in [Recommended Manual Interactive Testing](#recommended-manual-interactive-testing). The wrapper scripts generate a temporary `model_catalog_json` from your proxy source config, pass it to Codex automatically, and inject `-c 'tools.view_image=false'` for text-only Codex lanes.
 
 For the common `200000` context / `128000` max-output setup, the wrapper-generated compact threshold is `61200`.
 
@@ -185,7 +185,7 @@ If you want to manually launch a real interactive Codex, Claude, or Gemini sessi
 > Warning:
 > Do not validate a proxy-backed custom Codex model by running bare `codex` with only `model_provider`, `model_providers.*.base_url`, and `model_providers.*.wire_api="responses"`.
 > Without `model_catalog_json`, Codex treats aliases such as `minimax-openai` as unknown models and falls back to generic metadata. In practice that can drop `apply_patch`, set the wrong compact threshold, and incorrectly treat a text-only model as image-capable.
-> The Codex wrapper fixes this by generating a temporary catalog from the source config and injecting `-c 'model_catalog_json=...'` automatically.
+> The Codex wrapper fixes this by generating a temporary catalog from the source config, injecting `-c 'model_catalog_json=...'` automatically, and adding `-c 'tools.view_image=false'` for text-only lanes such as the default MiniMax coding aliases.
 
 ### 1. Start the proxy manually
 
@@ -277,7 +277,7 @@ You can override the defaults with:
   - Gemini: `GEMINI_API_KEY=dummy`, `GOOGLE_GEMINI_BASE_URL=<proxy>/google`
 - Clear `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` and set `NO_PROXY=127.0.0.1,localhost` so local proxy traffic does not get routed through an outer HTTP proxy.
 - Preserve host `CARGO_HOME` / `RUSTUP_HOME` when present so Rust toolchain commands still work inside the isolated client environment.
-- For Codex, resolve `limits` and `codex` metadata from the source config, write a temporary `~/.codex/catalog.json`, inject `model_catalog_json`, and disable Codex web search when the source config marks the model as `supports_search_tool: false`.
+- For Codex, resolve `limits` and `codex` metadata from the source config, write a temporary `~/.codex/catalog.json`, inject `model_catalog_json`, disable Codex web search when the source config marks the model as `supports_search_tool: false`, and inject `tools.view_image=false` when the source config marks the model as text-only.
 - For Gemini, write a temporary `~/.gemini/settings.json` with the model limits that the harness can express through Gemini's real settings schema.
 
 ## Configuration

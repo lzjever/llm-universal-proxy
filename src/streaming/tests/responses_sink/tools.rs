@@ -203,3 +203,152 @@ fn openai_chunk_to_responses_sse_includes_call_metadata_on_function_events() {
     assert!(joined.contains("\"call_id\":\"call_1\""));
     assert!(joined.contains("\"name\":\"lookup\""));
 }
+
+#[test]
+fn openai_chunk_to_responses_sse_closes_function_call_before_minimax_usage_terminal() {
+    let mut state = StreamState::default();
+    let tool_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "model": "MiniMax-M2.7-highspeed",
+        "created": 123,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": { "name": "lookup", "arguments": "{\"x\":1}" }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let finish_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "model": "MiniMax-M2.7-highspeed",
+        "created": 123,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+    });
+    let usage_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "model": "MiniMax-M2.7-highspeed",
+        "created": 123,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 42,
+            "completion_tokens": 172,
+            "total_tokens": 214,
+            "completion_tokens_details": { "reasoning_tokens": 162 }
+        }
+    });
+
+    let _ = openai_chunk_to_responses_sse(&tool_chunk, &mut state);
+    let finish_out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+    let usage_out = openai_chunk_to_responses_sse(&usage_chunk, &mut state);
+    let finish_types = finish_out
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .map(|event| event["type"].as_str().expect("event type").to_string())
+        .collect::<Vec<_>>();
+    let usage_types = usage_out
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .map(|event| event["type"].as_str().expect("event type").to_string())
+        .collect::<Vec<_>>();
+
+    assert!(
+        finish_types.contains(&"response.function_call_arguments.done".to_string()),
+        "finish types = {finish_types:?}"
+    );
+    assert!(
+        finish_types.contains(&"response.output_item.done".to_string()),
+        "finish types = {finish_types:?}"
+    );
+    assert!(
+        !finish_types.contains(&"response.completed".to_string()),
+        "finish types = {finish_types:?}"
+    );
+    assert!(
+        usage_types.contains(&"response.completed".to_string()),
+        "usage types = {usage_types:?}"
+    );
+    assert!(
+        !usage_types.contains(&"response.function_call_arguments.done".to_string()),
+        "usage types = {usage_types:?}"
+    );
+}
+
+#[test]
+fn openai_chunk_to_responses_sse_closes_custom_tool_call_before_minimax_usage_terminal() {
+    let mut state = StreamState::default();
+    let tool_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "model": "MiniMax-M2.7-highspeed",
+        "created": 123,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_custom",
+                    "type": "custom",
+                    "function": { "name": "code_exec", "arguments": "print('hi')" }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let finish_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "model": "MiniMax-M2.7-highspeed",
+        "created": 123,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+    });
+    let usage_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "model": "MiniMax-M2.7-highspeed",
+        "created": 123,
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 42,
+            "completion_tokens": 172,
+            "total_tokens": 214,
+            "completion_tokens_details": { "reasoning_tokens": 162 }
+        }
+    });
+
+    let _ = openai_chunk_to_responses_sse(&tool_chunk, &mut state);
+    let finish_out = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+    let usage_out = openai_chunk_to_responses_sse(&usage_chunk, &mut state);
+    let finish_types = finish_out
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .map(|event| event["type"].as_str().expect("event type").to_string())
+        .collect::<Vec<_>>();
+    let usage_types = usage_out
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .map(|event| event["type"].as_str().expect("event type").to_string())
+        .collect::<Vec<_>>();
+
+    assert!(
+        finish_types.contains(&"response.custom_tool_call_input.done".to_string()),
+        "finish types = {finish_types:?}"
+    );
+    assert!(
+        finish_types.contains(&"response.output_item.done".to_string()),
+        "finish types = {finish_types:?}"
+    );
+    assert!(
+        !finish_types.contains(&"response.completed".to_string()),
+        "finish types = {finish_types:?}"
+    );
+    assert!(
+        usage_types.contains(&"response.completed".to_string()),
+        "usage types = {usage_types:?}"
+    );
+    assert!(
+        !usage_types.contains(&"response.custom_tool_call_input.done".to_string()),
+        "usage types = {usage_types:?}"
+    );
+}

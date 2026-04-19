@@ -458,9 +458,9 @@ model_aliases:
 >
 > - `apply_patch` 这类工具不出现或能力退化
 > - compact 阈值按错误默认值计算，长会话更容易失控
-> - text-only / search / tool 元数据退回到泛化 fallback
+> - text-only / search / tool 元数据退回到泛化 fallback，导致 `view_image` 这类本该关闭的工具继续暴露
 >
-> 手动交互时，优先使用 `scripts/run_codex_proxy.sh`，让 wrapper 根据 `--config-source` 自动生成并注入当前仓库支持的 Codex catalog。
+> 手动交互时，优先使用 `scripts/run_codex_proxy.sh`，让 wrapper 根据 `--config-source` 自动生成并注入当前仓库支持的 Codex catalog；对 text-only lane 还会额外注入 `-c 'tools.view_image=false'`。
 
 #### 1. 手动启动 proxy 并做健康检查
 
@@ -568,6 +568,7 @@ Gemini：
   - Claude：`ANTHROPIC_API_KEY=dummy`、`ANTHROPIC_BASE_URL=<proxy>/anthropic`
   - Gemini：`GEMINI_API_KEY=dummy`、`GOOGLE_GEMINI_BASE_URL=<proxy>/google`
 - 为 Codex 生成并注入 `.codex/catalog.json`，再通过 `-c 'model_catalog_json=...'` 传给客户端；这样不会退回 unknown-model fallback。
+- 对 text-only 的 Codex alias 额外注入 `-c 'tools.view_image=false'`，避免 `minimax-openai` 这类模型继续暴露 `view_image`。
 - 为 Gemini 生成 `.gemini/settings.json`，把 alias 的模型上限写进 settings。
 - 清空本地 `HTTP_PROXY` / `HTTPS_PROXY` 等代理环境变量，避免 CLI 把 `127.0.0.1` 的 proxy 流量又错误地转发到外部代理。
 - 当上游配置使用 `auth_policy: force_server` 时，真正的上游凭证仍由 proxy 侧读取；客户端拿到的 dummy key 只是为了满足各自 CLI 的本地校验。

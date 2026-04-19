@@ -664,6 +664,7 @@ class RealCliMatrixTests(unittest.TestCase):
             model_entry["truncation_policy"],
             {"mode": "bytes", "limit": 10000},
         )
+        self.assertEqual(model_entry["apply_patch_tool_type"], "freeform")
         self.assertFalse(model_entry["supports_parallel_tool_calls"])
         self.assertEqual(model_entry["experimental_supported_tools"], [])
         self.assertEqual(model_entry["context_window"], 200000)
@@ -684,6 +685,7 @@ class RealCliMatrixTests(unittest.TestCase):
         )
 
         model_entry = payload["models"][0]
+        self.assertEqual(model_entry["apply_patch_tool_type"], "freeform")
         self.assertEqual(model_entry["context_window"], 200000)
         self.assertEqual(model_entry["auto_compact_token_limit"], 170000)
         self.assertEqual(model_entry["input_modalities"], ["text", "image"])
@@ -717,6 +719,7 @@ class RealCliMatrixTests(unittest.TestCase):
         )
 
         model_entry = payload["models"][0]
+        self.assertEqual(model_entry["apply_patch_tool_type"], "freeform")
         self.assertNotIn("context_window", model_entry)
         self.assertNotIn("auto_compact_token_limit", model_entry)
         self.assertEqual(model_entry["input_modalities"], ["text"])
@@ -800,6 +803,7 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertIn("model_catalog_json", " ".join(args))
         self.assertIn('web_search="disabled"', " ".join(args))
+        self.assertIn('tools.view_image=false', " ".join(args))
         self.assertEqual(
             payload["models"][0]["context_window"],
             200000,
@@ -808,6 +812,7 @@ class RealCliMatrixTests(unittest.TestCase):
             payload["models"][0]["auto_compact_token_limit"],
             61200,
         )
+        self.assertEqual(payload["models"][0]["apply_patch_tool_type"], "freeform")
         self.assertEqual(payload["models"][0]["input_modalities"], ["text"])
         self.assertFalse(payload["models"][0]["supports_search_tool"])
 
@@ -874,6 +879,7 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertIn("model_catalog_json", joined)
         self.assertIn(str(home_dir / ".codex" / "catalog.json"), joined)
         self.assertIn('web_search="disabled"', joined)
+        self.assertIn('tools.view_image=false', joined)
 
     def test_build_client_command_respects_codex_metadata_search_override(self):
         module = load_module()
@@ -897,6 +903,7 @@ class RealCliMatrixTests(unittest.TestCase):
         joined = " ".join(command)
         self.assertIn("model_catalog_json", joined)
         self.assertNotIn('web_search="disabled"', joined)
+        self.assertNotIn('tools.view_image=false', joined)
 
     def test_prepare_proxy_env_keeps_dotenv_scoped_to_proxy_only(self):
         module = load_module()

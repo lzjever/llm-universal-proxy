@@ -73,6 +73,7 @@ DEFAULT_POST_KILL_WAIT_SECS = 2
 DEFAULT_AUTO_COMPACT_RATIO = 0.85
 DEFAULT_GEMINI_COMPRESSION_THRESHOLD = DEFAULT_AUTO_COMPACT_RATIO
 DEFAULT_CODEX_TRUNCATION_LIMIT_BYTES = 10000
+DEFAULT_CODEX_APPLY_PATCH_TOOL_TYPE = "freeform"
 REPLAY_MARKER_KEY_ENV = "LLMUP_INTERNAL_REPLAY_MARKER_KEY"
 REPLAY_MARKER_KEY_FILENAME = ".llmup-internal-replay-marker-key"
 
@@ -175,6 +176,7 @@ def default_codex_catalog_entry(model_name: str) -> dict[str, object]:
             "mode": "bytes",
             "limit": DEFAULT_CODEX_TRUNCATION_LIMIT_BYTES,
         },
+        "apply_patch_tool_type": DEFAULT_CODEX_APPLY_PATCH_TOOL_TYPE,
         "supports_parallel_tool_calls": False,
         "experimental_supported_tools": [],
     }
@@ -999,6 +1001,16 @@ def build_codex_model_catalog(
     }
 
 
+def codex_should_disable_view_image(
+    codex_metadata: CodexModelMetadata | None,
+) -> bool:
+    if codex_metadata is None or codex_metadata.input_modalities is None:
+        return False
+    return "image" not in {
+        modality.strip().lower() for modality in codex_metadata.input_modalities
+    }
+
+
 def ensure_codex_model_catalog(
     home_dir: pathlib.Path,
     model_name: str,
@@ -1039,6 +1051,13 @@ def build_codex_catalog_args(
             [
                 "-c",
                 'web_search="disabled"',
+            ]
+        )
+    if codex_should_disable_view_image(codex_metadata):
+        args.extend(
+            [
+                "-c",
+                "tools.view_image=false",
             ]
         )
     return args

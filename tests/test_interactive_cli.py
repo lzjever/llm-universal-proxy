@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import pathlib
 import subprocess
@@ -117,28 +118,61 @@ class InteractiveCliTests(unittest.TestCase):
     def test_build_interactive_command_injects_codex_catalog_when_limits_exist(self):
         module = load_module()
         workspace = pathlib.Path("/tmp/workspace").resolve()
-        client_home = pathlib.Path("/tmp/codex-home").resolve()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client_home = pathlib.Path(temp_dir).resolve()
 
-        command = module.build_interactive_command(
-            "codex",
-            workspace,
-            "minimax-openai",
-            "http://127.0.0.1:18888",
-            client_home=client_home,
-            model_limits=module.ModelLimits(
-                context_window=200000,
-                max_output_tokens=128000,
-            ),
-            codex_metadata=module.CodexModelMetadata(
-                input_modalities=("text",),
-                supports_search_tool=False,
-            ),
-        )
+            command = module.build_interactive_command(
+                "codex",
+                workspace,
+                "minimax-openai",
+                "http://127.0.0.1:18888",
+                client_home=client_home,
+                model_limits=module.ModelLimits(
+                    context_window=200000,
+                    max_output_tokens=128000,
+                ),
+                codex_metadata=module.CodexModelMetadata(
+                    input_modalities=("text",),
+                    supports_search_tool=False,
+                ),
+            )
+
+            catalog = json.loads(
+                (client_home / ".codex" / "catalog.json").read_text(encoding="utf-8")
+            )
 
         joined = " ".join(command)
         self.assertIn("model_catalog_json", joined)
         self.assertIn(str(client_home / ".codex" / "catalog.json"), joined)
         self.assertIn('web_search="disabled"', joined)
+        self.assertIn('tools.view_image=false', joined)
+        self.assertEqual(
+            catalog["models"][0]["apply_patch_tool_type"],
+            "freeform",
+        )
+
+    def test_build_interactive_command_skips_view_image_disable_for_image_capable_models(self):
+        module = load_module()
+        workspace = pathlib.Path("/tmp/workspace").resolve()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client_home = pathlib.Path(temp_dir).resolve()
+
+            command = module.build_interactive_command(
+                "codex",
+                workspace,
+                "vision-openai",
+                "http://127.0.0.1:18888",
+                client_home=client_home,
+                model_limits=module.ModelLimits(context_window=200000),
+                codex_metadata=module.CodexModelMetadata(
+                    input_modalities=("text", "image"),
+                    supports_search_tool=True,
+                ),
+            )
+
+        joined = " ".join(command)
+        self.assertIn("model_catalog_json", joined)
+        self.assertNotIn('tools.view_image=false', joined)
 
     def test_run_with_proxy_base_does_not_call_start_proxy(self):
         module = load_module()
