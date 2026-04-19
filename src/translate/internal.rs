@@ -226,7 +226,7 @@ fn client_to_openai_completion(
             responses_to_messages(body, target_format)?;
         }
         UpstreamFormat::Anthropic => {
-            claude_to_openai(body)?;
+            claude_to_openai(body, target_format == UpstreamFormat::OpenAiResponses)?;
         }
         UpstreamFormat::Google => {
             gemini_to_openai(body)?;
@@ -266,7 +266,6 @@ pub(crate) mod tools;
 use assessment::assess_request_translation;
 use messages::{
     anthropic_request_tool_definition_not_portable_message,
-    anthropic_thinking_provenance_not_portable_message,
     anthropic_tool_result_order_not_portable_message, custom_tools_not_portable_message,
     gemini_function_response_parts_not_portable_message,
     openai_assistant_audio_not_portable_message, single_optional_array_item,
@@ -741,6 +740,9 @@ fn claude_system_to_openai_content(system: &Value) -> Result<Option<Value>, Stri
                 let Some(block_type) = block.get("type").and_then(Value::as_str) else {
                     continue;
                 };
+                if block_type == "thinking" {
+                    continue;
+                }
                 if block_type != "text" {
                     return Err(anthropic_block_not_portable_message(
                         block_type,
@@ -762,6 +764,9 @@ fn claude_system_to_openai_content(system: &Value) -> Result<Option<Value>, Stri
             let Some(block_type) = system.get("type").and_then(Value::as_str) else {
                 return Ok(None);
             };
+            if block_type == "thinking" {
+                return Ok(None);
+            }
             if block_type != "text" {
                 return Err(anthropic_block_not_portable_message(
                     block_type,
@@ -787,9 +792,6 @@ fn claude_response_to_openai_internal(
     body: &Value,
     allow_reasoning_replay: bool,
 ) -> Result<Value, String> {
-    if !allow_reasoning_replay && anthropic_response_has_nonportable_thinking_provenance(body) {
-        return Err(anthropic_thinking_provenance_not_portable_message());
-    }
     let content = body.get("content").cloned().ok_or("missing content")?;
     let mut converted = convert_claude_message_to_openai(&serde_json::json!({
         "role": "assistant",
@@ -898,13 +900,6 @@ fn claude_response_to_openai_internal(
         result["usage"] = usage_json;
     }
     Ok(result)
-}
-
-fn anthropic_response_has_nonportable_thinking_provenance(body: &Value) -> bool {
-    body.get("content")
-        .and_then(Value::as_array)
-        .map(|content| anthropic_blocks_have_nonportable_thinking_provenance(content))
-        .unwrap_or(false)
 }
 
 pub(crate) fn classify_portable_non_success_terminal(code_or_reason: Option<&str>) -> &'static str {
@@ -1061,7 +1056,7 @@ fn openai_usage_to_gemini_usage(usage: Option<&Value>) -> Value {
     mapped
 }
 
-fn claude_to_openai(body: &mut Value) -> Result<(), String> {
+fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result<(), String> {
     let mut result = serde_json::json!({
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "messages": [],
@@ -1109,7 +1104,33 @@ fn claude_to_openai(body: &mut Value) -> Result<(), String> {
     }
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
         for msg in messages {
-            if let Some(openai_msg) = convert_claude_message_to_openai(msg)? {
+            let thinking_blocks = msg
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("thinking")
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let preserve_message_replay = preserve_reasoning_replay
+                && msg.get("role").and_then(Value::as_str) == Some("assistant")
+                && anthropic_blocks_have_nonportable_thinking_provenance(&thinking_blocks);
+            if let Some(mut openai_msg) = convert_claude_message_to_openai(msg)? {
+                if preserve_message_replay {
+                    for translated_msg in openai_msg.iter_mut() {
+                        if translated_msg.get("role").and_then(Value::as_str) == Some("assistant") {
+                            append_openai_message_anthropic_reasoning_replay_blocks(
+                                translated_msg,
+                                thinking_blocks.clone(),
+                            );
+                        }
+                    }
+                }
                 for m in openai_msg {
                     result["messages"].as_array_mut().unwrap().push(m);
                 }
@@ -1175,11 +1196,9 @@ fn anthropic_tool_choice_to_openai(tool_choice: &Value) -> Result<Option<(Value,
                 "function": { "name": name }
             })
         }
-        other => {
-            return Err(format!(
-                "Anthropic tool_choice.type `{other}` cannot be translated to OpenAI Chat Completions"
-            ))
-        }
+        other => return Err(format!(
+            "Anthropic tool_choice.type `{other}` cannot be translated to OpenAI Chat Completions"
+        )),
     };
 
     Ok(Some((mapped, disable_parallel)))

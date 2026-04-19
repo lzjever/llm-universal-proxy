@@ -4415,12 +4415,15 @@ async fn responses_endpoint_streaming_preserves_plain_anthropic_thinking() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
-    assert!(body.contains("event: response.reasoning_summary_text.delta"), "body = {body}");
     assert!(
-        body.contains("\"delta\":\"think\""),
+        body.contains("event: response.reasoning_summary_text.delta"),
         "body = {body}"
     );
-    assert!(body.contains("response.reasoning_summary_text.done"), "body = {body}");
+    assert!(body.contains("\"delta\":\"think\""), "body = {body}");
+    assert!(
+        body.contains("response.reasoning_summary_text.done"),
+        "body = {body}"
+    );
     assert!(body.contains("response.completed"), "body = {body}");
     assert!(!body.contains("response.failed"), "body = {body}");
 }
@@ -4451,7 +4454,10 @@ async fn codex_minimax_anth_streaming_plain_thinking_succeeds() {
     let body = res.text().await.unwrap();
     assert!(body.contains("reasoning_content"), "body = {body}");
     assert!(body.contains("\"content\":\"Hi\""), "body = {body}");
-    assert!(!body.contains("\"finish_reason\":\"error\""), "body = {body}");
+    assert!(
+        !body.contains("\"finish_reason\":\"error\""),
+        "body = {body}"
+    );
 }
 
 #[tokio::test]

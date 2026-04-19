@@ -1585,7 +1585,15 @@ pub(super) fn openai_to_gemini(body: &mut Value, target_model: &str) -> Result<(
             }
         }
         if role == "assistant" {
-            let mut parts = openai_content_to_gemini_parts(msg.get("content"))?;
+            let mut parts = Vec::new();
+            if let Some(reasoning) = msg
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                parts.push(serde_json::json!({ "thought": true, "text": reasoning }));
+            }
+            parts.extend(openai_content_to_gemini_parts(msg.get("content"))?);
             if let Some(tc) = msg.get("tool_calls").and_then(Value::as_array) {
                 for (idx, t) in tc.iter().enumerate() {
                     let name = t.get("function").and_then(|f| f.get("name")).cloned();

@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::formats::UpstreamFormat;
 
 use super::messages::{
-    anthropic_thinking_provenance_not_portable_message, custom_tools_not_portable_message,
+    anthropic_thinking_provenance_dropped_message, custom_tools_not_portable_message,
     openai_assistant_audio_history_not_portable_message, openai_request_audio_not_portable_message,
     single_candidate_choice_contract_message, translation_target_label,
     OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
@@ -1184,7 +1184,11 @@ pub(crate) fn assess_request_translation(
             ));
         }
         if anthropic_request_has_nonportable_thinking_provenance(body) {
-            assessment.reject(anthropic_thinking_provenance_not_portable_message());
+            if upstream_format != UpstreamFormat::OpenAiResponses {
+                assessment.warning(anthropic_thinking_provenance_dropped_message(
+                    translation_target_label(upstream_format),
+                ));
+            }
         }
         if let Some(message) = anthropic_request_nonportable_tool_definition_message(
             body,

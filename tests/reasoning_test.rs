@@ -588,7 +588,10 @@ async fn anthropic_thinking_to_openai_chat_streaming() {
     let text = res.text().await.unwrap();
     assert!(text.contains("reasoning_content"), "body = {text}");
     assert!(text.contains("\"content\":\"Hi\""), "body = {text}");
-    assert!(!text.contains("\"finish_reason\":\"error\""), "body = {text}");
+    assert!(
+        !text.contains("\"finish_reason\":\"error\""),
+        "body = {text}"
+    );
 }
 
 #[tokio::test]
@@ -613,6 +616,68 @@ async fn anthropic_thinking_to_responses_streaming() {
     assert!(text.contains("response.output_text.delta"), "body = {text}");
     assert!(text.contains("response.completed"), "body = {text}");
     assert!(!text.contains("response.failed"), "body = {text}");
+}
+
+#[tokio::test]
+async fn anthropic_signed_thinking_to_openai_chat_streaming_drops_signature_and_continues() {
+    let (mock_base, _mock) = spawn_anthropic_signed_thinking_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let text = res.text().await.unwrap();
+    assert!(text.contains("reasoning_content"), "body = {text}");
+    assert!(text.contains("internal reasoning"), "body = {text}");
+    assert!(
+        text.contains("\"content\":\"Visible answer\""),
+        "body = {text}"
+    );
+    assert!(
+        !text.contains("\"finish_reason\":\"error\""),
+        "body = {text}"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_omitted_thinking_to_openai_chat_streaming_skips_hidden_reasoning_and_continues()
+{
+    let (mock_base, _mock) = spawn_anthropic_omitted_thinking_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let text = res.text().await.unwrap();
+    assert!(
+        text.contains("\"content\":\"Visible answer\""),
+        "body = {text}"
+    );
+    assert!(!text.contains("reasoning_content"), "body = {text}");
+    assert!(
+        !text.contains("\"finish_reason\":\"error\""),
+        "body = {text}"
+    );
 }
 
 #[tokio::test]
@@ -885,7 +950,10 @@ async fn anthropic_thinking_with_tools_to_openai_streaming() {
     assert!(text.contains("reasoning_content"), "body = {text}");
     assert!(text.contains("tool_calls"), "body = {text}");
     assert!(text.contains("get_weather"), "body = {text}");
-    assert!(!text.contains("\"finish_reason\":\"error\""), "body = {text}");
+    assert!(
+        !text.contains("\"finish_reason\":\"error\""),
+        "body = {text}"
+    );
 }
 
 // ============================================================

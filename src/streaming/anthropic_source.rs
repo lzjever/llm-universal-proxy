@@ -45,6 +45,9 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                         .and_then(|b| b.get("thinking").and_then(Value::as_str))
                         .unwrap_or("")
                         .to_string();
+                    let signature = block
+                        .and_then(|b| b.get("signature").and_then(Value::as_str))
+                        .map(str::to_string);
                     let omitted = block
                         .and_then(|b| {
                             b.get("thinking")
@@ -58,6 +61,7 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                         ClaudeBlockState {
                             kind: Some(ClaudeBlockKind::Thinking),
                             thinking: seeded_thinking,
+                            signature,
                             omitted,
                             ..Default::default()
                         },
@@ -359,10 +363,8 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
             if let Some(i) = idx {
                 let buffered_reasoning = state.claude_blocks.get(&i).and_then(|block_state| {
                     if block_state.kind == Some(ClaudeBlockKind::Thinking) {
-                        (!block_state.omitted
-                            && block_state.signature.is_none()
-                            && !block_state.thinking.is_empty())
-                        .then(|| block_state.thinking.clone())
+                        (!block_state.omitted && !block_state.thinking.is_empty())
+                            .then(|| block_state.thinking.clone())
                     } else {
                         None
                     }

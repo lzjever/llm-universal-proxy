@@ -75,8 +75,10 @@ pub(crate) fn reserved_openai_custom_bridge_prefix_message(name: &str) -> String
     )
 }
 
-pub(crate) fn anthropic_thinking_provenance_not_portable_message() -> String {
-    "Anthropic thinking provenance (`signature` or omitted thinking) cannot be faithfully translated to non-Anthropic downstreams".to_string()
+pub(crate) fn anthropic_thinking_provenance_dropped_message(target_label: &str) -> String {
+    format!(
+        "Anthropic thinking provenance (`signature` or omitted thinking) is not portable to {target_label}; provenance-only reasoning details will be dropped while preserving any portable assistant, tool, and visible text semantics"
+    )
 }
 
 pub(crate) fn anthropic_request_tool_definition_not_portable_message(

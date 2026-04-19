@@ -239,7 +239,10 @@ fn translate_sse_event_anthropic_plain_thinking_to_openai_buffers_until_stop_and
         fourth_joined.contains("reasoning_content"),
         "fourth_joined = {fourth_joined}"
     );
-    assert!(sixth_joined.contains("\"content\":\"Hi\""), "{sixth_joined}");
+    assert!(
+        sixth_joined.contains("\"content\":\"Hi\""),
+        "{sixth_joined}"
+    );
     assert!(state.fatal_rejection.is_none(), "state = {state:?}");
 }
 
@@ -312,8 +315,14 @@ fn translate_sse_event_anthropic_plain_thinking_to_responses_buffers_until_stop_
         "joined = {joined}"
     );
     assert!(started.is_empty(), "started = {started:?}");
-    assert!(buffered_reasoning.is_empty(), "buffered_reasoning = {buffered_reasoning:?}");
-    assert!(reasoning_done.is_empty(), "reasoning_done = {reasoning_done:?}");
+    assert!(
+        buffered_reasoning.is_empty(),
+        "buffered_reasoning = {buffered_reasoning:?}"
+    );
+    assert!(
+        reasoning_done.is_empty(),
+        "reasoning_done = {reasoning_done:?}"
+    );
     assert!(state.fatal_rejection.is_none(), "state = {state:?}");
 }
 
@@ -379,7 +388,7 @@ fn translate_sse_event_anthropic_plain_thinking_to_gemini_buffers_until_stop_and
 }
 
 #[test]
-fn translate_sse_event_anthropic_signature_delta_to_openai_fails_closed_before_releasing_reasoning() {
+fn translate_sse_event_anthropic_signature_delta_to_openai_drops_signature_and_flushes_reasoning() {
     let mut state = StreamState::default();
     let _ = translate_sse_event(
         UpstreamFormat::Anthropic,
@@ -413,7 +422,7 @@ fn translate_sse_event_anthropic_signature_delta_to_openai_fails_closed_before_r
         }),
         &mut state,
     );
-    let rejected = translate_sse_event(
+    let dropped_signature = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiCompletion,
         &serde_json::json!({
@@ -423,20 +432,33 @@ fn translate_sse_event_anthropic_signature_delta_to_openai_fails_closed_before_r
         }),
         &mut state,
     );
-    let joined = rejected
+    let flushed = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+        &mut state,
+    );
+    let joined = flushed
         .iter()
         .map(|bytes| String::from_utf8_lossy(bytes).to_string())
         .collect::<Vec<_>>()
         .join("\n");
 
     assert!(buffered.is_empty(), "buffered = {buffered:?}");
-    assert!(joined.contains("\"finish_reason\":\"error\""), "{joined}");
-    assert!(joined.contains("signature provenance"), "{joined}");
-    assert!(!joined.contains("reasoning_content"), "{joined}");
+    assert!(
+        dropped_signature.is_empty(),
+        "dropped_signature = {dropped_signature:?}"
+    );
+    assert!(joined.contains("reasoning_content"), "{joined}");
+    assert!(joined.contains("\"hidden\""), "{joined}");
+    assert!(state.fatal_rejection.is_none(), "state = {state:?}");
 }
 
 #[test]
-fn translate_sse_event_anthropic_omitted_thinking_still_fails_closed_at_start() {
+fn translate_sse_event_anthropic_omitted_thinking_skips_reasoning_and_keeps_following_text() {
     let mut state = StreamState::default();
     let _ = translate_sse_event(
         UpstreamFormat::Anthropic,
@@ -460,18 +482,44 @@ fn translate_sse_event_anthropic_omitted_thinking_still_fails_closed_at_start() 
         }),
         &mut state,
     );
-
+    let text_start = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "text",
+                "text": ""
+            }
+        }),
+        &mut state,
+    );
+    let text_delta = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": { "type": "text_delta", "text": "Visible answer" }
+        }),
+        &mut state,
+    );
     let joined = rejected
         .iter()
+        .chain(text_start.iter())
+        .chain(text_delta.iter())
         .map(|bytes| String::from_utf8_lossy(bytes).to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(joined.contains("\"finish_reason\":\"error\""), "{joined}");
+    assert!(rejected.is_empty(), "rejected = {rejected:?}");
+    assert!(text_start.is_empty(), "text_start = {text_start:?}");
     assert!(
-        joined.contains("thinking blocks cannot be translated losslessly")
-            || joined.contains("omitted thinking"),
+        joined.contains("\"content\":\"Visible answer\""),
         "{joined}"
     );
+    assert!(!joined.contains("reasoning_content"), "{joined}");
+    assert!(state.fatal_rejection.is_none(), "state = {state:?}");
 }
 
 #[test]

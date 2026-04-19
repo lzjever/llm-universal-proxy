@@ -996,13 +996,29 @@ pub(super) fn messages_to_responses(body: &mut Value) -> Result<(), String> {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
         if matches!(role, "system" | "developer" | "user" | "assistant") {
             if role == "assistant" {
+                let replay_blocks = openai_message_anthropic_reasoning_replay_blocks(msg);
                 if let Some(reasoning) = msg.get("reasoning_content").and_then(Value::as_str) {
-                    if !reasoning.is_empty() {
-                        input.push(serde_json::json!({
+                    if !reasoning.is_empty() || replay_blocks.is_some() {
+                        let mut reasoning_item = serde_json::json!({
                             "type": "reasoning",
-                            "summary": [{ "type": "summary_text", "text": reasoning }]
-                        }));
+                            "summary": []
+                        });
+                        if !reasoning.is_empty() {
+                            reasoning_item["summary"] =
+                                serde_json::json!([{ "type": "summary_text", "text": reasoning }]);
+                        }
+                        if let Some(blocks) = replay_blocks.as_ref() {
+                            reasoning_item["encrypted_content"] =
+                                Value::String(encode_anthropic_reasoning_carrier(blocks)?);
+                        }
+                        input.push(reasoning_item);
                     }
+                } else if let Some(blocks) = replay_blocks.as_ref() {
+                    input.push(serde_json::json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": encode_anthropic_reasoning_carrier(blocks)?
+                    }));
                 }
             }
             let content_type = if role == "assistant" {

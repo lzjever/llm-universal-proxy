@@ -80,39 +80,6 @@ pub(super) fn ensure_single_openai_choice_for_non_openai_sink(
     }
 }
 
-pub(super) fn anthropic_stream_incompatibility_for_non_anthropic_sink(
-    event: &Value,
-) -> Option<&'static str> {
-    match event.get("type").and_then(Value::as_str) {
-        Some("content_block_start") => {
-            let content_block = event.get("content_block")?;
-            if content_block.get("type").and_then(Value::as_str) != Some("thinking") {
-                return None;
-            }
-            let omitted = content_block
-                .get("thinking")
-                .and_then(|thinking| thinking.get("display"))
-                .or_else(|| content_block.get("display"))
-                .and_then(Value::as_str)
-                == Some("omitted");
-            if omitted {
-                Some("Anthropic omitted thinking blocks cannot be translated losslessly.")
-            } else if content_block.get("signature").is_some() {
-                Some("Anthropic thinking signature provenance cannot be translated losslessly.")
-            } else {
-                None
-            }
-        }
-        Some("content_block_delta") => (event
-            .get("delta")
-            .and_then(|delta| delta.get("type"))
-            .and_then(Value::as_str)
-            == Some("signature_delta"))
-        .then_some("Anthropic thinking signature provenance cannot be translated losslessly."),
-        _ => None,
-    }
-}
-
 pub fn translate_sse_event(
     upstream_format: UpstreamFormat,
     client_format: UpstreamFormat,
@@ -121,36 +88,6 @@ pub fn translate_sse_event(
 ) -> Vec<Vec<u8>> {
     if upstream_format != client_format && state.fatal_rejection.is_some() {
         return Vec::new();
-    }
-    if upstream_format == UpstreamFormat::Anthropic && client_format != UpstreamFormat::Anthropic {
-        if let Some(message) = anthropic_stream_incompatibility_for_non_anthropic_sink(event) {
-            let openai_chunks = reject_openai_stream(
-                state,
-                "invalid_request_error",
-                "unsupported_anthropic_stream_event",
-                message,
-            );
-            if client_format == UpstreamFormat::OpenAiCompletion {
-                return openai_chunks
-                    .into_iter()
-                    .map(|chunk| format_sse_data(&chunk))
-                    .collect();
-            }
-            if client_format == UpstreamFormat::Google {
-                let mut out = Vec::new();
-                for chunk in &openai_chunks {
-                    out.extend(openai_chunk_to_gemini_sse(chunk, state));
-                }
-                return out;
-            }
-            if client_format == UpstreamFormat::OpenAiResponses {
-                let mut out = Vec::new();
-                for chunk in &openai_chunks {
-                    out.extend(openai_chunk_to_responses_sse(chunk, state));
-                }
-                return out;
-            }
-        }
     }
     if upstream_format == UpstreamFormat::OpenAiCompletion
         && client_format == UpstreamFormat::OpenAiResponses

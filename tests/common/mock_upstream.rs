@@ -167,6 +167,36 @@ data: {"type":"message_stop"}"#,
 }
 
 async fn anthropic_signed_thinking_handler(Json(body): Json<Value>) -> Response {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream {
+        let events = [
+            r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_signed_thinking","type":"message","role":"assistant","model":"claude-3","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":"sig_123"}}"#,
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"internal reasoning"}}"#,
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Visible answer"}}"#,
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":1}"#,
+            r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":2}}"#,
+            r#"event: message_stop
+data: {"type":"message_stop"}"#,
+        ];
+        let body = events.join("\n\n") + "\n\n";
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap();
+    }
+
     let resp = serde_json::json!({
         "id": "msg_signed_thinking",
         "type": "message",
@@ -188,6 +218,34 @@ async fn anthropic_signed_thinking_handler(Json(body): Json<Value>) -> Response 
 }
 
 async fn anthropic_omitted_thinking_handler(Json(body): Json<Value>) -> Response {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream {
+        let events = [
+            r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_omitted_thinking","type":"message","role":"assistant","model":"claude-3","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":{"display":"omitted"},"signature":"sig_omitted"}}"#,
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}"#,
+            r#"event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Visible answer"}}"#,
+            r#"event: content_block_stop
+data: {"type":"content_block_stop","index":1}"#,
+            r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":2}}"#,
+            r#"event: message_stop
+data: {"type":"message_stop"}"#,
+        ];
+        let body = events.join("\n\n") + "\n\n";
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap();
+    }
+
     let resp = serde_json::json!({
         "id": "msg_omitted_thinking",
         "type": "message",
