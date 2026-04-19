@@ -6871,7 +6871,7 @@ fn translate_response_openai_to_claude_has_content_array() {
 fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_visible_answer() {
     let body = json!({
         "id": "chatcmpl-1",
-        "model": "gpt-4o-mini",
+        "model": "minimax-openai",
         "choices": [{
             "message": {
                 "role": "assistant",
@@ -6901,11 +6901,11 @@ fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_v
 fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_tool_use() {
     let body = json!({
         "id": "chatcmpl-1",
-        "model": "gpt-4o-mini",
+        "model": "minimax-openai",
         "choices": [{
             "message": {
                 "role": "assistant",
-                "reasoning_content": "need to inspect python traceback",
+                "reasoning_content": "use python to inspect the traceback",
                 "content": "Calling tool.",
                 "tool_calls": [{
                     "id": "call_1",
@@ -6937,6 +6937,43 @@ fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_t
     assert_eq!(content[1]["id"], "call_1");
     assert_eq!(content[1]["name"], "run_python");
     assert_eq!(content[1]["input"]["file"], "bug.py");
+}
+
+#[test]
+fn translate_response_openai_to_claude_preserves_reasoning_with_anthropic_replay_blocks() {
+    let body = json!({
+        "id": "chatcmpl-1",
+        "model": "anthropic-bridge",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "reasoning_content": "internal reasoning",
+                "_anthropic_reasoning_replay": [{
+                    "type": "thinking",
+                    "thinking": "internal reasoning",
+                    "signature": "sig_123"
+                }],
+                "content": "Visible answer"
+            },
+            "finish_reason": "stop"
+        }]
+    });
+
+    let out = translate_response(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        &body,
+    )
+    .unwrap();
+
+    assert_eq!(out["type"], "message");
+    let content = out["content"].as_array().expect("anthropic content");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "internal reasoning");
+    assert_eq!(content[0]["signature"], "sig_123");
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "Visible answer");
 }
 
 #[test]

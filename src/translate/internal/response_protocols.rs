@@ -7,8 +7,9 @@ use super::response_logprobs::{
 };
 use super::{
     classify_portable_non_success_terminal, openai_message_to_claude_blocks,
+    openai_message_anthropic_reasoning_replay_blocks,
     openai_tool_arguments_to_structured_value, single_optional_array_item,
-    single_required_array_item, OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
+    single_required_array_item,
 };
 
 pub(crate) fn gemini_finish_reason_to_openai(
@@ -318,6 +319,21 @@ pub(super) fn normalize_openai_completion_response(body: &Value) -> Value {
     out
 }
 
+fn sanitize_openai_message_for_claude_response(message: &Value) -> Value {
+    let mut sanitized = message.clone();
+    if openai_message_reasoning_text(message).is_none()
+        || openai_message_anthropic_reasoning_replay_blocks(message).is_some()
+    {
+        return sanitized;
+    }
+    let Some(obj) = sanitized.as_object_mut() else {
+        return sanitized;
+    };
+    obj.remove("reasoning_content");
+    obj.remove("reasoning_details");
+    sanitized
+}
+
 pub(super) fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
     let choice = single_required_array_item(
         body.get("choices")
@@ -328,18 +344,8 @@ pub(super) fn openai_response_to_claude(body: &Value) -> Result<Value, String> {
         "choices",
     )?;
     let message = choice.get("message").ok_or("missing message")?;
-    if let Some(rc) = openai_message_reasoning_text(message) {
-        if !rc.is_empty() {
-            return Ok(serde_json::json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": format!("{OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE}.")
-                }
-            }));
-        }
-    }
-    let content = openai_message_to_claude_blocks(message)?
+    let sanitized_message = sanitize_openai_message_for_claude_response(message);
+    let content = openai_message_to_claude_blocks(&sanitized_message)?
         .unwrap_or_else(|| vec![serde_json::json!({ "type": "text", "text": "" })]);
     let finish = choice
         .get("finish_reason")
