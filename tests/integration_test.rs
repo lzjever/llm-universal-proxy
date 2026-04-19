@@ -4138,7 +4138,7 @@ async fn hooks_mark_cancelled_when_stream_is_dropped_early() {
 }
 
 #[tokio::test]
-async fn hooks_capture_translated_responses_reasoning_as_text_for_messages_stream() {
+async fn hooks_capture_translated_responses_reasoning_as_thinking_for_messages_stream() {
     let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
     let (hook_base, _hook, captured) = spawn_hook_capture_server().await;
     let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
@@ -4172,15 +4172,11 @@ async fn hooks_capture_translated_responses_reasoning_as_text_for_messages_strea
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
-    assert!(body.contains("event: error"), "body = {body}");
-    assert!(
-        body.contains("\"type\":\"invalid_request_error\""),
-        "body = {body}"
-    );
-    assert!(body.contains("reasoning"), "body = {body}");
-    assert!(body.contains("provenance"), "body = {body}");
-    assert!(!body.contains("text_delta"), "body = {body}");
-    assert!(!body.contains("message_stop"), "body = {body}");
+    assert!(body.contains("\"content_block\":{\"thinking\":\"\",\"type\":\"thinking\"}"), "body = {body}");
+    assert!(body.contains("\"delta\":{\"thinking\":\"think\",\"type\":\"thinking_delta\"}"), "body = {body}");
+    assert!(body.contains("\"delta\":{\"text\":\"Hi\",\"type\":\"text_delta\"}"), "body = {body}");
+    assert!(body.contains("event: message_stop"), "body = {body}");
+    assert!(!body.contains("event: error"), "body = {body}");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let payloads = captured.payloads.lock().unwrap();
@@ -4188,16 +4184,12 @@ async fn hooks_capture_translated_responses_reasoning_as_text_for_messages_strea
         .iter()
         .find(|payload| payload.get("request").is_some())
         .unwrap();
-    assert_eq!(exchange["response"]["body"]["type"], "error");
-    assert_eq!(
-        exchange["response"]["body"]["error"]["type"],
-        "invalid_request_error"
-    );
-    let message = exchange["response"]["body"]["error"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(message.contains("reasoning"), "payload = {exchange:?}");
-    assert!(message.contains("provenance"), "payload = {exchange:?}");
+    assert_eq!(exchange["response"]["body"]["type"], "message");
+    assert_eq!(exchange["response"]["body"]["content"][0]["type"], "thinking");
+    assert_eq!(exchange["response"]["body"]["content"][0]["thinking"], "think");
+    assert!(exchange["response"]["body"]["content"][0].get("signature").is_none());
+    assert_eq!(exchange["response"]["body"]["content"][1]["type"], "text");
+    assert_eq!(exchange["response"]["body"]["content"][1]["text"], "Hi");
 }
 
 #[tokio::test]
@@ -4627,7 +4619,7 @@ async fn chat_completions_endpoint_preserves_responses_reasoning_stream() {
 }
 
 #[tokio::test]
-async fn messages_endpoint_preserves_responses_reasoning_stream() {
+async fn messages_endpoint_preserves_responses_reasoning_as_thinking_stream() {
     let (mock_base, _mock) = spawn_openai_responses_reasoning_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -4646,15 +4638,11 @@ async fn messages_endpoint_preserves_responses_reasoning_stream() {
         .unwrap();
     assert!(res.status().is_success(), "status: {}", res.status());
     let body = res.text().await.unwrap();
-    assert!(body.contains("event: error"), "body = {body}");
-    assert!(
-        body.contains("\"type\":\"invalid_request_error\""),
-        "body = {body}"
-    );
-    assert!(body.contains("reasoning"), "body = {body}");
-    assert!(body.contains("provenance"), "body = {body}");
-    assert!(!body.contains("text_delta"), "body = {body}");
-    assert!(!body.contains("message_stop"), "body = {body}");
+    assert!(body.contains("\"content_block\":{\"thinking\":\"\",\"type\":\"thinking\"}"), "body = {body}");
+    assert!(body.contains("\"delta\":{\"thinking\":\"think\",\"type\":\"thinking_delta\"}"), "body = {body}");
+    assert!(body.contains("\"delta\":{\"text\":\"Hi\",\"type\":\"text_delta\"}"), "body = {body}");
+    assert!(body.contains("event: message_stop"), "body = {body}");
+    assert!(!body.contains("event: error"), "body = {body}");
 }
 
 #[tokio::test]
