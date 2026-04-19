@@ -145,6 +145,12 @@ The implementation is still OpenAI-centric internally, but the important archite
 - translation is fail-closed on high-risk incompatibilities
 - field-level degradations are intentionally tracked outside this document
 
+Current structural guardrails:
+
+- `RequestTranslationPolicy` is the runtime boundary from resolved config/model limits into the translator. Translation consumes policy defaults such as effective `max_output_tokens`; it does not reach back into config on its own.
+- Only complete and trusted structured tool calls are allowed to enter replayable history. Incomplete or truncated calls are marked non-replayable and intentionally degraded on later replay/bridge paths instead of being treated as safe structured replay.
+- When a bridge rewrites tool-call representation, any trusted non-replayable marker must be re-attested against the rewritten value. Literal marker copy is invalid because the signature is bound to the current `name` / raw payload.
+
 For current compatibility rules, use the protocol matrix and baseline docs, not this file.
 
 ## Streaming and Transport Lifecycle

@@ -1,7 +1,7 @@
 # Protocol Compatibility Matrix
 
 - Status: active summary
-- Last refreshed: 2026-04-16
+- Last refreshed: 2026-04-19
 - Scope: short entrypoint into the detailed compatibility docs
 
 This file is now the short compatibility front door. Detailed provider comparisons live under [`protocol-baselines/matrices/`](protocol-baselines/matrices/) and the dated refresh audit lives under [`protocol-baselines/audits/`](protocol-baselines/audits/).
@@ -33,3 +33,6 @@ Status cells in the quick matrix answer whether the capability is officially doc
 ## Current compatibility posture
 
 The proxy should treat function calling and explicit transcript replay as the common denominator. Hosted tools, provider-managed state, compaction, and cache-control semantics are increasingly vendor-specific and should be preserved only on same-provider paths or documented as intentional degradations.
+
+- Reasoning text and continuity should be preserved where possible, but request-side reasoning knobs remain vendor-specific. Translation should keep the model-visible reasoning trail when portable without implying that all providers expose equivalent control surfaces.
+- Replayable tool history requires a complete and trusted structured call. Non-replayable or truncated tool calls should intentionally degrade to text/context preservation rather than masquerade as valid structured replay across providers.

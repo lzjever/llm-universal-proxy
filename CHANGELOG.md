@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Propagated configured `max_output_tokens` defaults from resolved model limits into request translation when clients omit an explicit output cap, so Anthropic, OpenAI Completions, and sibling target protocols no longer silently fall back to incorrect hard-coded defaults such as `4096`.
+- Updated the generated Codex custom model catalog to follow the current real schema and to compute default `auto_compact_token_limit` from available input budget: `0.85 * (context_window - max_output_tokens)` when both limits are known, while keeping the older `0.85 * context_window` fallback only when no output budget is available.
+- Hardened long-session tool replay boundaries by marking incomplete or truncated tool calls as non-replayable and intentionally degrading later replay / bridge paths instead of pretending the partial call is still valid structured history.
+- Fixed custom-tool bridge trust transfer so representation rewrites re-sign non-replayable markers after verification instead of literally copying a marker that no longer matches the bridged `name` / raw payload.
+- Verified fixes against known failures observed on the Anthropic and OpenAI-completions Codex yolo mainlines, including long-session translation, replay, and compaction regressions, without claiming cross-provider full fidelity for every long-horizon path.
 - Tightened cross-protocol compatibility handling so more non-portable request and typed-item semantics fail closed or surface explicit compatibility warnings instead of silently widening behavior across OpenAI, Responses, Anthropic, and Gemini paths.
 - Hardened runtime-chain observability during streaming teardown: hooks and `debug_trace` now preserve protocol-level terminal outcomes through disconnects and error endings, while bounded background capture paths surface explicit truncation / overflow accounting instead of silently dropping data or accumulating unbounded exchange payloads.
 - Expanded `debug_trace` coverage for Google / Gemini client-format streaming so traces record protocol-level terminal, error, text, and tool-call summaries rather than only the final transport outcome.

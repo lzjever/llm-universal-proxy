@@ -106,6 +106,7 @@ bash scripts/test_cli_clients.sh --list-matrix
 - 在 `test-reports/cli-matrix/<timestamp>/` 下输出带时间戳的矩阵报告目录，并在运行结束时打印最终路径。
 - 使用 `--list-matrix` 列出 cases，使用 `--case <case-id>` 精确挑选指定行（可重复传入），使用 `--skip-slow` 跳过长时程任务，使用 `--proxy-only` 只启动代理并等待。
 - 可通过 `python3 scripts/real_cli_matrix.py --help` 查看当前 checkout 支持的完整参数集合。
+- 这套 runner 已用于验证真实 Codex yolo 长会话在 Anthropic lane 和 OpenAI-completions lane 上暴露过的已知问题，重点覆盖 replay、compact、tool translation 等主线回归。
 
 兼容层说明：
 - `scripts/test_cli_clients.sh` 是给旧流程和包装脚本保留的兼容 shim。它会直接转发到 `scripts/real_cli_matrix.py`，所以两种入口支持同一组参数。
@@ -172,6 +173,7 @@ debug_trace:
 - `credential_env` 表示“去哪个环境变量读取该上游的 fallback credential”，密钥本身不写进 YAML。
 - `credential_actual` 可用于直接在 YAML 中写 fallback credential；它与 `credential_env` 互斥。
 - `auth_policy` 支持 `client_or_fallback` 和 `force_server`。
+- upstream 或 alias 上配置的 `limits` 会作为“缺省默认值”参与请求翻译和客户端元数据生成；如果客户端显式传了 `max_tokens`、`max_output_tokens` 或目标协议对应字段，仍然以客户端显式值优先。
 - hooks 是异步 best-effort 模式。通常只开 `usage` 就够；`exchange` 会在请求结束后上报 client-facing 请求和最终响应形状，但流式 capture 是有界的，必要时会截断。
 - `debug_trace` 会把按 turn 的请求尾部增量和归一化响应摘要写入本地 JSONL，适合交互式排障，不适合长期原始流量归档。
 - 对流式响应，`debug_trace` 记录的是客户端可见结果的聚合摘要，例如文本、reasoning、tool call、terminal event、finish reason 和归一化错误，而不是原始 SSE 逐行镜像。
@@ -479,6 +481,35 @@ HOME="$(mktemp -d)" GLM_APIKEY="你的真实 Key" codex exec --ephemeral \
 - 这里用了临时 `HOME` 和 `--ephemeral`，不会污染你全局的 Codex CLI 配置。
 - 客户端访问的是代理的 `/openai/v1/responses`；代理会先把本地模型名 `GLM-5` 解析成 `GLM-OFFICIAL:GLM-5`，再转换成 Anthropic Messages 发给上游。
 - 如果上游还需要额外静态协议头，可以在对应 upstream 条目里配置 `headers`。
+
+### Codex 自定义 Catalog 与 Compact 阈值
+
+如果本地 Codex 模型别名不在 Codex 内建 catalog 里，Codex 会退回到一套很泛的默认元数据。对代理后的自定义模型，这通常不够准确，尤其是 text-only 模型和长会话 compact 阈值。
+
+当前建议是提供符合最新真实 schema 的 `model_catalog_json`，并让 compact 阈值基于“可用输入预算”而不是裸 `context_window`：
+
+- 若同时知道 `context_window` 和 `max_output_tokens`，默认 compact 阈值按 `0.85 * (context_window - max_output_tokens)` 计算。
+- 若只知道 `context_window`，才回退到 `0.85 * context_window`。
+
+例如常见的 `context_window = 200000`、`max_output_tokens = 128000` 场景，默认 `auto_compact_token_limit` 应是 `61200`，不是旧示例里的 `176000`。
+
+下面这个 JSON 片段只展示 compact / limits 相关关键字段，不是可直接使用的完整 catalog：
+
+```json
+{
+  "models": [
+    {
+      "slug": "codex-anthropic",
+      "context_window": 200000,
+      "auto_compact_token_limit": 61200,
+      "input_modalities": ["text"],
+      "supports_search_tool": false
+    }
+  ]
+}
+```
+
+如果你需要当前真实可用的完整 catalog 形状，优先使用 `scripts/real_cli_matrix.py` 生成；如果只是想看完整示例，也可以参考英文版 [README.md](./README.md) 里的完整 `catalog.json` 示例。`scripts/real_cli_matrix.py` 生成的文件会按这套当前逻辑产出最新 schema 兼容的 compact 值。
 
 ### 隔离的 CLI Smoke 测试
 

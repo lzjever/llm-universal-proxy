@@ -73,13 +73,14 @@ HOME="/tmp/tmp-codex" GLM_APIKEY='...' codex resume --yolo \
   -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
   -c 'model_providers.glm-proxy.wire_api="responses"' \
   -c 'model_context_window=200000' \
-  -c 'model_auto_compact_token_limit=176000'
+  -c 'model_auto_compact_token_limit=61200'
 ```
 
-Recommended thresholds for `GLM-5-Turbo`:
-- Default: `176000` (`88%` of 200k)
-- More conservative: `170000`
-- More aggressive: `184000`
+For the common `200000` context / `128000` max-output setup, the default compact threshold is `61200`.
+
+Default compact formula:
+- When both `context_window` and `max_output_tokens` are known, Codex auto-compact should be budgeted from available input capacity: `0.85 * (context_window - max_output_tokens)`.
+- When only `context_window` is known, the fallback remains `0.85 * context_window`.
 
 Set `model_context_window` to the real upstream limit and tune only `model_auto_compact_token_limit` if you want compaction earlier or later.
 
@@ -170,6 +171,7 @@ What this runner does:
 - Writes a timestamped report directory under `test-reports/cli-matrix/<timestamp>/` and prints the resolved report path at the end of the run.
 - Uses `--list-matrix` to enumerate cases, `--case <case-id>` to target specific rows (repeatable), `--skip-slow` to skip long-horizon tasks, and `--proxy-only` to start the proxy and wait.
 - `python3 scripts/real_cli_matrix.py --help` shows the full current flag set.
+- This runner has been used to validate known failures observed on the Anthropic and OpenAI-completions Codex yolo mainlines, especially long-horizon replay, compaction, and tool-translation regressions.
 
 Legacy compatibility:
 - `scripts/test_cli_clients.sh` is the compatibility shim for older local flows and wrappers. It forwards directly to `scripts/real_cli_matrix.py`, so the same flags work through either entrypoint.
@@ -236,6 +238,7 @@ Notes:
 - `credential_env` is the environment variable name holding that upstream's fallback credential. The secret stays out of the YAML file.
 - `credential_actual` can be used instead of `credential_env` when you want to place a fallback credential directly in YAML. `credential_env` and `credential_actual` are mutually exclusive.
 - `auth_policy` supports `client_or_fallback` and `force_server`.
+- `limits` on an upstream or alias act as translation defaults and generated client-metadata defaults. If the client explicitly sends `max_tokens`, `max_output_tokens`, or the target protocol's equivalent field, that explicit request still wins.
 - Hooks are best-effort and asynchronous. `usage` is usually enough; `exchange` captures the client-facing request plus the final client-facing response shape after completion, but streaming capture is bounded and may be truncated.
 - `debug_trace` writes a local JSONL file for debugging protocol issues. It is designed for interactive troubleshooting, not long-term traffic archival.
 - `debug_trace` records only the tail "new input" portion of each client request rather than rewriting the full accumulated conversation each turn.
@@ -556,6 +559,8 @@ To avoid that mismatch, provide Codex with a custom `model_catalog_json` entry f
 - disable built-in web search with `supports_search_tool: false` and `web_search="disabled"`
 - set the real context window and compaction threshold for the upstream model
 
+The example below matches the current catalog shape emitted by `scripts/real_cli_matrix.py`. In the common `200000` context / `128000` output-budget case, the correct `auto_compact_token_limit` is `61200`, not `176000`, because the default threshold is computed from available input budget rather than raw context window.
+
 Example `catalog.json` for a proxy-backed `GLM-5-TURBO` alias:
 
 ```json
@@ -590,7 +595,7 @@ Example `catalog.json` for a proxy-backed `GLM-5-TURBO` alias:
       "supports_parallel_tool_calls": false,
       "supports_image_detail_original": false,
       "context_window": 200000,
-      "auto_compact_token_limit": 176000,
+      "auto_compact_token_limit": 61200,
       "effective_context_window_percent": 95,
       "experimental_supported_tools": [],
       "input_modalities": ["text"],
@@ -622,6 +627,7 @@ Notes:
 - `input_modalities: ["text"]` prevents Codex from treating the model as image-capable.
 - `supports_search_tool: false` removes the built-in search tool from the model metadata, and `web_search="disabled"` ensures the runtime search mode stays off.
 - `context_window` and `auto_compact_token_limit` should match the real upstream model, not Codex's generic fallback values.
+- If the proxy config also knows `max_output_tokens`, the generated catalog uses that output budget to derive a more realistic compact threshold from `0.85 * (context_window - max_output_tokens)`.
 
 ### Isolated CLI Smoke Tests
 
