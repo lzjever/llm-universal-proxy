@@ -81,6 +81,18 @@ pub(crate) fn anthropic_thinking_provenance_dropped_message(target_label: &str) 
     )
 }
 
+pub(crate) fn responses_reasoning_carrier_dropped_message(target_label: &str) -> String {
+    format!(
+        "OpenAI Responses reasoning encrypted_content is not portable to {target_label}; the carrier will be dropped and the reasoning summary will be preserved when possible"
+    )
+}
+
+pub(crate) fn responses_reasoning_carrier_malformed_message(target_label: &str) -> String {
+    format!(
+        "OpenAI Responses reasoning encrypted_content is malformed for {target_label}; the carrier will be dropped and the reasoning summary will be preserved when possible"
+    )
+}
+
 pub(crate) fn anthropic_request_tool_definition_not_portable_message(
     detail: &str,
     target_label: &str,

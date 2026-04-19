@@ -6,13 +6,13 @@ use super::messages::{
     anthropic_thinking_provenance_dropped_message, custom_tools_not_portable_message,
     openai_assistant_audio_history_not_portable_message, openai_request_audio_not_portable_message,
     single_candidate_choice_contract_message, translation_target_label,
+    responses_reasoning_carrier_dropped_message, responses_reasoning_carrier_malformed_message,
     OPENAI_REASONING_TO_ANTHROPIC_REJECT_MESSAGE,
 };
 use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
     SemanticToolKind, SharedControlProfile, TranslationAssessment,
 };
-use super::openai_family::extract_responses_text_content;
 use super::openai_responses::decode_anthropic_reasoning_carrier;
 use super::request_gemini::gemini_generation_config_field;
 use super::response_protocols::openai_message_reasoning_text;
@@ -678,20 +678,10 @@ pub(super) fn responses_nonportable_input_item_message(
             .and_then(Value::as_str)
             .or_else(|| item.get("role").and_then(Value::as_str).map(|_| "message"))?;
         if item_type == "reasoning" {
-            if let Some(encrypted_content) = item.get("encrypted_content") {
+            if item.get("encrypted_content").is_some() {
                 match target_format {
                     UpstreamFormat::Anthropic => {
-                        let Some(carrier) = encrypted_content.as_str() else {
-                            return Some(
-                                "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: carrier must be a string"
-                                    .to_string(),
-                            );
-                        };
-                        if let Err(err) = decode_anthropic_reasoning_carrier(carrier) {
-                            return Some(format!(
-                                "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: {err}"
-                            ));
-                        }
+                        return None;
                     }
                     UpstreamFormat::OpenAiCompletion => {}
                     _ => {
@@ -730,22 +720,33 @@ pub(super) fn responses_warning_only_input_item_message(
     body: &Value,
     target_format: UpstreamFormat,
 ) -> Option<String> {
-    if target_format != UpstreamFormat::OpenAiCompletion {
-        return None;
-    }
-
-    body.get("input")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items.iter().find(|item| {
-                item.get("type").and_then(Value::as_str) == Some("reasoning")
-                    && item.get("encrypted_content").is_some()
-            })
-        })
-        .map(|_| {
-            "OpenAI Responses reasoning item field `encrypted_content` is not portable to OpenAI Chat Completions and will be dropped while preserving reasoning summary text"
-                .to_string()
-        })
+    let items = body.get("input").and_then(Value::as_array)?;
+    items.iter().find_map(|item| {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return None;
+        }
+        let encrypted_content = item.get("encrypted_content")?;
+        match target_format {
+            UpstreamFormat::OpenAiCompletion => Some(
+                "OpenAI Responses reasoning item field `encrypted_content` is not portable to OpenAI Chat Completions and will be dropped while preserving reasoning summary text"
+                    .to_string(),
+            ),
+            UpstreamFormat::Anthropic => {
+                if let Some(carrier) = encrypted_content.as_str() {
+                    decode_anthropic_reasoning_carrier(carrier)
+                        .err()
+                        .map(|_| responses_reasoning_carrier_dropped_message(
+                            translation_target_label(target_format),
+                        ))
+                } else {
+                    Some(responses_reasoning_carrier_malformed_message(
+                        translation_target_label(target_format),
+                    ))
+                }
+            }
+            _ => None,
+        }
+    })
 }
 
 pub(super) fn cross_protocol_requested_choice_count(
@@ -807,33 +808,7 @@ pub(super) fn request_contains_openai_reasoning_without_provenance(
                 })
             })
             .unwrap_or(false),
-        UpstreamFormat::OpenAiResponses => body
-            .get("input")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items.iter().any(|item| {
-                    (item.get("type").and_then(Value::as_str) == Some("reasoning")
-                        && item
-                            .get("encrypted_content")
-                            .and_then(Value::as_str)
-                            .map(|carrier| decode_anthropic_reasoning_carrier(carrier).is_err())
-                            .unwrap_or(true))
-                        || (item.get("type").and_then(Value::as_str) == Some("message")
-                            && item.get("role").and_then(Value::as_str) == Some("assistant")
-                            && extract_responses_text_content(item.get("content")).is_empty()
-                            && item
-                                .get("content")
-                                .and_then(Value::as_array)
-                                .map(|content| {
-                                    content.iter().any(|part| {
-                                        part.get("type").and_then(Value::as_str)
-                                            == Some("summary_text")
-                                    })
-                                })
-                                .unwrap_or(false))
-                })
-            })
-            .unwrap_or(false),
+        UpstreamFormat::OpenAiResponses => false,
         _ => false,
     }
 }

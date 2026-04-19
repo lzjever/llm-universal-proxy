@@ -90,6 +90,40 @@ pub(super) fn openai_message_anthropic_reasoning_replay_blocks(
         .cloned()
 }
 
+pub(super) fn responses_reasoning_summary_text(item: &Value) -> String {
+    item.get("summary")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("summary_text") => part.get("text").and_then(Value::as_str),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
+pub(super) fn responses_reasoning_replay_blocks_for_anthropic(item: &Value) -> Option<Vec<Value>> {
+    let summary = responses_reasoning_summary_text(item);
+    if let Some(carrier) = item.get("encrypted_content").and_then(Value::as_str) {
+        if let Ok(blocks) = decode_anthropic_reasoning_carrier(carrier) {
+            if !blocks.is_empty() {
+                return Some(blocks);
+            }
+        }
+    }
+    if !summary.is_empty() {
+        return Some(vec![serde_json::json!({
+            "type": "thinking",
+            "thinking": summary
+        })]);
+    }
+    None
+}
+
 pub(super) fn append_openai_message_anthropic_reasoning_replay_blocks(
     message: &mut Value,
     blocks: Vec<Value>,
@@ -702,59 +736,34 @@ pub(super) fn responses_to_messages(
                 }
             }
             "reasoning" => {
-                let summary = item
-                    .get("summary")
-                    .and_then(Value::as_array)
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-                                Some("summary_text") => {
-                                    part.get("text").and_then(Value::as_str).map(str::to_string)
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("")
-                    })
-                    .unwrap_or_default();
-                let replay_blocks = if target_format == UpstreamFormat::Anthropic {
-                    item.get("encrypted_content")
-                        .and_then(Value::as_str)
-                        .map(decode_anthropic_reasoning_carrier)
-                        .transpose()
-                        .map_err(|err| {
-                            format!(
-                                "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: {err}"
-                            )
-                        })?
+                if target_format == UpstreamFormat::Anthropic {
+                    if let Some(blocks) = responses_reasoning_replay_blocks_for_anthropic(&item) {
+                        if current_assistant.is_none() {
+                            current_assistant = Some(serde_json::json!({
+                                "role": "assistant",
+                                "content": null
+                            }));
+                        }
+                        if let Some(ref mut a) = current_assistant {
+                            append_openai_message_anthropic_reasoning_replay_blocks(a, blocks);
+                        }
+                    }
                 } else {
-                    None
-                };
-                if !summary.is_empty() {
-                    if current_assistant.is_none() {
-                        current_assistant = Some(serde_json::json!({
-                            "role": "assistant",
-                            "content": null
-                        }));
-                    }
-                    if let Some(ref mut a) = current_assistant {
-                        let existing = a
-                            .get("reasoning_content")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        a["reasoning_content"] = Value::String(format!("{existing}{summary}"));
-                    }
-                }
-                if let Some(blocks) = replay_blocks {
-                    if current_assistant.is_none() {
-                        current_assistant = Some(serde_json::json!({
-                            "role": "assistant",
-                            "content": null
-                        }));
-                    }
-                    if let Some(ref mut a) = current_assistant {
-                        append_openai_message_anthropic_reasoning_replay_blocks(a, blocks);
+                    let summary = responses_reasoning_summary_text(&item);
+                    if !summary.is_empty() {
+                        if current_assistant.is_none() {
+                            current_assistant = Some(serde_json::json!({
+                                "role": "assistant",
+                                "content": null
+                            }));
+                        }
+                        if let Some(ref mut a) = current_assistant {
+                            let existing = a
+                                .get("reasoning_content")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            a["reasoning_content"] = Value::String(format!("{existing}{summary}"));
+                        }
                     }
                 }
             }

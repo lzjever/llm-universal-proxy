@@ -1417,27 +1417,40 @@ fn translate_request_responses_to_google_rejects_reasoning_encrypted_content_ite
 }
 
 #[test]
-fn translate_request_responses_to_claude_rejects_unknown_reasoning_encrypted_content() {
+fn translate_request_responses_to_claude_drops_malformed_reasoning_carrier_but_preserves_summary() {
     let mut body = json!({
         "model": "claude-3",
         "input": [{
             "type": "reasoning",
             "summary": [{ "type": "summary_text", "text": "thinking" }],
-            "encrypted_content": "opaque_state"
+            "encrypted_content": { "opaque": "state" }
+        }, {
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "Visible answer" }]
         }]
     });
 
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect_err("unknown Responses reasoning carrier should fail closed for Anthropic");
+    .expect("malformed Responses reasoning carrier should not fail closed for Anthropic");
 
-    assert!(err.contains("encrypted_content"), "err = {err}");
-    assert!(err.contains("Anthropic"), "err = {err}");
+    let messages = body["messages"].as_array().expect("anthropic messages");
+    assert_eq!(messages.len(), 1, "messages = {messages:?}");
+    assert_eq!(messages[0]["role"], "assistant");
+    assert!(messages[0].get("reasoning_content").is_none());
+    let assistant_content = messages[0]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "thinking");
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "Visible answer");
 }
 
 #[test]
@@ -6852,6 +6865,78 @@ fn translate_response_openai_to_claude_has_content_array() {
         .unwrap()
         .iter()
         .any(|b| b.get("type").and_then(Value::as_str) == Some("text")));
+}
+
+#[test]
+fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_visible_answer() {
+    let body = json!({
+        "id": "chatcmpl-1",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "reasoning_content": "private chain of thought",
+                "content": "PONG"
+            },
+            "finish_reason": "stop"
+        }]
+    });
+
+    let out = translate_response(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        &body,
+    )
+    .unwrap();
+
+    assert_eq!(out["type"], "message");
+    assert_eq!(out["stop_reason"], "end_turn");
+    let content = out["content"].as_array().expect("anthropic content");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "PONG");
+}
+
+#[test]
+fn translate_response_openai_to_claude_drops_unprovenanced_reasoning_and_keeps_tool_use() {
+    let body = json!({
+        "id": "chatcmpl-1",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "reasoning_content": "need to inspect python traceback",
+                "content": "Calling tool.",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "run_python",
+                        "arguments": "{\"file\":\"bug.py\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+
+    let out = translate_response(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        &body,
+    )
+    .unwrap();
+
+    assert_eq!(out["type"], "message");
+    assert_eq!(out["stop_reason"], "tool_use");
+    let content = out["content"].as_array().expect("anthropic content");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "Calling tool.");
+    assert_eq!(content[1]["type"], "tool_use");
+    assert_eq!(content[1]["id"], "call_1");
+    assert_eq!(content[1]["name"], "run_python");
+    assert_eq!(content[1]["input"]["file"], "bug.py");
 }
 
 #[test]
