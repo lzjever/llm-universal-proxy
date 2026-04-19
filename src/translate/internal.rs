@@ -123,27 +123,23 @@ fn coalesce_openai_string_messages(body: &mut Value) {
 
     let mut coalesced: Vec<Value> = Vec::new();
     for message in std::mem::take(messages) {
-        let role = message
-            .get("role")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let content = message
-            .get("content")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let Some(role) = role else {
+        let Some(role) = openai_string_message_role_if_coalescible(&message) else {
             coalesced.push(message);
             continue;
         };
-        let Some(content) = content else {
+        let Some(content) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
             coalesced.push(message);
             continue;
         };
 
         if let Some(previous) = coalesced.last_mut() {
-            let previous_role = previous.get("role").and_then(Value::as_str);
+            let previous_role = openai_string_message_role_if_coalescible(previous);
             let previous_content = previous.get("content").and_then(Value::as_str);
-            if previous_role == Some(role.as_str()) {
+            if previous_role == Some(role) {
                 if let Some(previous_content) = previous_content {
                     previous["content"] = Value::String(format!("{previous_content}\n\n{content}"));
                     continue;
@@ -155,6 +151,18 @@ fn coalesce_openai_string_messages(body: &mut Value) {
     }
 
     *messages = coalesced;
+}
+
+fn openai_string_message_role_if_coalescible(message: &Value) -> Option<&str> {
+    let role = message.get("role").and_then(Value::as_str)?;
+    if message.get("content").and_then(Value::as_str).is_none() {
+        return None;
+    }
+    let Some(object) = message.as_object() else {
+        return None;
+    };
+    let has_only_role_and_content = object.keys().all(|key| key == "role" || key == "content");
+    has_only_role_and_content.then_some(role)
 }
 
 fn hoist_and_merge_system_messages(body: &mut Value) {

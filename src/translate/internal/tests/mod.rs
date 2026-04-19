@@ -5732,6 +5732,121 @@ fn translate_request_gemini_to_openai_allows_structured_function_response_withou
 }
 
 #[test]
+fn translate_request_gemini_to_openai_streaming_does_not_coalesce_parallel_tool_results() {
+    let mut body = json!({
+        "model": "minimax-anth",
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{ "text": "<session_context>workspace snapshot</session_context>" }]
+            },
+            {
+                "role": "user",
+                "parts": [{ "text": "Inspect calc.py and main.py." }]
+            },
+            {
+                "role": "model",
+                "parts": [
+                    { "text": "\n" },
+                    {
+                        "functionCall": {
+                            "id": "call_function_1",
+                            "name": "read_file",
+                            "args": { "file_path": "/tmp/calc.py" }
+                        }
+                    },
+                    {
+                        "functionCall": {
+                            "id": "call_function_2",
+                            "name": "read_file",
+                            "args": { "file_path": "/tmp/main.py" }
+                        }
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "functionResponse": {
+                            "id": "call_function_1",
+                            "name": "read_file",
+                            "response": {
+                                "output": "def add(a, b):\n    return a - b\n"
+                            }
+                        }
+                    },
+                    {
+                        "functionResponse": {
+                            "id": "call_function_2",
+                            "name": "read_file",
+                            "response": {
+                                "output": "print(add(2, 3))\n"
+                            }
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::Google,
+        UpstreamFormat::OpenAiCompletion,
+        "MiniMax-M2.7-highspeed",
+        &mut body,
+        true,
+    )
+    .expect("realistic streaming Gemini request should preserve both tool results");
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 4, "messages = {messages:?}");
+    assert_eq!(messages[0]["role"], "user");
+    assert!(messages[0]["content"]
+        .as_str()
+        .expect("string content")
+        .contains("Inspect calc.py and main.py."));
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_function_1");
+    assert_eq!(
+        messages[2]["content"],
+        "{\"output\":\"def add(a, b):\\n    return a - b\\n\"}"
+    );
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["tool_call_id"], "call_function_2");
+    assert_eq!(
+        messages[3]["content"],
+        "{\"output\":\"print(add(2, 3))\\n\"}"
+    );
+}
+
+#[test]
+fn translate_request_openai_streaming_still_coalesces_plain_string_user_messages() {
+    let mut body = json!({
+        "model": "minimax-openai",
+        "messages": [
+            { "role": "user", "content": "alpha" },
+            { "role": "user", "content": "beta" }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiCompletion,
+        "minimax-openai",
+        &mut body,
+        true,
+    )
+    .expect("plain user messages should still coalesce");
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "messages = {messages:?}");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "alpha\n\nbeta");
+}
+
+#[test]
 fn translate_request_openai_to_gemini_keeps_json_tool_results_on_response_result_path() {
     let mut body = json!({
         "model": "gemini-1.5",
