@@ -57,32 +57,20 @@ Use the namespace that matches the client protocol instead of the upstream vendo
 | Claude Code | `/anthropic/v1` | Anthropic Messages client in front of Anthropic-compatible upstreams |
 | Gemini CLI | `/google/v1beta` | Gemini-native client in front of Google-style or translated upstreams |
 
-## Codex With GLM-5-Turbo
+## Codex Metadata And Compact Caveat
 
-When Codex uses a custom local model alias through the proxy, Codex may fall back to built-in default metadata for unknown model names. That fallback assumes a `272000` token window and does not set an automatic compaction threshold, which can make auto-compact happen too late or not at all.
+When Codex uses a proxy-backed local alias that is not present in Codex's built-in model catalog, Codex falls back to unknown-model metadata. That fallback is not good enough for serious manual testing of custom proxy-backed coding models.
 
-For `GLM-5-Turbo`, set both values explicitly at launch time:
+Important practical consequence:
+- Bare `codex` with only `model_provider`, `base_url`, and `wire_api="responses"` can miss `apply_patch`, use the wrong compact threshold, and treat a text-only proxy-backed model as image-capable.
 
-```bash
-HOME="/tmp/tmp-codex" GLM_APIKEY='...' codex resume --yolo \
-  -C /path/to/worktree \
-  -c 'model="claude-local"' \
-  -c 'model_provider="glm-proxy"' \
-  -c 'model_providers.glm-proxy.name="GLM Proxy"' \
-  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:18149/openai/v1"' \
-  -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
-  -c 'model_providers.glm-proxy.wire_api="responses"' \
-  -c 'model_context_window=200000' \
-  -c 'model_auto_compact_token_limit=61200'
-```
+Prefer the wrapper flow in [Recommended Manual Interactive Testing](#recommended-manual-interactive-testing). The wrapper scripts generate a temporary `model_catalog_json` from your proxy source config and pass it to Codex automatically.
 
-For the common `200000` context / `128000` max-output setup, the default compact threshold is `61200`.
+For the common `200000` context / `128000` max-output setup, the wrapper-generated compact threshold is `61200`.
 
 Default compact formula:
-- When both `context_window` and `max_output_tokens` are known, Codex auto-compact should be budgeted from available input capacity: `0.85 * (context_window - max_output_tokens)`.
+- When both `context_window` and `max_output_tokens` are known, Codex auto-compact is budgeted from available input capacity: `0.85 * (context_window - max_output_tokens)`.
 - When only `context_window` is known, the fallback remains `0.85 * context_window`.
-
-Set `model_context_window` to the real upstream limit and tune only `model_auto_compact_token_limit` if you want compaction earlier or later.
 
 ### How Codex Compact Actually Works With A Proxy
 
@@ -189,6 +177,108 @@ Notes:
 - `.env.test` is optional local developer input only and should not be committed. When present, the runner loads it into the proxy subprocess only; it does not become persistent shell state or a shared global client config. Use `--env-file` to point at a different dotenv file.
 - `qwen-local` is optional coverage. It is enabled only when `LOCAL_QWEN_BASE_URL` and `LOCAL_QWEN_MODEL` are both configured; otherwise that lane is skipped. When enabled, the default matrix still limits it to smoke coverage and excludes long-horizon code-edit fixtures.
 - Use this matrix for real end-to-end CLI behavior. For lower-level protocol/HTTP smoke without real CLI processes, use `scripts/real_endpoint_matrix.py` as described below.
+
+## Recommended Manual Interactive Testing
+
+If you want to manually launch a real interactive Codex, Claude, or Gemini session against the proxy, prefer the wrapper scripts in `scripts/run_codex_proxy.sh`, `scripts/run_claude_proxy.sh`, and `scripts/run_gemini_proxy.sh`. They are thin shims over `scripts/interactive_cli.py`, which is the canonical interactive harness used by this repo.
+
+> Warning:
+> Do not validate a proxy-backed custom Codex model by running bare `codex` with only `model_provider`, `model_providers.*.base_url`, and `model_providers.*.wire_api="responses"`.
+> Without `model_catalog_json`, Codex treats aliases such as `minimax-openai` as unknown models and falls back to generic metadata. In practice that can drop `apply_patch`, set the wrong compact threshold, and incorrectly treat a text-only model as image-capable.
+> The Codex wrapper fixes this by generating a temporary catalog from the source config and injecting `-c 'model_catalog_json=...'` automatically.
+
+### 1. Start the proxy manually
+
+From the repo root:
+
+```bash
+cargo build --locked --release
+./target/release/llm-universal-proxy --config proxy-test-minimax-and-local.yaml --dashboard
+```
+
+In another shell, verify the proxy is up:
+
+```bash
+curl -fsS http://127.0.0.1:18888/health && echo
+```
+
+If your local config uses `credential_env` values instead of inline credentials, export them first or `source .env.test` before starting the proxy.
+
+### 2. Attach an interactive client to the already running proxy
+
+Codex, OpenAI-completions lane:
+
+```bash
+bash scripts/run_codex_proxy.sh \
+  --proxy-base http://127.0.0.1:18888 \
+  --config-source proxy-test-minimax-and-local.yaml \
+  --workspace "$PWD" \
+  --model minimax-openai
+```
+
+Codex, Anthropic lane:
+
+```bash
+bash scripts/run_codex_proxy.sh \
+  --proxy-base http://127.0.0.1:18888 \
+  --config-source proxy-test-minimax-and-local.yaml \
+  --workspace "$PWD" \
+  --model minimax-anth
+```
+
+Claude:
+
+```bash
+bash scripts/run_claude_proxy.sh \
+  --proxy-base http://127.0.0.1:18888 \
+  --config-source proxy-test-minimax-and-local.yaml \
+  --workspace "$PWD" \
+  --model claude-haiku-4-5
+```
+
+Gemini:
+
+```bash
+bash scripts/run_gemini_proxy.sh \
+  --proxy-base http://127.0.0.1:18888 \
+  --config-source proxy-test-minimax-and-local.yaml \
+  --workspace "$PWD" \
+  --model minimax-openai
+```
+
+Notes:
+- These wrappers default to `proxy-test-minimax-and-local.yaml` as the source config even when you pass `--proxy-base`. If your live proxy was started from a different source file, also pass `--config-source /path/to/that.yaml` so the wrapper resolves the same limits and metadata.
+- If you omit `--model`, the current defaults are `minimax-openai` for Codex, `claude-haiku-4-5` for Claude, and `minimax-openai` for Gemini.
+- `--workspace` defaults to the current working directory. It is shown explicitly above because that is usually what you want for manual testing.
+
+### 3. Managed mode: let the wrapper start and stop the proxy for you
+
+If you omit `--proxy-base`, the wrapper starts `./target/release/llm-universal-proxy` itself, derives a temporary runtime config from the source YAML, waits for `/health`, launches the client, and stops the proxy when the client exits.
+
+Example:
+
+```bash
+bash scripts/run_codex_proxy.sh \
+  --workspace "$PWD" \
+  --model minimax-openai
+```
+
+You can override the defaults with:
+- `--config-source /path/to/config.yaml`
+- `--env-file /path/to/.env`
+- `--binary /path/to/llm-universal-proxy`
+
+### 4. What the wrappers do for you
+
+- Create an isolated temporary `HOME` plus XDG directories so your normal `~/.codex`, `~/.claude`, and Gemini state are not rewritten.
+- Set dummy client-side keys and local base URLs automatically:
+  - Codex: `OPENAI_API_KEY=dummy`, `OPENAI_BASE_URL=<proxy>/openai/v1`
+  - Claude: `ANTHROPIC_API_KEY=dummy`, `ANTHROPIC_BASE_URL=<proxy>/anthropic`
+  - Gemini: `GEMINI_API_KEY=dummy`, `GOOGLE_GEMINI_BASE_URL=<proxy>/google`
+- Clear `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` and set `NO_PROXY=127.0.0.1,localhost` so local proxy traffic does not get routed through an outer HTTP proxy.
+- Preserve host `CARGO_HOME` / `RUSTUP_HOME` when present so Rust toolchain commands still work inside the isolated client environment.
+- For Codex, resolve `limits` and `codex` metadata from the source config, write a temporary `~/.codex/catalog.json`, inject `model_catalog_json`, and disable Codex web search when the source config marks the model as `supports_search_tool: false`.
+- For Gemini, write a temporary `~/.gemini/settings.json` with the model limits that the harness can express through Gemini's real settings schema.
 
 ## Configuration
 
@@ -508,205 +598,14 @@ model_aliases:
 
 Clients can then request `opus`, `sonnet`, `haiku`, `coder-fast`, or `coder-strong` without caring which upstream vendor actually serves the request.
 
-### Codex CLI to an Anthropic-Compatible Upstream
+### Low-Level Manual CLI Wiring
 
-This is the practical setup for tools such as Codex CLI when the real upstream speaks the Anthropic Messages API but the client expects the OpenAI Responses API.
+Prefer [Recommended Manual Interactive Testing](#recommended-manual-interactive-testing) for day-to-day work. The wrapper scripts are the supported manual path in this repo because they isolate CLI state, inject the correct proxy base URLs, and add Codex catalog metadata automatically.
 
-1. Start the proxy against the Anthropic-compatible upstream:
-
-```bash
-cat > codex-proxy.yaml <<'YAML'
-listen: 127.0.0.1:8099
-
-upstreams:
-  GLM-OFFICIAL:
-    api_root: https://open.bigmodel.cn/api/anthropic/v1
-    format: anthropic
-    credential_env: GLM_APIKEY
-
-model_aliases:
-  GLM-5: GLM-OFFICIAL:GLM-5
-YAML
-
-./target/release/llm-universal-proxy --config codex-proxy.yaml
-```
-
-2. Point Codex CLI at the local proxy with an isolated config:
-
-```bash
-HOME="$(mktemp -d)" GLM_APIKEY="your-real-key" codex exec --ephemeral \
-  -c 'model="GLM-5"' \
-  -c 'model_provider="glm-proxy"' \
-  -c 'model_providers.glm-proxy.name="GLM Proxy"' \
-  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:8099/openai/v1"' \
-  -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
-  -c 'model_providers.glm-proxy.wire_api="responses"' \
-  'Reply with exactly: codex-ok'
-```
-
-Notes:
-- This does not modify your global Codex CLI configuration because it uses a temporary `HOME` and `--ephemeral`.
-- The client talks OpenAI Responses to the proxy at `/openai/v1/responses`; the proxy resolves local model `GLM-5` to `GLM-OFFICIAL:GLM-5`, then translates upstream to Anthropic Messages.
-- For providers that need extra static headers beyond the Anthropic default, set the upstream's `headers` field in the matching upstream entry.
-
-#### Custom Text-Only Models For Codex
-
-If your local Codex model alias is not present in Codex's built-in model catalog, Codex falls back to generic metadata. That fallback assumes the model supports both text and image input. For proxy-backed custom models, that is often wrong: many upstreams are text-only, and some setups also want the built-in web search tool disabled.
-
-To avoid that mismatch, provide Codex with a custom `model_catalog_json` entry for your local alias. This lets you:
-
-- mark the model as text-only with `input_modalities: ["text"]`
-- disable built-in web search with `supports_search_tool: false` and `web_search="disabled"`
-- set the real context window and compaction threshold for the upstream model
-
-The example below matches the current catalog shape emitted by `scripts/real_cli_matrix.py`. In the common `200000` context / `128000` output-budget case, the correct `auto_compact_token_limit` is `61200`, not `176000`, because the default threshold is computed from available input budget rather than raw context window.
-
-Example `catalog.json` for a proxy-backed `GLM-5-TURBO` alias:
-
-```json
-{
-  "models": [
-    {
-      "slug": "codex-anthropic",
-      "display_name": "codex-anthropic",
-      "description": "Custom proxy-backed Codex model with text-only input.",
-      "default_reasoning_level": "medium",
-      "supported_reasoning_levels": [
-        { "effort": "low", "description": "Fast responses with lighter reasoning" },
-        { "effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
-        { "effort": "high", "description": "Greater reasoning depth for complex problems" },
-        { "effort": "xhigh", "description": "Extra high reasoning depth for complex problems" }
-      ],
-      "shell_type": "shell_command",
-      "visibility": "list",
-      "supported_in_api": true,
-      "priority": 0,
-      "availability_nux": null,
-      "upgrade": null,
-      "base_instructions": "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.",
-      "model_messages": null,
-      "supports_reasoning_summaries": false,
-      "default_reasoning_summary": "auto",
-      "support_verbosity": false,
-      "default_verbosity": null,
-      "apply_patch_tool_type": "freeform",
-      "web_search_tool_type": "text",
-      "truncation_policy": { "mode": "bytes", "limit": 10000 },
-      "supports_parallel_tool_calls": false,
-      "supports_image_detail_original": false,
-      "context_window": 200000,
-      "auto_compact_token_limit": 61200,
-      "effective_context_window_percent": 95,
-      "experimental_supported_tools": [],
-      "input_modalities": ["text"],
-      "supports_search_tool": false
-    }
-  ]
-}
-```
-
-Start Codex with that custom catalog:
-
-```bash
-HOME="$(mktemp -d)" GLM_APIKEY="your-real-key" codex \
-  -C /path/to/worktree \
-  -m codex-anthropic \
-  -c 'model_provider="glm-proxy"' \
-  -c 'model_providers.glm-proxy.name="GLM Proxy"' \
-  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:18149/openai/v1"' \
-  -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
-  -c 'model_providers.glm-proxy.wire_api="responses"' \
-  -c 'model_catalog_json="/path/to/catalog.json"' \
-  -c 'web_search="disabled"' \
-  -s danger-full-access \
-  -a never
-```
-
-Notes:
-- `model_catalog_json` is applied on startup only. Update the file first, then start a new Codex session.
-- `input_modalities: ["text"]` prevents Codex from treating the model as image-capable.
-- `supports_search_tool: false` removes the built-in search tool from the model metadata, and `web_search="disabled"` ensures the runtime search mode stays off.
-- `context_window` and `auto_compact_token_limit` should match the real upstream model, not Codex's generic fallback values.
-- If the proxy config also knows `max_output_tokens`, the generated catalog uses that output budget to derive a more realistic compact threshold from `0.85 * (context_window - max_output_tokens)`.
-
-### Isolated CLI Smoke Tests
-
-The following patterns let you verify real CLI clients against the proxy without touching user-level configuration. Every example uses a temporary `HOME` and placeholder credentials.
-
-Start the proxy first:
-
-```yaml
-listen: 127.0.0.1:18129
-upstream_timeout_secs: 120
-
-upstreams:
-  GLM-ANTHROPIC:
-    api_root: https://open.bigmodel.cn/api/anthropic/v1
-    format: anthropic
-    credential_env: GLM_APIKEY
-    auth_policy: force_server
-
-  GLM-OPENAI:
-    api_root: https://open.bigmodel.cn/api/coding/paas/v4
-    format: openai-completion
-    credential_env: GLM_APIKEY
-    auth_policy: force_server
-
-model_aliases:
-  claude-local: GLM-ANTHROPIC:GLM-5
-  codex-local: GLM-OPENAI:glm-4.7
-  gemini-local: GLM-OPENAI:glm-4.7
-```
-
-Run it with:
-
-```bash
-GLM_APIKEY="your-real-key" ./target/release/llm-universal-proxy --config proxec-test.yaml
-```
-
-Codex CLI via `/openai/v1`:
-
-```bash
-HOME="$(mktemp -d)" GLM_APIKEY=dummy codex exec --ephemeral \
-  -C /path/to/llm-universal-proxy \
-  -c 'model="codex-local"' \
-  -c 'model_provider="proxec"' \
-  -c 'model_providers.proxec.name="proxec"' \
-  -c 'model_providers.proxec.base_url="http://127.0.0.1:18129/openai/v1"' \
-  -c 'model_providers.proxec.env_key="GLM_APIKEY"' \
-  -c 'model_providers.proxec.wire_api="responses"' \
-  'Reply with exactly: codex-ok'
-```
-
-Claude Code via `/anthropic/v1`:
-
-```bash
-HOME="$(mktemp -d)" \
-ANTHROPIC_API_KEY=dummy \
-ANTHROPIC_BASE_URL='http://127.0.0.1:18129/anthropic' \
-claude --print --output-format text --no-session-persistence \
-  --model claude-local \
-  'Reply with exactly: claude-ok'
-```
-
-Gemini CLI via `/google/v1beta`:
-
-```bash
-HOME="$(mktemp -d)" \
-GEMINI_API_KEY=dummy \
-GOOGLE_GEMINI_BASE_URL='http://127.0.0.1:18129/google' \
-HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= \
-NO_PROXY='127.0.0.1,localhost' no_proxy='127.0.0.1,localhost' \
-gemini --prompt 'Reply with exactly: gemini-ok' \
-  --model gemini-local \
-  --sandbox=false \
-  --output-format text
-```
-
-Notes:
-- The proxy uses the configured upstream credential because `auth_policy: force_server` is set. The dummy client-side keys only satisfy CLI validation.
-- Clearing proxy environment variables for Gemini CLI is recommended when the proxy is running on `127.0.0.1`, because some Node-based proxy stacks will otherwise try to send local traffic through the global HTTP proxy.
-- Replace `/path/to/llm-universal-proxy` with your actual repository path or remove `-C` if you are already in the repository.
+Use raw `codex`, `claude`, or `gemini` commands only for low-level debugging. In particular:
+- bare `codex` plus `model_provider` / `base_url` / `wire_api` is not enough for proxy-backed custom models
+- if you run raw Codex directly, you are responsible for supplying the same `model_catalog_json` metadata that the wrapper would have generated
+- if you use a different source YAML than `proxy-test-minimax-and-local.yaml`, keep the source config and the running proxy aligned so the generated client metadata matches the actual proxy routing
 
 ### Real Upstream Smoke Matrix
 

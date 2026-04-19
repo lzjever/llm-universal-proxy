@@ -440,155 +440,145 @@ model_aliases:
 
 这样客户端只需要请求 `opus`、`sonnet`、`haiku`、`coder-fast`、`coder-strong`，不需要关心底层到底接的是哪家模型。
 
-### 通过 Codex CLI 使用 Anthropic 兼容上游
+### 推荐的手动交互测试
 
-这是一个真实可用的场景：客户端是 Codex CLI，只会发 OpenAI Responses API；真实上游却是 Anthropic Messages 兼容接口。
+如果你想手动联调真实的 Codex CLI、Claude Code、Gemini CLI，优先使用仓库自带的 wrapper：
 
-1. 先启动代理，指向 Anthropic 兼容上游：
+- `scripts/run_codex_proxy.sh`
+- `scripts/run_claude_proxy.sh`
+- `scripts/run_gemini_proxy.sh`
+
+这三个脚本都是 `scripts/interactive_cli.py` 的薄包装，参数和默认行为保持一致。
+
+> **高可见警告**
+>
+> 不要像下面这样裸跑 `codex`：只传 `model_provider`、`base_url`、`wire_api="responses"`，却不注入 `model_catalog_json`。
+>
+> 对 `minimax-openai` 这类代理 alias，Codex 很可能会把它当成 unknown model，后果通常包括：
+>
+> - `apply_patch` 这类工具不出现或能力退化
+> - compact 阈值按错误默认值计算，长会话更容易失控
+> - text-only / search / tool 元数据退回到泛化 fallback
+>
+> 手动交互时，优先使用 `scripts/run_codex_proxy.sh`，让 wrapper 根据 `--config-source` 自动生成并注入当前仓库支持的 Codex catalog。
+
+#### 1. 手动启动 proxy 并做健康检查
+
+如果你要先单独启动代理，再让 wrapper 连接到它，最直接的仓库内命令是：
 
 ```bash
-cat > codex-proxy.yaml <<'YAML'
-listen: 127.0.0.1:8099
-
-upstreams:
-  GLM-OFFICIAL:
-    api_root: https://open.bigmodel.cn/api/anthropic/v1
-    format: anthropic
-    credential_env: GLM_APIKEY
-    auth_policy: client_or_fallback
-
-model_aliases:
-  GLM-5: GLM-OFFICIAL:GLM-5
-YAML
-
-./target/release/llm-universal-proxy --config codex-proxy.yaml
+cargo build --locked --release
+./target/release/llm-universal-proxy --config proxy-test-minimax-and-local.yaml --dashboard
 ```
 
-2. 再让 Codex CLI 指向本地代理，并使用隔离配置：
+另开一个终端做健康检查：
 
 ```bash
-HOME="$(mktemp -d)" GLM_APIKEY="你的真实 Key" codex exec --ephemeral \
-  -c 'model="GLM-5"' \
-  -c 'model_provider="glm-proxy"' \
-  -c 'model_providers.glm-proxy.name="GLM Proxy"' \
-  -c 'model_providers.glm-proxy.base_url="http://127.0.0.1:8099/openai/v1"' \
-  -c 'model_providers.glm-proxy.env_key="GLM_APIKEY"' \
-  -c 'model_providers.glm-proxy.wire_api="responses"' \
-  'Reply with exactly: codex-ok'
+curl http://127.0.0.1:18888/health
 ```
 
-说明：
-- 这里用了临时 `HOME` 和 `--ephemeral`，不会污染你全局的 Codex CLI 配置。
-- 客户端访问的是代理的 `/openai/v1/responses`；代理会先把本地模型名 `GLM-5` 解析成 `GLM-OFFICIAL:GLM-5`，再转换成 Anthropic Messages 发给上游。
-- 如果上游还需要额外静态协议头，可以在对应 upstream 条目里配置 `headers`。
-
-### Codex 自定义 Catalog 与 Compact 阈值
-
-如果本地 Codex 模型别名不在 Codex 内建 catalog 里，Codex 会退回到一套很泛的默认元数据。对代理后的自定义模型，这通常不够准确，尤其是 text-only 模型和长会话 compact 阈值。
-
-当前建议是提供符合最新真实 schema 的 `model_catalog_json`，并让 compact 阈值基于“可用输入预算”而不是裸 `context_window`：
-
-- 若同时知道 `context_window` 和 `max_output_tokens`，默认 compact 阈值按 `0.85 * (context_window - max_output_tokens)` 计算。
-- 若只知道 `context_window`，才回退到 `0.85 * context_window`。
-
-例如常见的 `context_window = 200000`、`max_output_tokens = 128000` 场景，默认 `auto_compact_token_limit` 应是 `61200`，不是旧示例里的 `176000`。
-
-下面这个 JSON 片段只展示 compact / limits 相关关键字段，不是可直接使用的完整 catalog：
+预期返回：
 
 ```json
-{
-  "models": [
-    {
-      "slug": "codex-anthropic",
-      "context_window": 200000,
-      "auto_compact_token_limit": 61200,
-      "input_modalities": ["text"],
-      "supports_search_tool": false
-    }
-  ]
-}
+{"status":"ok"}
 ```
 
-如果你需要当前真实可用的完整 catalog 形状，优先使用 `scripts/real_cli_matrix.py` 生成；如果只是想看完整示例，也可以参考英文版 [README.md](./README.md) 里的完整 `catalog.json` 示例。`scripts/real_cli_matrix.py` 生成的文件会按这套当前逻辑产出最新 schema 兼容的 compact 值。
+如果你不是用仓库自带的 `proxy-test-minimax-and-local.yaml`，把上面的配置文件路径和后续示例里的模型 alias 换成你自己的即可。
 
-### 隔离的 CLI Smoke 测试
+#### 2. 用 wrapper 连接已经运行的 proxy
 
-下面这些模式可以让你在不碰用户级配置的前提下，用真实 CLI 通过代理做联调。所有示例都使用临时 `HOME` 和占位符密钥。
+下面这些命令都可以直接在仓库根目录复制执行。它们会连接到已经运行在 `http://127.0.0.1:18888` 的 proxy。
 
-先启动代理：
-
-```yaml
-listen: 127.0.0.1:18129
-upstream_timeout_secs: 120
-
-upstreams:
-  GLM-ANTHROPIC:
-    api_root: https://open.bigmodel.cn/api/anthropic/v1
-    format: anthropic
-    credential_env: GLM_APIKEY
-    auth_policy: force_server
-
-  GLM-OPENAI:
-    api_root: https://open.bigmodel.cn/api/coding/paas/v4
-    format: openai-completion
-    credential_env: GLM_APIKEY
-    auth_policy: force_server
-
-model_aliases:
-  claude-local: GLM-ANTHROPIC:GLM-5
-  codex-local: GLM-OPENAI:glm-4.7
-  gemini-local: GLM-OPENAI:glm-4.7
-```
-
-启动命令：
+Codex：
 
 ```bash
-GLM_APIKEY="your-real-key" ./target/release/llm-universal-proxy --config proxec-test.yaml
+./scripts/run_codex_proxy.sh \
+  --proxy-base http://127.0.0.1:18888 \
+  --config-source proxy-test-minimax-and-local.yaml \
+  --workspace "$PWD" \
+  --model minimax-openai
 ```
 
-Codex CLI 通过 `/openai/v1`：
+Codex（Anthropic lane）：
 
 ```bash
-HOME="$(mktemp -d)" GLM_APIKEY=dummy codex exec --ephemeral \
-  -C /path/to/llm-universal-proxy \
-  -c 'model="codex-local"' \
-  -c 'model_provider="proxec"' \
-  -c 'model_providers.proxec.name="proxec"' \
-  -c 'model_providers.proxec.base_url="http://127.0.0.1:18129/openai/v1"' \
-  -c 'model_providers.proxec.env_key="GLM_APIKEY"' \
-  -c 'model_providers.proxec.wire_api="responses"' \
-  'Reply with exactly: codex-ok'
+./scripts/run_codex_proxy.sh \
+  --proxy-base http://127.0.0.1:18888 \
+  --config-source proxy-test-minimax-and-local.yaml \
+  --workspace "$PWD" \
+  --model minimax-anth
 ```
 
-Claude Code 通过 `/anthropic/v1`：
+Claude：
 
 ```bash
-HOME="$(mktemp -d)" \
-ANTHROPIC_API_KEY=dummy \
-ANTHROPIC_BASE_URL='http://127.0.0.1:18129/anthropic' \
-claude --print --output-format text --no-session-persistence \
-  --model claude-local \
-  'Reply with exactly: claude-ok'
+./scripts/run_claude_proxy.sh \
+  --proxy-base http://127.0.0.1:18888 \
+  --config-source proxy-test-minimax-and-local.yaml \
+  --workspace "$PWD" \
+  --model claude-haiku-4-5
 ```
 
-Gemini CLI 通过 `/google/v1beta`：
+Gemini：
 
 ```bash
-HOME="$(mktemp -d)" \
-GEMINI_API_KEY=dummy \
-GOOGLE_GEMINI_BASE_URL='http://127.0.0.1:18129/google' \
-HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= \
-NO_PROXY='127.0.0.1,localhost' no_proxy='127.0.0.1,localhost' \
-gemini --prompt 'Reply with exactly: gemini-ok' \
-  --model gemini-local \
-  --sandbox=false \
-  --output-format text
+./scripts/run_gemini_proxy.sh \
+  --proxy-base http://127.0.0.1:18888 \
+  --config-source proxy-test-minimax-and-local.yaml \
+  --workspace "$PWD" \
+  --model minimax-openai
 ```
 
 说明：
-- 因为这里配置了 `auth_policy: force_server`，所以真正使用的是代理侧配置的上游凭证；客户端传入的 dummy key 只是为了满足各个 CLI 自身的校验。
-- 当代理跑在 `127.0.0.1` 时，Gemini CLI 建议显式清空代理环境变量；某些 Node 代理栈否则会尝试把本地流量也走全局 HTTP 代理。
-- 把 `/path/to/llm-universal-proxy` 替换成你的实际仓库路径；如果你已经在仓库目录里执行，也可以直接去掉 `-C`。
+
+- `--proxy-base` 表示“连接一个已经启动好的 proxy”，wrapper 自己不会再拉起新进程。
+- `--config-source` 仍然建议显式传入，因为 wrapper 会从这里解析模型 alias 的 `limits` 和客户端元数据，用来生成 Codex catalog 和 Gemini settings。
+- 如果你传了 `--proxy-base`，但 live proxy 实际用的是另一份 YAML，务必把 `--config-source` 也同步成同一份配置；否则 wrapper 生成的 catalog / settings 可能和正在运行的 proxy 不一致。
+- 如果你用的是自己的 YAML，请同时替换 `--config-source` 和 `--model`。
+
+#### 3. 不传 `--proxy-base`，让 wrapper 托管启动 proxy
+
+如果你不想自己单独开 proxy，直接让 wrapper 托管启动即可。Codex 的例子如下：
+
+```bash
+./scripts/run_codex_proxy.sh \
+  --config-source proxy-test-minimax-and-local.yaml \
+  --env-file .env.test \
+  --workspace "$PWD" \
+  --model minimax-openai
+```
+
+这条命令会：
+
+- 读取 `proxy-test-minimax-and-local.yaml`
+- 默认从 `.env.test` 读取代理子进程需要的环境变量
+- 派生临时运行时配置并启动 proxy
+- 等待 `/health`
+- 再启动交互式 Codex，并在退出后停止 proxy
+
+如果你的环境文件不是 `.env.test`，用 `--env-file /path/to/your.env` 替换即可。
+
+#### 4. wrapper 会帮你做什么
+
+这些 wrapper 的价值不只是少打一串参数，它们还会统一处理几类很容易踩坑的细节：
+
+- 为每次运行创建隔离的 `HOME` / `XDG_*` 目录，不污染你平时的本机 CLI 配置。
+- 给客户端注入占位符密钥和本地 base URL：
+  - Codex：`OPENAI_API_KEY=dummy`、`OPENAI_BASE_URL=<proxy>/openai/v1`
+  - Claude：`ANTHROPIC_API_KEY=dummy`、`ANTHROPIC_BASE_URL=<proxy>/anthropic`
+  - Gemini：`GEMINI_API_KEY=dummy`、`GOOGLE_GEMINI_BASE_URL=<proxy>/google`
+- 为 Codex 生成并注入 `.codex/catalog.json`，再通过 `-c 'model_catalog_json=...'` 传给客户端；这样不会退回 unknown-model fallback。
+- 为 Gemini 生成 `.gemini/settings.json`，把 alias 的模型上限写进 settings。
+- 清空本地 `HTTP_PROXY` / `HTTPS_PROXY` 等代理环境变量，避免 CLI 把 `127.0.0.1` 的 proxy 流量又错误地转发到外部代理。
+- 当上游配置使用 `auth_policy: force_server` 时，真正的上游凭证仍由 proxy 侧读取；客户端拿到的 dummy key 只是为了满足各自 CLI 的本地校验。
+
+如果你更喜欢直接调用 Python 入口，也可以把上面的 shell wrapper 等价替换为：
+
+```bash
+python3 scripts/interactive_cli.py --client codex ...
+python3 scripts/interactive_cli.py --client claude ...
+python3 scripts/interactive_cli.py --client gemini ...
+```
 
 ### 真实上游 Smoke 矩阵
 
