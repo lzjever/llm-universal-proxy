@@ -679,21 +679,26 @@ pub(super) fn responses_nonportable_input_item_message(
             .or_else(|| item.get("role").and_then(Value::as_str).map(|_| "message"))?;
         if item_type == "reasoning" {
             if let Some(encrypted_content) = item.get("encrypted_content") {
-                if target_format != UpstreamFormat::Anthropic {
-                    return Some(format!(
-                        "OpenAI Responses reasoning item field `encrypted_content` cannot be faithfully translated to {target_label}"
-                    ));
-                }
-                let Some(carrier) = encrypted_content.as_str() else {
-                    return Some(
-                        "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: carrier must be a string"
-                            .to_string(),
-                    );
-                };
-                if let Err(err) = decode_anthropic_reasoning_carrier(carrier) {
-                    return Some(format!(
-                        "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: {err}"
-                    ));
+                match target_format {
+                    UpstreamFormat::Anthropic => {
+                        let Some(carrier) = encrypted_content.as_str() else {
+                            return Some(
+                                "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: carrier must be a string"
+                                    .to_string(),
+                            );
+                        };
+                        if let Err(err) = decode_anthropic_reasoning_carrier(carrier) {
+                            return Some(format!(
+                                "OpenAI Responses reasoning encrypted_content cannot be replayed to Anthropic: {err}"
+                            ));
+                        }
+                    }
+                    UpstreamFormat::OpenAiCompletion => {}
+                    _ => {
+                        return Some(format!(
+                            "OpenAI Responses reasoning item field `encrypted_content` cannot be faithfully translated to {target_label}"
+                        ))
+                    }
                 }
             }
         }
@@ -719,6 +724,28 @@ pub(super) fn responses_nonportable_input_item_message(
             "OpenAI Responses input item type `{item_type}` is outside the portable cross-protocol subset and cannot be faithfully translated to {target_label}"
         ))
     })
+}
+
+pub(super) fn responses_warning_only_input_item_message(
+    body: &Value,
+    target_format: UpstreamFormat,
+) -> Option<String> {
+    if target_format != UpstreamFormat::OpenAiCompletion {
+        return None;
+    }
+
+    body.get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("reasoning")
+                    && item.get("encrypted_content").is_some()
+            })
+        })
+        .map(|_| {
+            "OpenAI Responses reasoning item field `encrypted_content` is not portable to OpenAI Chat Completions and will be dropped while preserving reasoning summary text"
+                .to_string()
+        })
 }
 
 pub(super) fn cross_protocol_requested_choice_count(
@@ -998,6 +1025,9 @@ pub(crate) fn assess_request_translation(
                 "OpenAI Responses controls {quoted} are not portable on this translation path to {} and will be dropped",
                 translation_target_label(upstream_format)
             ));
+        }
+        if let Some(message) = responses_warning_only_input_item_message(body, upstream_format) {
+            assessment.warning(message);
         }
         if let Some(message) = responses_nonportable_tool_choice_message(body, upstream_format) {
             assessment.reject(message);

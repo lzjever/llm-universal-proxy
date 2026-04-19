@@ -248,9 +248,20 @@ fn translate_request_chat_to_responses_uses_custom_tool_call_output_for_custom_t
 }
 
 #[test]
-fn translate_request_responses_to_openai_keeps_custom_tool_call_output_messages() {
+fn translate_request_responses_to_openai_bridges_custom_tool_definition_choice_and_history() {
+    let bridge_name = "__llmup_custom__code_exec";
     let mut body = json!({
         "model": "gpt-4o",
+        "tools": [{
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes code",
+            "format": { "type": "text" }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "code_exec"
+        },
         "input": [
             {
                 "type": "message",
@@ -280,14 +291,49 @@ fn translate_request_responses_to_openai_keeps_custom_tool_call_output_messages(
     )
     .unwrap();
 
+    let tools = body["tools"].as_array().expect("chat tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(
+        tools[0],
+        json!({
+            "type": "function",
+            "function": {
+                "name": bridge_name,
+                "description": "Executes code",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": { "type": "string" }
+                    },
+                    "required": ["input"],
+                    "additionalProperties": false
+                }
+            }
+        })
+    );
+    assert_eq!(
+        body["tool_choice"],
+        json!({
+            "type": "function",
+            "function": {
+                "name": bridge_name
+            }
+        })
+    );
+
     let messages = body["messages"].as_array().expect("messages");
     assert_eq!(messages.len(), 3, "messages = {messages:?}");
     assert_eq!(messages[1]["role"], "assistant");
-    assert_eq!(messages[1]["tool_calls"][0]["type"], "custom");
-    assert_eq!(messages[1]["tool_calls"][0]["custom"]["name"], "code_exec");
     assert_eq!(
-        messages[1]["tool_calls"][0]["custom"]["input"],
-        "print('hi')"
+        messages[1]["tool_calls"][0],
+        json!({
+            "id": "call_custom",
+            "type": "function",
+            "function": {
+                "name": bridge_name,
+                "arguments": "{\"input\":\"print('hi')\"}"
+            }
+        })
     );
     assert_eq!(messages[2]["role"], "tool");
     assert_eq!(messages[2]["tool_call_id"], "call_custom");
@@ -398,7 +444,8 @@ fn translate_request_responses_tool_output_media_arrays_to_openai_rejects() {
 }
 
 #[test]
-fn translate_request_responses_to_openai_preserves_custom_tools_and_custom_tool_choice() {
+fn translate_request_responses_to_openai_bridges_custom_tools_and_tool_choice_variants() {
+    let bridge_name = "__llmup_custom__code_exec";
     let mut body = json!({
         "model": "gpt-4o",
         "input": "run this",
@@ -425,17 +472,24 @@ fn translate_request_responses_to_openai_preserves_custom_tools_and_custom_tool_
 
     let tools = body["tools"].as_array().expect("chat tools");
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0]["type"], "custom");
-    assert_eq!(tools[0]["custom"]["name"], "code_exec");
-    assert_eq!(tools[0]["custom"]["description"], "Executes code");
-    assert_eq!(tools[0]["custom"]["format"]["type"], "text");
-    assert_eq!(body["tool_choice"]["type"], "custom");
-    assert_eq!(body["tool_choice"]["custom"]["name"], "code_exec");
-}
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["function"]["name"], bridge_name);
+    assert_eq!(tools[0]["function"]["description"], "Executes code");
+    assert_eq!(
+        tools[0]["function"]["parameters"],
+        json!({
+            "type": "object",
+            "properties": {
+                "input": { "type": "string" }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        })
+    );
+    assert_eq!(body["tool_choice"]["type"], "function");
+    assert_eq!(body["tool_choice"]["function"]["name"], bridge_name);
 
-#[test]
-fn translate_request_responses_to_openai_preserves_custom_allowed_tools_shape() {
-    let mut body = json!({
+    let mut allowed_tools_body = json!({
         "model": "gpt-4o",
         "input": "run this",
         "tools": [
@@ -464,21 +518,21 @@ fn translate_request_responses_to_openai_preserves_custom_allowed_tools_shape() 
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
-        &mut body,
+        &mut allowed_tools_body,
         false,
     )
     .unwrap();
 
-    let tools = body["tools"].as_array().expect("chat tools");
-    assert_eq!(tools[0]["type"], "custom");
-    assert_eq!(tools[0]["custom"]["name"], "code_exec");
+    let tools = allowed_tools_body["tools"].as_array().expect("chat tools");
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["function"]["name"], bridge_name);
     assert_eq!(tools[1]["type"], "function");
-    assert_eq!(body["tool_choice"]["type"], "allowed_tools");
-    let allowed_tools = body["tool_choice"]["allowed_tools"]["tools"]
+    assert_eq!(allowed_tools_body["tool_choice"]["type"], "allowed_tools");
+    let allowed_tools = allowed_tools_body["tool_choice"]["allowed_tools"]["tools"]
         .as_array()
         .expect("allowed tools");
-    assert_eq!(allowed_tools[0]["type"], "custom");
-    assert_eq!(allowed_tools[0]["custom"]["name"], "code_exec");
+    assert_eq!(allowed_tools[0]["type"], "function");
+    assert_eq!(allowed_tools[0]["function"]["name"], bridge_name);
     assert_eq!(allowed_tools[1]["type"], "function");
     assert_eq!(allowed_tools[1]["function"]["name"], "lookup_weather");
 }
@@ -1264,28 +1318,56 @@ fn translate_request_responses_to_non_responses_rejects_item_reference_items() {
 }
 
 #[test]
-fn translate_request_responses_to_non_responses_rejects_reasoning_encrypted_content_items() {
-    for upstream_format in [UpstreamFormat::OpenAiCompletion, UpstreamFormat::Google] {
-        let mut body = json!({
-            "model": "gpt-4o",
-            "input": [{
-                "type": "reasoning",
-                "summary": [{ "type": "summary_text", "text": "thinking" }],
-                "encrypted_content": "enc_123"
-            }]
-        });
+fn translate_request_responses_to_openai_downgrades_reasoning_encrypted_content_items() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": "thinking" }],
+            "encrypted_content": "opaque_state"
+        }]
+    });
 
-        let err = translate_request(
-            UpstreamFormat::OpenAiResponses,
-            upstream_format,
-            "target-model",
-            &mut body,
-            false,
-        )
-        .expect_err("Responses reasoning encrypted_content should fail closed cross-protocol");
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        "target-model",
+        &mut body,
+        false,
+    )
+    .expect("Responses reasoning encrypted_content should downgrade on Chat-compatible upstreams");
 
-        assert!(err.contains("encrypted_content"), "err = {err}");
-    }
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "messages = {messages:?}");
+    assert_eq!(messages[0]["role"], "assistant");
+    assert_eq!(messages[0]["reasoning_content"], "thinking");
+    assert!(
+        messages[0].get("_anthropic_reasoning_replay").is_none(),
+        "messages = {messages:?}"
+    );
+}
+
+#[test]
+fn translate_request_responses_to_google_rejects_reasoning_encrypted_content_items() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": "thinking" }],
+            "encrypted_content": "enc_123"
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Google,
+        "target-model",
+        &mut body,
+        false,
+    )
+    .expect_err("Responses reasoning encrypted_content should still fail closed for Gemini");
+
+    assert!(err.contains("encrypted_content"), "err = {err}");
 }
 
 #[test]
@@ -3998,6 +4080,35 @@ fn assess_request_translation_gemini_to_anthropic_warns_on_dropped_logprobs_cont
         "warnings = {warnings:?}"
     );
     assert!(joined.contains("logprobs"), "warnings = {warnings:?}");
+}
+
+#[test]
+fn assess_request_translation_responses_to_openai_warns_when_reasoning_encrypted_content_is_dropped(
+) {
+    let body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": "thinking" }],
+            "encrypted_content": "opaque_state"
+        }]
+    });
+
+    let assessment = assess_request_translation(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        &body,
+    );
+    let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
+        panic!("expected warning policy, got {assessment:?}");
+    };
+    let joined = warnings.join("\n");
+    assert!(
+        joined.contains("encrypted_content"),
+        "warnings = {warnings:?}"
+    );
+    assert!(joined.contains("dropped"), "warnings = {warnings:?}");
+    assert!(joined.contains("summary"), "warnings = {warnings:?}");
 }
 
 #[test]
@@ -7323,7 +7434,9 @@ fn translate_response_openai_to_claude_restores_server_tool_use_from_marker() {
 }
 
 #[test]
-fn translate_response_openai_to_responses_preserves_custom_and_proxied_tool_kinds() {
+fn translate_response_openai_to_responses_decodes_bridged_function_call_to_custom_tool_call_with_exact_input(
+) {
+    let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let body = json!({
         "id": "chatcmpl_tools",
         "object": "chat.completion",
@@ -7334,19 +7447,11 @@ fn translate_response_openai_to_responses_preserves_custom_and_proxied_tool_kind
                 "tool_calls": [
                     {
                         "id": "call_custom",
-                        "type": "custom",
-                        "function": {
-                            "name": "code_exec",
-                            "arguments": "print('hi')"
-                        }
-                    },
-                    {
-                        "id": "call_server",
                         "type": "function",
-                        "proxied_tool_kind": "anthropic_server_tool_use",
                         "function": {
-                            "name": "web_search",
-                            "arguments": "{\"query\":\"rust\"}"
+                            "name": "__llmup_custom__code_exec",
+                            "arguments": serde_json::to_string(&json!({ "input": exact_input }))
+                                .expect("bridge args")
                         }
                     }
                 ]
@@ -7363,10 +7468,59 @@ fn translate_response_openai_to_responses_preserves_custom_and_proxied_tool_kind
     .unwrap();
 
     let output = out["output"].as_array().expect("responses output");
-    assert_eq!(output[0]["type"], "custom_tool_call");
-    assert_eq!(output[0]["input"], "print('hi')");
-    assert_eq!(output[1]["type"], "function_call");
-    assert_eq!(output[1]["proxied_tool_kind"], "anthropic_server_tool_use");
+    assert_eq!(
+        output[0],
+        json!({
+            "type": "custom_tool_call",
+            "call_id": "call_custom",
+            "name": "code_exec",
+            "input": exact_input
+        })
+    );
+}
+
+#[test]
+fn translate_response_openai_to_responses_keeps_unprefixed_apply_patch_as_function() {
+    let raw_arguments =
+        serde_json::to_string(&json!({ "patch": "*** Begin Patch\n*** End Patch\n" }))
+            .expect("function args");
+    let body = json!({
+        "id": "chatcmpl_tools",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_apply_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": raw_arguments
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+
+    let out = translate_response(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .unwrap();
+
+    let output = out["output"].as_array().expect("responses output");
+    assert_eq!(
+        output[0],
+        json!({
+            "type": "function_call",
+            "call_id": "call_apply_patch",
+            "name": "apply_patch",
+            "arguments": raw_arguments
+        })
+    );
 }
 
 #[test]

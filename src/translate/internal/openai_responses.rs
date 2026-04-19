@@ -24,9 +24,12 @@ use super::response_protocols::{openai_message_reasoning_text, responses_finish_
 use super::tools::{
     content_value_is_effectively_empty, normalized_openai_tool_definitions_from_request,
     normalized_responses_tool_definitions_from_request, normalized_tool_definition_to_openai,
-    normalized_tool_definition_to_responses, openai_tool_call_to_responses_item,
+    normalized_tool_definition_to_openai_with_custom_bridge,
+    normalized_tool_definition_to_responses, openai_responses_custom_tool_bridge_name,
+    openai_tool_call_to_responses_item, openai_tool_call_to_responses_item_decoding_custom_bridge,
     openai_tool_result_content_to_responses_output, responses_item_is_tool_output,
     responses_tool_call_item_to_openai_tool_call_strict,
+    responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict,
     responses_tool_output_to_openai_tool_content, semantic_text_part_to_openai_value,
     semantic_text_part_to_responses_value, semantic_tool_kind_from_value,
     semantic_tool_output_item_type,
@@ -402,7 +405,9 @@ pub(super) fn openai_response_to_responses(body: &Value) -> Result<Value, String
     }
     if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
         for t in tc {
-            output.push(openai_tool_call_to_responses_item(t));
+            output.push(openai_tool_call_to_responses_item_decoding_custom_bridge(
+                t,
+            )?);
         }
     }
     if let Some(audio_output) = audio_output {
@@ -482,6 +487,7 @@ pub(super) fn responses_to_messages(
     body: &mut Value,
     target_format: UpstreamFormat,
 ) -> Result<(), String> {
+    let bridge_custom_responses_semantics = target_format == UpstreamFormat::OpenAiCompletion;
     let controls = responses_normalized_request_controls(body)?;
     let profile = shared_control_profile_for_target(target_format);
     let input = body.get("input").ok_or("missing input")?;
@@ -553,11 +559,18 @@ pub(super) fn responses_to_messages(
                 }
             }
             "function_call" | "custom_tool_call" => {
-                let Some(tc) = responses_tool_call_item_to_openai_tool_call_strict(
-                    &item,
-                    translation_target_label(target_format),
-                )?
-                else {
+                let tc = if bridge_custom_responses_semantics {
+                    responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
+                        &item,
+                        translation_target_label(target_format),
+                    )?
+                } else {
+                    responses_tool_call_item_to_openai_tool_call_strict(
+                        &item,
+                        translation_target_label(target_format),
+                    )?
+                };
+                let Some(tc) = tc else {
                     idx += 1;
                     continue;
                 };
@@ -708,8 +721,10 @@ pub(super) fn responses_to_messages(
         }
     }
     if let Some(tool_choice) = body.get("tool_choice").cloned() {
-        if let Some(mapped_tool_choice) = responses_tool_choice_to_openai_tool_choice(&tool_choice)
-        {
+        if let Some(mapped_tool_choice) = responses_tool_choice_to_openai_tool_choice(
+            &tool_choice,
+            bridge_custom_responses_semantics,
+        ) {
             out.insert("tool_choice".to_string(), mapped_tool_choice);
         }
     }
@@ -785,14 +800,18 @@ pub(super) fn responses_to_messages(
         );
     }
 
-    // Convert tools from Responses API format to Chat Completions format
-    // Responses: { "name": "...", "description": "...", "parameters": {...} }
-    // Chat: { "type": "function", "function": { "name": "...", "description": "...", "parameters": {...} } }
-    // OpenAI-family custom tools stay as top-level { type: "custom", name, ... }.
+    // Convert tools from Responses API format to Chat Completions format.
+    // The OpenAICompletion bridge rewrites Responses custom tools into synthetic function tools.
     if tools.is_some() {
         let converted_tools = normalized_responses_tool_definitions_from_request(body)?
             .into_iter()
-            .map(|tool| normalized_tool_definition_to_openai(&tool))
+            .map(|tool| {
+                if bridge_custom_responses_semantics {
+                    normalized_tool_definition_to_openai_with_custom_bridge(&tool)
+                } else {
+                    normalized_tool_definition_to_openai(&tool)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if !converted_tools.is_empty() {
             out.insert("tools".to_string(), Value::Array(converted_tools));
@@ -1060,7 +1079,10 @@ pub(super) fn messages_to_responses(body: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
-fn responses_tool_choice_to_openai_tool_choice(choice: &Value) -> Option<Value> {
+fn responses_tool_choice_to_openai_tool_choice(
+    choice: &Value,
+    bridge_custom_responses_semantics: bool,
+) -> Option<Value> {
     if choice.is_string() {
         return Some(choice.clone());
     }
@@ -1078,10 +1100,19 @@ fn responses_tool_choice_to_openai_tool_choice(choice: &Value) -> Option<Value> 
         }
         "custom" => {
             let name = openai_named_tool_choice_name(choice, "custom")?;
-            Some(serde_json::json!({
-                "type": "custom",
-                "custom": { "name": name }
-            }))
+            if bridge_custom_responses_semantics {
+                Some(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": openai_responses_custom_tool_bridge_name(name)
+                    }
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "type": "custom",
+                    "custom": { "name": name }
+                }))
+            }
         }
         "allowed_tools" => {
             let mode = obj.get("mode")?;
@@ -1093,6 +1124,18 @@ fn responses_tool_choice_to_openai_tool_choice(choice: &Value) -> Option<Value> 
                         "type": "function",
                         "function": { "name": tool.get("name").cloned().unwrap_or(Value::Null) }
                     }),
+                    Some("custom") if bridge_custom_responses_semantics => tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(|name| {
+                            serde_json::json!({
+                                "type": "function",
+                                "function": {
+                                    "name": openai_responses_custom_tool_bridge_name(name)
+                                }
+                            })
+                        })
+                        .unwrap_or_else(|| tool.clone()),
                     Some("custom") if tool.get("name").is_some() => serde_json::json!({
                         "type": "custom",
                         "custom": { "name": tool.get("name").cloned().unwrap_or(Value::Null) }

@@ -239,6 +239,37 @@ pub(crate) fn openai_custom_tool_input_raw(value: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+pub(crate) const OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX: &str = "__llmup_custom__";
+
+pub(crate) fn openai_responses_custom_tool_bridge_name(name: &str) -> String {
+    format!("{OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX}{name}")
+}
+
+fn openai_responses_custom_tool_name_from_bridge(name: &str) -> Option<&str> {
+    name.strip_prefix(OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX)
+        .filter(|name| !name.is_empty())
+}
+
+pub(crate) fn openai_responses_custom_tool_bridge_arguments(input: &str) -> Result<String, String> {
+    serde_json::to_string(&serde_json::json!({ "input": input }))
+        .map_err(|err| format!("serialize OpenAI Responses custom tool bridge arguments: {err}"))
+}
+
+fn openai_responses_custom_tool_input_from_bridge_arguments(
+    arguments: &str,
+) -> Result<String, String> {
+    let value: Value = serde_json::from_str(arguments)
+        .map_err(|err| format!("decode OpenAI Responses custom tool bridge arguments: {err}"))?;
+    value
+        .get("input")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or(
+            "OpenAI Responses custom tool bridge arguments must contain a string `input` field."
+                .to_string(),
+        )
+}
+
 pub(crate) fn openai_tool_arguments_raw(tool_call: &Value) -> Option<&str> {
     tool_call
         .get("function")
@@ -453,6 +484,39 @@ pub(crate) fn normalized_tool_definition_to_openai(
             "OpenAI Responses namespace tool `{}` cannot be faithfully translated to OpenAI Chat Completions",
             namespace.name
         )),
+    }
+}
+
+pub(crate) fn normalized_tool_definition_to_openai_with_custom_bridge(
+    tool: &NormalizedOpenAiFamilyToolDef,
+) -> Result<Value, String> {
+    match tool {
+        NormalizedOpenAiFamilyToolDef::Custom(custom) => {
+            let mut payload = serde_json::Map::new();
+            payload.insert(
+                "name".to_string(),
+                Value::String(openai_responses_custom_tool_bridge_name(&custom.name)),
+            );
+            if let Some(description) = custom.description.clone() {
+                payload.insert("description".to_string(), description);
+            }
+            payload.insert(
+                "parameters".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "input": { "type": "string" }
+                    },
+                    "required": ["input"],
+                    "additionalProperties": false
+                }),
+            );
+            Ok(serde_json::json!({
+                "type": "function",
+                "function": Value::Object(payload)
+            }))
+        }
+        _ => normalized_tool_definition_to_openai(tool),
     }
 }
 
@@ -675,48 +739,98 @@ pub(crate) fn responses_tool_call_item_to_openai_tool_call_strict(
     }
 }
 
+pub(crate) fn responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
+    item: &Value,
+    target_label: &str,
+) -> Result<Option<Value>, String> {
+    let Some(tool_call) = normalized_responses_tool_call(item)? else {
+        return Ok(None);
+    };
+    match tool_call {
+        NormalizedOpenAiFamilyToolCall::Function {
+            name,
+            namespace: Some(_),
+            ..
+        } => Err(format!(
+            "OpenAI Responses namespaced tool call `{name}` cannot be faithfully translated to {target_label}"
+        )),
+        NormalizedOpenAiFamilyToolCall::Custom {
+            name,
+            namespace: Some(_),
+            ..
+        } => Err(format!(
+            "OpenAI Responses namespaced tool call `{name}` cannot be faithfully translated to {target_label}"
+        )),
+        NormalizedOpenAiFamilyToolCall::Custom {
+            id,
+            name,
+            input,
+            proxied_tool_kind,
+            ..
+        } => {
+            let mut tool_call = serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": openai_responses_custom_tool_bridge_name(&name),
+                    "arguments": openai_responses_custom_tool_bridge_arguments(&input)?
+                }
+            });
+            if let Some(proxied_tool_kind) = proxied_tool_kind {
+                tool_call["proxied_tool_kind"] = proxied_tool_kind;
+            }
+            Ok(Some(tool_call))
+        }
+        other => Ok(Some(normalized_tool_call_to_openai(&other))),
+    }
+}
+
+fn normalized_tool_call_to_responses_item(call: NormalizedOpenAiFamilyToolCall) -> Value {
+    match call {
+        NormalizedOpenAiFamilyToolCall::Function {
+            id,
+            name,
+            arguments,
+            proxied_tool_kind,
+            ..
+        } => {
+            let mut item = serde_json::json!({
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                "arguments": arguments
+            });
+            if let Some(proxied_tool_kind) = proxied_tool_kind {
+                item["proxied_tool_kind"] = proxied_tool_kind;
+            }
+            item
+        }
+        NormalizedOpenAiFamilyToolCall::Custom {
+            id,
+            name,
+            input,
+            proxied_tool_kind,
+            ..
+        } => {
+            let mut item = serde_json::json!({
+                "type": "custom_tool_call",
+                "call_id": id,
+                "name": name,
+                "input": input
+            });
+            if let Some(proxied_tool_kind) = proxied_tool_kind {
+                item["proxied_tool_kind"] = proxied_tool_kind;
+            }
+            item
+        }
+    }
+}
+
 pub(crate) fn openai_tool_call_to_responses_item(tool_call: &Value) -> Value {
     normalized_openai_tool_call(tool_call)
         .ok()
         .flatten()
-        .map(|call| match call {
-            NormalizedOpenAiFamilyToolCall::Function {
-                id,
-                name,
-                arguments,
-                proxied_tool_kind,
-                ..
-            } => {
-                let mut item = serde_json::json!({
-                    "type": "function_call",
-                    "call_id": id,
-                    "name": name,
-                    "arguments": arguments
-                });
-                if let Some(proxied_tool_kind) = proxied_tool_kind {
-                    item["proxied_tool_kind"] = proxied_tool_kind;
-                }
-                item
-            }
-            NormalizedOpenAiFamilyToolCall::Custom {
-                id,
-                name,
-                input,
-                proxied_tool_kind,
-                ..
-            } => {
-                let mut item = serde_json::json!({
-                    "type": "custom_tool_call",
-                    "call_id": id,
-                    "name": name,
-                    "input": input
-                });
-                if let Some(proxied_tool_kind) = proxied_tool_kind {
-                    item["proxied_tool_kind"] = proxied_tool_kind;
-                }
-                item
-            }
-        })
+        .map(normalized_tool_call_to_responses_item)
         .unwrap_or_else(|| {
             serde_json::json!({
                 "type": "function_call",
@@ -725,4 +839,49 @@ pub(crate) fn openai_tool_call_to_responses_item(tool_call: &Value) -> Value {
                 "arguments": openai_tool_arguments_raw(tool_call).unwrap_or("{}")
             })
         })
+}
+
+pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge(
+    tool_call: &Value,
+) -> Result<Value, String> {
+    let call = match normalized_openai_tool_call(tool_call) {
+        Ok(Some(call)) => call,
+        Ok(None) | Err(_) => {
+            return Ok(openai_tool_call_to_responses_item(tool_call));
+        }
+    };
+
+    match call {
+        NormalizedOpenAiFamilyToolCall::Function {
+            id,
+            name,
+            arguments,
+            namespace,
+            proxied_tool_kind,
+        } => {
+            if let Some(custom_name) = openai_responses_custom_tool_name_from_bridge(&name) {
+                let mut item = serde_json::json!({
+                    "type": "custom_tool_call",
+                    "call_id": id,
+                    "name": custom_name,
+                    "input": openai_responses_custom_tool_input_from_bridge_arguments(&arguments)?
+                });
+                if let Some(proxied_tool_kind) = proxied_tool_kind {
+                    item["proxied_tool_kind"] = proxied_tool_kind;
+                }
+                Ok(item)
+            } else {
+                Ok(normalized_tool_call_to_responses_item(
+                    NormalizedOpenAiFamilyToolCall::Function {
+                        id,
+                        name,
+                        arguments,
+                        namespace,
+                        proxied_tool_kind,
+                    },
+                ))
+            }
+        }
+        other => Ok(normalized_tool_call_to_responses_item(other)),
+    }
 }
