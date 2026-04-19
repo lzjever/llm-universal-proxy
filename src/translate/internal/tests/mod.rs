@@ -2379,6 +2379,35 @@ fn translate_request_openai_to_gemini_tool_turns_use_dummy_signature_without_rea
 }
 
 #[test]
+fn translate_request_openai_to_gemini_non_tool_assistant_turn_keeps_reasoning_as_thought() {
+    let mut body = json!({
+        "model": "gemini-1.5",
+        "messages": [
+            { "role": "user", "content": "Hi" },
+            {
+                "role": "assistant",
+                "reasoning_content": "internal reasoning",
+                "content": "Visible answer"
+            }
+        ]
+    });
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Google,
+        "gemini-3-pro",
+        &mut body,
+        false,
+    )
+    .unwrap();
+    let assistant_parts = body["contents"][1]["parts"]
+        .as_array()
+        .expect("assistant parts");
+    assert_eq!(assistant_parts[0]["thought"], true);
+    assert_eq!(assistant_parts[0]["text"], "internal reasoning");
+    assert_eq!(assistant_parts[1]["text"], "Visible answer");
+}
+
+#[test]
 fn translate_request_openai_to_claude_omitted_stream_defaults_false() {
     let mut body = json!({
         "model": "claude-3",
