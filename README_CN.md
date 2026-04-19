@@ -61,7 +61,7 @@ git clone https://github.com/lzjever/llm-universal-proxy.git
 cd llm-universal-proxy
 
 # 构建 release 版本
-cargo build --release
+cargo build --locked --release
 
 # 二进制文件位于 ./target/release/llm-universal-proxy
 ```
@@ -91,7 +91,7 @@ make test-binary-smoke
 常用方式：
 
 ```bash
-cargo build --release
+cargo build --locked --release
 python3 scripts/real_cli_matrix.py
 ```
 

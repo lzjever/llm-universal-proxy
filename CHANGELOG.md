@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.2.6 - 2026-04-19
+
 - Propagated configured `max_output_tokens` defaults from resolved model limits into request translation when clients omit an explicit output cap, so Anthropic, OpenAI Completions, and sibling target protocols no longer silently fall back to incorrect hard-coded defaults such as `4096`.
 - Updated the generated Codex custom model catalog to follow the current real schema and to compute default `auto_compact_token_limit` from available input budget: `0.85 * (context_window - max_output_tokens)` when both limits are known, while keeping the older `0.85 * context_window` fallback only when no output budget is available.
 - Hardened long-session tool replay boundaries by marking incomplete or truncated tool calls as non-replayable and intentionally degrading later replay / bridge paths instead of pretending the partial call is still valid structured history.

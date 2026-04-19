@@ -126,7 +126,7 @@ git clone https://github.com/lzjever/llm-universal-proxy.git
 cd llm-universal-proxy
 
 # Build release binary
-cargo build --release
+cargo build --locked --release
 
 # The binary will be at ./target/release/llm-universal-proxy
 ```
@@ -156,7 +156,7 @@ The formal automated real-client matrix uses `scripts/real_cli_matrix.py` as the
 Typical flow:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 python3 scripts/real_cli_matrix.py
 ```
 
