@@ -573,7 +573,12 @@ class RealCliMatrixTests(unittest.TestCase):
                 },
                 "entrypoint": {
                     "path": "main.py",
-                    "expect_stdout_contains": ["2 + 3 = 5", "4 * 5 = 20"],
+                    "expect_stdout_contains": [
+                        "2 + 3 = 5",
+                        "-1 + 5 = 4",
+                        "0 + 0 = 0",
+                        "4 * 5 = 20",
+                    ],
                 },
             },
         )
@@ -601,6 +606,8 @@ class RealCliMatrixTests(unittest.TestCase):
                     from calc import add, multiply
 
                     print(f"2 + 3 = {add(2, 3)}")
+                    print(f"-1 + 5 = {add(-1, 5)}")
+                    print(f"0 + 0 = {add(0, 0)}")
                     print(f"4 * 5 = {multiply(4, 5)}")
                     """
                 ).strip()
@@ -634,7 +641,12 @@ class RealCliMatrixTests(unittest.TestCase):
                 },
                 "entrypoint": {
                     "path": "main.py",
-                    "expect_stdout_contains": ["2 + 3 = 5", "4 * 5 = 20"],
+                    "expect_stdout_contains": [
+                        "2 + 3 = 5",
+                        "-1 + 5 = 4",
+                        "0 + 0 = 0",
+                        "4 * 5 = 20",
+                    ],
                 },
             },
         )
@@ -655,7 +667,7 @@ class RealCliMatrixTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (workspace_dir / "main.py").write_text(
-                'print("2 + 3 = 6")\nprint("4 * 5 = 20")\n',
+                'print("2 + 3 = 6")\nprint("-1 + 5 = 4")\nprint("0 + 0 = 0")\nprint("4 * 5 = 20")\n',
                 encoding="utf-8",
             )
 
@@ -685,7 +697,12 @@ class RealCliMatrixTests(unittest.TestCase):
                 },
                 "entrypoint": {
                     "path": "main.py",
-                    "expect_stdout_contains": ["2 + 3 = 5", "4 * 5 = 20"],
+                    "expect_stdout_contains": [
+                        "2 + 3 = 5",
+                        "-1 + 5 = 4",
+                        "0 + 0 = 0",
+                        "4 * 5 = 20",
+                    ],
                 },
             },
         )
@@ -711,6 +728,8 @@ class RealCliMatrixTests(unittest.TestCase):
                     from calc import add, multiply
 
                     print(f"2 + 3 = {add(2, 3)}")
+                    print(f"-1 + 5 = {add(-1, 5)}")
+                    print(f"0 + 0 = {add(0, 0)}")
                     print(f"4 * 5 = {multiply(4, 5)}")
                     """
                 ).strip()

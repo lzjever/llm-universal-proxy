@@ -1,9 +1,9 @@
 {
   "id": "python_bugfix",
   "kind": "long_horizon",
-  "description": "Workspace-edit task that fixes the add() bug in calc.py.",
-  "prompt": "Read calc.py. The add function uses minus instead of plus. Fix it by changing the implementation to return a + b. Then read main.py and confirm the output is correct.",
-  "timeout_secs": 240,
+  "description": "Workspace-edit task that fixes the add() regression while preserving the public API and validating several scenarios.",
+  "prompt": "Inspect calc.py and main.py. There is a regression in add(): it currently subtracts instead of adding. Fix the implementation so add(a, b) returns a + b without changing the function name, argument list, or multiply() behavior. Then validate the workspace by running main.py and make sure the printed output is correct for positive, negative, and zero addition cases, plus the existing multiply case. In your final response, briefly summarize what changed and how you verified it.",
+  "timeout_secs": 300,
   "workspace_template": "workspace",
   "verifier": {
     "type": "python_source_and_output",
@@ -20,7 +20,12 @@
     },
     "entrypoint": {
       "path": "main.py",
-      "expect_stdout_contains": ["2 + 3 = 5", "4 * 5 = 20"]
+      "expect_stdout_contains": [
+        "2 + 3 = 5",
+        "-1 + 5 = 4",
+        "0 + 0 = 0",
+        "4 * 5 = 20"
+      ]
     }
   }
 }
