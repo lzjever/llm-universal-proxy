@@ -476,7 +476,7 @@ fn translate_sse_event_responses_to_anthropic_rejects_custom_tool_call_and_suppr
 }
 
 #[test]
-fn translate_sse_event_responses_to_anthropic_does_not_fallback_after_reasoning_rejection() {
+fn translate_sse_event_responses_to_anthropic_preserves_reasoning_before_text_and_completion() {
     let reasoning_event = serde_json::json!({
         "type": "response.reasoning_summary_text.delta",
         "delta": "think"
@@ -501,33 +501,45 @@ fn translate_sse_event_responses_to_anthropic_does_not_fallback_after_reasoning_
     });
 
     let mut state = StreamState::default();
-    let error_joined = translate_sse_event(
+    let events = translate_sse_event(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         &reasoning_event,
         &mut state,
     )
     .into_iter()
-    .map(|b| String::from_utf8_lossy(&b).to_string())
-    .collect::<Vec<_>>()
-    .join("\n");
-    assert!(error_joined.contains("event: error"), "{error_joined}");
-
-    let content_out = translate_sse_event(
+    .chain(translate_sse_event(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         &content_event,
         &mut state,
-    );
-    assert!(content_out.is_empty(), "{content_out:?}");
-
-    let finish_out = translate_sse_event(
+    ))
+    .chain(translate_sse_event(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         &complete_event,
         &mut state,
-    );
-    assert!(finish_out.is_empty(), "{finish_out:?}");
+    ))
+    .map(|bytes| parse_sse_json(&bytes))
+    .collect::<Vec<_>>();
+
+    assert_eq!(events[0]["type"], "message_start");
+    assert_eq!(events[1]["type"], "content_block_start");
+    assert_eq!(events[1]["content_block"]["type"], "thinking");
+    assert_eq!(events[2]["type"], "content_block_delta");
+    assert_eq!(events[2]["delta"]["type"], "thinking_delta");
+    assert_eq!(events[2]["delta"]["thinking"], "think");
+    assert_eq!(events[3]["type"], "content_block_stop");
+    assert_eq!(events[4]["type"], "content_block_start");
+    assert_eq!(events[4]["content_block"]["type"], "text");
+    assert_eq!(events[5]["type"], "content_block_delta");
+    assert_eq!(events[5]["delta"]["type"], "text_delta");
+    assert_eq!(events[5]["delta"]["text"], "Hi");
+    assert_eq!(events[6]["type"], "content_block_stop");
+    assert_eq!(events[7]["type"], "message_delta");
+    assert_eq!(events[7]["delta"]["stop_reason"], "end_turn");
+    assert_eq!(events[8]["type"], "message_stop");
+    assert!(events.iter().all(|event| event["type"] != "error"));
 }
 
 #[test]

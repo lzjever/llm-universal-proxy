@@ -315,7 +315,10 @@ fn gemini_stream_non_success_finish_reasons_do_not_collapse_to_success() {
             }
         });
         let mut state = StreamState::default();
-        let chunks = gemini_event_to_openai_chunks(&event, &mut state);
+        let mut chunks = gemini_event_to_openai_chunks(&event, &mut state);
+        if let Some(chunk) = flush_pending_gemini_finish_chunk(&mut state) {
+            chunks.push(chunk);
+        }
         let finish_chunk = chunks
             .iter()
             .find(|chunk| chunk["choices"][0]["finish_reason"].is_string())
