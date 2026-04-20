@@ -1220,22 +1220,44 @@ fn emit_responses_tool_call_delta(
     ));
 }
 
+struct ResponsesToolCallDone {
+    call_id: String,
+    name: String,
+    arguments: String,
+    output_index: usize,
+    tool_type: String,
+    proxied_tool_kind: Option<String>,
+}
+
+struct ResponsesToolCallDoneContext<'a> {
+    response_id: &'a str,
+    incomplete_reason: Option<&'a str>,
+    terminated_without_finish_reason: bool,
+}
+
 fn emit_responses_tool_call_done(
     state: &mut StreamState,
-    response_id: &str,
-    call_id: &str,
-    name: &str,
-    arguments: &str,
-    output_index: usize,
-    tool_type: &str,
-    proxied_tool_kind: Option<String>,
-    incomplete_reason: Option<&str>,
-    terminated_without_finish_reason: bool,
+    tool_call: ResponsesToolCallDone,
+    context: ResponsesToolCallDoneContext<'_>,
     out: &mut Vec<Vec<u8>>,
 ) {
-    let payload_field = responses_tool_call_payload_field(tool_type);
+    let ResponsesToolCallDone {
+        call_id,
+        name,
+        arguments,
+        output_index,
+        tool_type,
+        proxied_tool_kind,
+    } = tool_call;
+    let ResponsesToolCallDoneContext {
+        response_id,
+        incomplete_reason,
+        terminated_without_finish_reason,
+    } = context;
+
+    let payload_field = responses_tool_call_payload_field(&tool_type);
     let mut args_done_ev = serde_json::json!({
-        "type": responses_tool_call_done_event_type(tool_type),
+        "type": responses_tool_call_done_event_type(&tool_type),
         "sequence_number": next_responses_seq(state),
         "response_id": response_id,
         "call_id": call_id,
@@ -1243,9 +1265,9 @@ fn emit_responses_tool_call_done(
         "item_id": format!("fc_{}", call_id),
         "output_index": output_index,
     });
-    args_done_ev[payload_field] = Value::String(arguments.to_string());
+    args_done_ev[payload_field] = Value::String(arguments.clone());
     out.push(format_sse_event(
-        responses_tool_call_done_event_type(tool_type),
+        responses_tool_call_done_event_type(&tool_type),
         &args_done_ev,
     ));
 
@@ -1256,20 +1278,20 @@ fn emit_responses_tool_call_done(
         "output_index": output_index,
         "item": {
             "id": format!("fc_{}", call_id),
-            "type": responses_tool_call_item_type(tool_type),
+            "type": responses_tool_call_item_type(&tool_type),
             "call_id": call_id,
             "name": name,
         }
     });
-    output_item_done_ev["item"][payload_field] = Value::String(arguments.to_string());
+    output_item_done_ev["item"][payload_field] = Value::String(arguments.clone());
     if let Some(proxied_tool_kind) = proxied_tool_kind {
         output_item_done_ev["item"]["proxied_tool_kind"] = Value::String(proxied_tool_kind);
     }
     maybe_mark_responses_stream_tool_call_item_non_replayable(
         &mut output_item_done_ev["item"],
-        name,
-        tool_type,
-        arguments,
+        &name,
+        &tool_type,
+        &arguments,
         incomplete_reason,
         terminated_without_finish_reason,
     );
@@ -1333,15 +1355,19 @@ fn emit_pending_responses_tool_call_done_events(
     {
         emit_responses_tool_call_done(
             state,
-            response_id,
-            &call_id,
-            &name,
-            &arguments,
-            output_index,
-            &tool_type,
-            proxied_tool_kind,
-            incomplete_reason,
-            terminated_without_finish_reason,
+            ResponsesToolCallDone {
+                call_id,
+                name,
+                arguments,
+                output_index,
+                tool_type,
+                proxied_tool_kind,
+            },
+            ResponsesToolCallDoneContext {
+                response_id,
+                incomplete_reason,
+                terminated_without_finish_reason,
+            },
             out,
         );
     }
