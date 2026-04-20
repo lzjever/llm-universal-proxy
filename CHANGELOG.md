@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.2.7 - 2026-04-20
+
+- Routed dashboard-mode runtime logs into an in-memory TUI log buffer and rendered them inside a new `Runtime Logs` panel, so live `warn!` / `info!` / `error!` output no longer overwrites the alternate-screen dashboard while the proxy is serving traffic.
+- Rebalanced the dashboard activity area so recent latency is shown as a compact trend sparkline and recent-request tables stay readable across tighter terminal heights while sharing space cleanly with live runtime logs.
+- Fixed OpenAI Responses sink tool-stream finalization so pending tool calls emit the expected done events promptly on tool-call finishes instead of leaving completion semantics to later terminal cleanup paths.
+- Improved the Codex interactive wrapper flow by generating explicit `apply_patch_tool_type: freeform` metadata in temporary catalogs, disabling `view_image` for text-only lanes, and refreshing the English / Chinese manual-testing docs around those safer defaults.
+
 ## v0.2.6 - 2026-04-19
 
 - Propagated configured `max_output_tokens` defaults from resolved model limits into request translation when clients omit an explicit output cap, so Anthropic, OpenAI Completions, and sibling target protocols no longer silently fall back to incorrect hard-coded defaults such as `4096`.
