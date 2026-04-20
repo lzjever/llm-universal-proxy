@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod dashboard;
+pub(crate) mod dashboard_logs;
 pub mod debug_trace;
 pub mod detect;
 pub mod discovery;

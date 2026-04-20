@@ -24,6 +24,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::dashboard::run_dashboard;
+use crate::dashboard_logs;
 use crate::telemetry::RuntimeMetrics;
 
 use state::{build_runtime_state, AdminAccess, AppState};
@@ -66,12 +67,7 @@ async fn run_internal(
             .validate()
             .map_err(|e| format!("invalid config: {e}"))?;
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("llm_universal_proxy=info".parse()?),
-        )
-        .init();
+    init_tracing(dashboard_enabled)?;
 
     let listen = config
         .listen
@@ -84,6 +80,26 @@ async fn run_internal(
     } else {
         run_with_listener(config, listener).await
     }
+}
+
+fn init_tracing(dashboard_enabled: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("llm_universal_proxy=info".parse()?);
+
+    if dashboard_enabled {
+        tracing_subscriber::fmt()
+            .compact()
+            .without_time()
+            .with_target(false)
+            .with_env_filter(env_filter)
+            .with_ansi(false)
+            .with_writer(dashboard_logs::make_writer())
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
+
+    Ok(())
 }
 
 /// Run the proxy on an already-bound listener. Used by integration tests to bind to port 0 and get the port.

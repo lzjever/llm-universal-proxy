@@ -10,13 +10,13 @@ use crossterm::{
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::{Alignment, Color, CrosstermBackend, Line, Modifier, Span, Style},
-    symbols,
     text::Text,
-    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, Gauge, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table, Wrap},
     Terminal,
 };
 
 use crate::config::{AuthPolicy, Config};
+use crate::dashboard_logs::DashboardLogSnapshot;
 use crate::hooks::HookSnapshot;
 use crate::server::{DashboardNamespaceSnapshot, DashboardRuntimeHandle, DashboardUpstreamStatus};
 use crate::telemetry::{RequestOutcome, RuntimeMetrics};
@@ -57,7 +57,9 @@ fn dashboard_loop(
     loop {
         let snapshot = runtime.snapshot();
         let metrics_snapshot = metrics.snapshot(&snapshot.config);
-        terminal.draw(|frame| draw_dashboard(frame, &snapshot, &metrics_snapshot))?;
+        let log_snapshot = crate::dashboard_logs::shared().snapshot();
+        terminal
+            .draw(|frame| draw_dashboard(frame, &snapshot, &metrics_snapshot, &log_snapshot))?;
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
@@ -76,6 +78,7 @@ fn draw_dashboard(
     frame: &mut ratatui::Frame<'_>,
     runtime_snapshot: &DashboardNamespaceSnapshot,
     metrics_snapshot: &crate::telemetry::MetricsSnapshot,
+    log_snapshot: &DashboardLogSnapshot,
 ) {
     let area = frame.area();
     frame.render_widget(
@@ -109,12 +112,26 @@ fn draw_dashboard(
         runtime_snapshot.hooks.as_ref(),
     );
 
-    let lower = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
-        .split(vertical[3]);
-    render_upstreams(frame, lower[0], metrics_snapshot);
-    render_recent(frame, lower[1], metrics_snapshot);
+    if vertical[3].height >= 18 {
+        let lower = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(10), Constraint::Length(8)])
+            .split(vertical[3]);
+        let activity = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+            .split(lower[0]);
+        render_upstreams(frame, activity[0], metrics_snapshot);
+        render_recent(frame, activity[1], metrics_snapshot, None);
+        render_logs(frame, lower[1], log_snapshot);
+    } else {
+        let lower = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+            .split(vertical[3]);
+        render_upstreams(frame, lower[0], metrics_snapshot);
+        render_recent(frame, lower[1], metrics_snapshot, Some(log_snapshot));
+    }
 }
 
 fn render_header(
@@ -396,40 +413,60 @@ fn render_recent(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     snapshot: &crate::telemetry::MetricsSnapshot,
+    logs: Option<&DashboardLogSnapshot>,
 ) {
+    let constraints = if logs.is_some() {
+        vec![
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(8),
+        ]
+    } else {
+        vec![Constraint::Length(5), Constraint::Min(8)]
+    };
     let inner = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(8)])
+        .constraints(constraints)
         .split(area);
 
-    let history: Vec<(f64, f64)> = snapshot
+    render_latency(frame, inner[0], snapshot);
+    render_recent_requests(frame, inner[1], snapshot);
+    if let Some(logs) = logs {
+        render_logs(frame, inner[2], logs);
+    }
+}
+
+fn render_latency(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &crate::telemetry::MetricsSnapshot,
+) {
+    let history: Vec<u64> = snapshot
         .recent_requests
         .iter()
-        .enumerate()
         .rev()
-        .map(|(index, item)| (index as f64, item.duration_ms as f64))
+        .map(|item| item.duration_ms.min(u64::MAX as u128) as u64)
         .collect();
-    let chart = Chart::new(vec![Dataset::default()
-        .name("Latency")
-        .marker(symbols::Marker::Braille)
+    let latest = snapshot
+        .recent_requests
+        .first()
+        .map(|item| item.duration_ms);
+    let title = latest
+        .map(|value| format!("Latency Trend (latest {value} ms)"))
+        .unwrap_or_else(|| "Latency Trend".to_string());
+    let sparkline = Sparkline::default()
+        .block(panel(title.as_str()))
         .style(Style::default().fg(Color::Rgb(106, 227, 199)))
-        .data(&history)])
-    .block(panel("Recent Latency ms"))
-    .x_axis(
-        Axis::default()
-            .bounds([0.0, 12.0])
-            .labels([Line::from("old"), Line::from("new")]),
-    )
-    .y_axis(
-        Axis::default()
-            .bounds([0.0, max_latency(snapshot) as f64])
-            .labels([
-                Line::from("0"),
-                Line::from(max_latency(snapshot).to_string()),
-            ]),
-    );
-    frame.render_widget(chart, inner[0]);
+        .max(max_latency(snapshot).min(u64::MAX as u128) as u64)
+        .data(if history.is_empty() { vec![0] } else { history });
+    frame.render_widget(sparkline, area);
+}
 
+fn render_recent_requests(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &crate::telemetry::MetricsSnapshot,
+) {
     let rows = snapshot.recent_requests.iter().map(|req| {
         let (status_text, status_style) = match req.outcome {
             RequestOutcome::Success => (
@@ -446,35 +483,30 @@ fn render_recent(
             ),
         };
         Row::new(vec![
-            Cell::from(req.path.clone()),
-            Cell::from(req.client_model.clone()),
-            Cell::from(req.upstream_name.clone().unwrap_or_else(|| "-".to_string())),
-            Cell::from(if req.stream { "yes" } else { "no" }),
+            Cell::from(truncate_text(&req.path, 22)),
+            Cell::from(truncate_text(&req.client_model, 20)),
+            Cell::from(truncate_text(
+                req.upstream_name.as_deref().unwrap_or("-"),
+                14,
+            )),
+            Cell::from(if req.stream { "Y" } else { "-" }),
             Cell::from(status_text).style(status_style),
-            Cell::from(format!("{} ms", req.duration_ms)),
+            Cell::from(req.duration_ms.to_string()),
         ])
     });
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(22),
             Constraint::Percentage(24),
-            Constraint::Percentage(20),
+            Constraint::Percentage(24),
+            Constraint::Percentage(18),
+            Constraint::Percentage(8),
             Constraint::Percentage(10),
-            Constraint::Percentage(10),
-            Constraint::Percentage(14),
+            Constraint::Percentage(16),
         ],
     )
     .header(
-        Row::new(vec![
-            "Path",
-            "Client Model",
-            "Upstream",
-            "SSE",
-            "Status",
-            "Latency",
-        ])
-        .style(
+        Row::new(vec!["Path", "Model", "Upstream", "SSE", "Code", "Ms"]).style(
             Style::default()
                 .fg(Color::Rgb(248, 208, 111))
                 .add_modifier(Modifier::BOLD),
@@ -482,7 +514,40 @@ fn render_recent(
     )
     .block(panel("Recent Requests"))
     .column_spacing(1);
-    frame.render_widget(table, inner[1]);
+    frame.render_widget(table, area);
+}
+
+fn render_logs(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &DashboardLogSnapshot) {
+    let content_width = area.width.saturating_sub(4) as usize;
+    let visible_lines = area.height.saturating_sub(2) as usize;
+    let entries = snapshot
+        .lines
+        .iter()
+        .rev()
+        .take(visible_lines)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let lines = if entries.is_empty() {
+        vec![Line::styled(
+            "No runtime logs yet",
+            Style::default().fg(Color::Rgb(142, 150, 170)),
+        )]
+    } else {
+        entries
+            .into_iter()
+            .rev()
+            .map(|entry| {
+                let truncated = truncate_text(&entry, content_width.max(8));
+                Line::styled(truncated, log_style(&entry))
+            })
+            .collect()
+    };
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(panel("Runtime Logs")),
+        area,
+    );
 }
 
 fn panel(title: &str) -> Block<'_> {
@@ -564,4 +629,35 @@ fn max_latency(snapshot: &crate::telemetry::MetricsSnapshot) -> u128 {
         .max()
         .unwrap_or(1)
         .max(1)
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return value.chars().take(max_chars).collect();
+    }
+
+    let kept = max_chars.saturating_sub(3);
+    format!("{}...", value.chars().take(kept).collect::<String>())
+}
+
+fn log_style(line: &str) -> Style {
+    match line.split_whitespace().next().unwrap_or_default() {
+        "ERROR" => Style::default()
+            .fg(Color::Rgb(255, 123, 114))
+            .add_modifier(Modifier::BOLD),
+        "WARN" => Style::default()
+            .fg(Color::Rgb(255, 184, 108))
+            .add_modifier(Modifier::BOLD),
+        "INFO" => Style::default().fg(Color::Rgb(143, 199, 255)),
+        "DEBUG" => Style::default().fg(Color::Rgb(196, 167, 231)),
+        _ => Style::default().fg(Color::Rgb(222, 226, 230)),
+    }
 }
