@@ -1,5 +1,7 @@
 use super::*;
 
+const INTERNAL_TOOL_BRIDGE_CONTEXT_FIELD: &str = "_llmup_tool_bridge_context";
+
 #[test]
 fn classify_request_boundary_rejects_translated_stateful_responses_controls() {
     let decision = classify_request_boundary(
@@ -190,6 +192,68 @@ async fn live_responses_plain_text_custom_tool_bridge_to_openai_balanced_keeps_v
         upstream_body.get("_llmup_tool_bridge_context").is_none(),
         "internal bridge context must not be sent upstream: {upstream_body:?}"
     );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_rejects_external_tool_bridge_context_ingress() {
+    let response_body = serde_json::json!({
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hi" },
+            "finish_reason": "stop"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            }],
+            "_llmup_tool_bridge_context": {
+                "visible_tool_names": {
+                    "__llmup_custom__code_exec": "code_exec"
+                }
+            },
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body: Value = serde_json::from_slice(&body).expect("json body");
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("error message string");
+    assert!(
+        message.contains(INTERNAL_TOOL_BRIDGE_CONTEXT_FIELD),
+        "message = {message}"
+    );
+    assert!(message.contains("internal-only"), "message = {message}");
+
+    let recorded = requests.lock().await;
+    assert!(recorded.is_empty(), "requests = {recorded:?}");
 
     server.abort();
 }

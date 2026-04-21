@@ -335,6 +335,10 @@ pub(super) async fn handle_request_core(
     let mut tracker = state
         .metrics
         .start_request(path.as_str(), requested_model.clone(), stream);
+    if let Some(message) = reject_internal_request_scoped_tool_bridge_context(&original_body) {
+        tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+        return error_response(client_format, StatusCode::BAD_REQUEST, &message);
+    }
     let resolved_model = match resolve_request_model_or_error(
         &namespace_state,
         &requested_model,
@@ -735,6 +739,14 @@ pub(super) fn classify_request_boundary(
         body,
         crate::config::CompatibilityMode::Balanced,
     )
+}
+
+fn reject_internal_request_scoped_tool_bridge_context(body: &Value) -> Option<String> {
+    body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).map(|_| {
+        format!(
+            "request must not include internal-only field `{REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD}`"
+        )
+    })
 }
 
 fn classify_request_boundary_with_compatibility_mode(

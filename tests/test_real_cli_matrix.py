@@ -897,6 +897,97 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertLess(compact_limit, observed_live_failure_input_tokens)
         self.assertEqual(compact_limit, 61200)
 
+    def test_resolve_codex_model_metadata_and_catalog_args_use_surface_defaults_and_alias_surface(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    limits:
+                      context_window: 200000
+                    surface_defaults:
+                      modalities:
+                        input: ["text"]
+                      tools:
+                        supports_search: false
+                model_aliases:
+                  vision-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-Vision"
+                    surface:
+                      modalities:
+                        input: ["text", "image"]
+                      tools:
+                        supports_search: true
+                """
+            )
+        )
+        model_limits = module.resolve_model_limits(parsed, "vision-openai")
+        codex_metadata = module.resolve_codex_model_metadata(parsed, "vision-openai")
+
+        self.assertEqual(codex_metadata.input_modalities, ("text", "image"))
+        self.assertTrue(codex_metadata.supports_search_tool)
+        self.assertFalse(module.codex_should_disable_view_image(codex_metadata))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home_dir = pathlib.Path(temp_dir)
+            args = module.build_codex_catalog_args(
+                home_dir,
+                "vision-openai",
+                model_limits,
+                codex_metadata,
+            )
+            payload = json.loads(
+                (home_dir / ".codex" / "catalog.json").read_text(encoding="utf-8")
+            )
+
+        self.assertIn("model_catalog_json", " ".join(args))
+        self.assertNotIn('web_search="disabled"', " ".join(args))
+        self.assertNotIn("tools.view_image=false", " ".join(args))
+        self.assertEqual(payload["models"][0]["input_modalities"], ["text", "image"])
+        self.assertTrue(payload["models"][0]["supports_search_tool"])
+
+    def test_resolve_codex_model_metadata_merges_legacy_codex_over_surface_derived_values(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    surface_defaults:
+                      modalities:
+                        input: ["text"]
+                      tools:
+                        supports_search: false
+                model_aliases:
+                  vision-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-Vision"
+                    surface:
+                      modalities:
+                        input: ["text", "image"]
+                      tools:
+                        supports_search: true
+                    codex:
+                      supports_search_tool: false
+                """
+            )
+        )
+
+        metadata = module.resolve_codex_model_metadata(parsed, "vision-openai")
+
+        self.assertEqual(metadata.input_modalities, ("text", "image"))
+        self.assertFalse(metadata.supports_search_tool)
+
     def test_build_client_command_uses_known_good_gemini_sandbox_flag_form(self):
         module = load_module()
         lane = make_lane(module, name="minimax-openai", proxy_model="minimax-openai")

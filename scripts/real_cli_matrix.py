@@ -131,6 +131,41 @@ class CodexModelMetadata:
         return merged
 
 
+@dataclasses.dataclass
+class SurfaceMetadata:
+    input_modalities: tuple[str, ...] | None = None
+    supports_search: bool | None = None
+
+    def merged_with(self, override: SurfaceMetadata | None) -> SurfaceMetadata | None:
+        merged = SurfaceMetadata(
+            input_modalities=(
+                override.input_modalities
+                if override and override.input_modalities is not None
+                else self.input_modalities
+            ),
+            supports_search=(
+                override.supports_search
+                if override and override.supports_search is not None
+                else self.supports_search
+            ),
+        )
+        if merged.input_modalities is None and merged.supports_search is None:
+            return None
+        return merged
+
+    def to_codex_metadata(self) -> CodexModelMetadata | None:
+        metadata = CodexModelMetadata(
+            input_modalities=self.input_modalities,
+            supports_search_tool=self.supports_search,
+        )
+        if (
+            metadata.input_modalities is None
+            and metadata.supports_search_tool is None
+        ):
+            return None
+        return metadata
+
+
 DEFAULT_PROXY_CODEX_METADATA = CodexModelMetadata(
     input_modalities=("text",),
     supports_search_tool=False,
@@ -227,6 +262,7 @@ def default_codex_catalog_entry(model_name: str) -> dict[str, object]:
 class ParsedModelAlias:
     target: str
     limits: ModelLimits | None = None
+    surface: SurfaceMetadata | None = None
     codex_metadata: CodexModelMetadata | None = None
 
 
@@ -255,6 +291,7 @@ class ProxySourceConfig:
     upstream_timeout_secs: int | None
     upstreams: collections.OrderedDict[str, collections.OrderedDict[str, object]]
     upstream_limits: collections.OrderedDict[str, ModelLimits]
+    upstream_surface_defaults: collections.OrderedDict[str, SurfaceMetadata]
     upstream_codex_metadata: collections.OrderedDict[str, CodexModelMetadata]
     model_aliases: collections.OrderedDict[str, str]
     model_alias_configs: collections.OrderedDict[str, ParsedModelAlias]
@@ -381,6 +418,9 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
         collections.OrderedDict()
     )
     upstream_limits: collections.OrderedDict[str, ModelLimits] = collections.OrderedDict()
+    upstream_surface_defaults: collections.OrderedDict[str, SurfaceMetadata] = (
+        collections.OrderedDict()
+    )
     upstream_codex_metadata: collections.OrderedDict[str, CodexModelMetadata] = (
         collections.OrderedDict()
     )
@@ -393,8 +433,10 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
     section: str | None = None
     current_upstream: str | None = None
     current_upstream_subsection: str | None = None
+    current_upstream_surface_section: str | None = None
     current_alias: str | None = None
     current_alias_subsection: str | None = None
+    current_alias_surface_section: str | None = None
 
     for raw_line in text.splitlines():
         line = raw_line.split("#", 1)[0].rstrip()
@@ -405,8 +447,10 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
         if indent == 0:
             current_upstream = None
             current_upstream_subsection = None
+            current_upstream_surface_section = None
             current_alias = None
             current_alias_subsection = None
+            current_alias_surface_section = None
             if stripped == "upstreams:":
                 section = "upstreams"
                 continue
@@ -429,15 +473,55 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
             if indent == 2 and stripped.endswith(":"):
                 current_upstream = stripped[:-1]
                 current_upstream_subsection = None
+                current_upstream_surface_section = None
                 upstreams[current_upstream] = collections.OrderedDict()
                 continue
             if indent == 4 and current_upstream is not None and stripped == "limits:":
                 current_upstream_subsection = "limits"
+                current_upstream_surface_section = None
                 upstream_limits[current_upstream] = ModelLimits()
+                continue
+            if (
+                indent == 4
+                and current_upstream is not None
+                and stripped == "surface_defaults:"
+            ):
+                current_upstream_subsection = "surface_defaults"
+                current_upstream_surface_section = None
+                upstream_surface_defaults[current_upstream] = SurfaceMetadata()
                 continue
             if indent == 4 and current_upstream is not None and stripped == "codex:":
                 current_upstream_subsection = "codex"
+                current_upstream_surface_section = None
                 upstream_codex_metadata[current_upstream] = CodexModelMetadata()
+                continue
+            if (
+                indent == 6
+                and current_upstream is not None
+                and current_upstream_subsection == "surface_defaults"
+                and stripped in {"modalities:", "tools:"}
+            ):
+                current_upstream_surface_section = stripped[:-1]
+                continue
+            if (
+                indent == 8
+                and current_upstream is not None
+                and current_upstream_subsection == "surface_defaults"
+                and current_upstream_surface_section is not None
+            ):
+                key, value = stripped.split(":", 1)
+                parsed_value = parse_scalar(value)
+                surface_defaults = upstream_surface_defaults[current_upstream]
+                if (
+                    current_upstream_surface_section == "modalities"
+                    and key == "input"
+                ):
+                    surface_defaults.input_modalities = parse_string_list(value)
+                elif (
+                    current_upstream_surface_section == "tools"
+                    and key == "supports_search"
+                ):
+                    surface_defaults.supports_search = bool(parsed_value)
                 continue
             if (
                 indent == 6
@@ -469,6 +553,7 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
                 continue
             if indent >= 4 and current_upstream is not None:
                 current_upstream_subsection = None
+                current_upstream_surface_section = None
                 key, value = stripped.split(":", 1)
                 upstreams[current_upstream][key] = parse_scalar(value)
                 continue
@@ -477,12 +562,14 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
             if indent == 2 and stripped.endswith(":"):
                 current_alias = stripped[:-1]
                 current_alias_subsection = None
+                current_alias_surface_section = None
                 model_aliases[current_alias] = ""
                 model_alias_configs[current_alias] = ParsedModelAlias(target="")
                 continue
             if indent == 2:
                 current_alias = None
                 current_alias_subsection = None
+                current_alias_surface_section = None
                 key, value = stripped.split(":", 1)
                 target = str(parse_scalar(value))
                 model_aliases[key] = target
@@ -491,23 +578,58 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
             if indent == 4 and current_alias is not None:
                 if stripped == "limits:":
                     current_alias_subsection = "limits"
+                    current_alias_surface_section = None
                     alias_config = model_alias_configs[current_alias]
                     if alias_config.limits is None:
                         alias_config.limits = ModelLimits()
                     continue
+                if stripped == "surface:":
+                    current_alias_subsection = "surface"
+                    current_alias_surface_section = None
+                    alias_config = model_alias_configs[current_alias]
+                    if alias_config.surface is None:
+                        alias_config.surface = SurfaceMetadata()
+                    continue
                 if stripped == "codex:":
                     current_alias_subsection = "codex"
+                    current_alias_surface_section = None
                     alias_config = model_alias_configs[current_alias]
                     if alias_config.codex_metadata is None:
                         alias_config.codex_metadata = CodexModelMetadata()
                     continue
                 current_alias_subsection = None
+                current_alias_surface_section = None
                 key, value = stripped.split(":", 1)
                 parsed_value = parse_scalar(value)
                 if key == "target":
                     target = str(parsed_value)
                     model_aliases[current_alias] = target
                     model_alias_configs[current_alias].target = target
+                continue
+            if (
+                indent == 6
+                and current_alias is not None
+                and current_alias_subsection == "surface"
+                and stripped in {"modalities:", "tools:"}
+            ):
+                current_alias_surface_section = stripped[:-1]
+                continue
+            if (
+                indent == 8
+                and current_alias is not None
+                and current_alias_subsection == "surface"
+                and current_alias_surface_section is not None
+            ):
+                key, value = stripped.split(":", 1)
+                parsed_value = parse_scalar(value)
+                surface = model_alias_configs[current_alias].surface
+                if surface is None:
+                    surface = SurfaceMetadata()
+                    model_alias_configs[current_alias].surface = surface
+                if current_alias_surface_section == "modalities" and key == "input":
+                    surface.input_modalities = parse_string_list(value)
+                elif current_alias_surface_section == "tools" and key == "supports_search":
+                    surface.supports_search = bool(parsed_value)
                 continue
             if (
                 indent == 6
@@ -551,6 +673,7 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
         upstream_timeout_secs=upstream_timeout_secs,
         upstreams=upstreams,
         upstream_limits=upstream_limits,
+        upstream_surface_defaults=upstream_surface_defaults,
         upstream_codex_metadata=upstream_codex_metadata,
         model_aliases=model_aliases,
         model_alias_configs=model_alias_configs,
@@ -655,6 +778,22 @@ def _target_upstream_name(target: str) -> str | None:
     return upstream_name or None
 
 
+def _merged_codex_metadata(
+    base: CodexModelMetadata | None, override: CodexModelMetadata | None
+) -> CodexModelMetadata | None:
+    if base is None:
+        return override
+    return base.merged_with(override)
+
+
+def _codex_metadata_from_surface(
+    surface: SurfaceMetadata | None,
+) -> CodexModelMetadata | None:
+    if surface is None:
+        return None
+    return surface.to_codex_metadata()
+
+
 def resolve_model_limits(
     config: ProxySourceConfig, model_name: str
 ) -> ModelLimits | None:
@@ -684,23 +823,33 @@ def resolve_codex_model_metadata(
         upstream_name = _target_upstream_name(model_name)
         if upstream_name is None:
             return None
-        return config.upstream_codex_metadata.get(
-            upstream_name, DEFAULT_PROXY_CODEX_METADATA
+        metadata = _merged_codex_metadata(
+            _codex_metadata_from_surface(
+                config.upstream_surface_defaults.get(upstream_name)
+            ),
+            config.upstream_codex_metadata.get(upstream_name),
         )
+        return metadata if metadata is not None else DEFAULT_PROXY_CODEX_METADATA
 
     upstream_name = _target_upstream_name(alias_config.target)
-    base_metadata = (
-        config.upstream_codex_metadata.get(upstream_name)
-        if upstream_name is not None
-        else None
+    surface_metadata = _merged_codex_metadata(
+        _codex_metadata_from_surface(
+            config.upstream_surface_defaults.get(upstream_name)
+            if upstream_name is not None
+            else None
+        ),
+        _codex_metadata_from_surface(alias_config.surface),
     )
-    if base_metadata is None:
-        return (
-            alias_config.codex_metadata
-            if alias_config.codex_metadata is not None
-            else DEFAULT_PROXY_CODEX_METADATA
-        )
-    return base_metadata.merged_with(alias_config.codex_metadata)
+    metadata = _merged_codex_metadata(
+        surface_metadata,
+        _merged_codex_metadata(
+            config.upstream_codex_metadata.get(upstream_name)
+            if upstream_name is not None
+            else None,
+            alias_config.codex_metadata,
+        ),
+    )
+    return metadata if metadata is not None else DEFAULT_PROXY_CODEX_METADATA
 
 
 def _runtime_alias_configs(
@@ -718,12 +867,14 @@ def _runtime_alias_configs(
             aliases[alias_name] = ParsedModelAlias(
                 target=f"LOCAL-QWEN:{qwen_model}",
                 limits=alias_config.limits,
+                surface=alias_config.surface,
                 codex_metadata=alias_config.codex_metadata,
             )
             continue
         aliases[alias_name] = ParsedModelAlias(
             target=target,
             limits=alias_config.limits,
+            surface=alias_config.surface,
             codex_metadata=alias_config.codex_metadata,
         )
 
