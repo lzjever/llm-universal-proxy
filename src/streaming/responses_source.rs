@@ -297,7 +297,7 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
             let full_input = event
                 .get("input")
                 .and_then(Value::as_str)
-                .or_else(|| tool_call.custom_input_text.as_deref())
+                .or(tool_call.custom_input_text.as_deref())
                 .unwrap_or("")
                 .to_string();
             let Some(bridge_delta) =

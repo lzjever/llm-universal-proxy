@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.2.8 - 2026-04-20
+
+- Switched the default compatibility posture to `max_compat`, so translated agent-facing paths now prefer the safer client-usable bridge behavior by default while still keeping `strict` and `balanced` available for tighter boundary control.
+- Preserved stable public tool identity across translated live paths: client-visible and model-visible surfaces now keep original tool names such as `apply_patch` instead of exposing proxy-private `__llmup_custom__*` transport artifacts, with matching smoke and regression coverage around that contract.
+- Stopped trusting client-supplied `_llmup_tool_bridge_context` payloads at proxy ingress; the bridge context is now enforced as an internal-only request-scoped field so external callers cannot spoof custom/freeform tool decoding state.
+- Synced Codex-facing model surface metadata from the same source-of-truth model surface used by the proxy, so generated catalogs and wrapper defaults stay aligned on text-only modalities, search support, and `apply_patch` tool surfacing instead of drifting through parallel metadata paths.
+- Fixed OpenAI Responses tool-call sink finalization so pending translated tool calls emit consistent `done` / `response.output_item.done` events with the correct payload and proxied tool metadata during flush and teardown paths.
+- Removed the dead Claude-to-OpenAI single-argument conversion wrapper after the last test-only caller moved to the real implementation, clearing the remaining Rust `dead_code` warning without changing translation behavior.
+
 ## v0.2.7 - 2026-04-20
 
 - Routed dashboard-mode runtime logs into an in-memory TUI log buffer and rendered them inside a new `Runtime Logs` panel, so live `warn!` / `info!` / `error!` output no longer overwrites the alternate-screen dashboard while the proxy is serving traffic.

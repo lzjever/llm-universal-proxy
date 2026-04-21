@@ -549,18 +549,20 @@ fn translate_sse_event_responses_to_anthropic_bridges_custom_tool_call_successfu
 
 #[test]
 fn translate_sse_event_anthropic_to_responses_decodes_bridged_custom_tool_use() {
-    let mut state = StreamState::default();
-    state.request_scoped_tool_bridge_context = Some(serde_json::json!({
-        "compatibility_mode": "balanced",
-        "entries": {
-            "code_exec": {
-                "source_kind": "custom_text",
-                "transport_kind": "function_object_wrapper",
-                "wrapper_field": "input",
-                "expected_canonical_shape": "single_required_string"
+    let mut state = StreamState {
+        request_scoped_tool_bridge_context: Some(serde_json::json!({
+            "compatibility_mode": "balanced",
+            "entries": {
+                "code_exec": {
+                    "source_kind": "custom_text",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
             }
-        }
-    }));
+        })),
+        ..Default::default()
+    };
     let joined = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
@@ -623,18 +625,20 @@ fn translate_sse_event_anthropic_to_responses_decodes_bridged_custom_tool_use() 
 
 #[test]
 fn translate_sse_event_anthropic_to_responses_malformed_bridged_payload_falls_back_to_function() {
-    let mut state = StreamState::default();
-    state.request_scoped_tool_bridge_context = Some(serde_json::json!({
-        "compatibility_mode": "balanced",
-        "entries": {
-            "code_exec": {
-                "source_kind": "custom_text",
-                "transport_kind": "function_object_wrapper",
-                "wrapper_field": "input",
-                "expected_canonical_shape": "single_required_string"
+    let mut state = StreamState {
+        request_scoped_tool_bridge_context: Some(serde_json::json!({
+            "compatibility_mode": "balanced",
+            "entries": {
+                "code_exec": {
+                    "source_kind": "custom_text",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
             }
-        }
-    }));
+        })),
+        ..Default::default()
+    };
     let joined = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
