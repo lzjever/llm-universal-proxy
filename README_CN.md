@@ -8,6 +8,20 @@
 
 这个代理最有价值的地方，就是把“客户端支持的协议”和“你真正想用的模型协议”解耦开。比如新版 Codex CLI 只支持 OpenAI Responses API，但通过 `llm-universal-proxy`，它仍然可以接入 Anthropic 兼容或 OpenAI Completions 兼容的 coding 模型，例如 GLM、Kimi、MiniMax。
 
+## 重要说明
+
+> **设计定位**
+>
+> `llm-universal-proxy` 的核心目标，是让上层 LLM client 尽量面向稳定的客户端接口和本地模型名工作，而不必把 OpenAI Responses、Anthropic Messages、Gemini 等上游协议差异直接暴露给使用者或工具链。
+>
+> **常见用法**
+>
+> 它最常见的使用方式，是把 Codex CLI、Claude Code、Gemini CLI 这类 coding/agent 客户端，接到不同 provider 的 API 型计划上，包括 GLM、MiniMax、Kimi 等中国 provider，也包括 OpenAI API 或订阅支持的接入方式；客户端继续使用自己熟悉的调用形式，协议兼容、路由和模型映射由代理层处理。
+>
+> **边界提醒**
+>
+> 请不要把本工具理解为“桥接官方消费型订阅权益”的通用办法。就当前公开官方口径而言，Anthropic Claude 和 Google Gemini 的官方 app / consumer subscription 风格 coding plan，仍应以各自官方明确支持的账号体系、API、云接入或官方客户端路径为准。除非官方文档明确允许第三方接入，否则不建议尝试用本工具去桥接这类官方 plan。
+
 ![LLMUP dashboard](./docs/images/dashboard.png)
 
 运行时 dashboard 可以直接看到路由、流式请求、取消统计、上游流量和 hook 状态。

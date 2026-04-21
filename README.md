@@ -8,6 +8,12 @@ A single-binary HTTP proxy that provides a unified interface for Large Language 
 
 This proxy is especially useful when your client only supports one protocol, but the real model you want to use lives behind another one. For example, newer Codex CLI versions only speak the OpenAI Responses API, but `llm-universal-proxy` can still let Codex use Anthropic-compatible or OpenAI-Completions-compatible coding models such as GLM, Kimi, or MiniMax.
 
+> [!IMPORTANT]
+> **Important Usage Scope**
+> `llm-up` is designed to make upstream protocol differences as invisible as practical to the client. A common workflow is to point tools such as Codex CLI, Claude Code, or Gemini CLI at the coding models and API-backed plans you actually want to use, even when those models live behind a different provider protocol. In practice, that often means connecting those clients to providers such as GLM, MiniMax, or Kimi, or to OpenAI-backed API access and other officially supported client access paths.
+>
+> `llm-up` is an interoperability layer for provider APIs and compatible endpoints. It should not be treated as a bridge into Anthropic Claude or Google Gemini first-party app-style or consumer-subscription-style coding plans unless the relevant vendor explicitly documents that kind of third-party access. If your goal is to use vendor-specific first-party entitlements, bundled benefits, or official CLI access rules, follow the official client and authentication path published by that vendor.
+
 ![LLMUP dashboard](./docs/images/dashboard.png)
 
 The dashboard gives you a direct view into routing, streaming, cancellation, upstream traffic, and hook state while the proxy is running.
