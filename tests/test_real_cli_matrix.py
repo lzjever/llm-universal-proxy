@@ -277,6 +277,51 @@ class RealCliMatrixTests(unittest.TestCase):
             parsed.model_alias_configs["minimax-openai"].codex_metadata.supports_search_tool
         )
 
+    def test_parse_proxy_source_extracts_upstream_surface_defaults_and_alias_surface(self):
+        module = load_module()
+
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    surface_defaults:
+                      modalities:
+                        input: ["text"]
+                      tools:
+                        supports_search: false
+                model_aliases:
+                  vision-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-Vision"
+                    surface:
+                      modalities:
+                        input: ["text", "image"]
+                      tools:
+                        supports_search: true
+                """
+            )
+        )
+
+        self.assertEqual(
+            parsed.upstream_surface_defaults["MINIMAX-OPENAI"].input_modalities,
+            ("text",),
+        )
+        self.assertFalse(
+            parsed.upstream_surface_defaults["MINIMAX-OPENAI"].supports_search
+        )
+        self.assertEqual(
+            parsed.model_alias_configs["vision-openai"].surface.input_modalities,
+            ("text", "image"),
+        )
+        self.assertTrue(
+            parsed.model_alias_configs["vision-openai"].surface.supports_search
+        )
+
     def test_resolve_lanes_marks_qwen_optional_when_env_missing(self):
         module = load_module()
         parsed = module.parse_proxy_source(
