@@ -1,419 +1,173 @@
 # LLM Universal Proxy
 
-[中文文档](./README_CN.md)
+[中文文档](./README_CN.md) · [Documentation](./docs/README.md)
 
-A single-binary HTTP proxy that provides a unified interface for Large Language Model APIs. It accepts requests in multiple LLM API formats, routes models to named upstreams, and automatically handles format conversion when needed.
+`llmup` is a single-binary LLM HTTP proxy. Put it between your client and your real model provider, and it gives you one stable local entrypoint even when the client protocol and upstream protocol do not match.
 
-**Use GLM, Kimi, MiniMax, and other non-native models in Codex CLI, Claude Code, and Gemini CLI through one stable proxy layer.**
+It is most useful when you want to:
 
-This proxy is especially useful when your client only supports one protocol, but the real model you want to use lives behind another one. For example, newer Codex CLI versions only speak the OpenAI Responses API, but `llm-universal-proxy` can still let Codex use Anthropic-compatible or OpenAI-Completions-compatible coding models such as GLM, Kimi, or MiniMax.
+- use non-native models behind Codex CLI
+- route Claude Code or Gemini CLI through one local proxy
+- expose stable local model aliases instead of vendor model IDs
 
 > [!IMPORTANT]
-> **Important Usage Scope**
-> `llm-up` is designed to make upstream protocol differences as invisible as practical to the client. A common workflow is to point tools such as Codex CLI, Claude Code, or Gemini CLI at the coding models and API-backed plans you actually want to use, even when those models live behind a different provider protocol. In practice, that often means connecting those clients to providers such as GLM, MiniMax, or Kimi, or to OpenAI-backed API access and other officially supported client access paths.
->
-> `llm-up` is an interoperability layer for provider APIs and compatible endpoints. It should not be treated as a bridge into Anthropic Claude or Google Gemini first-party app-style or consumer-subscription-style coding plans unless the relevant vendor explicitly documents that kind of third-party access. If your goal is to use vendor-specific first-party entitlements, bundled benefits, or official CLI access rules, follow the official client and authentication path published by that vendor.
+> `llmup` is designed for provider APIs and compatible endpoints. It is not a bridge into vendor first-party app subscriptions or bundled first-party CLI entitlements unless that vendor explicitly documents that kind of third-party access.
 
 ![LLMUP dashboard](./docs/images/dashboard.png)
 
-The dashboard gives you a direct view into routing, streaming, cancellation, upstream traffic, and hook state while the proxy is running.
+The optional local dashboard helps you inspect routing, streaming, cancellation, upstream state, and hook activity while the proxy is running.
 
-![Codex CLI using GLM-5-Turbo through llmup](./docs/images/codex-glm5-turbo.png)
+## Quick Start
 
-This is a real Codex CLI session using a local alias routed to `GLM-5-Turbo` through the proxy.
+This homepage path shows two upstreams directly:
 
-## Features
+- official OpenAI API routing to `gpt-5.4`
+- MiniMax's OpenAI-compatible endpoint routing to `MiniMax-M2.7-highspeed`
 
-- **Multi-Format Support**: Accepts requests in 4 different LLM API formats:
-  - Google Gemini
-  - Anthropic Claude
-  - OpenAI Chat Completions
-  - OpenAI Responses API
-- **Auto-Discovery**: Automatically detects which formats the upstream service supports
-- **Smart Routing**: Passes through requests when client format matches upstream capabilities (no translation overhead)
-- **Format Translation**: Seamlessly converts between formats when needed
-- **Streaming Support**: Handles both streaming and non-streaming responses
-- **Concurrent Requests**: Asynchronous handling for high performance
-- **Named Upstreams**: Route requests to multiple upstream providers from one proxy instance
-- **Local Model Aliases**: Expose one unique local model name for any upstream model
-- **Audit Hooks**: Optional async `exchange` / `usage` HTTP hooks for metering and bounded client-facing audit capture
-- **Local Debug Trace**: Optional local JSONL trace for per-turn debugging with normalized request/response summaries
-- **Credential Policy**: Supports fallback credentials, direct configured credentials, and force-server auth
-- **Codex CLI Friendly**: Works as a Responses-compatible endpoint in front of Anthropic-compatible upstreams
-- **Model Unification Layer**: Map models from different providers to one stable local naming scheme, such as `opus`, `sonnet`, `haiku`, or team-specific coding aliases
-
-Important routing boundary:
-- OpenAI Responses lifecycle routes are forwarded only when the proxy can uniquely determine the native Responses upstream from the current request context. The proxy does not invent response-to-upstream session state.
-
-## Why It Is Useful
-
-- **One stable model namespace across providers**: You can map models from different vendors into one local naming layer. For example, different upstream models can be exposed as stable names such as `opus`, `sonnet`, `haiku`, or any team-specific alias. That makes tools that assume fixed model names easier to operate.
-- **Useful for Claude Code style workflows**: If you want Claude-style routing semantics but your real upstreams come from different vendors, the proxy can present a consistent set of local model names while routing to whichever provider you choose underneath.
-- **Useful for modern Codex CLI**: Newer Codex CLI versions only speak the OpenAI Responses API. This proxy lets Codex use upstreams that speak Anthropic Messages, OpenAI Chat Completions, or other non-Responses-compatible APIs. That is especially useful when you want to use coding-capable providers such as GLM, MiniMax, or Kimi behind a Responses-only client.
-- **Cross-provider protocol bridge**: You can place Anthropic-compatible, OpenAI-compatible, and Gemini-style upstreams behind one consistent interface instead of teaching each client multiple protocols.
-- **Built-in observability for analysis**: `usage` hooks export metering data; `exchange` hooks export best-effort, bounded client-facing captures; `debug_trace` keeps a lightweight local per-turn trail for protocol troubleshooting. That gives you practical observability for auditing, analytics, and evaluation without forcing full-fidelity raw stream archival into the hot path.
-
-## Client Namespace Map
-
-Use the namespace that matches the client protocol instead of the upstream vendor:
-
-| Client | Namespace | Typical Use |
-|------|------|------|
-| Codex CLI | `/openai/v1` | Responses client in front of Anthropic or OpenAI-compatible coding models |
-| Claude Code | `/anthropic/v1` | Anthropic Messages client in front of Anthropic-compatible upstreams |
-| Gemini CLI | `/google/v1beta` | Gemini-native client in front of Google-style or translated upstreams |
-
-## Compatibility Modes And Tool Identity
-
-This project is moving toward a client-first `max_compat` posture for translated agent-facing paths while staying protocol-first in the core architecture.
-
-- `strict` is the boundary-checking mode: prefer native semantics, reject high-risk translation, and never invent provider-owned state.
-- `balanced` is the current compatibility style for many translated paths: preserve the portable core, warning when non-portable fields are dropped or degraded.
-- `max_compat` is the intended common operating mode for real agent clients: preserve the portable core, preserve stable client-facing contracts, and add explicit shims where that can be done safely.
-
-Locked contract:
-
-- The proxy must not rewrite the visible tool name supplied by the client. Tool names are part of the semantic contract for both the client and the model. The model must see the original tool name, not a proxy-generated surrogate.
-- `__llmup_custom__*` is an internal transport artifact, not a public contract.
-- `apply_patch` remains a public freeform tool on client-visible surfaces.
-
-Enforcement:
-
-- Reserved synthetic names such as `__llmup_custom__apply_patch` are not part of the public surface. Client-visible output and model-visible tool definitions must reject or clear them instead of treating them as an acceptable translated-path artifact.
-- The current design note and rollout plan for fixing that behavior live in [docs/max-compat-design.md](/home/percy/works/mbos-v1/llm-universal-proxy/docs/max-compat-design.md:1).
-- The phased implementation plan lives in [docs/max-compat-development-plan.md](/home/percy/works/mbos-v1/llm-universal-proxy/docs/max-compat-development-plan.md:1).
-
-## Codex Metadata And Compact Caveat
-
-When Codex uses a proxy-backed local alias that is not present in Codex's built-in model catalog, Codex falls back to unknown-model metadata. That fallback is not good enough for serious manual testing of custom proxy-backed coding models.
-
-Important practical consequence:
-- Bare `codex` with only `model_provider`, `base_url`, and `wire_api="responses"` can miss `apply_patch`, use the wrong compact threshold, and treat a text-only proxy-backed model as image-capable, which leaves `view_image` enabled when it should be off.
-- Treat any surfaced `__llmup_custom__*` name as a contract failure. Manual and automated checks should validate public tool execution and public tool naming against the original client-facing name such as `apply_patch`.
-
-Prefer the wrapper flow in [Recommended Manual Interactive Testing](#recommended-manual-interactive-testing). The wrapper scripts generate a temporary `model_catalog_json` from your proxy source config, pass it to Codex automatically, and inject `-c 'tools.view_image=false'` for text-only Codex lanes.
-
-For the common `200000` context / `128000` max-output setup, the wrapper-generated compact threshold is `61200`.
-
-Default compact formula:
-- When both `context_window` and `max_output_tokens` are known, Codex auto-compact is budgeted from available input capacity: `0.85 * (context_window - max_output_tokens)`.
-- When only `context_window` is known, the fallback remains `0.85 * context_window`.
-
-### How Codex Compact Actually Works With A Proxy
-
-When Codex talks to a custom proxy-backed provider, compaction does not behave exactly like official OpenAI-hosted Codex.
-
-- Codex has two compaction paths:
-  - official OpenAI provider: remote `/responses/compact`
-  - custom providers: local inline compaction using the current model
-- The remote compact path is only used when Codex recognizes the provider as built-in OpenAI. A custom provider such as `glm-proxy` does not qualify, even if it serves a Responses-compatible API.
-- That means proxy-backed Codex sessions use model-generated summarization, not the official OpenAI compact service.
-
-Practical consequences:
-
-- Compact quality depends on the routed upstream model, because that model is the one producing the summary.
-- Compact timing depends on token accounting coming back through the proxy. If usage mapping is wrong, Codex may compact too late or not at all.
-- Compact replacement history is still reconstructed by Codex locally, so protocol normalization after compaction matters. If translated history contains roles or message layouts that the upstream rejects, the next turn after compaction can fail even though compaction itself succeeded.
-
-Important boundary:
-
-- The proxy does not persist or grow system prompts on its own.
-- Codex may inject new compacted thread summaries into later requests.
-- The proxy only normalizes those messages so they remain valid for the upstream protocol.
-
-Best practice for proxy-backed Codex sessions:
-
-- Set both `model_context_window` and `model_auto_compact_token_limit`.
-- Prefer shorter threads and start a new thread after multiple compactions.
-- Treat proxy-backed compact as "local summary compaction" rather than "official OpenAI remote compaction".
-
-## Installation
-
-### Download Binary
-
-Download the latest release from the [Releases](https://github.com/lzjever/llm-universal-proxy/releases) page.
-
-### Build from Source
-
-```bash
-# Clone the repository
-git clone https://github.com/lzjever/llm-universal-proxy.git
-cd llm-universal-proxy
-
-# Build release binary
-cargo build --locked --release
-
-# The binary will be at ./target/release/llm-universal-proxy
-```
-
-### Using Make
-
-```bash
-make build        # Build release binary
-make test         # Run all tests
-make run-release  # Build and run in release mode
-```
-
-## Local Binary Smoke Script
-
-The repo also includes a local binary smoke script at [scripts/test_binary_smoke.sh](/home/percy/works/mbos-v1/llm-universal-proxy/scripts/test_binary_smoke.sh). It builds the release binary, starts a mock upstream in-process, and validates a small set of high-value startup and routing paths. It is meant to confirm that the built binary actually boots and serves core endpoints, not to replace the Rust integration test suite.
-
-Typical flow:
-
-```bash
-make test-binary-smoke
-```
-
-## Real Client Matrix
-
-The formal automated real-client matrix uses `scripts/real_cli_matrix.py` as the main entrypoint. It starts a proxy runtime config derived from `proxy-test-minimax-and-local.yaml`, then drives real `codex`, `claude`, and `gemini` CLI processes through the proxy.
-
-Typical flow:
-
-```bash
-cargo build --locked --release
-python3 scripts/real_cli_matrix.py
-```
-
-Compatibility shim:
-
-```bash
-bash scripts/test_cli_clients.sh --list-matrix
-```
-
-What this runner does:
-- Isolates user-global CLI state with runner-managed home/config directories and per-run env overrides so your normal Codex, Claude Code, and Gemini CLI settings are not rewritten; Gemini keeps a runner-managed home/cache under the reports root instead of reusing your normal profile.
-- Writes a timestamped report directory under `test-reports/cli-matrix/<timestamp>/` and prints the resolved report path at the end of the run.
-- Uses `--list-matrix` to enumerate cases, `--case <case-id>` to target specific rows (repeatable), `--skip-slow` to skip long-horizon tasks, and `--proxy-only` to start the proxy and wait.
-- `python3 scripts/real_cli_matrix.py --help` shows the full current flag set.
-- This runner has been used to validate known failures observed on the Anthropic and OpenAI-completions Codex yolo mainlines, especially long-horizon replay, compaction, and tool-translation regressions.
-
-Legacy compatibility:
-- `scripts/test_cli_clients.sh` is the compatibility shim for older local flows and wrappers. It forwards directly to `scripts/real_cli_matrix.py`, so the same flags work through either entrypoint.
-- Common entrypoint examples:
-
-```bash
-python3 scripts/real_cli_matrix.py --list-matrix
-python3 scripts/real_cli_matrix.py --case <case-id>
-bash scripts/test_cli_clients.sh --skip-slow
-bash scripts/test_cli_clients.sh --proxy-only
-```
-
-Targeted regression case:
-
-```bash
-python3 scripts/real_cli_matrix.py --case codex__minimax-openai__tool_identity_public_contract
-```
-
-Notes:
-- `proxy-test-minimax-and-local.yaml` is the source config for this matrix. The runner derives a temporary runtime config from it instead of editing the file in place.
-- `.env.test` is optional local developer input only and should not be committed. When present, the runner loads it into the proxy subprocess only; it does not become persistent shell state or a shared global client config. Use `--env-file` to point at a different dotenv file.
-- `qwen-local` is optional coverage. It is enabled only when `LOCAL_QWEN_BASE_URL` and `LOCAL_QWEN_MODEL` are both configured; otherwise that lane is skipped. When enabled, the default matrix still limits it to smoke coverage and excludes long-horizon code-edit fixtures.
-- Use this matrix for real end-to-end CLI behavior. For lower-level protocol/HTTP smoke without real CLI processes, use `scripts/real_endpoint_matrix.py` as described below.
-- The `tool_identity_public_contract` smoke fixture is a runnable acceptance harness for this contract. It verifies that CLI-visible output rejects or clears `__llmup_custom__*`; deeper live request-shape assertions still belong in translator/integration coverage.
-
-## Recommended Manual Interactive Testing
-
-If you want to manually launch a real interactive Codex, Claude, or Gemini session against the proxy, prefer the wrapper scripts in `scripts/run_codex_proxy.sh`, `scripts/run_claude_proxy.sh`, and `scripts/run_gemini_proxy.sh`. They are thin shims over `scripts/interactive_cli.py`, which is the canonical interactive harness used by this repo.
-
-> Warning:
-> Do not validate a proxy-backed custom Codex model by running bare `codex` with only `model_provider`, `model_providers.*.base_url`, and `model_providers.*.wire_api="responses"`.
-> Without `model_catalog_json`, Codex treats aliases such as `minimax-openai` as unknown models and falls back to generic metadata. In practice that can drop `apply_patch`, set the wrong compact threshold, and incorrectly treat a text-only model as image-capable.
-> The Codex wrapper fixes this by generating a temporary catalog from the source config, injecting `-c 'model_catalog_json=...'` automatically, and adding `-c 'tools.view_image=false'` for text-only lanes such as the default MiniMax coding aliases.
-
-### 1. Start the proxy manually
-
-From the repo root:
-
-```bash
-cargo build --locked --release
-./target/release/llm-universal-proxy --config proxy-test-minimax-and-local.yaml --dashboard
-```
-
-In another shell, verify the proxy is up:
-
-```bash
-curl -fsS http://127.0.0.1:18888/health && echo
-```
-
-If your local config uses `credential_env` values instead of inline credentials, export them first or `source .env.test` before starting the proxy.
-
-### 2. Attach an interactive client to the already running proxy
-
-Codex, OpenAI-completions lane:
-
-```bash
-bash scripts/run_codex_proxy.sh \
-  --proxy-base http://127.0.0.1:18888 \
-  --config-source proxy-test-minimax-and-local.yaml \
-  --workspace "$PWD" \
-  --model minimax-openai
-```
-
-Codex, Anthropic lane:
-
-```bash
-bash scripts/run_codex_proxy.sh \
-  --proxy-base http://127.0.0.1:18888 \
-  --config-source proxy-test-minimax-and-local.yaml \
-  --workspace "$PWD" \
-  --model minimax-anth
-```
-
-Claude:
-
-```bash
-bash scripts/run_claude_proxy.sh \
-  --proxy-base http://127.0.0.1:18888 \
-  --config-source proxy-test-minimax-and-local.yaml \
-  --workspace "$PWD" \
-  --model claude-haiku-4-5
-```
-
-Gemini:
-
-```bash
-bash scripts/run_gemini_proxy.sh \
-  --proxy-base http://127.0.0.1:18888 \
-  --config-source proxy-test-minimax-and-local.yaml \
-  --workspace "$PWD" \
-  --model minimax-openai
-```
-
-Notes:
-- These wrappers default to `proxy-test-minimax-and-local.yaml` as the source config even when you pass `--proxy-base`. If your live proxy was started from a different source file, also pass `--config-source /path/to/that.yaml` so the wrapper resolves the same limits and metadata.
-- If you omit `--model`, the current defaults are `minimax-openai` for Codex, `claude-haiku-4-5` for Claude, and `minimax-openai` for Gemini.
-- `--workspace` defaults to the current working directory. It is shown explicitly above because that is usually what you want for manual testing.
-
-### 3. Managed mode: let the wrapper start and stop the proxy for you
-
-If you omit `--proxy-base`, the wrapper starts `./target/release/llm-universal-proxy` itself, derives a temporary runtime config from the source YAML, waits for `/health`, launches the client, and stops the proxy when the client exits.
-
-Example:
-
-```bash
-bash scripts/run_codex_proxy.sh \
-  --workspace "$PWD" \
-  --model minimax-openai
-```
-
-You can override the defaults with:
-- `--config-source /path/to/config.yaml`
-- `--env-file /path/to/.env`
-- `--binary /path/to/llm-universal-proxy`
-
-### 4. What the wrappers do for you
-
-- Create an isolated temporary `HOME` plus XDG directories so your normal `~/.codex`, `~/.claude`, and Gemini state are not rewritten.
-- Set dummy client-side keys and local base URLs automatically:
-  - Codex: `OPENAI_API_KEY=dummy`, `OPENAI_BASE_URL=<proxy>/openai/v1`
-  - Claude: `ANTHROPIC_API_KEY=dummy`, `ANTHROPIC_BASE_URL=<proxy>/anthropic`
-  - Gemini: `GEMINI_API_KEY=dummy`, `GOOGLE_GEMINI_BASE_URL=<proxy>/google`
-- Clear `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` and set `NO_PROXY=127.0.0.1,localhost` so local proxy traffic does not get routed through an outer HTTP proxy.
-- That wrapper-side cleanup only affects the local client -> proxy hop. The proxy's own upstream egress proxy behavior is configured separately through the YAML `proxy` fields documented below.
-- Preserve host `CARGO_HOME` / `RUSTUP_HOME` when present so Rust toolchain commands still work inside the isolated client environment.
-- For Codex, resolve `limits` and `codex` metadata from the source config, write a temporary `~/.codex/catalog.json`, inject `model_catalog_json`, disable Codex web search when the source config marks the model as `supports_search_tool: false`, and inject `tools.view_image=false` when the source config marks the model as text-only.
-- For Gemini, write a temporary `~/.gemini/settings.json` with the model limits that the harness can express through Gemini's real settings schema.
-
-## Configuration
-
-The proxy is configured with a YAML file passed via `--config`:
+Start from [examples/quickstart-openai-minimax.yaml](./examples/quickstart-openai-minimax.yaml). The file contents are:
 
 ```yaml
-listen: 0.0.0.0:8080
+listen: 127.0.0.1:8080
 upstream_timeout_secs: 120
-# proxy:
-#   url: http://proxy.example:8080/global-hop
 
 upstreams:
-  GLM-OFFICIAL:
-    api_root: https://open.bigmodel.cn/api/anthropic/v1
-    format: anthropic
-    credential_env: GLM_APIKEY
-    auth_policy: client_or_fallback
-
   OPENAI:
     api_root: https://api.openai.com/v1
     format: openai-responses
     credential_env: OPENAI_API_KEY
     auth_policy: force_server
 
+  MINIMAX_OPENAI:
+    api_root: https://api.minimaxi.com/v1
+    format: openai-completion
+    credential_env: MINIMAX_API_KEY
+    auth_policy: force_server
+
 model_aliases:
-  GLM-5: GLM-OFFICIAL:GLM-5
-  gpt-4o: OPENAI:gpt-4o
-
-hooks:
-  max_pending_bytes: 104857600
-  timeout_secs: 30
-  failure_threshold: 3
-  cooldown_secs: 300
-  usage:
-    url: https://example.com/hooks/usage
-  exchange:
-    url: https://example.com/hooks/exchange
-
-debug_trace:
-  path: /tmp/llm-proxy-debug.jsonl
-  max_text_chars: 16384
+  gpt-5-4: OPENAI:gpt-5.4
+  gpt-5-4-mini: MINIMAX_OPENAI:MiniMax-M2.7-highspeed
 ```
 
-Notes:
-- `api_root` should be the official upstream API root and must include the version segment, for example `https://api.openai.com/v1`, `https://api.anthropic.com/v1`, or `https://generativelanguage.googleapis.com/v1beta`.
-- The proxy's public API is namespaced by protocol. Use `/openai/v1/...`, `/anthropic/v1/...`, and `/google/v1beta/...`. The older mixed `/v1/...` routes are intentionally not provided.
-- Anthropic-compatible upstreams usually require `x-api-key` and `anthropic-version`. The proxy forwards client auth headers when present, can fall back to the upstream's configured `credential_env`, and injects a default `anthropic-version: 2023-06-01` header for Anthropic upstreams.
-- Provider-specific headers belong inside each upstream entry's `headers` object.
-- `credential_env` is the environment variable name holding that upstream's fallback credential. The secret stays out of the YAML file.
-- `credential_actual` can be used instead of `credential_env` when you want to place a fallback credential directly in YAML. `credential_env` and `credential_actual` are mutually exclusive.
-- `auth_policy` supports `client_or_fallback` and `force_server`.
-- `limits` on an upstream or alias act as translation defaults and generated client-metadata defaults. If the client explicitly sends `max_tokens`, `max_output_tokens`, or the target protocol's equivalent field, that explicit request still wins.
-- Hooks are best-effort and asynchronous. `usage` is usually enough; `exchange` captures the client-facing request plus the final client-facing response shape after completion, but streaming capture is bounded and may be truncated.
-- `debug_trace` writes a local JSONL file for debugging protocol issues. It is designed for interactive troubleshooting, not long-term traffic archival.
-- `debug_trace` records only the tail "new input" portion of each client request rather than rewriting the full accumulated conversation each turn.
-- For streaming responses, `debug_trace` records the processed client-visible result: aggregated text, reasoning text, tool-call deltas, terminal event, finish reason, and any normalized error. It does not dump raw SSE JSON lines.
+What those aliases mean:
 
-### Upstream Proxy Support
+- `gpt-5-4` is your stable local alias for OpenAI `gpt-5.4`
+- `gpt-5-4-mini` is also a local alias; in this example it routes to MiniMax `MiniMax-M2.7-highspeed`
 
-The proxy can apply upstream egress proxying at two configuration layers:
+Build and start the proxy:
 
-- Top-level `proxy` sets the namespace default for every upstream that does not define its own override.
-- `upstreams.<NAME>.proxy` overrides the namespace default for one upstream.
+```bash
+git clone https://github.com/lzjever/llm-universal-proxy.git
+cd llm-universal-proxy
+cargo build --locked --release
 
-Resolution order is:
+export OPENAI_API_KEY="your-openai-key"
+export MINIMAX_API_KEY="your-minimax-key"
 
-- `upstreams[].proxy`
-- top-level `proxy`
-- inherited reqwest/system proxy handling when no explicit proxy is configured
-- no proxy
+./target/release/llm-universal-proxy --config examples/quickstart-openai-minimax.yaml
+```
 
-Supported explicit values:
+Check health:
 
-- `proxy: direct`
-- `proxy: { url: "http://proxy.example:8080" }`
-- `proxy: { url: "https://proxy.example:8443" }`
-- `proxy: { url: "socks5://proxy.example:1080" }`
-- `proxy: { url: "socks5h://proxy.example:1080" }`
+```bash
+curl -fsS http://127.0.0.1:8080/health && echo
+```
 
-Behavior rules:
+Try both aliases through the same local OpenAI-style client surface:
 
-- `proxy: direct` forces direct egress for that scope and cuts off inherited environment/system proxy behavior.
-- An explicit proxy URL also cuts off inherited environment/system proxy behavior for that scope and pins the upstream to the configured proxy.
-- If neither `upstreams[].proxy` nor the top-level `proxy` is set, the proxy leaves reqwest's default proxy resolution enabled, so environment/system proxy settings remain in effect.
-- Discovery probes, normal upstream requests, streaming upstream requests, and OpenAI Responses resource routes all reuse the same resolved per-upstream transport policy.
+```bash
+curl http://127.0.0.1:8080/openai/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5-4",
+    "input": "Reply with pong."
+  }'
+```
 
-For a complete commented example, see [examples/upstream-proxy.yaml](/home/percy/works/mbos-v1/llm-universal-proxy/examples/upstream-proxy.yaml).
+```bash
+curl http://127.0.0.1:8080/openai/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5-4-mini",
+    "input": "Reply with pong."
+  }'
+```
 
-## Admin Control Plane
+Reasoning effort such as `xhigh` is a client/request-side setting, not part of the model name. Keep the alias stable and set reasoning in the request or client config.
 
-Admin endpoints are intentionally separated from the data plane:
+## Codex / Claude Code / Gemini Basic Setup
 
-- Admin routes live under `/admin/...`.
-- Admin routes do **not** inherit the proxy's global CORS policy.
-- Data-plane routes such as `/openai/v1/...` still use the permissive browser-facing CORS layer.
+For day-to-day usage, prefer the repo's wrapper scripts instead of hand-configuring each client. They handle local environment isolation, base URL injection, and client-specific metadata.
 
-Current admin access policy:
+With the quickstart config above, start with `--model gpt-5-4`. Swap to `--model gpt-5-4-mini` when you want the MiniMax lane instead.
 
-- If `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is set, every admin request must send `Authorization: Bearer <token>`.
-- If `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is not set, admin access is limited to loopback clients only (`127.0.0.1` / `::1`).
+### Codex CLI
+
+```bash
+bash scripts/run_codex_proxy.sh \
+  --proxy-base http://127.0.0.1:8080 \
+  --config-source examples/quickstart-openai-minimax.yaml \
+  --workspace "$PWD" \
+  --model gpt-5-4
+```
+
+### Claude Code
+
+```bash
+bash scripts/run_claude_proxy.sh \
+  --proxy-base http://127.0.0.1:8080 \
+  --config-source examples/quickstart-openai-minimax.yaml \
+  --workspace "$PWD" \
+  --model gpt-5-4
+```
+
+### Gemini CLI
+
+```bash
+bash scripts/run_gemini_proxy.sh \
+  --proxy-base http://127.0.0.1:8080 \
+  --config-source examples/quickstart-openai-minimax.yaml \
+  --workspace "$PWD" \
+  --model gpt-5-4
+```
+
+Wrapper base URL and actual proxy endpoint are related but not identical.
+
+For Codex specifically, the wrapper currently fixes `wire_api="responses"`, so Codex uses the Responses route:
+
+| Client | Wrapper-configured base URL | Client appends | Proxy endpoint actually hit |
+| --- | --- | --- | --- |
+| Codex CLI | `OPENAI_BASE_URL=<proxy>/openai/v1` | `/responses` | `/openai/v1/responses` |
+| Claude Code | `ANTHROPIC_BASE_URL=<proxy>/anthropic` | `/v1/messages` | `/anthropic/v1/messages` |
+| Gemini CLI | `GOOGLE_GEMINI_BASE_URL=<proxy>/google` | `/v1beta/models/...` | `/google/v1beta/models/...` |
+
+Codex especially benefits from the wrapper because it injects temporary model metadata for proxy-backed aliases. For more detail, see [docs/clients.md](./docs/clients.md).
+
+## Most Common Static Configuration
+
+The static YAML story is intentionally small:
+
+| Field | Purpose |
+| --- | --- |
+| `listen` | Proxy listen address |
+| `upstream_timeout_secs` | Upstream request timeout |
+| `upstreams` | Named upstream API roots, formats, and credential policy |
+| `model_aliases` | Stable local names mapped to `UPSTREAM:MODEL` |
+| `proxy` | Optional default upstream egress proxy |
+| `hooks` | Optional usage / exchange export hooks |
+| `debug_trace` | Optional local debug trace |
+
+Practical rules:
+
+- `api_root` should be the provider API root and include its version segment, such as `.../v1` or `.../v1beta`
+- `format` pins the upstream protocol: `openai-responses`, `openai-completion`, `anthropic`, or `google`
+- aliases such as `gpt-5-4` and `gpt-5-4-mini` are local names; they do not need to equal the upstream model ID
+- use structured aliases only when you want extra `limits` or `surface` metadata on top of `target: UPSTREAM:MODEL`
+
+For the full YAML reference and more examples, see [docs/configuration.md](./docs/configuration.md).
+
+## Dynamic Configuration Overview
+
+Static YAML is the default. If you need live updates, the proxy also exposes admin endpoints for reading runtime state and replacing namespace config without restarting the whole process.
 
 Current admin endpoints:
 
@@ -421,430 +175,17 @@ Current admin endpoints:
 - `GET /admin/namespaces/:namespace/state`
 - `POST /admin/namespaces/:namespace/config`
 
-Write/read model boundary:
-
-- `POST /admin/namespaces/:namespace/config` keeps the existing runtime config input shape.
-- Admin read endpoints use a separate redacted view model and never serialize the internal `Config` directly.
-- Admin state responses never return upstream `fallback_credential_actual` or hook `authorization` secrets in plaintext.
-- Redacted state exposes boolean presence flags instead, such as `fallback_credential_configured` and `authorization_configured`.
-- `GET /admin/namespaces/:namespace/state` also reports each upstream's resolved proxy summary:
-  - `proxy_source`: `upstream`, `namespace`, `env`, or `none`
-  - `proxy_mode`: `proxy`, `direct`, or `inherited`
-  - `proxy_url`: sanitized explicit proxy URL for namespace/upstream-configured proxies only; omitted for env-derived or no-proxy cases
-
-Example:
-
-```json
-{
-  "namespace": "demo",
-  "revision": "rev-1",
-  "config": {
-    "upstreams": [
-      {
-        "name": "default",
-        "fallback_credential_env": "OPENAI_API_KEY",
-        "fallback_credential_configured": true
-      }
-    ],
-    "hooks": {
-      "exchange": {
-        "url": "https://example.com/hooks/exchange",
-        "authorization_configured": true
-      }
-    }
-  },
-  "upstreams": [
-    {
-      "name": "default",
-      "api_root": "https://api.openai.com/v1",
-      "supported_formats": ["openai-responses"],
-      "availability": {
-        "status": "available"
-      },
-      "proxy_source": "namespace",
-      "proxy_mode": "proxy",
-      "proxy_url": "http://proxy.example:8080/global-hop"
-    }
-  ]
-}
-```
-
-### Full YAML Reference
-
-```yaml
-listen: 0.0.0.0:8080
-upstream_timeout_secs: 120
-# proxy:
-#   url: http://proxy.example:8080/global-hop
-
-upstreams:
-  UPSTREAM_NAME:
-    api_root: https://example.com/v1
-    format: anthropic
-    credential_env: EXAMPLE_API_KEY
-    # credential_actual: sk-xxx
-    auth_policy: client_or_fallback
-    # proxy: direct
-    headers:
-      x-example-header: example-value
-
-model_aliases:
-  local-model-name: UPSTREAM_NAME:real-upstream-model
-
-hooks:
-  max_pending_bytes: 104857600
-  timeout_secs: 30
-  failure_threshold: 3
-  cooldown_secs: 300
-  usage:
-    url: https://example.com/hooks/usage
-    authorization: Bearer usage-hook-token
-  exchange:
-    url: https://example.com/hooks/exchange
-    authorization: Bearer exchange-hook-token
-
-debug_trace:
-  path: /tmp/llm-proxy-debug.jsonl
-  max_text_chars: 16384
-```
-
-### Top-Level Fields
-
-| Field | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `listen` | string | No | `0.0.0.0:8080` | Proxy listen address in `host:port` form |
-| `upstream_timeout_secs` | integer | No | `120` | Timeout for upstream HTTP requests |
-| `proxy` | `direct` or object | No | inherited env/system handling | Optional namespace default upstream egress policy |
-| `upstreams` | map | Yes | none | Named upstream definitions |
-| `model_aliases` | map | No | empty | Maps local model names to `upstream:model` |
-| `hooks` | object | No | disabled | Optional async audit and usage export hooks |
-| `debug_trace` | object | No | disabled | Optional local JSONL debug trace for per-turn request/response summaries |
-
-### `debug_trace`
-
-Use `debug_trace` when you need to troubleshoot client or proxy behavior locally and want something lighter than full exchange capture.
-
-```yaml
-debug_trace:
-  path: /tmp/llm-proxy-debug.jsonl
-  max_text_chars: 16384
-```
-
-Design notes:
-- The request entry records only the new tail input for the current turn, not the full accumulated transcript.
-- The response entry records a normalized summary.
-  - Non-streaming: summarized final body.
-  - Streaming: aggregated text, aggregated reasoning text, tool-call deltas, terminal event such as `response.completed` or `response.failed`, and normalized error details when present.
-- The writer is intentionally non-blocking for live traffic. If the local writer falls behind, the trace emits explicit overflow records instead of blocking request teardown or trying to persist every raw event.
-- This format is meant to answer "what did the client add this turn?" and "what did the model actually send back?" without forcing you to reconstruct long raw SSE logs.
-
-### `upstreams`
-
-`upstreams` is a YAML object keyed by upstream name:
-
-```yaml
-upstreams:
-  GLM-OFFICIAL:
-    api_root: https://open.bigmodel.cn/api/anthropic/v1
-    format: anthropic
-    credential_env: GLM_APIKEY
-```
-
-Each upstream supports these fields:
-
-| Field | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `api_root` | string | Yes | none | Official upstream API root including version |
-| `format` | enum | No | auto-discover | Fixed upstream protocol format |
-| `credential_env` | string | No | none | Environment variable name containing the fallback credential |
-| `credential_actual` | string | No | none | Fallback credential written directly in YAML |
-| `auth_policy` | enum | No | `client_or_fallback` | Controls whether client auth is honored |
-| `proxy` | `direct` or object | No | inherit top-level `proxy` or env/system handling | Optional per-upstream egress override |
-| `headers` | map<string,string> | No | empty | Static headers injected into every upstream request |
-
-Rules:
-- `credential_env` and `credential_actual` are mutually exclusive.
-- If `auth_policy: force_server` is used, the upstream must define either `credential_env` or `credential_actual`.
-- `headers` are per-upstream, not global.
-- `proxy` follows the precedence and `direct` semantics described in [Upstream Proxy Support](#upstream-proxy-support).
-
-#### `format` enum
-
-Allowed values:
-
-| Value | Meaning |
-|------|---------|
-| `openai-completion` | OpenAI Chat Completions style upstream |
-| `openai-responses` | OpenAI Responses style upstream |
-| `anthropic` | Anthropic Messages style upstream |
-| `google` | Google Gemini GenerateContent / streamGenerateContent style upstream |
-| `responses` | Alias of `openai-responses` |
-
-If omitted, the proxy probes the upstream to determine supported formats.
-
-#### `auth_policy` enum
-
-| Value | Meaning |
-|------|---------|
-| `client_or_fallback` | Use client-provided auth if present; otherwise use the upstream fallback credential |
-| `force_server` | Ignore client-provided auth and always use the upstream fallback credential |
-
-### `model_aliases`
-
-`model_aliases` maps one stable local model name to one concrete upstream model:
-
-```yaml
-model_aliases:
-  sonnet: ANTHROPIC:claude-sonnet-4
-  coder-fast: GLM-OFFICIAL:GLM-4.5-Air
-```
-
-Rules:
-- Key: local model name exposed to clients
-- Value: `UPSTREAM_NAME:REAL_MODEL_NAME`
-- Local model names should be unique
-- If multiple upstreams are configured and a request uses an unmapped bare model name, the proxy returns `400`
-
-### `hooks`
-
-`hooks` configures optional async HTTP exports for audit and metering.
-
-| Field | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `max_pending_bytes` | integer | No | `104857600` | Max pending hook bytes; also the bounded capture budget for streaming `exchange` payloads |
-| `timeout_secs` | integer | No | `30` | Per-hook HTTP timeout |
-| `failure_threshold` | integer | No | `3` | Consecutive failures before a hook enters cooldown |
-| `cooldown_secs` | integer | No | `300` | Cooldown period before retrying a failed hook |
-| `usage` | object | No | disabled | Usage export hook |
-| `exchange` | object | No | disabled | Bounded request/response export hook |
-
-Hook behavior:
-- Hooks are asynchronous and best-effort.
-- `usage` is usually enough for billing or observability.
-- `exchange` captures the client-facing request plus a client-facing response snapshot after completion. For non-streaming requests that is normally the full final body; for streaming requests it is a bounded capture of the processed client-visible result rather than raw SSE lines.
-- When streaming exchange capture exceeds its budget or the background capture path overflows, the hook still completes best-effort with an explicit truncated/unavailable response marker such as `capture_truncated` / `capture_unavailable` instead of replaying the full body.
-- When pending hook payloads exceed `max_pending_bytes`, new hook payloads are dropped until pressure falls.
-- Each hook type has its own circuit breaker. After `failure_threshold` consecutive failures, that hook pauses for `cooldown_secs`.
-
-#### `hooks.usage` and `hooks.exchange`
-
-Each endpoint supports:
-
-| Field | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `url` | string | Yes | none | HTTP or HTTPS endpoint to receive hook payloads |
-| `authorization` | string | No | none | Optional `Authorization` header value for the hook request |
-
-## Usage
-
-### Multi-Upstream Example
-
-```bash
-cat > proxy.yaml <<'YAML'
-listen: 0.0.0.0:8080
-upstream_timeout_secs: 120
-
-upstreams:
-  GLM-OFFICIAL:
-    api_root: https://open.bigmodel.cn/api/anthropic/v1
-    format: anthropic
-    credential_env: GLM_APIKEY
-    auth_policy: client_or_fallback
-
-  OPENAI:
-    api_root: https://api.openai.com/v1
-    format: openai-responses
-    credential_env: OPENAI_API_KEY
-    auth_policy: force_server
-
-model_aliases:
-  GLM-5: GLM-OFFICIAL:GLM-5
-  gpt-4o: OPENAI:gpt-4o
-YAML
-
-export GLM_APIKEY="your-glm-key"
-export OPENAI_API_KEY="your-openai-key"
-
-./llm-universal-proxy --config proxy.yaml
-```
-
-Clients can then select a model in either of these ways:
-- Explicit upstream selector: `GLM-OFFICIAL:GLM-5`
-- Local alias: `GLM-5`
-
-If more than one upstream is configured and a model is not an explicit `upstream:model` reference or a configured alias, the proxy returns `400`.
-
-### Stable Local Model Names
-
-One practical pattern is to expose a provider-neutral local naming layer and hide vendor-specific model IDs behind it:
-
-```yaml
-model_aliases:
-  opus: ANTHROPIC:claude-opus-4-1
-  sonnet: ANTHROPIC:claude-sonnet-4
-  haiku: ANTHROPIC:claude-haiku-4
-  coder-fast: GLM-OFFICIAL:GLM-4.5-Air
-  coder-strong: KIMI:kimi-k2
-```
-
-Clients can then request `opus`, `sonnet`, `haiku`, `coder-fast`, or `coder-strong` without caring which upstream vendor actually serves the request.
-
-### Low-Level Manual CLI Wiring
-
-Prefer [Recommended Manual Interactive Testing](#recommended-manual-interactive-testing) for day-to-day work. The wrapper scripts are the supported manual path in this repo because they isolate CLI state, inject the correct proxy base URLs, and add Codex catalog metadata automatically.
-
-Use raw `codex`, `claude`, or `gemini` commands only for low-level debugging. In particular:
-- bare `codex` plus `model_provider` / `base_url` / `wire_api` is not enough for proxy-backed custom models
-- if you run raw Codex directly, you are responsible for supplying the same `model_catalog_json` metadata that the wrapper would have generated
-- if you use a different source YAML than `proxy-test-minimax-and-local.yaml`, keep the source config and the running proxy aligned so the generated client metadata matches the actual proxy routing
-
-### Real Upstream Smoke Matrix
-
-The repository includes a lower-level protocol/HTTP smoke script that exercises Anthropic-compatible and OpenAI-compatible upstreams through the proxy without launching real CLI clients:
-
-```bash
-GLM_APIKEY="your-real-key" python3 scripts/real_endpoint_matrix.py
-```
-
-It covers these client entrypoints:
-- `/openai/v1/chat/completions`
-- `/openai/v1/responses`
-- `/anthropic/v1/messages`
-
-And validates both non-streaming and streaming paths against:
-- Anthropic-compatible upstreams
-- OpenAI-compatible upstreams
-
-### Docker
-
-```bash
-# Build the image
-docker build -t llm-universal-proxy .
-
-# Run the container
-docker run -p 8080:8080 \
-  -v "$PWD/proxy.yaml:/app/proxy.yaml:ro" \
-  llm-universal-proxy \
-  --config /app/proxy.yaml
-```
-
-### API Endpoints
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /openai/v1/chat/completions` | OpenAI Chat Completions view |
-| `POST /openai/v1/responses` | OpenAI Responses view |
-| `GET /openai/v1/responses/{response_id}` | OpenAI Responses retrieve view |
-| `DELETE /openai/v1/responses/{response_id}` | OpenAI Responses delete view |
-| `POST /openai/v1/responses/{response_id}/cancel` | OpenAI Responses cancel view |
-| `POST /openai/v1/responses/compact` | OpenAI Responses compact view |
-| `GET /openai/v1/models` | OpenAI-compatible local model catalog |
-| `GET /openai/v1/models/{id}` | OpenAI-compatible local model detail |
-| `POST /anthropic/v1/messages` | Anthropic Messages view |
-| `GET /anthropic/v1/models` | Anthropic-compatible local model catalog |
-| `GET /anthropic/v1/models/{id}` | Anthropic-compatible local model detail |
-| `GET /google/v1beta/models` | Gemini-compatible local model catalog |
-| `GET /google/v1beta/models/{id}` | Gemini-compatible local model detail |
-| `POST /google/v1beta/models/{model}:generateContent` | Gemini GenerateContent view |
-| `POST /google/v1beta/models/{model}:streamGenerateContent` | Gemini streaming view |
-| `GET /health` | Health check (returns `{"status":"ok"}`) |
-
-### Example Requests
-
-#### OpenAI Chat Completions Format
-
-```bash
-curl http://localhost:8080/openai/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": false
-  }'
-```
-
-#### Anthropic Claude Format
-
-```bash
-curl http://localhost:8080/anthropic/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: YOUR_API_KEY" \
-  -H "anthropic-version: 2023-06-01" \
-  -d '{
-    "model": "claude-3-opus-20240229",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "max_tokens": 1024
-  }'
-```
-
-#### Google Gemini Format
-
-```bash
-curl "http://localhost:8080/google/v1beta/models/gemini-local:generateContent" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "contents": [{"parts": [{"text": "Hello!"}]}]
-  }'
-```
-
-## How It Works
-
-1. **Format Detection**: Analyzes the request path and body to determine the client's API format
-2. **Capability Discovery**: Probes the upstream service to determine supported formats
-3. **Smart Routing**:
-   - If client format matches upstream → **Passthrough** (zero overhead)
-   - If formats differ → **Translation** using OpenAI Chat Completions as pivot format
-4. **Streaming Support**: Handles SSE streams with chunk-by-chunk translation
-
-## Architecture
-
-```
-                    ┌──────────────────────┐
-                    │   LLM Universal      │
-   Client Request   │       Proxy          │   Upstream Request
-   (Any Format) ───▶│                      │──────────────────▶
-                    │  ┌────────────────┐  │   (Converted if needed)
-                    │  │   Detection    │  │
-                    │  └───────┬────────┘  │
-                    │          │           │
-                    │  ┌───────▼────────┐  │
-                    │  │   Translation  │  │
-                    │  └───────┬────────┘  │
-                    │          │           │
-                    │  ┌───────▼────────┐  │
-                    │  │   Upstream     │  │
-                    │  │   Client       │──┼──────▶ OpenAI / Anthropic / Google
-                    │  └────────────────┘  │
-                    └──────────────────────┘
-```
-
-## Supported Format Conversions
-
-| From → To | OpenAI | Anthropic | Gemini |
-|-----------|--------|-----------|--------|
-| OpenAI | ✅ Passthrough | ✅ Translate | ✅ Translate |
-| Anthropic | ✅ Translate | ✅ Passthrough | ✅ Translate |
-| Gemini | ✅ Translate | ✅ Translate | ✅ Passthrough |
-
-## Development
-
-```bash
-# Run tests
-cargo test
-
-# Build the release binary and run the local binary smoke
-make test-binary-smoke
-
-# Run with detailed test report
-make test-report
-
-# Check code
-cargo clippy --all-targets --all-features -- -D warnings
-
-# Format code
-cargo fmt --all -- --check
-```
+That flow is documented in [docs/admin-dynamic-config.md](./docs/admin-dynamic-config.md).
+
+## Keep Reading
+
+- [docs/configuration.md](./docs/configuration.md): static config, alias patterns, YAML reference
+- [docs/clients.md](./docs/clients.md): Codex / Claude Code / Gemini wrapper setup and base URL details
+- [docs/admin-dynamic-config.md](./docs/admin-dynamic-config.md): admin API, live config, CAS updates
+- [docs/protocol-compatibility-matrix.md](./docs/protocol-compatibility-matrix.md): compatibility boundaries and portability summary
+- [docs/max-compat-design.md](./docs/max-compat-design.md): deeper translated-path compatibility notes
+- [docs/DESIGN.md](./docs/DESIGN.md): current architecture map
+- [docs/README.md](./docs/README.md): docs index
 
 ## License
 

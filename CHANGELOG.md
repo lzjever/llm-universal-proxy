@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.2.11 - 2026-04-21
+
+### Configuration And Routing
+
+- Added upstream egress proxy configuration at both the namespace and per-upstream levels, so you can route provider traffic through a forward proxy or explicitly bypass it with `direct`.
+- Exposed resolved upstream proxy source and mode in the admin state views, and added a copyable `examples/upstream-proxy.yaml` example for static config setups.
+
+### Docs And Quickstart
+
+- Reworked the public README/docs around the `llmup` name and provider-API-only usage scope, with a docs index plus dedicated guides for configuration, client setup, and admin-driven dynamic config.
+- Replaced the old homepage path with a simpler two-upstream OpenAI + MiniMax quickstart and matching `examples/quickstart-openai-minimax.yaml`, including stable alias examples such as `gpt-5-4` and `gpt-5-4-mini`.
+- Clarified Codex, Claude Code, and Gemini wrapper routing so the docs now distinguish wrapper base URLs from the proxy endpoints they eventually hit.
+
+### Tooling
+
+- Updated the interactive wrappers and real CLI matrix to auto-pick the newest available proxy binary from `target/debug` or `target/release` instead of assuming a release build.
+
 ## v0.2.10 - 2026-04-21
 
 - Closed the remaining public `proxec` -> `llmup` rename drift across model-catalog list, object, and direct-upstream object responses so public `owned_by`, Google `version`, Google `description`, and embedded metadata all expose one consistent `llmup` namespace.

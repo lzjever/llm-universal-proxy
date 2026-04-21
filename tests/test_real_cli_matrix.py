@@ -22,8 +22,7 @@ TOOL_IDENTITY_FIXTURE_PATH = (
     / "smoke"
     / "tool_identity_public_contract.json"
 )
-DOC_CONTRACT_PATHS = (
-    REPO_ROOT / "README.md",
+LOCKED_TOOL_CONTRACT_SPEC_PATHS = (
     REPO_ROOT / "docs" / "DESIGN.md",
     REPO_ROOT / "docs" / "PRD.md",
     REPO_ROOT / "docs" / "CONSTITUTION.md",
@@ -35,6 +34,15 @@ LOCKED_TOOL_CONTRACT_LINES = (
     "The proxy must not rewrite the visible tool name supplied by the client.",
     "`__llmup_custom__*` is an internal transport artifact, not a public contract.",
     "`apply_patch` remains a public freeform tool on client-visible surfaces.",
+)
+README_DOC_ENTRY_SNIPPETS = (
+    "[docs/max-compat-design.md](./docs/max-compat-design.md)",
+    "[docs/protocol-compatibility-matrix.md](./docs/protocol-compatibility-matrix.md)",
+    "[docs/DESIGN.md](./docs/DESIGN.md)",
+)
+README_FORBIDDEN_RESERVED_PREFIX_PUBLIC_CONTRACT_PATTERNS = (
+    r"`__llmup_custom__[^`]*`\s+is\s+(?:an?\s+)?public contract",
+    r"`__llmup_custom__[^`]*`\s+is\s+(?:an?\s+)?public tool(?: name)?",
 )
 FORBIDDEN_LEGACY_TOOL_IDENTITY_LANGUAGE = {
     REPO_ROOT / "README.md": (
@@ -2517,11 +2525,22 @@ class RealCliMatrixTests(unittest.TestCase):
             )
 
     def test_docs_publish_the_locked_tool_identity_contract(self):
-        for path in DOC_CONTRACT_PATHS:
+        for path in LOCKED_TOOL_CONTRACT_SPEC_PATHS:
             with self.subTest(path=path.name):
                 text = path.read_text(encoding="utf-8")
                 for line in LOCKED_TOOL_CONTRACT_LINES:
                     self.assertIn(line, text)
+
+    def test_readme_points_to_contract_docs_without_promoting_reserved_prefix_as_public_contract(self):
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for snippet in README_DOC_ENTRY_SNIPPETS:
+            with self.subTest(required_entry=snippet):
+                self.assertIn(snippet, text)
+
+        for pattern in README_FORBIDDEN_RESERVED_PREFIX_PUBLIC_CONTRACT_PATTERNS:
+            with self.subTest(forbidden_pattern=pattern):
+                self.assertNotRegex(text, pattern)
 
     def test_docs_do_not_describe_reserved_prefix_bridge_as_current_limitation_or_fallback(self):
         for path, forbidden_snippets in FORBIDDEN_LEGACY_TOOL_IDENTITY_LANGUAGE.items():

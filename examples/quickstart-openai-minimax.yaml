@@ -1,0 +1,26 @@
+# Public quickstart example:
+# - official OpenAI API on gpt-5.4
+# - MiniMax OpenAI-compatible endpoint on MiniMax-M2.7-highspeed
+# - stable local aliases for clients: gpt-5-4 and gpt-5-4-mini
+#
+# Reasoning effort such as xhigh belongs on the client request, not in the alias name.
+
+listen: 127.0.0.1:8080
+upstream_timeout_secs: 120
+
+upstreams:
+  OPENAI:
+    api_root: https://api.openai.com/v1
+    format: openai-responses
+    credential_env: OPENAI_API_KEY
+    auth_policy: force_server
+
+  MINIMAX_OPENAI:
+    api_root: https://api.minimaxi.com/v1
+    format: openai-completion
+    credential_env: MINIMAX_API_KEY
+    auth_policy: force_server
+
+model_aliases:
+  gpt-5-4: OPENAI:gpt-5.4
+  gpt-5-4-mini: MINIMAX_OPENAI:MiniMax-M2.7-highspeed
