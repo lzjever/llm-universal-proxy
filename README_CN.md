@@ -132,6 +132,8 @@ bash scripts/test_cli_clients.sh --proxy-only
 ```yaml
 listen: 0.0.0.0:8080
 upstream_timeout_secs: 120
+proxy:
+  url: http://corp-proxy.example:8080
 
 upstreams:
   GLM-OFFICIAL:
@@ -145,6 +147,7 @@ upstreams:
     format: openai-responses
     credential_env: OPENAI_API_KEY
     auth_policy: force_server
+    proxy: direct
 
 model_aliases:
   GLM-5: GLM-OFFICIAL:GLM-5
@@ -170,6 +173,11 @@ debug_trace:
 - 代理对外只提供按协议分 namespace 的正式 API：`/openai/v1/...`、`/anthropic/v1/...`、`/google/v1beta/...`。旧的混合 `/v1/...` 路由刻意不再提供。
 - Anthropic 兼容上游通常要求 `x-api-key` 和 `anthropic-version`。代理会优先透传客户端鉴权头；若客户端没有提供，可回退到该上游配置的 `credential_env`，并会为 Anthropic 上游默认补上 `anthropic-version: 2023-06-01`。
 - 服务商特定静态头应配置在 `upstreams` 中对应上游的 `headers` 字段里。
+- `proxy` 用于控制代理访问上游时所使用的 forward proxy。顶层 `proxy` 是 namespace 级默认值，`upstreams.<NAME>.proxy` 可对单个上游覆盖。
+- 代理选择优先级是：`upstreams.<NAME>.proxy` > 顶层 `proxy` > 环境变量代理。也就是说，只有当两层配置都省略时，才会回退到环境变量。
+- `proxy: direct` 表示显式直连，并切断更低优先级的代理继承；它既可以写在顶层，也可以写在单个 upstream 下。
+- 当配置层级都省略时，请求会沿用标准环境变量代理行为：HTTP 目标使用 `HTTP_PROXY` / `http_proxy`，HTTPS 目标使用 `HTTPS_PROXY` / `https_proxy`，两者都可回退到 `ALL_PROXY` / `all_proxy`；`NO_PROXY` / `no_proxy` 仍然生效。
+- 显式 `proxy.url` 目前仅支持 `http`、`https`、`socks5`、`socks5h`，并且必须是带 host 的绝对 URL。
 - `credential_env` 表示“去哪个环境变量读取该上游的 fallback credential”，密钥本身不写进 YAML。
 - `credential_actual` 可用于直接在 YAML 中写 fallback credential；它与 `credential_env` 互斥。
 - `auth_policy` 支持 `client_or_fallback` 和 `force_server`。
@@ -203,6 +211,9 @@ admin 路由与数据面是显式分离的：
 - admin 读接口使用单独的 redacted view model，不会直接序列化内部 `Config`
 - admin state 响应绝不会明文返回上游 `fallback_credential_actual` 或 hook `authorization`
 - 对应位置会改为布尔标记，例如 `fallback_credential_configured` 和 `authorization_configured`
+- `GET /admin/namespaces/:namespace/state` 的 `upstreams[]` 摘要还会给出代理决策信息：`proxy_source`、`proxy_mode`，以及在显式 namespace/upstream 代理场景下给出脱敏后的 `proxy_url`
+- `proxy_source` 可能是 `upstream`、`namespace`、`env`、`none`；`proxy_mode` 可能是 `proxy`、`direct`、`inherited`
+- admin 视图中的 `config.proxy`、`config.upstreams[].proxy`、`upstreams[].proxy_url` 都会脱敏处理：用户名/密码、query、fragment 不会回显；环境变量继承的代理 URL 也不会被直接返回
 
 示例：
 
@@ -233,6 +244,8 @@ admin 路由与数据面是显式分离的：
 ```yaml
 listen: 0.0.0.0:8080
 upstream_timeout_secs: 120
+proxy:
+  url: http://corp-proxy.example:8080
 
 upstreams:
   UPSTREAM_NAME:
@@ -241,6 +254,9 @@ upstreams:
     credential_env: EXAMPLE_API_KEY
     # credential_actual: sk-xxx
     auth_policy: client_or_fallback
+    # proxy: direct
+    # proxy:
+    #   url: socks5h://regional-proxy.example:1080
     headers:
       x-example-header: example-value
 
@@ -270,6 +286,7 @@ debug_trace:
 |------|------|------|--------|------|
 | `listen` | string | 否 | `0.0.0.0:8080` | 代理监听地址，格式为 `host:port` |
 | `upstream_timeout_secs` | integer | 否 | `120` | 请求上游时的 HTTP 超时 |
+| `proxy` | `direct` 或 object | 否 | 继承环境变量代理 | namespace 级上游访问代理默认值；可写 `direct` 或 `{ url: ... }` |
 | `upstreams` | map | 是 | 无 | 命名上游配置 |
 | `model_aliases` | map | 否 | 空 | 把本地模型名映射到 `upstream:model` |
 | `hooks` | object | 否 | 关闭 | 可选的异步审计与用量导出 hooks |
@@ -314,12 +331,16 @@ upstreams:
 | `credential_env` | string | 否 | 无 | 指向 fallback credential 的环境变量名 |
 | `credential_actual` | string | 否 | 无 | 直接写在 YAML 里的 fallback credential |
 | `auth_policy` | enum | 否 | `client_or_fallback` | 控制是否接受客户端传入的认证信息 |
+| `proxy` | `direct` 或 object | 否 | 继承顶层 `proxy`，若顶层也省略则继承环境变量代理 | 该 upstream 的 forward proxy 覆盖项 |
 | `headers` | map<string,string> | 否 | 空 | 注入到该上游每个请求的静态头 |
 
 规则：
 - `credential_env` 和 `credential_actual` 互斥。
 - 如果使用 `auth_policy: force_server`，则该 upstream 必须配置 `credential_env` 或 `credential_actual`。
 - `headers` 是按 upstream 单独配置，不是全局配置。
+- 代理优先级是：`upstreams.<NAME>.proxy` > 顶层 `proxy` > 环境变量代理。
+- `proxy: direct` 会显式禁用这一层以下的代理继承。
+- 显式 `proxy.url` 仅支持 `http`、`https`、`socks5`、`socks5h`，并且必须是带 host 的绝对 URL。
 
 #### `format` 枚举
 
@@ -570,7 +591,7 @@ Gemini：
 - 为 Codex 生成并注入 `.codex/catalog.json`，再通过 `-c 'model_catalog_json=...'` 传给客户端；这样不会退回 unknown-model fallback。
 - 对 text-only 的 Codex alias 额外注入 `-c 'tools.view_image=false'`，避免 `minimax-openai` 这类模型继续暴露 `view_image`。
 - 为 Gemini 生成 `.gemini/settings.json`，把 alias 的模型上限写进 settings。
-- 清空本地 `HTTP_PROXY` / `HTTPS_PROXY` 等代理环境变量，避免 CLI 把 `127.0.0.1` 的 proxy 流量又错误地转发到外部代理。
+- 清空本地 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，并设置 `NO_PROXY=127.0.0.1,localhost`，避免 CLI 把本地 `127.0.0.1` 的 proxy 流量又错误地转发到外部代理。
 - 当上游配置使用 `auth_policy: force_server` 时，真正的上游凭证仍由 proxy 侧读取；客户端拿到的 dummy key 只是为了满足各自 CLI 的本地校验。
 
 如果你更喜欢直接调用 Python 入口，也可以把上面的 shell wrapper 等价替换为：

@@ -1,0 +1,66 @@
+# Example: upstream proxy configuration
+#
+# Resolution order:
+#   per-upstream proxy > namespace proxy > env proxy > no proxy
+#
+# Supported proxy URL schemes:
+#   http://
+#   https://
+#   socks5://
+#   socks5h://
+#
+# Notes:
+# - `proxy: direct` is an explicit no-proxy override. It cuts off namespace and env proxy use.
+# - A concrete proxy URL is also explicit. It cuts off env proxy inheritance for that upstream.
+# - Env proxy fallback only applies when both the namespace-level `proxy` and the upstream-level
+#   `proxy` are omitted for that upstream.
+
+listen: 127.0.0.1:8080
+upstream_timeout_secs: 120
+
+# Namespace default proxy for this runtime config.
+# Any upstream that omits `proxy` will use this proxy unless it sets its own override.
+proxy:
+  url: http://proxy.example:8080/egress
+
+upstreams:
+  OPENAI:
+    api_root: https://api.openai.com/v1
+    format: openai-responses
+    credential_env: OPENAI_API_KEY
+    auth_policy: force_server
+    # No upstream `proxy` here:
+    # this upstream inherits the namespace default proxy above.
+
+  ANTHROPIC:
+    api_root: https://api.anthropic.com/v1
+    format: anthropic
+    credential_env: ANTHROPIC_API_KEY
+    auth_policy: force_server
+    proxy:
+      url: socks5h://regional-proxy.example:1080/anthropic-egress
+    # Per-upstream override:
+    # this wins over the namespace default proxy.
+
+  GOOGLE:
+    api_root: https://generativelanguage.googleapis.com/v1beta
+    format: google
+    credential_env: GEMINI_API_KEY
+    auth_policy: force_server
+    proxy: direct
+    # Explicit direct:
+    # this upstream bypasses both the namespace default proxy and env proxies.
+
+  OPENROUTER:
+    api_root: https://openrouter.ai/api/v1
+    format: openai-responses
+    credential_env: OPENROUTER_API_KEY
+    auth_policy: force_server
+    # If you want this upstream to inherit HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY,
+    # omit `proxy` here and also remove the top-level namespace `proxy` above.
+    # With the file as written, this upstream still uses the namespace default proxy.
+
+model_aliases:
+  gpt-4o: OPENAI:gpt-4o
+  claude-sonnet: ANTHROPIC:claude-sonnet-4-5
+  gemini-flash: GOOGLE:gemini-2.0-flash

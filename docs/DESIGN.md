@@ -54,8 +54,6 @@ The live runtime is namespace-scoped rather than process-global.
 - `RuntimeNamespaceState` contains:
   - current namespace `Config`
   - resolved `UpstreamState` map
-  - unary HTTP client
-  - streaming HTTP client
   - optional `HookDispatcher`
   - optional `DebugTraceRecorder`
   - server-owned revision used by admin writes
@@ -63,6 +61,9 @@ The live runtime is namespace-scoped rather than process-global.
   - configured upstream info
   - discovered or fixed capability
   - availability status
+  - unary HTTP client
+  - streaming HTTP client
+  - resolved proxy metadata used by request execution and admin state
 
 This matters because:
 
@@ -111,6 +112,20 @@ Discovery still exists, but it is now only one part of a larger routing system. 
 
 Important caveat: discovery is a capability bootstrap signal, not a guarantee that every route or field is portable. Request-side assessment and route-specific rules still decide whether a request is allowed, warned, translated, or rejected.
 
+### Upstream Transport Policy
+
+Outbound transport is resolved per upstream, not by sharing one namespace-wide client pair.
+
+- Each namespace config may define a top-level `proxy` default.
+- Each upstream may define its own `proxy` override.
+- Effective priority is `upstream > namespace > env > no proxy`.
+- `proxy: direct` explicitly cuts off env proxy inheritance for that scope.
+- An explicit proxy URL also cuts off env proxy inheritance for that scope and pins the upstream to that proxy.
+- Explicit proxy URLs are currently validated as `http`, `https`, `socks5`, or `socks5h`.
+- Discovery, normal requests, streaming requests, and OpenAI Responses resource routes reuse the same resolved per-upstream transport policy.
+- The runtime resolves that policy once when building `UpstreamState`, then reuses the upstream's unary and streaming clients everywhere that upstream is called.
+- Admin state exposes a redacted summary of that decision through `proxy_source`, `proxy_mode`, and `proxy_url`.
+
 ## Request Execution Flow
 
 Most client-facing request execution lives in `src/server/proxy.rs`.
@@ -125,7 +140,7 @@ The current flow is:
 6. If client format is natively supported, pass through the request body.
 7. Otherwise, translate the request through the translate facade.
 8. Apply auth forwarding and configured upstream headers.
-9. Call upstream with either the unary or streaming HTTP client.
+9. Call upstream through the selected upstream state's unary or streaming HTTP client.
 10. Normalize non-stream responses or wrap stream responses in the runtime chain.
 
 OpenAI Responses lifecycle resources are a special case. They do not use the generic "translate anything anywhere" path. `src/server/responses_resources.rs` only proxies those resource routes when the namespace can identify a unique native OpenAI Responses upstream. The server does not invent response-session ownership state.
@@ -203,12 +218,12 @@ This order matters:
 - `TrackedBodyStream` owns success/error/cancel transport finalization
 - downstream disconnect tears down the stream by dropping the wrapper chain
 
-The runtime also uses two HTTP clients per namespace:
+Each `UpstreamState` owns two HTTP clients:
 
 - a unary client with total upstream timeout
 - a streaming client with connect/setup timeout but no shared total-request timeout
 
-That split prevents long-lived SSE streams from inheriting unary timeout behavior.
+That split prevents long-lived SSE streams from inheriting unary timeout behavior while still keeping discovery, request execution, and resource routes on the same upstream-scoped transport policy.
 
 ## Observability Design
 

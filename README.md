@@ -304,6 +304,7 @@ You can override the defaults with:
   - Claude: `ANTHROPIC_API_KEY=dummy`, `ANTHROPIC_BASE_URL=<proxy>/anthropic`
   - Gemini: `GEMINI_API_KEY=dummy`, `GOOGLE_GEMINI_BASE_URL=<proxy>/google`
 - Clear `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` and set `NO_PROXY=127.0.0.1,localhost` so local proxy traffic does not get routed through an outer HTTP proxy.
+- That wrapper-side cleanup only affects the local client -> proxy hop. The proxy's own upstream egress proxy behavior is configured separately through the YAML `proxy` fields documented below.
 - Preserve host `CARGO_HOME` / `RUSTUP_HOME` when present so Rust toolchain commands still work inside the isolated client environment.
 - For Codex, resolve `limits` and `codex` metadata from the source config, write a temporary `~/.codex/catalog.json`, inject `model_catalog_json`, disable Codex web search when the source config marks the model as `supports_search_tool: false`, and inject `tools.view_image=false` when the source config marks the model as text-only.
 - For Gemini, write a temporary `~/.gemini/settings.json` with the model limits that the harness can express through Gemini's real settings schema.
@@ -315,6 +316,8 @@ The proxy is configured with a YAML file passed via `--config`:
 ```yaml
 listen: 0.0.0.0:8080
 upstream_timeout_secs: 120
+# proxy:
+#   url: http://proxy.example:8080/global-hop
 
 upstreams:
   GLM-OFFICIAL:
@@ -362,6 +365,37 @@ Notes:
 - `debug_trace` records only the tail "new input" portion of each client request rather than rewriting the full accumulated conversation each turn.
 - For streaming responses, `debug_trace` records the processed client-visible result: aggregated text, reasoning text, tool-call deltas, terminal event, finish reason, and any normalized error. It does not dump raw SSE JSON lines.
 
+### Upstream Proxy Support
+
+The proxy can apply upstream egress proxying at two configuration layers:
+
+- Top-level `proxy` sets the namespace default for every upstream that does not define its own override.
+- `upstreams.<NAME>.proxy` overrides the namespace default for one upstream.
+
+Resolution order is:
+
+- `upstreams[].proxy`
+- top-level `proxy`
+- inherited reqwest/system proxy handling when no explicit proxy is configured
+- no proxy
+
+Supported explicit values:
+
+- `proxy: direct`
+- `proxy: { url: "http://proxy.example:8080" }`
+- `proxy: { url: "https://proxy.example:8443" }`
+- `proxy: { url: "socks5://proxy.example:1080" }`
+- `proxy: { url: "socks5h://proxy.example:1080" }`
+
+Behavior rules:
+
+- `proxy: direct` forces direct egress for that scope and cuts off inherited environment/system proxy behavior.
+- An explicit proxy URL also cuts off inherited environment/system proxy behavior for that scope and pins the upstream to the configured proxy.
+- If neither `upstreams[].proxy` nor the top-level `proxy` is set, the proxy leaves reqwest's default proxy resolution enabled, so environment/system proxy settings remain in effect.
+- Discovery probes, normal upstream requests, streaming upstream requests, and OpenAI Responses resource routes all reuse the same resolved per-upstream transport policy.
+
+For a complete commented example, see [examples/upstream-proxy.yaml](/home/percy/works/mbos-v1/llm-universal-proxy/examples/upstream-proxy.yaml).
+
 ## Admin Control Plane
 
 Admin endpoints are intentionally separated from the data plane:
@@ -387,6 +421,10 @@ Write/read model boundary:
 - Admin read endpoints use a separate redacted view model and never serialize the internal `Config` directly.
 - Admin state responses never return upstream `fallback_credential_actual` or hook `authorization` secrets in plaintext.
 - Redacted state exposes boolean presence flags instead, such as `fallback_credential_configured` and `authorization_configured`.
+- `GET /admin/namespaces/:namespace/state` also reports each upstream's resolved proxy summary:
+  - `proxy_source`: `upstream`, `namespace`, `env`, or `none`
+  - `proxy_mode`: `proxy`, `direct`, or `inherited`
+  - `proxy_url`: sanitized explicit proxy URL for namespace/upstream-configured proxies only; omitted for env-derived or no-proxy cases
 
 Example:
 
@@ -408,7 +446,20 @@ Example:
         "authorization_configured": true
       }
     }
-  }
+  },
+  "upstreams": [
+    {
+      "name": "default",
+      "api_root": "https://api.openai.com/v1",
+      "supported_formats": ["openai-responses"],
+      "availability": {
+        "status": "available"
+      },
+      "proxy_source": "namespace",
+      "proxy_mode": "proxy",
+      "proxy_url": "http://proxy.example:8080/global-hop"
+    }
+  ]
 }
 ```
 
@@ -417,6 +468,8 @@ Example:
 ```yaml
 listen: 0.0.0.0:8080
 upstream_timeout_secs: 120
+# proxy:
+#   url: http://proxy.example:8080/global-hop
 
 upstreams:
   UPSTREAM_NAME:
@@ -425,6 +478,7 @@ upstreams:
     credential_env: EXAMPLE_API_KEY
     # credential_actual: sk-xxx
     auth_policy: client_or_fallback
+    # proxy: direct
     headers:
       x-example-header: example-value
 
@@ -454,6 +508,7 @@ debug_trace:
 |------|------|----------|---------|-------------|
 | `listen` | string | No | `0.0.0.0:8080` | Proxy listen address in `host:port` form |
 | `upstream_timeout_secs` | integer | No | `120` | Timeout for upstream HTTP requests |
+| `proxy` | `direct` or object | No | inherited env/system handling | Optional namespace default upstream egress policy |
 | `upstreams` | map | Yes | none | Named upstream definitions |
 | `model_aliases` | map | No | empty | Maps local model names to `upstream:model` |
 | `hooks` | object | No | disabled | Optional async audit and usage export hooks |
@@ -498,12 +553,14 @@ Each upstream supports these fields:
 | `credential_env` | string | No | none | Environment variable name containing the fallback credential |
 | `credential_actual` | string | No | none | Fallback credential written directly in YAML |
 | `auth_policy` | enum | No | `client_or_fallback` | Controls whether client auth is honored |
+| `proxy` | `direct` or object | No | inherit top-level `proxy` or env/system handling | Optional per-upstream egress override |
 | `headers` | map<string,string> | No | empty | Static headers injected into every upstream request |
 
 Rules:
 - `credential_env` and `credential_actual` are mutually exclusive.
 - If `auth_policy: force_server` is used, the upstream must define either `credential_env` or `credential_actual`.
 - `headers` are per-upstream, not global.
+- `proxy` follows the precedence and `direct` semantics described in [Upstream Proxy Support](#upstream-proxy-support).
 
 #### `format` enum
 
