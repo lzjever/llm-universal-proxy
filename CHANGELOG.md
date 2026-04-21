@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.2.10 - 2026-04-21
+
+- Closed the remaining public `proxec` -> `llmup` rename drift across model-catalog list, object, and direct-upstream object responses so public `owned_by`, Google `version`, Google `description`, and embedded metadata all expose one consistent `llmup` namespace.
+- Aligned live `llmup.surface` metadata with the proxy's effective model surface source of truth, so public model payloads and wrapper-generated runtime config now agree on surfaced limits, modalities, search support, and related tool metadata instead of drifting through parallel metadata paths.
+- Restored the public Codex `apply_patch` contract to `freeform` on surfaced metadata and wrapper catalogs, keeping the internal function-wrapper bridge transport private instead of exposing it as the user-visible tool transport.
+- Hardened the OpenAI Responses -> Google custom/grammar tool bridge so max-compat paths preserve stable public tool identity such as `apply_patch` while using the canonical single-string wrapper only as an internal transport detail for Gemini compatibility.
+- Preserved Gemini live custom-tool streaming on the native SSE path instead of silently downgrading to unary transport, with regression coverage around `:streamGenerateContent` routing and streamed Responses tool-call behavior.
+
 ## v0.2.9 - 2026-04-21
 
 - Fixed wrapper-generated runtime config serialization so managed proxy launches now preserve upstream `surface_defaults` and structured alias `surface` overrides instead of silently dropping model-surface metadata when rewriting the source config for test and interactive runs.
