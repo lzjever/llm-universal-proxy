@@ -83,7 +83,7 @@ Work items:
 - add `surface_defaults` to upstream config
 - add `surface` to alias config
 - implement `effective_model_surface()`
-- expose `proxec.surface` from model catalog endpoints
+- expose `llmup.surface` from model catalog endpoints
 
 Exit criteria:
 

@@ -8,11 +8,11 @@
 
 这个代理最有价值的地方，就是把“客户端支持的协议”和“你真正想用的模型协议”解耦开。比如新版 Codex CLI 只支持 OpenAI Responses API，但通过 `llm-universal-proxy`，它仍然可以接入 Anthropic 兼容或 OpenAI Completions 兼容的 coding 模型，例如 GLM、Kimi、MiniMax。
 
-![Proxec dashboard](./docs/images/dashboard.png)
+![LLMUP dashboard](./docs/images/dashboard.png)
 
 运行时 dashboard 可以直接看到路由、流式请求、取消统计、上游流量和 hook 状态。
 
-![通过 proxec 使用 GLM-5-Turbo 的 Codex CLI](./docs/images/codex-glm5-turbo.png)
+![通过 llmup 使用 GLM-5-Turbo 的 Codex CLI](./docs/images/codex-glm5-turbo.png)
 
 这是一张真实的 Codex CLI 使用截图：前端是 Codex，底层实际模型是通过代理路由到 `GLM-5-Turbo`。
 

@@ -293,16 +293,24 @@ class RealCliMatrixTests(unittest.TestCase):
                     surface_defaults:
                       modalities:
                         input: ["text"]
+                        output: ["text"]
                       tools:
                         supports_search: false
+                        supports_view_image: false
+                        apply_patch_transport: function
+                        supports_parallel_calls: true
                 model_aliases:
                   vision-openai:
                     target: "MINIMAX-OPENAI:MiniMax-Vision"
                     surface:
                       modalities:
                         input: ["text", "image"]
+                        output: ["text"]
                       tools:
                         supports_search: true
+                        supports_view_image: true
+                        apply_patch_transport: freeform
+                        supports_parallel_calls: false
                 """
             )
         )
@@ -311,15 +319,45 @@ class RealCliMatrixTests(unittest.TestCase):
             parsed.upstream_surface_defaults["MINIMAX-OPENAI"].input_modalities,
             ("text",),
         )
+        self.assertEqual(
+            parsed.upstream_surface_defaults["MINIMAX-OPENAI"].output_modalities,
+            ("text",),
+        )
         self.assertFalse(
             parsed.upstream_surface_defaults["MINIMAX-OPENAI"].supports_search
+        )
+        self.assertFalse(
+            parsed.upstream_surface_defaults["MINIMAX-OPENAI"].supports_view_image
+        )
+        self.assertEqual(
+            parsed.upstream_surface_defaults["MINIMAX-OPENAI"].apply_patch_transport,
+            "function",
+        )
+        self.assertTrue(
+            parsed.upstream_surface_defaults[
+                "MINIMAX-OPENAI"
+            ].supports_parallel_calls
         )
         self.assertEqual(
             parsed.model_alias_configs["vision-openai"].surface.input_modalities,
             ("text", "image"),
         )
+        self.assertEqual(
+            parsed.model_alias_configs["vision-openai"].surface.output_modalities,
+            ("text",),
+        )
         self.assertTrue(
             parsed.model_alias_configs["vision-openai"].surface.supports_search
+        )
+        self.assertTrue(
+            parsed.model_alias_configs["vision-openai"].surface.supports_view_image
+        )
+        self.assertEqual(
+            parsed.model_alias_configs["vision-openai"].surface.apply_patch_transport,
+            "freeform",
+        )
+        self.assertFalse(
+            parsed.model_alias_configs["vision-openai"].surface.supports_parallel_calls
         )
 
     def test_resolve_lanes_marks_qwen_optional_when_env_missing(self):
@@ -444,16 +482,24 @@ class RealCliMatrixTests(unittest.TestCase):
                     surface_defaults:
                       modalities:
                         input: ["text"]
+                        output: ["text"]
                       tools:
                         supports_search: false
+                        supports_view_image: false
+                        apply_patch_transport: function
+                        supports_parallel_calls: true
                 model_aliases:
                   vision-openai:
                     target: "MINIMAX-OPENAI:MiniMax-Vision"
                     surface:
                       modalities:
                         input: ["text", "image"]
+                        output: ["text"]
                       tools:
                         supports_search: true
+                        supports_view_image: true
+                        apply_patch_transport: freeform
+                        supports_parallel_calls: false
                 """
             )
         )
@@ -468,10 +514,18 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertIn("surface_defaults:", rendered)
         self.assertIn('input: ["text"]', rendered)
+        self.assertIn('output: ["text"]', rendered)
         self.assertIn("supports_search: false", rendered)
+        self.assertIn("supports_view_image: false", rendered)
+        self.assertIn("apply_patch_transport: function", rendered)
+        self.assertIn("supports_parallel_calls: true", rendered)
         self.assertIn("surface:", rendered)
         self.assertIn('input: ["text", "image"]', rendered)
+        self.assertIn('output: ["text"]', rendered)
         self.assertIn("supports_search: true", rendered)
+        self.assertIn("supports_view_image: true", rendered)
+        self.assertIn("apply_patch_transport: freeform", rendered)
+        self.assertIn("supports_parallel_calls: false", rendered)
 
     def test_resolve_model_limits_inherits_upstream_defaults_and_alias_overrides(self):
         module = load_module()
@@ -781,6 +835,9 @@ class RealCliMatrixTests(unittest.TestCase):
             module.CodexModelMetadata(
                 input_modalities=("text",),
                 supports_search_tool=False,
+                supports_view_image=False,
+                apply_patch_tool_type="freeform",
+                supports_parallel_tool_calls=False,
             ),
         )
 
@@ -806,6 +863,172 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(model_entry["auto_compact_token_limit"], 61200)
         self.assertEqual(model_entry["input_modalities"], ["text"])
         self.assertFalse(model_entry["supports_search_tool"])
+
+    def test_build_codex_catalog_args_keeps_public_apply_patch_contract_freeform(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home_dir = pathlib.Path(temp_dir)
+            args = module.build_codex_catalog_args(
+                home_dir,
+                "vision-openai",
+                module.ModelLimits(context_window=200000),
+                module.CodexModelMetadata(
+                    input_modalities=("text", "image"),
+                    supports_search_tool=True,
+                    supports_view_image=False,
+                    apply_patch_tool_type="freeform",
+                    supports_parallel_tool_calls=True,
+                ),
+            )
+            payload = json.loads(
+                (home_dir / ".codex" / "catalog.json").read_text(encoding="utf-8")
+            )
+
+        self.assertIn("tools.view_image=false", " ".join(args))
+        self.assertEqual(payload["models"][0]["apply_patch_tool_type"], "freeform")
+        self.assertTrue(payload["models"][0]["supports_parallel_tool_calls"])
+
+    def test_fetch_live_model_profile_reads_llmup_surface_for_direct_upstream_model(self):
+        module = load_module()
+        payload = {
+            "id": "MINIMAX-OPENAI:MiniMax-Vision",
+            "llmup": {
+                "upstream_name": "MINIMAX-OPENAI",
+                "upstream_model": "MiniMax-Vision",
+                "surface": {
+                    "limits": {
+                        "context_window": 200000,
+                        "max_output_tokens": 128000,
+                    },
+                    "modalities": {"input": ["text", "image"]},
+                    "tools": {
+                        "supports_search": True,
+                        "supports_view_image": True,
+                        "apply_patch_transport": "function",
+                        "supports_parallel_calls": True,
+                    },
+                },
+            },
+        }
+
+        with mock.patch.object(
+            module,
+            "http_get_json",
+            return_value=payload,
+        ) as http_get_json:
+            profile = module.fetch_live_model_profile(
+                "http://127.0.0.1:18888",
+                "MINIMAX-OPENAI:MiniMax-Vision",
+            )
+
+        self.assertEqual(http_get_json.call_args.args[0], "http://127.0.0.1:18888/openai/v1/models/MINIMAX-OPENAI:MiniMax-Vision")
+        self.assertEqual(profile.limits.context_window, 200000)
+        self.assertEqual(profile.limits.max_output_tokens, 128000)
+        self.assertEqual(profile.codex_metadata.input_modalities, ("text", "image"))
+        self.assertTrue(profile.codex_metadata.supports_search_tool)
+        self.assertTrue(profile.codex_metadata.supports_view_image)
+        self.assertEqual(profile.codex_metadata.apply_patch_tool_type, "freeform")
+        self.assertTrue(profile.codex_metadata.supports_parallel_tool_calls)
+
+    def test_build_codex_model_catalog_rejects_internal_apply_patch_transport_as_public_tool_type(self):
+        module = load_module()
+
+        with self.assertRaisesRegex(
+            ValueError, "apply_patch public contract must remain freeform"
+        ):
+            module.build_codex_model_catalog(
+                "vision-openai",
+                module.ModelLimits(context_window=200000),
+                module.CodexModelMetadata(
+                    input_modalities=("text", "image"),
+                    supports_search_tool=True,
+                    apply_patch_tool_type="function",
+                ),
+            )
+
+    def test_fetch_live_model_profile_rejects_legacy_proxec_payloads(self):
+        module = load_module()
+
+        with mock.patch.object(
+            module,
+            "http_get_json",
+            return_value={"proxec": {"surface": {"limits": {"context_window": 1}}}},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "llmup"):
+                module.fetch_live_model_profile(
+                    "http://127.0.0.1:18888",
+                    "minimax-openai",
+                )
+
+    def test_fetch_live_model_profile_requires_llmup_surface_as_the_live_truth_source(self):
+        module = load_module()
+
+        with mock.patch.object(
+            module,
+            "http_get_json",
+            return_value={
+                "id": "minimax-openai",
+                "llmup": {
+                    "limits": {
+                        "context_window": 200000,
+                        "max_output_tokens": 128000,
+                    },
+                },
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "llmup\\.surface"):
+                module.fetch_live_model_profile(
+                    "http://127.0.0.1:18888",
+                    "minimax-openai",
+                )
+
+    def test_refresh_lane_model_profiles_uses_live_models_for_enabled_lanes(self):
+        module = load_module()
+        enabled_lane = make_lane(
+            module,
+            name="vision-openai",
+            proxy_model="MINIMAX-OPENAI:MiniMax-Vision",
+            upstream_name="MINIMAX-OPENAI",
+        )
+        disabled_lane = make_lane(
+            module,
+            name="disabled-openai",
+            enabled=False,
+            proxy_model="disabled-openai",
+        )
+        live_profile = module.LiveModelProfile(
+            limits=module.ModelLimits(
+                context_window=200000,
+                max_output_tokens=128000,
+            ),
+            codex_metadata=module.CodexModelMetadata(
+                input_modalities=("text", "image"),
+                supports_search_tool=True,
+                supports_view_image=True,
+                apply_patch_tool_type="freeform",
+                supports_parallel_tool_calls=True,
+            ),
+        )
+
+        with mock.patch.object(
+            module,
+            "fetch_live_model_profile",
+            return_value=live_profile,
+        ) as fetch_live_model_profile:
+            module.refresh_lane_model_profiles(
+                "http://127.0.0.1:18888",
+                [enabled_lane, disabled_lane],
+            )
+
+        fetch_live_model_profile.assert_called_once_with(
+            "http://127.0.0.1:18888",
+            "MINIMAX-OPENAI:MiniMax-Vision",
+        )
+        self.assertEqual(enabled_lane.limits, live_profile.limits)
+        self.assertEqual(enabled_lane.codex_metadata, live_profile.codex_metadata)
+        self.assertIsNone(disabled_lane.limits)
+        self.assertIsNone(disabled_lane.codex_metadata)
 
     def test_build_codex_model_catalog_keeps_85_percent_of_context_when_output_limit_missing(self):
         module = load_module()

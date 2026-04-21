@@ -28,11 +28,10 @@ from real_cli_matrix import (  # noqa: E402
     build_codex_catalog_args,
     build_runtime_config_text,
     ensure_no_public_internal_tool_artifacts,
+    fetch_live_model_profile,
     load_dotenv_file,
     parse_proxy_source,
     prepare_proxy_env,
-    resolve_codex_model_metadata,
-    resolve_model_limits,
     start_proxy,
     stop_proxy,
     timeout_policy_from_args,
@@ -225,9 +224,6 @@ def run(argv: list[str] | None = None) -> int:
         proxy_process: subprocess.Popen[str] | None = None
 
         try:
-            parsed_source = parse_proxy_source(config_source.read_text(encoding="utf-8"))
-            model_limits = resolve_model_limits(parsed_source, args.model)
-            codex_metadata = resolve_codex_model_metadata(parsed_source, args.model)
             if args.proxy_base:
                 proxy_base = normalize_proxy_base(args.proxy_base)
             else:
@@ -240,6 +236,7 @@ def run(argv: list[str] | None = None) -> int:
             wait_for_health(
                 proxy_base, timeout_secs=timeout_policy.proxy_health_timeout_secs
             )
+            live_profile = fetch_live_model_profile(proxy_base, args.model)
 
             client_home = runtime_root / "homes" / args.client
             client_env = build_client_env(
@@ -248,7 +245,7 @@ def run(argv: list[str] | None = None) -> int:
                 proxy_base,
                 client_home,
                 model_name=args.model,
-                model_limits=model_limits,
+                model_limits=live_profile.limits,
             )
             command = build_interactive_command(
                 args.client,
@@ -256,8 +253,8 @@ def run(argv: list[str] | None = None) -> int:
                 args.model,
                 proxy_base,
                 client_home=client_home,
-                model_limits=model_limits,
-                codex_metadata=codex_metadata,
+                model_limits=live_profile.limits,
+                codex_metadata=live_profile.codex_metadata,
             )
             return launch_interactive_client(command, workspace, client_env)
         finally:

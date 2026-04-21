@@ -3240,41 +3240,43 @@ async fn openai_models_endpoint_lists_local_aliases() {
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["object"], "list");
     assert_eq!(body["data"][0]["id"], "sonnet");
-    assert_eq!(body["data"][0]["proxec"]["upstream_model"], "gpt-4o");
+    assert_eq!(body["data"][0]["owned_by"], "llmup");
+    assert!(body["data"][0].get("proxec").is_none(), "body = {body:?}");
+    assert_eq!(body["data"][0]["llmup"]["upstream_model"], "gpt-4o");
     assert_eq!(
-        body["data"][0]["proxec"]["limits"]["context_window"],
+        body["data"][0]["llmup"]["limits"]["context_window"],
         200_000
     );
     assert_eq!(
-        body["data"][0]["proxec"]["limits"]["max_output_tokens"],
+        body["data"][0]["llmup"]["limits"]["max_output_tokens"],
         128_000
     );
     assert_eq!(
-        body["data"][0]["proxec"]["surface"]["limits"]["context_window"],
+        body["data"][0]["llmup"]["surface"]["limits"]["context_window"],
         200_000
     );
     assert_eq!(
-        body["data"][0]["proxec"]["surface"]["modalities"]["input"][0],
+        body["data"][0]["llmup"]["surface"]["modalities"]["input"][0],
         "text"
     );
     assert_eq!(
-        body["data"][0]["proxec"]["surface"]["modalities"]["input"][1],
+        body["data"][0]["llmup"]["surface"]["modalities"]["input"][1],
         "image"
     );
     assert_eq!(
-        body["data"][0]["proxec"]["surface"]["tools"]["supports_search"],
+        body["data"][0]["llmup"]["surface"]["tools"]["supports_search"],
         false
     );
     assert_eq!(
-        body["data"][0]["proxec"]["surface"]["tools"]["supports_view_image"],
+        body["data"][0]["llmup"]["surface"]["tools"]["supports_view_image"],
         true
     );
     assert_eq!(
-        body["data"][0]["proxec"]["surface"]["tools"]["apply_patch_transport"],
+        body["data"][0]["llmup"]["surface"]["tools"]["apply_patch_transport"],
         "freeform"
     );
     assert_eq!(
-        body["data"][0]["proxec"]["surface"]["tools"]["supports_parallel_calls"],
+        body["data"][0]["llmup"]["surface"]["tools"]["supports_parallel_calls"],
         false
     );
 }
@@ -3329,27 +3331,53 @@ async fn anthropic_models_endpoint_retrieves_local_alias() {
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["id"], "haiku");
     assert_eq!(body["type"], "model");
-    assert_eq!(body["proxec"]["limits"]["context_window"], 200_000);
-    assert_eq!(body["proxec"]["limits"]["max_output_tokens"], 128_000);
+    assert!(body.get("proxec").is_none(), "body = {body:?}");
+    assert_eq!(body["llmup"]["limits"]["context_window"], 200_000);
+    assert_eq!(body["llmup"]["limits"]["max_output_tokens"], 128_000);
     assert_eq!(
-        body["proxec"]["surface"]["limits"]["context_window"],
+        body["llmup"]["surface"]["limits"]["context_window"],
         200_000
     );
-    assert_eq!(body["proxec"]["surface"]["modalities"]["input"][0], "text");
-    assert_eq!(body["proxec"]["surface"]["modalities"]["input"][1], "image");
-    assert_eq!(body["proxec"]["surface"]["tools"]["supports_search"], false);
+    assert_eq!(body["llmup"]["surface"]["modalities"]["input"][0], "text");
+    assert_eq!(body["llmup"]["surface"]["modalities"]["input"][1], "image");
+    assert_eq!(body["llmup"]["surface"]["tools"]["supports_search"], false);
     assert_eq!(
-        body["proxec"]["surface"]["tools"]["supports_view_image"],
+        body["llmup"]["surface"]["tools"]["supports_view_image"],
         true
     );
     assert_eq!(
-        body["proxec"]["surface"]["tools"]["apply_patch_transport"],
+        body["llmup"]["surface"]["tools"]["apply_patch_transport"],
         "freeform"
     );
     assert_eq!(
-        body["proxec"]["surface"]["tools"]["supports_parallel_calls"],
+        body["llmup"]["surface"]["tools"]["supports_parallel_calls"],
         false
     );
+}
+
+#[tokio::test]
+async fn openai_models_endpoint_retrieves_local_alias_object_with_llmup_owner() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let config = config_with_alias(
+        &mock_base,
+        UpstreamFormat::OpenAiCompletion,
+        "sonnet",
+        "gpt-4o",
+    );
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .get(format!("{proxy_base}/openai/v1/models/sonnet"))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "sonnet");
+    assert_eq!(body["owned_by"], "llmup");
+    assert!(body.get("proxec").is_none(), "body = {body:?}");
+    assert_eq!(body["llmup"]["upstream_model"], "gpt-4o");
 }
 
 #[tokio::test]
@@ -3405,36 +3433,133 @@ async fn google_models_endpoint_lists_local_aliases() {
         body["models"][0]["supportedGenerationMethods"][0],
         "generateContent"
     );
+    assert_eq!(body["models"][0]["version"], "llmup");
+    assert_eq!(
+        body["models"][0]["description"],
+        "llmup alias -> default:gemini-2.0-flash"
+    );
     assert_eq!(body["models"][0]["inputTokenLimit"], 200_000);
     assert_eq!(body["models"][0]["outputTokenLimit"], 128_000);
     assert_eq!(
-        body["models"][0]["proxec"]["surface"]["limits"]["context_window"],
+        body["models"][0]["llmup"]["surface"]["limits"]["context_window"],
         200_000
     );
     assert_eq!(
-        body["models"][0]["proxec"]["surface"]["modalities"]["input"][0],
+        body["models"][0]["llmup"]["surface"]["modalities"]["input"][0],
         "text"
     );
     assert_eq!(
-        body["models"][0]["proxec"]["surface"]["modalities"]["input"][1],
+        body["models"][0]["llmup"]["surface"]["modalities"]["input"][1],
         "image"
     );
     assert_eq!(
-        body["models"][0]["proxec"]["surface"]["tools"]["supports_search"],
+        body["models"][0]["llmup"]["surface"]["tools"]["supports_search"],
         false
     );
     assert_eq!(
-        body["models"][0]["proxec"]["surface"]["tools"]["supports_view_image"],
+        body["models"][0]["llmup"]["surface"]["tools"]["supports_view_image"],
         true
     );
     assert_eq!(
-        body["models"][0]["proxec"]["surface"]["tools"]["apply_patch_transport"],
+        body["models"][0]["llmup"]["surface"]["tools"]["apply_patch_transport"],
         "freeform"
     );
     assert_eq!(
-        body["models"][0]["proxec"]["surface"]["tools"]["supports_parallel_calls"],
+        body["models"][0]["llmup"]["surface"]["tools"]["supports_parallel_calls"],
         false
     );
+}
+
+#[tokio::test]
+async fn openai_models_endpoint_resolves_direct_upstream_model_surface() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    config.compatibility_mode = CompatibilityMode::MaxCompat;
+    config.upstreams[0].name = "MINIMAX-OPENAI".to_string();
+    config.upstreams[0].limits = Some(ModelLimits {
+        context_window: Some(200_000),
+        max_output_tokens: Some(128_000),
+    });
+    config.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
+        modalities: Some(ModelModalities {
+            input: Some(vec![ModelModality::Text, ModelModality::Image]),
+            output: Some(vec![ModelModality::Text]),
+        }),
+        tools: Some(ModelToolSurface {
+            supports_search: Some(true),
+            supports_view_image: Some(true),
+            apply_patch_transport: Some(ApplyPatchTransport::Function),
+            supports_parallel_calls: Some(true),
+        }),
+    });
+    config.model_aliases.clear();
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .get(format!(
+            "{proxy_base}/openai/v1/models/MINIMAX-OPENAI:MiniMax-Vision"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "MINIMAX-OPENAI:MiniMax-Vision");
+    assert_eq!(body["owned_by"], "llmup");
+    assert!(body.get("proxec").is_none(), "body = {body:?}");
+    assert_eq!(body["llmup"]["upstream_name"], "MINIMAX-OPENAI");
+    assert_eq!(body["llmup"]["upstream_model"], "MiniMax-Vision");
+    assert_eq!(
+        body["llmup"]["surface"]["limits"]["context_window"],
+        200_000
+    );
+    assert_eq!(
+        body["llmup"]["surface"]["limits"]["max_output_tokens"],
+        128_000
+    );
+    assert_eq!(
+        body["llmup"]["surface"]["tools"]["apply_patch_transport"],
+        "function"
+    );
+    assert_eq!(
+        body["llmup"]["surface"]["tools"]["supports_parallel_calls"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn google_models_endpoint_resolves_direct_upstream_model_with_llmup_labels() {
+    let (mock_base, _mock) = spawn_google_mock().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::Google);
+    config.compatibility_mode = CompatibilityMode::MaxCompat;
+    config.upstreams[0].name = "MINIMAX-GOOGLE".to_string();
+    config.upstreams[0].limits = Some(ModelLimits {
+        context_window: Some(200_000),
+        max_output_tokens: Some(128_000),
+    });
+    config.model_aliases.clear();
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let res = client
+        .get(format!(
+            "{proxy_base}/google/v1beta/models/MINIMAX-GOOGLE:gemini-2.0-flash"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["name"], "models/MINIMAX-GOOGLE:gemini-2.0-flash");
+    assert_eq!(body["version"], "llmup");
+    assert_eq!(
+        body["description"],
+        "llmup route -> MINIMAX-GOOGLE:gemini-2.0-flash"
+    );
+    assert!(body.get("proxec").is_none(), "body = {body:?}");
+    assert_eq!(body["llmup"]["upstream_name"], "MINIMAX-GOOGLE");
+    assert_eq!(body["llmup"]["upstream_model"], "gemini-2.0-flash");
 }
 
 #[tokio::test]

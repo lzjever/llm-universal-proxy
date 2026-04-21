@@ -204,6 +204,19 @@ class InteractiveCliTests(unittest.TestCase):
 
     def test_run_with_proxy_base_does_not_call_start_proxy(self):
         module = load_module()
+        live_profile = mock.Mock(
+            limits=module.ModelLimits(
+                context_window=200000,
+                max_output_tokens=128000,
+            ),
+            codex_metadata=module.CodexModelMetadata(
+                input_modalities=("text", "image"),
+                supports_search_tool=True,
+                supports_view_image=True,
+                apply_patch_tool_type="freeform",
+                supports_parallel_tool_calls=True,
+            ),
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with mock.patch.object(
@@ -215,6 +228,10 @@ class InteractiveCliTests(unittest.TestCase):
             ) as wait_for_health, mock.patch.object(
                 module, "stop_proxy"
             ) as stop_proxy, mock.patch.object(
+                module,
+                "fetch_live_model_profile",
+                return_value=live_profile,
+            ) as fetch_live_model_profile, mock.patch.object(
                 module, "launch_interactive_client", return_value=0
             ) as launch_client:
                 exit_code = module.run(
@@ -233,11 +250,12 @@ class InteractiveCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         start_proxy.assert_not_called()
         wait_for_health.assert_called_once_with("http://127.0.0.1:18888", timeout_secs=55)
+        fetch_live_model_profile.assert_called_once_with(
+            "http://127.0.0.1:18888",
+            "minimax-openai",
+        )
         stop_proxy.assert_called_once_with(None, terminate_grace_secs=15)
         launch_args = launch_client.call_args.args
-        parsed_source = module.parse_proxy_source(
-            pathlib.Path(module.DEFAULT_CONFIG_SOURCE).read_text(encoding="utf-8")
-        )
         self.assertEqual(
             launch_args[0],
             module.build_interactive_command(
@@ -246,10 +264,71 @@ class InteractiveCliTests(unittest.TestCase):
                 "minimax-openai",
                 "http://127.0.0.1:18888",
                 client_home=pathlib.Path(launch_args[2]["HOME"]),
-                model_limits=module.resolve_model_limits(parsed_source, "minimax-openai"),
-                codex_metadata=module.resolve_codex_model_metadata(
-                    parsed_source, "minimax-openai"
-                ),
+                model_limits=live_profile.limits,
+                codex_metadata=live_profile.codex_metadata,
+            ),
+        )
+
+    def test_run_with_proxy_base_uses_live_profile_without_reading_local_config(self):
+        module = load_module()
+        live_profile = mock.Mock(
+            limits=module.ModelLimits(
+                context_window=200000,
+                max_output_tokens=128000,
+            ),
+            codex_metadata=module.CodexModelMetadata(
+                input_modalities=("text", "image"),
+                supports_search_tool=True,
+                supports_view_image=False,
+                apply_patch_tool_type="freeform",
+                supports_parallel_tool_calls=True,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_config = pathlib.Path(temp_dir) / "missing-proxy.yaml"
+            with mock.patch.object(
+                module, "ensure_client_binary"
+            ), mock.patch.object(
+                module, "wait_for_health"
+            ), mock.patch.object(
+                module, "stop_proxy"
+            ), mock.patch.object(
+                module,
+                "fetch_live_model_profile",
+                return_value=live_profile,
+            ) as fetch_live_model_profile, mock.patch.object(
+                module, "launch_interactive_client", return_value=0
+            ) as launch_client:
+                exit_code = module.run(
+                    [
+                        "--client",
+                        "codex",
+                        "--workspace",
+                        temp_dir,
+                        "--proxy-base",
+                        "http://127.0.0.1:18888/",
+                        "--config-source",
+                        str(missing_config),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        fetch_live_model_profile.assert_called_once_with(
+            "http://127.0.0.1:18888",
+            "minimax-openai",
+        )
+        launch_args = launch_client.call_args.args
+        self.assertEqual(
+            launch_args[0],
+            module.build_interactive_command(
+                "codex",
+                pathlib.Path(temp_dir).resolve(),
+                "minimax-openai",
+                "http://127.0.0.1:18888",
+                client_home=pathlib.Path(launch_args[2]["HOME"]),
+                model_limits=live_profile.limits,
+                codex_metadata=live_profile.codex_metadata,
             ),
         )
 
@@ -280,6 +359,13 @@ class InteractiveCliTests(unittest.TestCase):
             ) as wait_for_health, mock.patch.object(
                 module, "stop_proxy"
             ) as stop_proxy, mock.patch.object(
+                module,
+                "fetch_live_model_profile",
+                return_value=mock.Mock(
+                    limits=None,
+                    codex_metadata=None,
+                ),
+            ) as fetch_live_model_profile, mock.patch.object(
                 module, "launch_interactive_client", return_value=0
             ):
                 exit_code = module.run(
@@ -296,6 +382,10 @@ class InteractiveCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         start_proxy.assert_called_once()
         wait_for_health.assert_called_once_with("http://127.0.0.1:18888", timeout_secs=65)
+        fetch_live_model_profile.assert_called_once_with(
+            "http://127.0.0.1:18888",
+            "claude-haiku-4-5",
+        )
         stop_proxy.assert_called_once_with(fake_process, terminate_grace_secs=15)
 
     def test_start_managed_proxy_serializes_surface_fields_into_runtime_config(self):
@@ -316,16 +406,24 @@ upstreams:
     surface_defaults:
       modalities:
         input: ["text"]
+        output: ["text"]
       tools:
         supports_search: false
+        supports_view_image: false
+        apply_patch_transport: function
+        supports_parallel_calls: true
 model_aliases:
   vision-openai:
     target: "MINIMAX-OPENAI:MiniMax-Vision"
     surface:
       modalities:
         input: ["text", "image"]
+        output: ["text"]
       tools:
         supports_search: true
+        supports_view_image: true
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
 """.lstrip(),
                 encoding="utf-8",
             )
@@ -370,10 +468,18 @@ model_aliases:
         runtime_config_text = start_proxy.call_args.args[1]
         self.assertIn("surface_defaults:", runtime_config_text)
         self.assertIn('input: ["text"]', runtime_config_text)
+        self.assertIn('output: ["text"]', runtime_config_text)
         self.assertIn("supports_search: false", runtime_config_text)
+        self.assertIn("supports_view_image: false", runtime_config_text)
+        self.assertIn("apply_patch_transport: function", runtime_config_text)
+        self.assertIn("supports_parallel_calls: true", runtime_config_text)
         self.assertIn("surface:", runtime_config_text)
         self.assertIn('input: ["text", "image"]', runtime_config_text)
+        self.assertIn('output: ["text"]', runtime_config_text)
         self.assertIn("supports_search: true", runtime_config_text)
+        self.assertIn("supports_view_image: true", runtime_config_text)
+        self.assertIn("apply_patch_transport: freeform", runtime_config_text)
+        self.assertIn("supports_parallel_calls: false", runtime_config_text)
 
     def test_parse_args_exposes_structured_timeout_policy(self):
         module = load_module()

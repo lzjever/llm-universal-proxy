@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Iterable
 
@@ -107,6 +108,9 @@ class ModelLimits:
 class CodexModelMetadata:
     input_modalities: tuple[str, ...] | None = None
     supports_search_tool: bool | None = None
+    supports_view_image: bool | None = None
+    apply_patch_tool_type: str | None = None
+    supports_parallel_tool_calls: bool | None = None
 
     def merged_with(
         self, override: CodexModelMetadata | None
@@ -122,10 +126,28 @@ class CodexModelMetadata:
                 if override and override.supports_search_tool is not None
                 else self.supports_search_tool
             ),
+            supports_view_image=(
+                override.supports_view_image
+                if override and override.supports_view_image is not None
+                else self.supports_view_image
+            ),
+            apply_patch_tool_type=(
+                override.apply_patch_tool_type
+                if override and override.apply_patch_tool_type is not None
+                else self.apply_patch_tool_type
+            ),
+            supports_parallel_tool_calls=(
+                override.supports_parallel_tool_calls
+                if override and override.supports_parallel_tool_calls is not None
+                else self.supports_parallel_tool_calls
+            ),
         )
         if (
             merged.input_modalities is None
             and merged.supports_search_tool is None
+            and merged.supports_view_image is None
+            and merged.apply_patch_tool_type is None
+            and merged.supports_parallel_tool_calls is None
         ):
             return None
         return merged
@@ -134,7 +156,11 @@ class CodexModelMetadata:
 @dataclasses.dataclass
 class SurfaceMetadata:
     input_modalities: tuple[str, ...] | None = None
+    output_modalities: tuple[str, ...] | None = None
     supports_search: bool | None = None
+    supports_view_image: bool | None = None
+    apply_patch_transport: str | None = None
+    supports_parallel_calls: bool | None = None
 
     def merged_with(self, override: SurfaceMetadata | None) -> SurfaceMetadata | None:
         merged = SurfaceMetadata(
@@ -143,13 +169,40 @@ class SurfaceMetadata:
                 if override and override.input_modalities is not None
                 else self.input_modalities
             ),
+            output_modalities=(
+                override.output_modalities
+                if override and override.output_modalities is not None
+                else self.output_modalities
+            ),
             supports_search=(
                 override.supports_search
                 if override and override.supports_search is not None
                 else self.supports_search
             ),
+            supports_view_image=(
+                override.supports_view_image
+                if override and override.supports_view_image is not None
+                else self.supports_view_image
+            ),
+            apply_patch_transport=(
+                override.apply_patch_transport
+                if override and override.apply_patch_transport is not None
+                else self.apply_patch_transport
+            ),
+            supports_parallel_calls=(
+                override.supports_parallel_calls
+                if override and override.supports_parallel_calls is not None
+                else self.supports_parallel_calls
+            ),
         )
-        if merged.input_modalities is None and merged.supports_search is None:
+        if (
+            merged.input_modalities is None
+            and merged.output_modalities is None
+            and merged.supports_search is None
+            and merged.supports_view_image is None
+            and merged.apply_patch_transport is None
+            and merged.supports_parallel_calls is None
+        ):
             return None
         return merged
 
@@ -157,10 +210,15 @@ class SurfaceMetadata:
         metadata = CodexModelMetadata(
             input_modalities=self.input_modalities,
             supports_search_tool=self.supports_search,
+            supports_view_image=self.supports_view_image,
+            supports_parallel_tool_calls=self.supports_parallel_calls,
         )
         if (
             metadata.input_modalities is None
             and metadata.supports_search_tool is None
+            and metadata.supports_view_image is None
+            and metadata.apply_patch_tool_type is None
+            and metadata.supports_parallel_tool_calls is None
         ):
             return None
         return metadata
@@ -169,13 +227,50 @@ class SurfaceMetadata:
 DEFAULT_PROXY_CODEX_METADATA = CodexModelMetadata(
     input_modalities=("text",),
     supports_search_tool=False,
+    apply_patch_tool_type=PUBLIC_APPLY_PATCH_TOOL_TYPE,
 )
+
+
+@dataclasses.dataclass
+class LiveModelProfile:
+    limits: ModelLimits | None = None
+    codex_metadata: CodexModelMetadata | None = None
 
 DEFAULT_CODEX_BASE_INSTRUCTIONS = (
     "You are Codex, a coding agent based on GPT-5. "
     "You and the user share the same workspace and collaborate "
     "to achieve the user's goals."
 )
+
+
+def normalize_proxy_base(proxy_base: str) -> str:
+    return proxy_base.rstrip("/")
+
+
+def _parse_surface_metadata_value(
+    surface: SurfaceMetadata,
+    surface_section: str,
+    key: str,
+    value: str,
+    parsed_value: object,
+) -> None:
+    if surface_section == "modalities":
+        if key == "input":
+            surface.input_modalities = parse_string_list(value)
+        elif key == "output":
+            surface.output_modalities = parse_string_list(value)
+        return
+
+    if surface_section != "tools":
+        return
+    if key == "supports_search":
+        surface.supports_search = bool(parsed_value)
+    elif key == "supports_view_image":
+        surface.supports_view_image = bool(parsed_value)
+    elif key == "apply_patch_transport" and isinstance(parsed_value, str):
+        surface.apply_patch_transport = parsed_value
+    elif key == "supports_parallel_calls":
+        surface.supports_parallel_calls = bool(parsed_value)
 
 
 def default_codex_supported_reasoning_levels() -> list[dict[str, str]]:
@@ -256,6 +351,16 @@ def default_codex_catalog_entry(model_name: str) -> dict[str, object]:
         "supports_parallel_tool_calls": False,
         "experimental_supported_tools": [],
     }
+
+
+def validate_public_apply_patch_tool_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value != PUBLIC_APPLY_PATCH_TOOL_TYPE:
+        raise ValueError(
+            "apply_patch public contract must remain freeform on client-visible surfaces"
+        )
+    return value
 
 
 @dataclasses.dataclass
@@ -512,16 +617,13 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
                 key, value = stripped.split(":", 1)
                 parsed_value = parse_scalar(value)
                 surface_defaults = upstream_surface_defaults[current_upstream]
-                if (
-                    current_upstream_surface_section == "modalities"
-                    and key == "input"
-                ):
-                    surface_defaults.input_modalities = parse_string_list(value)
-                elif (
-                    current_upstream_surface_section == "tools"
-                    and key == "supports_search"
-                ):
-                    surface_defaults.supports_search = bool(parsed_value)
+                _parse_surface_metadata_value(
+                    surface_defaults,
+                    current_upstream_surface_section,
+                    key,
+                    value,
+                    parsed_value,
+                )
                 continue
             if (
                 indent == 6
@@ -626,10 +728,13 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
                 if surface is None:
                     surface = SurfaceMetadata()
                     model_alias_configs[current_alias].surface = surface
-                if current_alias_surface_section == "modalities" and key == "input":
-                    surface.input_modalities = parse_string_list(value)
-                elif current_alias_surface_section == "tools" and key == "supports_search":
-                    surface.supports_search = bool(parsed_value)
+                _parse_surface_metadata_value(
+                    surface,
+                    current_alias_surface_section,
+                    key,
+                    value,
+                    parsed_value,
+                )
                 continue
             if (
                 indent == 6
@@ -779,18 +884,48 @@ def _render_surface_metadata(
 ) -> None:
     if surface is None:
         return
-    if surface.input_modalities is None and surface.supports_search is None:
+    if (
+        surface.input_modalities is None
+        and surface.output_modalities is None
+        and surface.supports_search is None
+        and surface.supports_view_image is None
+        and surface.apply_patch_transport is None
+        and surface.supports_parallel_calls is None
+    ):
         return
     lines.append(f"{indent}{section_name}:")
-    if surface.input_modalities is not None:
+    if surface.input_modalities is not None or surface.output_modalities is not None:
         lines.append(f"{indent}  modalities:")
+    if surface.input_modalities is not None:
         lines.append(
             f"{indent}    input: {render_scalar(list(surface.input_modalities))}"
         )
-    if surface.supports_search is not None:
+    if surface.output_modalities is not None:
+        lines.append(
+            f"{indent}    output: {render_scalar(list(surface.output_modalities))}"
+        )
+    if (
+        surface.supports_search is not None
+        or surface.supports_view_image is not None
+        or surface.apply_patch_transport is not None
+        or surface.supports_parallel_calls is not None
+    ):
         lines.append(f"{indent}  tools:")
+    if surface.supports_search is not None:
         lines.append(
             f"{indent}    supports_search: {render_scalar(surface.supports_search)}"
+        )
+    if surface.supports_view_image is not None:
+        lines.append(
+            f"{indent}    supports_view_image: {render_scalar(surface.supports_view_image)}"
+        )
+    if surface.apply_patch_transport is not None:
+        lines.append(
+            f"{indent}    apply_patch_transport: {render_scalar(surface.apply_patch_transport)}"
+        )
+    if surface.supports_parallel_calls is not None:
+        lines.append(
+            f"{indent}    supports_parallel_calls: {render_scalar(surface.supports_parallel_calls)}"
         )
 
 
@@ -1228,6 +1363,15 @@ def build_codex_model_catalog(
             model_entry["input_modalities"] = list(codex_metadata.input_modalities)
         if codex_metadata.supports_search_tool is not None:
             model_entry["supports_search_tool"] = codex_metadata.supports_search_tool
+        public_apply_patch_tool_type = validate_public_apply_patch_tool_type(
+            codex_metadata.apply_patch_tool_type
+        )
+        if public_apply_patch_tool_type is not None:
+            model_entry["apply_patch_tool_type"] = public_apply_patch_tool_type
+        if codex_metadata.supports_parallel_tool_calls is not None:
+            model_entry["supports_parallel_tool_calls"] = (
+                codex_metadata.supports_parallel_tool_calls
+            )
     payload = {
         "models": [
             model_entry
@@ -1240,7 +1384,11 @@ def build_codex_model_catalog(
 def codex_should_disable_view_image(
     codex_metadata: CodexModelMetadata | None,
 ) -> bool:
-    if codex_metadata is None or codex_metadata.input_modalities is None:
+    if codex_metadata is None:
+        return False
+    if codex_metadata.supports_view_image is not None:
+        return not codex_metadata.supports_view_image
+    if codex_metadata.input_modalities is None:
         return False
     return "image" not in {
         modality.strip().lower() for modality in codex_metadata.input_modalities
@@ -1588,6 +1736,137 @@ def wait_for_health(
         except Exception:
             time.sleep(0.2)
     raise RuntimeError(f"proxy at {base_url} did not become healthy in time")
+
+
+def http_get_json(url: str, timeout: int = 30) -> object:
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8")
+        raise RuntimeError(f"GET {url} returned HTTP {error.code}: {body[:240]}")
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"GET {url} failed: {error}") from error
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"GET {url} returned invalid JSON: {error}") from error
+
+
+def live_model_details_url(proxy_base: str, model_name: str) -> str:
+    quoted_model = urllib.parse.quote(model_name, safe=":")
+    return f"{normalize_proxy_base(proxy_base)}/openai/v1/models/{quoted_model}"
+
+
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return int(value)
+
+
+def _optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _optional_string_tuple(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, list):
+        return None
+    return tuple(str(item) for item in value)
+
+
+def _model_limits_from_live_surface(
+    surface_payload: dict[str, object],
+) -> ModelLimits | None:
+    limit_source = surface_payload.get("limits")
+    if not isinstance(limit_source, dict):
+        return None
+
+    limits = ModelLimits(
+        context_window=_optional_int(limit_source.get("context_window")),
+        max_output_tokens=_optional_int(limit_source.get("max_output_tokens")),
+    )
+    if limits.context_window is None and limits.max_output_tokens is None:
+        return None
+    return limits
+
+
+def _codex_metadata_from_live_surface(
+    surface_payload: dict[str, object],
+) -> CodexModelMetadata | None:
+    modalities = surface_payload.get("modalities")
+    tools = surface_payload.get("tools")
+    metadata = CodexModelMetadata(
+        input_modalities=(
+            _optional_string_tuple(modalities.get("input"))
+            if isinstance(modalities, dict)
+            else None
+        ),
+        supports_search_tool=(
+            _optional_bool(tools.get("supports_search"))
+            if isinstance(tools, dict)
+            else None
+        ),
+        supports_view_image=(
+            _optional_bool(tools.get("supports_view_image"))
+            if isinstance(tools, dict)
+            else None
+        ),
+        supports_parallel_tool_calls=(
+            _optional_bool(tools.get("supports_parallel_calls"))
+            if isinstance(tools, dict)
+            else None
+        ),
+    )
+    if metadata.merged_with(None) is None:
+        return None
+    return metadata
+
+
+def fetch_live_model_profile(
+    proxy_base: str,
+    model_name: str,
+    timeout_secs: int = 30,
+) -> LiveModelProfile:
+    payload = http_get_json(
+        live_model_details_url(proxy_base, model_name),
+        timeout=timeout_secs,
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("live model lookup must return a JSON object")
+
+    llmup_payload = payload.get("llmup")
+    if not isinstance(llmup_payload, dict):
+        raise RuntimeError("live model lookup did not include llmup surface metadata")
+
+    surface_payload = llmup_payload.get("surface")
+    if not isinstance(surface_payload, dict):
+        raise RuntimeError("live model lookup did not include llmup.surface metadata")
+
+    limits = _model_limits_from_live_surface(surface_payload)
+    live_surface_metadata = _codex_metadata_from_live_surface(surface_payload)
+    codex_metadata = DEFAULT_PROXY_CODEX_METADATA
+    if live_surface_metadata is not None:
+        merged = codex_metadata.merged_with(live_surface_metadata)
+        if merged is not None:
+            codex_metadata = merged
+
+    return LiveModelProfile(
+        limits=limits,
+        codex_metadata=codex_metadata,
+    )
+
+
+def refresh_lane_model_profiles(proxy_base: str, lanes: Iterable[Lane]) -> None:
+    for lane in lanes:
+        if not lane.enabled:
+            continue
+        profile = fetch_live_model_profile(proxy_base, lane.proxy_model)
+        lane.limits = profile.limits
+        lane.codex_metadata = profile.codex_metadata
 
 
 def http_json(url: str, payload: dict[str, object], timeout: int = 60) -> tuple[int, str]:
@@ -2259,6 +2538,8 @@ def run(argv: list[str] | None = None) -> int:
             except KeyboardInterrupt:
                 pass
             return 0
+
+        refresh_lane_model_profiles(proxy_base, lanes)
 
         lane_probes = {lane.name: classify_lane_health(lane, probe_lane(proxy_base, lane)) for lane in lanes}
         for case in cases:

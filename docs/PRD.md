@@ -10,7 +10,7 @@
 
 ### 1.1 Product Name
 
-LLM Universal Proxy (codename: proxec)
+LLM Universal Proxy (public short name: llmup)
 
 ### 1.2 Product Definition
 

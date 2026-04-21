@@ -14,6 +14,23 @@ fn assess_request_translation(
     )
 }
 
+fn request_translation_policy(
+    compatibility_mode: crate::config::CompatibilityMode,
+    max_output_tokens: Option<u64>,
+) -> RequestTranslationPolicy {
+    RequestTranslationPolicy {
+        compatibility_mode,
+        surface: crate::config::ModelSurface {
+            limits: max_output_tokens.map(|max_output_tokens| crate::config::ModelLimits {
+                context_window: None,
+                max_output_tokens: Some(max_output_tokens),
+            }),
+            modalities: None,
+            tools: None,
+        },
+    }
+}
+
 #[test]
 fn request_translation_policy_default_uses_default_compatibility_mode() {
     assert_eq!(
@@ -30,7 +47,7 @@ fn request_translation_policy_default_uses_default_compatibility_mode() {
 
     let balanced_policy = RequestTranslationPolicy {
         compatibility_mode: crate::config::CompatibilityMode::Balanced,
-        max_output_tokens: None,
+        surface: crate::config::ModelSurface::default(),
     };
     assert!(!balanced_policy.is_empty());
 }
@@ -3226,6 +3243,145 @@ fn assess_request_translation_responses_custom_tool_to_openai_balanced_allows_pl
 }
 
 #[test]
+fn assess_request_translation_responses_custom_tool_to_gemini_balanced_allows_plain_text_but_rejects_grammar(
+) {
+    let plain_text_body = json!({
+        "model": "gemini-2.5-flash",
+        "tools": [{
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes code",
+            "format": { "type": "text" }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "code_exec"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "run this" }]
+        }]
+    });
+    let plain_text_assessment =
+        super::assessment::assess_request_translation_with_compatibility_mode(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Google,
+            &plain_text_body,
+            crate::config::CompatibilityMode::Balanced,
+        );
+    assert_eq!(plain_text_assessment.decision(), TranslationDecision::Allow);
+
+    let grammar_body = json!({
+        "model": "gemini-2.5-flash",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /.+/"
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "apply_patch"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "create hello.txt" }]
+        }]
+    });
+    let grammar_assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Google,
+        &grammar_body,
+        crate::config::CompatibilityMode::Balanced,
+    );
+
+    let TranslationDecision::Reject(err) = grammar_assessment.decision() else {
+        panic!("expected reject policy, got {grammar_assessment:?}");
+    };
+    assert!(
+        err.contains("apply_patch") && err.contains("Gemini"),
+        "err = {err}"
+    );
+}
+
+#[test]
+fn assess_request_translation_responses_custom_tool_to_gemini_varies_by_compatibility_mode() {
+    let body = json!({
+        "model": "gemini-2.5-flash",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /.+/"
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "apply_patch"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "create hello.txt" }]
+        }]
+    });
+
+    let strict_assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Google,
+        &body,
+        crate::config::CompatibilityMode::Strict,
+    );
+    let TranslationDecision::Reject(strict_err) = strict_assessment.decision() else {
+        panic!("expected strict rejection, got {strict_assessment:?}");
+    };
+    assert_eq!(
+        strict_err,
+        custom_tools_not_portable_message(UpstreamFormat::Google)
+    );
+
+    let balanced_assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Google,
+        &body,
+        crate::config::CompatibilityMode::Balanced,
+    );
+    let TranslationDecision::Reject(balanced_err) = balanced_assessment.decision() else {
+        panic!("expected balanced rejection, got {balanced_assessment:?}");
+    };
+    assert!(
+        balanced_err.contains("apply_patch") && balanced_err.contains("Gemini"),
+        "err = {balanced_err}"
+    );
+
+    let max_compat_assessment =
+        super::assessment::assess_request_translation_with_compatibility_mode(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Google,
+            &body,
+            crate::config::CompatibilityMode::MaxCompat,
+        );
+    let TranslationDecision::AllowWithWarnings(warnings) = max_compat_assessment.decision() else {
+        panic!("expected max_compat warning path, got {max_compat_assessment:?}");
+    };
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("apply_patch") && warning.contains("Gemini")),
+        "warnings = {warnings:?}"
+    );
+}
+
+#[test]
 fn translate_request_chat_to_gemini_rejects_audio_format_without_documented_equivalent() {
     let mut body = json!({
         "model": "gemini-2.5-flash",
@@ -3344,10 +3500,7 @@ fn translate_request_openai_to_claude_uses_policy_default_max_output_tokens_when
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::Balanced,
-            max_output_tokens: Some(128_000),
-        },
+        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
         false,
     )
     .unwrap();
@@ -3368,10 +3521,7 @@ fn translate_request_openai_to_claude_preserves_explicit_max_completion_tokens_o
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::Balanced,
-            max_output_tokens: Some(128_000),
-        },
+        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
         false,
     )
     .unwrap();
@@ -3392,10 +3542,7 @@ fn translate_request_openai_to_claude_preserves_explicit_max_tokens_over_policy(
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::Balanced,
-            max_output_tokens: Some(128_000),
-        },
+        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
         false,
     )
     .unwrap();
@@ -3415,10 +3562,7 @@ fn translate_request_openai_to_responses_uses_policy_default_max_output_tokens_w
         UpstreamFormat::OpenAiResponses,
         "gpt-4o",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::Balanced,
-            max_output_tokens: Some(128_000),
-        },
+        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
         false,
     )
     .unwrap();
@@ -3438,10 +3582,7 @@ fn translate_request_responses_to_openai_uses_policy_default_max_completion_toke
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::Balanced,
-            max_output_tokens: Some(128_000),
-        },
+        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
         false,
     )
     .unwrap();
@@ -3468,10 +3609,7 @@ fn translate_request_google_passthrough_preserves_explicit_snake_case_max_output
         UpstreamFormat::Google,
         "gemini-1.5",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::Balanced,
-            max_output_tokens: Some(128_000),
-        },
+        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
         false,
     )
     .unwrap();
@@ -5806,10 +5944,7 @@ eof_line: "*** End of File" LF
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
-            max_output_tokens: None,
-        },
+        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
         false,
     )
     .expect("string-grammar custom tools should bridge to Anthropic under max_compat");
@@ -5934,10 +6069,7 @@ fn translate_request_responses_string_grammar_custom_tool_to_claude_max_compat_w
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
-            max_output_tokens: None,
-        },
+        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
         false,
     )
     .expect("max_compat grammar custom tools should bridge to Anthropic");
@@ -5998,10 +6130,7 @@ fn translate_request_responses_string_grammar_custom_tool_to_openai_max_compat_w
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
-            max_output_tokens: None,
-        },
+        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
         false,
     )
     .expect("max_compat grammar custom tools should bridge to OpenAI Chat Completions");
@@ -6083,10 +6212,7 @@ eof_line: "*** End of File" LF
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
-            max_output_tokens: None,
-        },
+        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
         false,
     )
     .expect(
@@ -6159,6 +6285,171 @@ eof_line: "*** End of File" LF
     assert_eq!(
         messages[2]["content"],
         "Success. Updated the following files:\nA hello.txt\n"
+    );
+}
+
+#[test]
+fn translate_request_responses_string_grammar_custom_tool_to_gemini_max_compat_bridges_with_gemini_contract(
+) {
+    let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+    let mut body = json!({
+        "model": "gemini-2.5-flash",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /.+/"
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "apply_patch"
+        },
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_apply_patch",
+                "name": "apply_patch",
+                "input": patch_input
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_apply_patch",
+                "output": "Success. Updated the following files:\nA hello.txt\n"
+            }
+        ]
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Google,
+        "gemini-2.5-flash",
+        &mut body,
+        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        false,
+    )
+    .expect("string-grammar custom tools should bridge to Gemini under max_compat");
+
+    assert_eq!(
+        body["_llmup_tool_bridge_context"]["compatibility_mode"],
+        "max_compat"
+    );
+    assert_eq!(
+        body["tools"][0]["functionDeclarations"][0]["name"],
+        "apply_patch"
+    );
+    assert_eq!(
+        body["tools"][0]["functionDeclarations"][0]["parameters"],
+        json!({
+            "type": "object",
+            "properties": {
+                "input": { "type": "string" }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        })
+    );
+    assert_eq!(
+        body["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
+        "apply_patch"
+    );
+    assert_eq!(body["contents"][1]["role"], "model");
+    assert_eq!(
+        body["contents"][1]["parts"][0]["functionCall"],
+        json!({
+            "id": "call_apply_patch",
+            "name": "apply_patch",
+            "args": { "input": patch_input }
+        })
+    );
+    assert_eq!(body["contents"][2]["role"], "user");
+    assert_eq!(
+        body["contents"][2]["parts"][0]["functionResponse"]["name"],
+        "apply_patch"
+    );
+    let serialized = body.to_string();
+    assert!(
+        !serialized.contains("__llmup_custom__"),
+        "Gemini bridge should keep stable tool names, body = {body:?}"
+    );
+}
+
+#[test]
+fn max_compat_structural_repair_pass_canonicalizes_request_scoped_custom_bridge_for_gemini_transport(
+) {
+    let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+    let mut body = json!({
+        "_llmup_tool_bridge_context": {
+            "compatibility_mode": "max_compat",
+            "entries": {
+                "apply_patch": {
+                    "source_kind": "custom_grammar",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        },
+        "tools": [{
+            "type": "custom",
+            "custom": {
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/"
+                }
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "custom": { "name": "apply_patch" }
+        },
+        "messages": [{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_apply_patch",
+                "type": "custom",
+                "custom": {
+                    "name": "apply_patch",
+                    "input": patch_input
+                }
+            }]
+        }]
+    });
+
+    super::apply_max_compat_structural_repair_pass(
+        crate::config::CompatibilityMode::MaxCompat,
+        UpstreamFormat::Google,
+        &mut body,
+    )
+    .expect("repair pass should canonicalize request-scoped custom bridge structures");
+
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["function"]["name"], "apply_patch");
+    assert_eq!(
+        body["tool_choice"],
+        json!({
+            "type": "function",
+            "function": { "name": "apply_patch" }
+        })
+    );
+    assert_eq!(body["messages"][0]["tool_calls"][0]["type"], "function");
+    assert_eq!(
+        body["messages"][0]["tool_calls"][0]["function"],
+        json!({
+            "name": "apply_patch",
+            "arguments": serde_json::to_string(&json!({ "input": patch_input })).unwrap()
+        })
     );
 }
 
@@ -9841,6 +10132,58 @@ fn translate_response_openai_to_claude_restores_server_tool_use_from_marker() {
     assert_eq!(content.len(), 1);
     assert_eq!(content[0]["type"], "server_tool_use");
     assert_eq!(content[0]["name"], "web_search");
+}
+
+#[test]
+fn translate_response_gemini_to_responses_decodes_request_scoped_custom_bridge_without_prefix_leak()
+{
+    let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+    let body = json!({
+        "_llmup_tool_bridge_context": {
+            "compatibility_mode": "max_compat",
+            "entries": {
+                "apply_patch": {
+                    "source_kind": "custom_grammar",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        },
+        "responseId": "resp_gemini_custom",
+        "modelVersion": "gemini-2.5-flash",
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{
+                    "functionCall": {
+                        "id": "call_apply_patch",
+                        "name": "apply_patch",
+                        "args": { "input": patch_input }
+                    }
+                }]
+            },
+            "finishReason": "STOP"
+        }]
+    });
+
+    let out = translate_response(
+        UpstreamFormat::Google,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect("Gemini response should decode bridged custom tool call");
+
+    let output = out["output"].as_array().expect("responses output");
+    assert_eq!(
+        output[0],
+        json!({
+            "type": "custom_tool_call",
+            "call_id": "call_apply_patch",
+            "name": "apply_patch",
+            "input": patch_input
+        })
+    );
 }
 
 #[test]

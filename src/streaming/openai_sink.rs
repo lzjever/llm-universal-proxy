@@ -1470,6 +1470,9 @@ pub(super) fn openai_chunk_to_responses_sse(
     state: &mut StreamState,
 ) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
+    if state.responses_terminal_sent {
+        return out;
+    }
     if let Some(error) = chunk.get("error") {
         state.openai_terminal_error = Some(error.clone());
     }

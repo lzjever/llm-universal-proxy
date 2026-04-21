@@ -15,7 +15,7 @@ use super::openai_family::{
     openai_normalized_request_controls, openai_select_function_tools_by_name,
 };
 use super::response_protocols::push_gemini_function_call_part;
-use super::tools::semantic_tool_kind_from_value;
+use super::tools::{semantic_tool_kind_from_value, REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD};
 
 pub(super) fn extract_gemini_text(content: &Value) -> String {
     if let Some(s) = content.as_str() {
@@ -1490,6 +1490,7 @@ pub(super) fn tool_message_to_gemini_function_response(
 
 pub(super) fn openai_to_gemini(body: &mut Value, target_model: &str) -> Result<(), String> {
     let controls = openai_normalized_request_controls(body)?;
+    let bridge_context = body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
     let mut result = serde_json::json!({
         "model": if target_model.is_empty() {
             body.get("model").cloned().unwrap_or(serde_json::Value::Null)
@@ -1666,6 +1667,9 @@ pub(super) fn openai_to_gemini(body: &mut Value, target_model: &str) -> Result<(
     if let Some(tool_policy) = controls.tool_policy.as_ref() {
         result["toolConfig"]["functionCallingConfig"] =
             normalized_tool_policy_to_gemini_function_calling_config(tool_policy);
+    }
+    if let Some(bridge_context) = bridge_context {
+        result[REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD] = bridge_context;
     }
     *body = result;
     Ok(())

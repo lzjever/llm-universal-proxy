@@ -2,6 +2,15 @@ use super::*;
 
 const INTERNAL_TOOL_BRIDGE_CONTEXT_FIELD: &str = "_llmup_tool_bridge_context";
 
+fn parse_sse_events(body: &[u8]) -> Vec<Value> {
+    let mut buffer = body.to_vec();
+    let mut events = Vec::new();
+    while let Some(event) = crate::streaming::take_one_sse_event(&mut buffer) {
+        events.push(event);
+    }
+    events
+}
+
 #[test]
 fn classify_request_boundary_rejects_translated_stateful_responses_controls() {
     let decision = classify_request_boundary(
@@ -687,6 +696,163 @@ async fn live_responses_grammar_custom_tool_bridge_to_anthropic_max_compat_allow
     assert!(
         upstream_body.get("_llmup_tool_bridge_context").is_none(),
         "internal bridge context must not be sent upstream: {upstream_body:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_gemini_custom_tool_stream_preserves_sse_and_stable_tool_identity() {
+    let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+    let response_bodies = vec![
+        serde_json::json!({
+            "responseId": "resp_gemini_custom",
+            "modelVersion": "gemini-2.5-flash",
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": "call_apply_patch",
+                            "name": "apply_patch",
+                            "args": { "input": patch_input }
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        }),
+        serde_json::json!({
+            "responseId": "resp_gemini_custom",
+            "modelVersion": "gemini-2.5-flash",
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": []
+                },
+                "finishReason": "STOP"
+            }]
+        }),
+    ];
+    let (mock_base, requests, server) =
+        spawn_google_stream_generate_content_mock(response_bodies).await;
+    let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Google);
+    {
+        let mut runtime = state.runtime.write().await;
+        let namespace = runtime
+            .namespaces
+            .get_mut(DEFAULT_NAMESPACE)
+            .expect("default namespace");
+        namespace.config.compatibility_mode = crate::config::CompatibilityMode::MaxCompat;
+    }
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gemini-2.5-flash",
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/"
+                }
+            }],
+            "tool_choice": {
+                "type": "custom",
+                "name": "apply_patch"
+            },
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            }],
+            "stream": true
+        }),
+        "gemini-2.5-flash".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("stream body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("stream body utf8");
+    let events = parse_sse_events(&body);
+    let event_types = events
+        .iter()
+        .filter_map(|event| event.get("type").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        event_types.contains(&"response.output_item.added"),
+        "body = {body_text}"
+    );
+    assert!(
+        event_types.contains(&"response.custom_tool_call_input.delta"),
+        "body = {body_text}"
+    );
+    assert!(
+        event_types.contains(&"response.custom_tool_call_input.done"),
+        "body = {body_text}"
+    );
+    assert!(
+        !event_types.contains(&"response.function_call_arguments.delta"),
+        "bridge should not regress into function-call delta events: {body_text}"
+    );
+    let output_item_done = events
+        .iter()
+        .find(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+        })
+        .expect("response.output_item.done");
+    assert_eq!(output_item_done["item"]["type"], "custom_tool_call");
+    assert_eq!(output_item_done["item"]["name"], "apply_patch");
+    assert_eq!(output_item_done["item"]["input"], patch_input);
+    assert!(
+        !body_text.contains("__llmup_custom__"),
+        "Gemini bridge must not leak prefixed tool names to Responses stream: {body_text}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    assert!(
+        recorded[0].0.ends_with(":streamGenerateContent"),
+        "streaming request must use Gemini stream path: {:?}",
+        recorded[0].0
+    );
+    assert!(
+        !recorded[0].0.contains(":generateContent"),
+        "streaming request must not be downgraded to unary Gemini path: {:?}",
+        recorded[0].0
+    );
+    assert!(
+        recorded[0]
+            .1
+            .get(INTERNAL_TOOL_BRIDGE_CONTEXT_FIELD)
+            .is_none(),
+        "internal bridge context must not be sent upstream: {:?}",
+        recorded[0].1
+    );
+    let serialized = recorded[0].1.to_string();
+    assert!(
+        !serialized.contains("__llmup_custom__"),
+        "Gemini bridge must not leak prefixed tool names upstream: {:?}",
+        recorded[0].1
     );
 
     server.abort();

@@ -637,7 +637,7 @@ pub(super) fn responses_to_messages(
 ) -> Result<(), String> {
     let use_request_scoped_openai_custom_bridge = matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
     );
     let bridge_custom_responses_semantics = use_request_scoped_openai_custom_bridge;
     let degrade_marked_tool_calls = matches!(
@@ -1466,7 +1466,7 @@ fn responses_tool_choice_to_openai_tool_choice(
 ) -> Option<Value> {
     let use_request_scoped_openai_custom_bridge = matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
     );
     let bridge_custom_responses_semantics = use_request_scoped_openai_custom_bridge;
     if choice.is_string() {

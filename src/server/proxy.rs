@@ -819,20 +819,21 @@ fn request_translation_policy(
     requested_model: &str,
     resolved_model: &crate::config::ResolvedModel,
 ) -> RequestTranslationPolicy {
-    let max_output_tokens = namespace_config
+    let surface = namespace_config
         .model_aliases
         .get(requested_model)
-        .and_then(|alias| namespace_config.effective_model_limits(alias))
-        .and_then(|limits| limits.max_output_tokens)
-        .or_else(|| {
-            namespace_config
-                .upstream(&resolved_model.upstream_name)
-                .and_then(|upstream| upstream.limits.as_ref())
-                .and_then(|limits| limits.max_output_tokens)
+        .map(|alias| namespace_config.effective_model_surface(alias))
+        .unwrap_or_else(|| {
+            namespace_config.effective_model_surface(&crate::config::ModelAlias {
+                upstream_name: resolved_model.upstream_name.clone(),
+                upstream_model: resolved_model.upstream_model.clone(),
+                limits: None,
+                surface: None,
+            })
         });
 
     RequestTranslationPolicy {
         compatibility_mode: namespace_config.compatibility_mode,
-        max_output_tokens,
+        surface,
     }
 }

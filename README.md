@@ -8,11 +8,11 @@ A single-binary HTTP proxy that provides a unified interface for Large Language 
 
 This proxy is especially useful when your client only supports one protocol, but the real model you want to use lives behind another one. For example, newer Codex CLI versions only speak the OpenAI Responses API, but `llm-universal-proxy` can still let Codex use Anthropic-compatible or OpenAI-Completions-compatible coding models such as GLM, Kimi, or MiniMax.
 
-![Proxec dashboard](./docs/images/dashboard.png)
+![LLMUP dashboard](./docs/images/dashboard.png)
 
 The dashboard gives you a direct view into routing, streaming, cancellation, upstream traffic, and hook state while the proxy is running.
 
-![Codex CLI using GLM-5-Turbo through proxec](./docs/images/codex-glm5-turbo.png)
+![Codex CLI using GLM-5-Turbo through llmup](./docs/images/codex-glm5-turbo.png)
 
 This is a real Codex CLI session using a local alias routed to `GLM-5-Turbo` through the proxy.
 

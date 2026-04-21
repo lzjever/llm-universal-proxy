@@ -187,6 +187,77 @@ pub(super) async fn spawn_anthropic_messages_mock(
     (format!("http://{addr}"), requests, server)
 }
 
+pub(super) async fn spawn_google_stream_generate_content_mock(
+    response_bodies: Vec<Value>,
+) -> (
+    String,
+    Arc<Mutex<Vec<(String, Value)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    #[derive(Clone)]
+    struct MockState {
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
+        response_bodies: Vec<Value>,
+    }
+
+    async fn handle_stream_generate_content(
+        uri: axum::http::Uri,
+        State(state): State<MockState>,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        state
+            .requests
+            .lock()
+            .await
+            .push((uri.path().trim_start_matches('/').to_string(), body));
+
+        let pieces = state
+            .response_bodies
+            .iter()
+            .flat_map(|response_body| {
+                let bytes =
+                    serde_json::to_vec(response_body).expect("serialize gemini sse payload");
+                vec![
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: ")),
+                    Ok(Bytes::from(bytes)),
+                    Ok(Bytes::from_static(b"\n\n")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let body_stream = stream::iter(pieces);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from_stream(body_stream))
+            .expect("streaming response")
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/*path", post(handle_stream_generate_content))
+        .with_state(MockState {
+            requests: requests.clone(),
+            response_bodies,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gemini stream mock upstream");
+    let addr = listener
+        .local_addr()
+        .expect("gemini stream mock local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("gemini stream mock server");
+    });
+
+    (format!("http://{addr}"), requests, server)
+}
+
 pub(super) fn app_state_for_single_upstream(
     api_root: String,
     upstream_format: crate::formats::UpstreamFormat,

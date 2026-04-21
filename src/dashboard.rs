@@ -21,6 +21,8 @@ use crate::hooks::HookSnapshot;
 use crate::server::{DashboardNamespaceSnapshot, DashboardRuntimeHandle, DashboardUpstreamStatus};
 use crate::telemetry::{RequestOutcome, RuntimeMetrics};
 
+const DASHBOARD_TITLE: &str = "LLMUP Dashboard";
+
 pub(crate) async fn run_dashboard(
     runtime: DashboardRuntimeHandle,
     metrics: Arc<RuntimeMetrics>,
@@ -141,7 +143,7 @@ fn render_header(
 ) {
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
-            "Proxec Dashboard",
+            DASHBOARD_TITLE,
             Style::default()
                 .fg(Color::Rgb(248, 208, 111))
                 .add_modifier(Modifier::BOLD),
@@ -659,5 +661,47 @@ fn log_style(line: &str) -> Style {
         "INFO" => Style::default().fg(Color::Rgb(143, 199, 255)),
         "DEBUG" => Style::default().fg(Color::Rgb(196, 167, 231)),
         _ => Style::default().fg(Color::Rgb(222, 226, 230)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn render_header_uses_llmup_public_title() {
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let snapshot = crate::telemetry::MetricsSnapshot {
+            uptime_secs: 0,
+            total_requests: 0,
+            active_requests: 0,
+            total_stream_requests: 0,
+            active_stream_requests: 0,
+            success_responses: 0,
+            error_responses: 0,
+            cancelled_responses: 0,
+            upstreams: Vec::new(),
+            recent_requests: Vec::new(),
+            configured_aliases: 0,
+            configured_upstreams: 0,
+        };
+
+        terminal
+            .draw(|frame| render_header(frame, frame.area(), &snapshot))
+            .expect("draw header");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains(DASHBOARD_TITLE),
+            "rendered = {rendered:?}"
+        );
     }
 }

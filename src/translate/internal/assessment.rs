@@ -576,7 +576,9 @@ pub(super) fn responses_nonportable_tool_choice_message(
     match choice_type {
         "function" => None,
         "custom" => match target_format {
-            UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic => None,
+            UpstreamFormat::OpenAiCompletion
+            | UpstreamFormat::Anthropic
+            | UpstreamFormat::Google => None,
             _ => Some(format!(
                 "OpenAI Responses tool_choice.type `custom` cannot be faithfully translated to {target_label}"
             )),
@@ -588,7 +590,9 @@ pub(super) fn responses_nonportable_tool_choice_message(
                     Some("custom")
                         if matches!(
                             target_format,
-                            UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+                            UpstreamFormat::OpenAiCompletion
+                                | UpstreamFormat::Anthropic
+                                | UpstreamFormat::Google
                         ) =>
                     {
                         None
@@ -655,7 +659,7 @@ pub(super) fn responses_custom_tool_format_reject_message(
 ) -> Option<String> {
     if !matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
     ) {
         return None;
     }
@@ -684,7 +688,7 @@ fn responses_custom_tool_bridge_mode_reject_message(
 ) -> Option<String> {
     if !matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
     ) {
         return None;
     }
@@ -725,7 +729,7 @@ fn responses_custom_tool_bridge_mode_warning_messages(
 ) -> Vec<String> {
     if !matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
     ) || compatibility_mode != CompatibilityMode::MaxCompat
     {
         return Vec::new();
@@ -1321,13 +1325,16 @@ pub(crate) fn assess_request_translation(
         }
     }
 
-    let anthropic_custom_bridge_supported = upstream_format == UpstreamFormat::Anthropic
-        && client_format == UpstreamFormat::OpenAiResponses;
+    let responses_custom_bridge_supported = client_format == UpstreamFormat::OpenAiResponses
+        && matches!(
+            upstream_format,
+            UpstreamFormat::Anthropic | UpstreamFormat::Google
+        );
     if matches!(
         upstream_format,
         UpstreamFormat::Anthropic | UpstreamFormat::Google
     ) && request_has_custom_tools(client_format, body)
-        && !anthropic_custom_bridge_supported
+        && !responses_custom_bridge_supported
     {
         assessment.reject(custom_tools_not_portable_message(upstream_format));
     }

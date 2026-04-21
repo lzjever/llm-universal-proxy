@@ -4,22 +4,30 @@
 
 use serde_json::{Map, Value};
 
-use crate::config::CompatibilityMode;
+use crate::config::{CompatibilityMode, ModelSurface};
 use crate::formats::UpstreamFormat;
 
 pub(crate) mod assessment;
 pub(crate) mod messages;
 pub(crate) mod models;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RequestTranslationPolicy {
     pub(crate) compatibility_mode: CompatibilityMode,
-    pub(crate) max_output_tokens: Option<u64>,
+    pub(crate) surface: ModelSurface,
 }
 
 impl RequestTranslationPolicy {
-    pub(crate) fn is_empty(self) -> bool {
-        self.max_output_tokens.is_none() && self.compatibility_mode == CompatibilityMode::default()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.max_output_tokens().is_none()
+            && self.compatibility_mode == CompatibilityMode::default()
+    }
+
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.surface
+            .limits
+            .as_ref()
+            .and_then(|limits| limits.max_output_tokens)
     }
 }
 
@@ -68,8 +76,8 @@ pub fn translate_request_with_policy(
         if client_format == UpstreamFormat::OpenAiCompletion {
             apply_openai_completion_compat_overrides(model, body);
         }
-        apply_request_translation_policy_defaults(upstream_format, policy, body);
-        apply_request_translation_policy_bridge_context(policy, body);
+        apply_request_translation_policy_defaults(upstream_format, &policy, body);
+        apply_request_translation_policy_bridge_context(&policy, body);
         return Ok(());
     }
     let translated_from_openai_completion = client_format == UpstreamFormat::OpenAiCompletion;
@@ -77,7 +85,8 @@ pub fn translate_request_with_policy(
     if client_format != UpstreamFormat::OpenAiCompletion {
         client_to_openai_completion(client_format, upstream_format, body)?;
     }
-    apply_request_translation_policy_defaults(UpstreamFormat::OpenAiCompletion, policy, body);
+    apply_request_translation_policy_defaults(UpstreamFormat::OpenAiCompletion, &policy, body);
+    apply_max_compat_structural_repair_pass(policy.compatibility_mode, upstream_format, body)?;
     // Step 2: openai → upstream (if upstream is not openai)
     if upstream_format != UpstreamFormat::OpenAiCompletion {
         openai_completion_to_upstream(upstream_format, model, body)?;
@@ -96,13 +105,13 @@ pub fn translate_request_with_policy(
         }
         apply_openai_completion_compat_overrides(model, body);
     }
-    apply_request_translation_policy_defaults(upstream_format, policy, body);
-    apply_request_translation_policy_bridge_context(policy, body);
+    apply_request_translation_policy_defaults(upstream_format, &policy, body);
+    apply_request_translation_policy_bridge_context(&policy, body);
     Ok(())
 }
 
 fn apply_request_translation_policy_bridge_context(
-    policy: RequestTranslationPolicy,
+    policy: &RequestTranslationPolicy,
     body: &mut Value,
 ) {
     let Some(bridge_context) = body.get_mut(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD) else {
@@ -122,12 +131,196 @@ fn apply_request_translation_policy_bridge_context(
     );
 }
 
+fn apply_max_compat_structural_repair_pass(
+    compatibility_mode: CompatibilityMode,
+    target_format: UpstreamFormat,
+    body: &mut Value,
+) -> Result<(), String> {
+    if compatibility_mode != CompatibilityMode::MaxCompat {
+        return Ok(());
+    }
+    let bridge_context = body
+        .get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD)
+        .cloned()
+        .filter(Value::is_object);
+    let Some(bridge_context) = bridge_context.as_ref() else {
+        return Ok(());
+    };
+
+    repair_request_scoped_custom_bridge_tool_definitions(target_format, body, bridge_context)?;
+    repair_request_scoped_custom_bridge_tool_choice(body, bridge_context);
+    repair_request_scoped_custom_bridge_message_tool_calls(body, bridge_context)?;
+    Ok(())
+}
+
+fn repair_request_scoped_custom_bridge_tool_definitions(
+    target_format: UpstreamFormat,
+    body: &mut Value,
+    bridge_context: &Value,
+) -> Result<(), String> {
+    let Some(original_tools) = body.get("tools").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let normalized =
+        normalized_openai_tool_definitions_from_request_with_request_scoped_custom_bridge(
+            body,
+            Some(bridge_context),
+        )?;
+    if normalized.len() != original_tools.len() {
+        return Ok(());
+    }
+    let repaired = normalized
+        .iter()
+        .map(|tool| {
+            normalized_tool_definition_to_openai_with_request_scoped_custom_bridge(
+                tool,
+                target_format,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("tools".to_string(), Value::Array(repaired));
+    }
+    Ok(())
+}
+
+fn request_scoped_bridge_choice_name(choice: &Value) -> Option<&str> {
+    choice
+        .get("name")
+        .or_else(|| choice.get("custom").and_then(|custom| custom.get("name")))
+        .or_else(|| {
+            choice
+                .get("function")
+                .and_then(|function| function.get("name"))
+        })
+        .and_then(Value::as_str)
+}
+
+fn repair_request_scoped_custom_bridge_tool_choice(body: &mut Value, bridge_context: &Value) {
+    let Some(choice) = body.get("tool_choice").cloned() else {
+        return;
+    };
+    let Some(choice_obj) = choice.as_object() else {
+        return;
+    };
+    let Some(choice_type) = choice_obj.get("type").and_then(Value::as_str) else {
+        return;
+    };
+
+    let repaired = match choice_type {
+        "custom" => request_scoped_bridge_choice_name(&choice)
+            .filter(|name| {
+                request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+                    Some(bridge_context),
+                    name,
+                )
+            })
+            .map(|name| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": name }
+                })
+            }),
+        "allowed_tools" => choice_obj
+            .get("allowed_tools")
+            .and_then(Value::as_object)
+            .and_then(|allowed_tools| {
+                let mode = allowed_tools.get("mode")?;
+                let tools = allowed_tools.get("tools")?.as_array()?;
+                Some(serde_json::json!({
+                    "type": "allowed_tools",
+                    "allowed_tools": {
+                        "mode": mode,
+                        "tools": tools
+                            .iter()
+                            .map(|tool| {
+                                let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+                                    return tool.clone();
+                                };
+                                if tool_type != "custom" {
+                                    return tool.clone();
+                                }
+                                request_scoped_bridge_choice_name(tool)
+                                    .filter(|name| {
+                                        request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+                                            Some(bridge_context),
+                                            name,
+                                        )
+                                    })
+                                    .map(|name| {
+                                        serde_json::json!({
+                                            "type": "function",
+                                            "function": { "name": name }
+                                        })
+                                    })
+                                    .unwrap_or_else(|| tool.clone())
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                }))
+            }),
+        _ => None,
+    };
+
+    if let Some(repaired) = repaired {
+        body["tool_choice"] = repaired;
+    }
+}
+
+fn repair_request_scoped_custom_bridge_message_tool_calls(
+    body: &mut Value,
+    bridge_context: &Value,
+) -> Result<(), String> {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for message in messages {
+        let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for tool_call in tool_calls.iter_mut() {
+            let Some(NormalizedOpenAiFamilyToolCall::Custom {
+                id,
+                name,
+                input,
+                namespace,
+                proxied_tool_kind,
+            }) = normalized_openai_tool_call(tool_call)?
+            else {
+                continue;
+            };
+            if namespace.is_some()
+                || !request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+                    Some(bridge_context),
+                    &name,
+                )
+            {
+                continue;
+            }
+            let mut repaired = serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": openai_responses_custom_tool_bridge_arguments(&input)?
+                }
+            });
+            if let Some(proxied_tool_kind) = proxied_tool_kind {
+                repaired["proxied_tool_kind"] = proxied_tool_kind;
+            }
+            copy_non_replayable_tool_call_marker(tool_call, &mut repaired);
+            *tool_call = repaired;
+        }
+    }
+    Ok(())
+}
+
 fn apply_request_translation_policy_defaults(
     target_format: UpstreamFormat,
-    policy: RequestTranslationPolicy,
+    policy: &RequestTranslationPolicy,
     body: &mut Value,
 ) {
-    let Some(max_output_tokens) = policy.max_output_tokens else {
+    let Some(max_output_tokens) = policy.max_output_tokens() else {
         return;
     };
     if request_body_has_explicit_output_limit(target_format, body) {
@@ -402,7 +595,9 @@ use messages::{
     openai_assistant_audio_not_portable_message, single_optional_array_item,
     single_required_array_item, translation_target_label,
 };
-use models::{NormalizedToolPolicy, SemanticToolKind, TranslationDecision};
+use models::{
+    NormalizedOpenAiFamilyToolCall, NormalizedToolPolicy, SemanticToolKind, TranslationDecision,
+};
 use openai_family::{
     collapse_openai_text_parts, copy_remaining_usage_fields, extract_openai_content_text,
     extract_openai_refusal, extract_responses_text_content, openai_normalized_request_controls,
@@ -435,7 +630,11 @@ use response_protocols::{
     push_gemini_function_call_part,
 };
 use tools::{
-    anthropic_tool_use_type_for_openai_tool_call,
+    anthropic_tool_use_type_for_openai_tool_call, copy_non_replayable_tool_call_marker,
+    normalized_openai_tool_call,
+    normalized_openai_tool_definitions_from_request_with_request_scoped_custom_bridge,
+    normalized_tool_definition_to_openai_with_request_scoped_custom_bridge,
+    openai_responses_custom_tool_bridge_arguments,
     openai_responses_custom_tool_input_from_bridge_value,
     openai_tool_arguments_to_structured_value, openai_tool_call_partial_replay_text,
     request_scoped_openai_custom_bridge_expects_canonical_input_wrapper,
@@ -455,7 +654,8 @@ pub fn translate_response(
     if upstream_format == client_format {
         return Ok(body.clone());
     }
-    let openai = if upstream_format == UpstreamFormat::Anthropic
+    let bridge_context = body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
+    let mut openai = if upstream_format == UpstreamFormat::Anthropic
         && client_format == UpstreamFormat::OpenAiResponses
     {
         claude_response_to_openai_with_reasoning_replay(body)?
@@ -466,6 +666,14 @@ pub fn translate_response(
     } else {
         upstream_response_to_openai(upstream_format, body)?
     };
+    if let Some(bridge_context) = bridge_context {
+        if let Some(openai_obj) = openai.as_object_mut() {
+            openai_obj.insert(
+                REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD.to_string(),
+                bridge_context,
+            );
+        }
+    }
     if client_format == UpstreamFormat::OpenAiCompletion {
         return Ok(openai);
     }

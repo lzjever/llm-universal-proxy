@@ -156,7 +156,7 @@ Recommended implementation points:
 - add `surface` to `ModelAlias`
 - add `effective_model_surface()` to config resolution
 - extend `RequestTranslationPolicy` to carry compatibility and surface data
-- expose `proxec.surface` from `/openai/v1/models`, `/anthropic/v1/models`, and `/google/v1beta/models`
+- expose `llmup.surface` from `/openai/v1/models`, `/anthropic/v1/models`, and `/google/v1beta/models`
 
 Wrappers should then consume the same effective surface instead of re-deriving private client metadata from source YAML.
 

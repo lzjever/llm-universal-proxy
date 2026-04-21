@@ -366,3 +366,59 @@ async fn translate_sse_stream_gemini_to_anthropic_defers_finish_until_stream_end
         1
     );
 }
+
+#[tokio::test]
+async fn translate_sse_stream_gemini_to_responses_bridges_custom_tool_calls_without_prefix_leak() {
+    let inner = futures_util::stream::iter(vec![
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            br#"data: {"responseId":"resp_gemini_custom","modelVersion":"gemini-2.5-flash","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call_apply_patch","name":"apply_patch","args":{"input":"*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"STOP"}]}
+
+"#,
+        )),
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            br#"data: {"responseId":"resp_gemini_custom","modelVersion":"gemini-2.5-flash","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}]}
+
+"#,
+        )),
+    ]);
+    let mut stream = TranslateSseStream::new(
+        inner,
+        UpstreamFormat::Google,
+        UpstreamFormat::OpenAiResponses,
+    )
+    .with_request_scoped_tool_bridge_context(Some(serde_json::json!({
+        "compatibility_mode": "max_compat",
+        "entries": {
+            "apply_patch": {
+                "source_kind": "custom_grammar",
+                "transport_kind": "function_object_wrapper",
+                "wrapper_field": "input",
+                "expected_canonical_shape": "single_required_string"
+            }
+        }
+    })));
+
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let frame = frame.expect("translated frame");
+        frames.push(String::from_utf8(frame.to_vec()).expect("utf8 frame"));
+    }
+    let joined = frames.join("\n");
+
+    assert!(
+        joined.contains("response.custom_tool_call_input.delta"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("response.custom_tool_call_input.done"),
+        "{joined}"
+    );
+    assert!(joined.contains("\"type\":\"custom_tool_call\""), "{joined}");
+    assert!(joined.contains("\"name\":\"apply_patch\""), "{joined}");
+    assert!(
+        !joined.contains("response.function_call_arguments.delta"),
+        "{joined}"
+    );
+    assert!(!joined.contains("\"type\":\"function_call\""), "{joined}");
+    assert!(!joined.contains("__llmup_custom__"), "{joined}");
+}
