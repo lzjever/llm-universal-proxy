@@ -15,8 +15,10 @@ use bytes::Bytes;
 use common::*;
 use futures_util::{future::join_all, stream, StreamExt};
 use llm_universal_proxy::config::{
-    AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ModelAlias, ModelLimits,
-    RuntimeConfigPayload, RuntimeHookConfig, RuntimeUpstreamConfig, UpstreamConfig,
+    ApplyPatchTransport, AuthPolicy, CompatibilityMode, Config, DebugTraceConfig, HookConfig,
+    HookEndpointConfig, ModelAlias, ModelLimits, ModelModalities, ModelModality, ModelSurface,
+    ModelSurfacePatch, ModelToolSurface, RuntimeConfigPayload, RuntimeHookConfig,
+    RuntimeUpstreamConfig, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::run_with_listener;
@@ -83,6 +85,7 @@ fn named_upstream(
         auth_policy: AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
         limits: None,
+        surface_defaults: None,
     }
 }
 
@@ -113,6 +116,7 @@ fn config_with_alias_limits(
             upstream_name: "default".to_string(),
             upstream_model: upstream_model.to_string(),
             limits: None,
+            surface: None,
         },
     );
     config.model_aliases = model_aliases;
@@ -123,6 +127,7 @@ fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
     RuntimeConfigPayload {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout_secs: 30,
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![RuntimeUpstreamConfig {
             name: "default".to_string(),
             api_root: upstream_api_root(mock_base, UpstreamFormat::OpenAiCompletion),
@@ -132,6 +137,7 @@ fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: std::collections::BTreeMap::new(),
         hooks: RuntimeHookConfig::default(),
@@ -144,6 +150,7 @@ fn yaml_config_parses_structured_model_alias_limits() {
     let config = Config::from_yaml_str(
         r#"
 listen: 127.0.0.1:18888
+compatibility_mode: max_compat
 upstreams:
   MINIMAX-OPENAI:
     api_root: https://api.minimaxi.com/v1
@@ -153,15 +160,32 @@ upstreams:
     limits:
       context_window: 200000
       max_output_tokens: 128000
+    surface_defaults:
+      modalities:
+        input: [text]
+        output: [text]
+      tools:
+        supports_search: true
+        supports_view_image: true
+        apply_patch_transport: function
+        supports_parallel_calls: true
 model_aliases:
   minimax-openai:
     target: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
     limits:
       max_output_tokens: 64000
+    surface:
+      modalities:
+        input: [text, image]
+      tools:
+        supports_search: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
 "#,
     )
     .unwrap();
 
+    assert_eq!(config.compatibility_mode, CompatibilityMode::MaxCompat);
     assert_eq!(
         config.upstreams[0].limits,
         Some(ModelLimits {
@@ -183,14 +207,46 @@ model_aliases:
             max_output_tokens: Some(64_000),
         })
     );
+    assert_eq!(
+        config.effective_model_surface(&config.model_aliases["minimax-openai"]),
+        ModelSurface {
+            limits: Some(ModelLimits {
+                context_window: Some(200_000),
+                max_output_tokens: Some(64_000),
+            }),
+            modalities: Some(ModelModalities {
+                input: Some(vec![ModelModality::Text, ModelModality::Image]),
+                output: Some(vec![ModelModality::Text]),
+            }),
+            tools: Some(ModelToolSurface {
+                supports_search: Some(false),
+                supports_view_image: Some(true),
+                apply_patch_transport: Some(ApplyPatchTransport::Freeform),
+                supports_parallel_calls: Some(false),
+            }),
+        }
+    );
 }
 
 #[test]
 fn runtime_config_round_trip_preserves_model_alias_limits() {
     let mut payload = demo_runtime_config("http://example.com");
+    payload.compatibility_mode = CompatibilityMode::MaxCompat;
     payload.upstreams[0].limits = Some(ModelLimits {
         context_window: Some(200_000),
         max_output_tokens: Some(128_000),
+    });
+    payload.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
+        modalities: Some(ModelModalities {
+            input: Some(vec![ModelModality::Text]),
+            output: Some(vec![ModelModality::Text]),
+        }),
+        tools: Some(ModelToolSurface {
+            supports_search: Some(true),
+            supports_view_image: Some(true),
+            apply_patch_transport: Some(ApplyPatchTransport::Function),
+            supports_parallel_calls: Some(true),
+        }),
     });
     payload.model_aliases.insert(
         "minimax-anth".to_string(),
@@ -201,17 +257,45 @@ fn runtime_config_round_trip_preserves_model_alias_limits() {
                 context_window: None,
                 max_output_tokens: Some(64_000),
             }),
+            surface: Some(ModelSurfacePatch {
+                modalities: Some(ModelModalities {
+                    input: Some(vec![ModelModality::Text, ModelModality::Image]),
+                    output: None,
+                }),
+                tools: Some(ModelToolSurface {
+                    supports_search: Some(false),
+                    supports_view_image: None,
+                    apply_patch_transport: Some(ApplyPatchTransport::Freeform),
+                    supports_parallel_calls: Some(false),
+                }),
+            }),
         },
     );
 
     let config = Config::try_from(payload).unwrap();
     let round_trip = RuntimeConfigPayload::from(&config);
 
+    assert_eq!(round_trip.compatibility_mode, CompatibilityMode::MaxCompat);
     assert_eq!(
         round_trip.upstreams[0].limits,
         Some(ModelLimits {
             context_window: Some(200_000),
             max_output_tokens: Some(128_000),
+        })
+    );
+    assert_eq!(
+        round_trip.upstreams[0].surface_defaults,
+        Some(ModelSurfacePatch {
+            modalities: Some(ModelModalities {
+                input: Some(vec![ModelModality::Text]),
+                output: Some(vec![ModelModality::Text]),
+            }),
+            tools: Some(ModelToolSurface {
+                supports_search: Some(true),
+                supports_view_image: Some(true),
+                apply_patch_transport: Some(ApplyPatchTransport::Function),
+                supports_parallel_calls: Some(true),
+            }),
         })
     );
     assert_eq!(
@@ -221,12 +305,93 @@ fn runtime_config_round_trip_preserves_model_alias_limits() {
             max_output_tokens: Some(64_000),
         })
     );
+    assert_eq!(
+        round_trip.model_aliases["minimax-anth"].surface,
+        Some(ModelSurfacePatch {
+            modalities: Some(ModelModalities {
+                input: Some(vec![ModelModality::Text, ModelModality::Image]),
+                output: None,
+            }),
+            tools: Some(ModelToolSurface {
+                supports_search: Some(false),
+                supports_view_image: None,
+                apply_patch_transport: Some(ApplyPatchTransport::Freeform),
+                supports_parallel_calls: Some(false),
+            }),
+        })
+    );
+}
+
+#[test]
+fn effective_model_surface_merges_upstream_defaults_and_alias_overrides() {
+    let mut config = proxy_config("http://example.com", UpstreamFormat::OpenAiCompletion);
+    config.compatibility_mode = CompatibilityMode::MaxCompat;
+    config.upstreams[0].limits = Some(ModelLimits {
+        context_window: Some(200_000),
+        max_output_tokens: Some(128_000),
+    });
+    config.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
+        modalities: Some(ModelModalities {
+            input: Some(vec![ModelModality::Text]),
+            output: Some(vec![ModelModality::Text]),
+        }),
+        tools: Some(ModelToolSurface {
+            supports_search: Some(true),
+            supports_view_image: Some(true),
+            apply_patch_transport: Some(ApplyPatchTransport::Function),
+            supports_parallel_calls: Some(true),
+        }),
+    });
+    config.model_aliases.insert(
+        "minimax-openai".to_string(),
+        ModelAlias {
+            upstream_name: "default".to_string(),
+            upstream_model: "MiniMax-M2.7-highspeed".to_string(),
+            limits: Some(ModelLimits {
+                context_window: None,
+                max_output_tokens: Some(64_000),
+            }),
+            surface: Some(ModelSurfacePatch {
+                modalities: Some(ModelModalities {
+                    input: Some(vec![ModelModality::Text, ModelModality::Image]),
+                    output: None,
+                }),
+                tools: Some(ModelToolSurface {
+                    supports_search: Some(false),
+                    supports_view_image: None,
+                    apply_patch_transport: Some(ApplyPatchTransport::Freeform),
+                    supports_parallel_calls: Some(false),
+                }),
+            }),
+        },
+    );
+
+    assert_eq!(
+        config.effective_model_surface(&config.model_aliases["minimax-openai"]),
+        ModelSurface {
+            limits: Some(ModelLimits {
+                context_window: Some(200_000),
+                max_output_tokens: Some(64_000),
+            }),
+            modalities: Some(ModelModalities {
+                input: Some(vec![ModelModality::Text, ModelModality::Image]),
+                output: Some(vec![ModelModality::Text]),
+            }),
+            tools: Some(ModelToolSurface {
+                supports_search: Some(false),
+                supports_view_image: Some(true),
+                apply_patch_transport: Some(ApplyPatchTransport::Freeform),
+                supports_parallel_calls: Some(false),
+            }),
+        }
+    );
 }
 
 fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -> Config {
     Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
             api_root: upstream_api_root(upstream_base, api_root_format),
@@ -237,6 +402,7 @@ fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
@@ -454,6 +620,7 @@ fn multi_native_responses_config(first_base: &str, second_base: &str) -> Config 
     Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![
             named_upstream(
                 "RESPONSES_A",
@@ -481,6 +648,7 @@ fn pinned_responses_plus_auto_discovery_config(
     Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![
             named_upstream(
                 "RESPONSES_A",
@@ -498,6 +666,7 @@ fn pinned_responses_plus_auto_discovery_config(
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
                 limits: None,
+                surface_defaults: None,
             },
         ],
         model_aliases: Default::default(),
@@ -685,6 +854,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
     let payload = RuntimeConfigPayload {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout_secs: 30,
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![RuntimeUpstreamConfig {
             name: "default".to_string(),
             api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
@@ -708,6 +878,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
                 ("x-api-key".to_string(), "api-secret".to_string()),
             ],
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: std::collections::BTreeMap::new(),
         hooks: RuntimeHookConfig {
@@ -1008,6 +1179,7 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
             "config": RuntimeConfigPayload {
                 listen: "127.0.0.1:0".to_string(),
                 upstream_timeout_secs: 30,
+                compatibility_mode: CompatibilityMode::Balanced,
                 upstreams: vec![RuntimeUpstreamConfig {
                     name: "default".to_string(),
                     api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
@@ -1031,6 +1203,7 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
                         ("x-service-apikey".to_string(), "apikey-secret".to_string()),
                     ],
                     limits: None,
+                    surface_defaults: None,
                 }],
                 model_aliases: std::collections::BTreeMap::new(),
                 hooks: RuntimeHookConfig {
@@ -1847,6 +2020,7 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
             api_root: mock_base.clone(),
@@ -1857,6 +2031,7 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
@@ -1990,6 +2165,7 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
             api_root: mock_base,
@@ -2000,6 +2176,7 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
@@ -2039,11 +2216,13 @@ async fn openai_responses_create_with_alias_routes_to_configured_upstream() {
             upstream_name: "RESPONSES_A".to_string(),
             upstream_model: "model-a".to_string(),
             limits: None,
+            surface: None,
         },
     );
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![
             named_upstream(
                 "RESPONSES_A",
@@ -2286,6 +2465,7 @@ async fn responses_stateful_request_without_model_routes_to_unique_native_respon
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![
             named_upstream(
                 "RESPONSES_A",
@@ -2333,6 +2513,7 @@ async fn stateful_model_less_create_returns_503_when_unique_configured_native_ow
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![named_upstream(
             "RESPONSES_A",
             &responses_base,
@@ -3012,7 +3193,7 @@ async fn google_passthrough_does_not_inject_top_level_stream_field() {
 #[tokio::test]
 async fn openai_models_endpoint_lists_local_aliases() {
     let (mock_base, _mock) = spawn_openai_completion_mock().await;
-    let config = config_with_alias_limits(
+    let mut config = config_with_alias_limits(
         &mock_base,
         UpstreamFormat::OpenAiCompletion,
         "sonnet",
@@ -3022,6 +3203,31 @@ async fn openai_models_endpoint_lists_local_aliases() {
             max_output_tokens: Some(128_000),
         }),
     );
+    config.compatibility_mode = CompatibilityMode::MaxCompat;
+    config.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
+        modalities: Some(ModelModalities {
+            input: Some(vec![ModelModality::Text]),
+            output: Some(vec![ModelModality::Text]),
+        }),
+        tools: Some(ModelToolSurface {
+            supports_search: Some(true),
+            supports_view_image: Some(true),
+            apply_patch_transport: Some(ApplyPatchTransport::Function),
+            supports_parallel_calls: Some(true),
+        }),
+    });
+    config.model_aliases.get_mut("sonnet").unwrap().surface = Some(ModelSurfacePatch {
+        modalities: Some(ModelModalities {
+            input: Some(vec![ModelModality::Text, ModelModality::Image]),
+            output: None,
+        }),
+        tools: Some(ModelToolSurface {
+            supports_search: Some(false),
+            supports_view_image: None,
+            apply_patch_transport: Some(ApplyPatchTransport::Freeform),
+            supports_parallel_calls: Some(false),
+        }),
+    });
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let client = Client::new();
@@ -3043,12 +3249,40 @@ async fn openai_models_endpoint_lists_local_aliases() {
         body["data"][0]["proxec"]["limits"]["max_output_tokens"],
         128_000
     );
+    assert_eq!(
+        body["data"][0]["proxec"]["surface"]["limits"]["context_window"],
+        200_000
+    );
+    assert_eq!(
+        body["data"][0]["proxec"]["surface"]["modalities"]["input"][0],
+        "text"
+    );
+    assert_eq!(
+        body["data"][0]["proxec"]["surface"]["modalities"]["input"][1],
+        "image"
+    );
+    assert_eq!(
+        body["data"][0]["proxec"]["surface"]["tools"]["supports_search"],
+        false
+    );
+    assert_eq!(
+        body["data"][0]["proxec"]["surface"]["tools"]["supports_view_image"],
+        true
+    );
+    assert_eq!(
+        body["data"][0]["proxec"]["surface"]["tools"]["apply_patch_transport"],
+        "freeform"
+    );
+    assert_eq!(
+        body["data"][0]["proxec"]["surface"]["tools"]["supports_parallel_calls"],
+        false
+    );
 }
 
 #[tokio::test]
 async fn anthropic_models_endpoint_retrieves_local_alias() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
-    let config = config_with_alias_limits(
+    let mut config = config_with_alias_limits(
         &mock_base,
         UpstreamFormat::Anthropic,
         "haiku",
@@ -3058,6 +3292,31 @@ async fn anthropic_models_endpoint_retrieves_local_alias() {
             max_output_tokens: Some(128_000),
         }),
     );
+    config.compatibility_mode = CompatibilityMode::MaxCompat;
+    config.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
+        modalities: Some(ModelModalities {
+            input: Some(vec![ModelModality::Text]),
+            output: Some(vec![ModelModality::Text]),
+        }),
+        tools: Some(ModelToolSurface {
+            supports_search: Some(true),
+            supports_view_image: Some(true),
+            apply_patch_transport: Some(ApplyPatchTransport::Function),
+            supports_parallel_calls: Some(true),
+        }),
+    });
+    config.model_aliases.get_mut("haiku").unwrap().surface = Some(ModelSurfacePatch {
+        modalities: Some(ModelModalities {
+            input: Some(vec![ModelModality::Text, ModelModality::Image]),
+            output: None,
+        }),
+        tools: Some(ModelToolSurface {
+            supports_search: Some(false),
+            supports_view_image: None,
+            apply_patch_transport: Some(ApplyPatchTransport::Freeform),
+            supports_parallel_calls: Some(false),
+        }),
+    });
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let client = Client::new();
@@ -3072,12 +3331,31 @@ async fn anthropic_models_endpoint_retrieves_local_alias() {
     assert_eq!(body["type"], "model");
     assert_eq!(body["proxec"]["limits"]["context_window"], 200_000);
     assert_eq!(body["proxec"]["limits"]["max_output_tokens"], 128_000);
+    assert_eq!(
+        body["proxec"]["surface"]["limits"]["context_window"],
+        200_000
+    );
+    assert_eq!(body["proxec"]["surface"]["modalities"]["input"][0], "text");
+    assert_eq!(body["proxec"]["surface"]["modalities"]["input"][1], "image");
+    assert_eq!(body["proxec"]["surface"]["tools"]["supports_search"], false);
+    assert_eq!(
+        body["proxec"]["surface"]["tools"]["supports_view_image"],
+        true
+    );
+    assert_eq!(
+        body["proxec"]["surface"]["tools"]["apply_patch_transport"],
+        "freeform"
+    );
+    assert_eq!(
+        body["proxec"]["surface"]["tools"]["supports_parallel_calls"],
+        false
+    );
 }
 
 #[tokio::test]
 async fn google_models_endpoint_lists_local_aliases() {
     let (mock_base, _mock) = spawn_google_mock().await;
-    let config = config_with_alias_limits(
+    let mut config = config_with_alias_limits(
         &mock_base,
         UpstreamFormat::Google,
         "flash",
@@ -3087,6 +3365,31 @@ async fn google_models_endpoint_lists_local_aliases() {
             max_output_tokens: Some(128_000),
         }),
     );
+    config.compatibility_mode = CompatibilityMode::MaxCompat;
+    config.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
+        modalities: Some(ModelModalities {
+            input: Some(vec![ModelModality::Text]),
+            output: Some(vec![ModelModality::Text]),
+        }),
+        tools: Some(ModelToolSurface {
+            supports_search: Some(true),
+            supports_view_image: Some(true),
+            apply_patch_transport: Some(ApplyPatchTransport::Function),
+            supports_parallel_calls: Some(true),
+        }),
+    });
+    config.model_aliases.get_mut("flash").unwrap().surface = Some(ModelSurfacePatch {
+        modalities: Some(ModelModalities {
+            input: Some(vec![ModelModality::Text, ModelModality::Image]),
+            output: None,
+        }),
+        tools: Some(ModelToolSurface {
+            supports_search: Some(false),
+            supports_view_image: None,
+            apply_patch_transport: Some(ApplyPatchTransport::Freeform),
+            supports_parallel_calls: Some(false),
+        }),
+    });
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let client = Client::new();
@@ -3104,6 +3407,34 @@ async fn google_models_endpoint_lists_local_aliases() {
     );
     assert_eq!(body["models"][0]["inputTokenLimit"], 200_000);
     assert_eq!(body["models"][0]["outputTokenLimit"], 128_000);
+    assert_eq!(
+        body["models"][0]["proxec"]["surface"]["limits"]["context_window"],
+        200_000
+    );
+    assert_eq!(
+        body["models"][0]["proxec"]["surface"]["modalities"]["input"][0],
+        "text"
+    );
+    assert_eq!(
+        body["models"][0]["proxec"]["surface"]["modalities"]["input"][1],
+        "image"
+    );
+    assert_eq!(
+        body["models"][0]["proxec"]["surface"]["tools"]["supports_search"],
+        false
+    );
+    assert_eq!(
+        body["models"][0]["proxec"]["surface"]["tools"]["supports_view_image"],
+        true
+    );
+    assert_eq!(
+        body["models"][0]["proxec"]["surface"]["tools"]["apply_patch_transport"],
+        "freeform"
+    );
+    assert_eq!(
+        body["models"][0]["proxec"]["surface"]["tools"]["supports_parallel_calls"],
+        false
+    );
 }
 
 #[tokio::test]
@@ -3829,6 +4160,7 @@ async fn multi_upstream_supports_explicit_upstream_model_selector() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![
             named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
             named_upstream(
@@ -3872,11 +4204,13 @@ async fn multi_upstream_supports_local_model_alias() {
             upstream_name: "GLM-OFFICIAL".to_string(),
             upstream_model: "GLM-5".to_string(),
             limits: None,
+            surface: None,
         },
     );
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![
             named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
             named_upstream(
@@ -3916,6 +4250,7 @@ async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![
             named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
             named_upstream(
@@ -3951,6 +4286,7 @@ async fn multi_upstream_uses_per_upstream_fallback_credential() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![named_upstream(
             "GLM-OFFICIAL",
             &glm_base,
@@ -3992,6 +4328,7 @@ async fn force_server_auth_policy_ignores_client_key() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![UpstreamConfig {
             name: "GLM-OFFICIAL".to_string(),
             api_root: upstream_api_root(&glm_base, UpstreamFormat::Anthropic),
@@ -4002,6 +4339,7 @@ async fn force_server_auth_policy_ignores_client_key() {
             auth_policy: AuthPolicy::ForceServer,
             upstream_headers: Vec::new(),
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),
@@ -4975,6 +5313,7 @@ async fn upstream_unreachable_returns_502() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_millis(100),
+        compatibility_mode: CompatibilityMode::Balanced,
         upstreams: vec![UpstreamConfig {
             name: "default".to_string(),
             api_root: "http://127.0.0.1:31999/v1".to_string(),
@@ -4985,6 +5324,7 @@ async fn upstream_unreachable_returns_502() {
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: Default::default(),
         hooks: Default::default(),

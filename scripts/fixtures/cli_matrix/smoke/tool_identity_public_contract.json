@@ -1,0 +1,13 @@
+{
+  "id": "tool_identity_public_contract",
+  "kind": "smoke",
+  "description": "Ask the client-facing model surface to describe available editing tools and fail if internal transport prefixes leak into public output.",
+  "prompt": "Briefly list the exact public names of any editing tools you can use in this environment. If you mention apply_patch, use that exact public name. Never include internal transport prefixes or proxy-private tool names.",
+  "verifier": {
+    "type": "stdout_contract",
+    "not_contains": [
+      "__llmup_custom__"
+    ]
+  },
+  "timeout_secs": 90
+}

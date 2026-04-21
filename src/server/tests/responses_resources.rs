@@ -93,6 +93,7 @@ fn resolve_native_responses_stateful_route_or_error_rejects_multi_upstream_auto_
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         upstreams: vec![pinned.clone(), auto.clone()],
         model_aliases: Default::default(),
         hooks: Default::default(),

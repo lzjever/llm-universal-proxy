@@ -27,6 +27,7 @@ from real_cli_matrix import (  # noqa: E402
     build_client_env,
     build_codex_catalog_args,
     build_runtime_config_text,
+    ensure_no_public_internal_tool_artifacts,
     load_dotenv_file,
     parse_proxy_source,
     prepare_proxy_env,
@@ -125,10 +126,13 @@ def build_interactive_command(
                 client_home, model, model_limits, codex_metadata
             )
         )
+        ensure_no_public_internal_tool_artifacts(
+            command, context="interactive CLI command"
+        )
         return command
 
     if client_name == "claude":
-        return [
+        command = [
             "claude",
             "--bare",
             "--setting-sources",
@@ -138,15 +142,23 @@ def build_interactive_command(
             "--add-dir",
             str(workspace),
         ]
+        ensure_no_public_internal_tool_artifacts(
+            command, context="interactive CLI command"
+        )
+        return command
 
     if client_name == "gemini":
-        return [
+        command = [
             "gemini",
             "--model",
             model,
             "--include-directories",
             str(workspace),
         ]
+        ensure_no_public_internal_tool_artifacts(
+            command, context="interactive CLI command"
+        )
+        return command
 
     raise ValueError(f"unknown client: {client_name}")
 

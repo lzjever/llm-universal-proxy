@@ -766,6 +766,7 @@ fn runtime_namespace_config(
     RuntimeConfigPayload {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout_secs: 30,
+        compatibility_mode: llm_universal_proxy::config::CompatibilityMode::Balanced,
         upstreams: vec![RuntimeUpstreamConfig {
             name: "default".to_string(),
             api_root: upstream_api_root(upstream_base, format),
@@ -775,6 +776,7 @@ fn runtime_namespace_config(
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: vec![("x-namespace-tag".to_string(), namespace_tag.to_string())],
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: std::collections::BTreeMap::new(),
         hooks: RuntimeHookConfig::default(),

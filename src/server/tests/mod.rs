@@ -66,6 +66,7 @@ pub(super) fn test_upstream_config_with_fixed_format(
         auth_policy: crate::config::AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
         limits: None,
+        surface_defaults: None,
     }
 }
 
@@ -75,6 +76,7 @@ pub(super) fn runtime_namespace_state_for_tests(
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         upstreams: upstreams
             .iter()
             .map(|(name, format, _)| test_upstream_config(name, *format))
@@ -211,10 +213,12 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         auth_policy: crate::config::AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
         limits: None,
+        surface_defaults: None,
     };
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout,
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         upstreams: vec![upstream.clone()],
         model_aliases: Default::default(),
         hooks: Default::default(),

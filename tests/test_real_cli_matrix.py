@@ -14,6 +14,52 @@ from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "real_cli_matrix.py"
+TOOL_IDENTITY_FIXTURE_PATH = (
+    REPO_ROOT
+    / "scripts"
+    / "fixtures"
+    / "cli_matrix"
+    / "smoke"
+    / "tool_identity_public_contract.json"
+)
+DOC_CONTRACT_PATHS = (
+    REPO_ROOT / "README.md",
+    REPO_ROOT / "docs" / "DESIGN.md",
+    REPO_ROOT / "docs" / "PRD.md",
+    REPO_ROOT / "docs" / "CONSTITUTION.md",
+    REPO_ROOT / "docs" / "protocol-baselines" / "capabilities" / "tools.md",
+    REPO_ROOT / "docs" / "max-compat-design.md",
+    REPO_ROOT / "docs" / "max-compat-development-plan.md",
+)
+LOCKED_TOOL_CONTRACT_LINES = (
+    "The proxy must not rewrite the visible tool name supplied by the client.",
+    "`__llmup_custom__*` is an internal transport artifact, not a public contract.",
+    "`apply_patch` remains a public freeform tool on client-visible surfaces.",
+)
+FORBIDDEN_LEGACY_TOOL_IDENTITY_LANGUAGE = {
+    REPO_ROOT / "README.md": (
+        "Important current limitation:",
+        "The current Responses custom-tool bridge still uses reserved synthetic names such as `__llmup_custom__apply_patch` on some translated live paths.",
+        "there is also a known current limitation: Responses custom tools may still be bridged with reserved proxy names visible to the upstream model.",
+    ),
+    REPO_ROOT / "docs" / "DESIGN.md": (
+        "It is acceptable only as an internal or stateless fallback",
+    ),
+    REPO_ROOT / "docs" / "max-compat-design.md": (
+        "The current live bridge for OpenAI Responses custom tools rewrites:",
+        "the current name-based encoding is not valid as a live model-visible contract for agent clients.",
+        "Current behavior is intentional.",
+        "keep reserved-prefix bridge names only as legacy/stateless fallback machinery",
+    ),
+}
+REQUIRED_TOOL_BRIDGE_DIRECTION_LANGUAGE = {
+    REPO_ROOT / "docs" / "max-compat-design.md": (
+        "The intended translated-path bridge preserves the stable visible tool name and carries bridge provenance in request-scoped translation context.",
+    ),
+    REPO_ROOT / "docs" / "max-compat-development-plan.md": (
+        "Phase 0 and Phase 1 together define the intended translated-path bridge: preserve the stable visible tool name on live requests and carry bridge provenance in request-scoped translation context.",
+    ),
+}
 
 
 def load_module():
@@ -725,6 +771,22 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(model_entry["input_modalities"], ["text"])
         self.assertFalse(model_entry["supports_search_tool"])
 
+    def test_build_codex_model_catalog_rejects_internal_tool_artifacts_in_public_payload(self):
+        module = load_module()
+        bad_entry = module.default_codex_catalog_entry("minimax-openai")
+        bad_entry["experimental_supported_tools"] = ["__llmup_custom__apply_patch"]
+
+        with mock.patch.object(module, "default_codex_catalog_entry", return_value=bad_entry):
+            with self.assertRaisesRegex(ValueError, "__llmup_custom__apply_patch"):
+                module.build_codex_model_catalog(
+                    "minimax-openai",
+                    module.ModelLimits(context_window=200000, max_output_tokens=128000),
+                    module.CodexModelMetadata(
+                        input_modalities=("text",),
+                        supports_search_tool=False,
+                    ),
+                )
+
     def test_real_codex_rejects_previous_minimal_catalog_shape(self):
         _module = load_module()
 
@@ -904,6 +966,29 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertIn("model_catalog_json", joined)
         self.assertNotIn('web_search="disabled"', joined)
         self.assertNotIn('tools.view_image=false', joined)
+
+    def test_build_client_command_rejects_internal_tool_artifacts_in_public_args(self):
+        module = load_module()
+        lane = make_lane(module, name="minimax-openai", proxy_model="minimax-openai")
+        fixture = make_fixture(module)
+
+        with mock.patch.object(
+            module,
+            "build_codex_catalog_args",
+            return_value=[
+                "-c",
+                'tool_identity_contract="__llmup_custom__apply_patch"',
+            ],
+        ):
+            with self.assertRaisesRegex(ValueError, "__llmup_custom__apply_patch"):
+                module.build_client_command(
+                    "codex",
+                    "http://127.0.0.1:18888",
+                    lane,
+                    fixture,
+                    pathlib.Path("/tmp/workspace").resolve(),
+                    client_home=pathlib.Path("/tmp/codex-home").resolve(),
+                )
 
     def test_prepare_proxy_env_keeps_dotenv_scoped_to_proxy_only(self):
         module = load_module()
@@ -1410,6 +1495,55 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertTrue(ok, message)
 
+    def test_verify_fixture_output_supports_stdout_contract_without_internal_tool_artifacts(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="tool_identity_public_contract",
+            verifier={
+                "type": "stdout_contract",
+                "not_contains": ["__llmup_custom__"],
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Public tools include apply_patch.",
+            workspace_dir=None,
+        )
+
+        self.assertTrue(ok, message)
+        self.assertEqual(message, "")
+
+    def test_verify_fixture_output_rejects_stdout_contract_internal_tool_artifacts(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="tool_identity_public_contract",
+            verifier={
+                "type": "stdout_contract",
+                "not_contains": ["__llmup_custom__"],
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Available tool: __llmup_custom__apply_patch",
+            workspace_dir=None,
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("__llmup_custom__", message)
+
+    def test_tool_identity_fixture_is_present_and_uses_stdout_contract(self):
+        payload = json.loads(TOOL_IDENTITY_FIXTURE_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["id"], "tool_identity_public_contract")
+        self.assertEqual(payload["kind"], "smoke")
+        self.assertEqual(payload["verifier"]["type"], "stdout_contract")
+        self.assertIn("__llmup_custom__", payload["verifier"]["not_contains"])
+        self.assertIn("apply_patch", payload["prompt"])
+
     def test_run_matrix_case_feeds_claude_prompt_via_stdin(self):
         module = load_module()
         case = make_case(
@@ -1870,6 +2004,27 @@ class RealCliMatrixTests(unittest.TestCase):
                 "codex__minimax-anth__smoke_pong",
                 (run_dir / "results.jsonl").read_text(encoding="utf-8"),
             )
+
+    def test_docs_publish_the_locked_tool_identity_contract(self):
+        for path in DOC_CONTRACT_PATHS:
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                for line in LOCKED_TOOL_CONTRACT_LINES:
+                    self.assertIn(line, text)
+
+    def test_docs_do_not_describe_reserved_prefix_bridge_as_current_limitation_or_fallback(self):
+        for path, forbidden_snippets in FORBIDDEN_LEGACY_TOOL_IDENTITY_LANGUAGE.items():
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                for snippet in forbidden_snippets:
+                    self.assertNotIn(snippet, text)
+
+    def test_max_compat_docs_publish_stable_name_request_scoped_bridge_direction(self):
+        for path, required_snippets in REQUIRED_TOOL_BRIDGE_DIRECTION_LANGUAGE.items():
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                for snippet in required_snippets:
+                    self.assertIn(snippet, text)
 
 
 if __name__ == "__main__":

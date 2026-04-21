@@ -31,6 +31,7 @@ When translating between protocols, the proxy must preserve as much semantic fid
 
 - **Text content** — exact preservation, zero loss
 - **Tool calls / function calling** — preserve function definitions, arguments, and results across all protocols
+- **Tool identity** — preserve the stable visible tool name supplied by the client; internal bridge names must never become the live model-visible or client-visible contract
 - **Thinking / reasoning** — preserve reasoning output in whatever form the upstream provides
 - **Usage / token counting** — map token metrics to the client's expected format
 - **Stop reasons / finish reasons** — map between protocol-specific stop reason semantics
@@ -72,9 +73,16 @@ These are non-negotiable properties that all future development must preserve:
 1. **Any-to-Any**: Every supported client protocol must be able to reach every supported upstream protocol.
 2. **Passthrough is lossless**: When client and upstream protocols match, the response must be byte-identical to what the upstream returned (modulo optional normalization like role mapping).
 3. **Translation is transparent**: The client must never need to know that translation happened. The response must conform to the client's expected protocol shape.
-4. **Streaming is first-class**: Streaming (SSE) support is mandatory for all protocol pairs, not optional.
-5. **Backward compatibility**: Adding a new protocol or feature must not break existing client-upstream combinations.
-6. **Degradation is visible**: When the proxy must drop or approximate request/response fields, it must emit compatibility warnings rather than silently failing.
+4. **Visible tool identity is preserved**: The proxy must never change the stable tool name supplied by the client on model-visible or client-visible surfaces.
+5. **Streaming is first-class**: Streaming (SSE) support is mandatory for all protocol pairs, not optional.
+6. **Backward compatibility**: Adding a new protocol or feature must not break existing client-upstream combinations.
+7. **Degradation is visible**: When the proxy must drop or approximate request/response fields, it must emit compatibility warnings rather than silently failing.
+
+Locked tool identity contract:
+
+- The proxy must not rewrite the visible tool name supplied by the client.
+- `__llmup_custom__*` is an internal transport artifact, not a public contract.
+- `apply_patch` remains a public freeform tool on client-visible surfaces.
 
 ## Scope Boundaries
 
@@ -88,12 +96,14 @@ These are non-negotiable properties that all future development must preserve:
 - Tool/function call translation across protocols
 - Reasoning/thinking output preservation
 - Usage/token metric normalization
+- Capability-surface projection for real agent clients and compatibility modes
 
 ### Out of Scope
 
 - LLM inference execution — the proxy does not run models
 - Prompt engineering or content modification
 - Persistent conversation state (the proxy is stateless per request)
+- Provider-owned lifecycle state reconstruction
 - Authentication to the proxy itself (delegated to upstream credential policy)
 - Rate limiting or quota management (delegated to upstream providers)
 - Training data collection

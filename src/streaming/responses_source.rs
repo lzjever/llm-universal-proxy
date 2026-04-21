@@ -6,6 +6,28 @@ pub(super) fn responses_failed_code_to_openai_finish_stream(code: Option<&str>) 
     responses_failed_code_to_openai_finish(code)
 }
 
+fn finalize_custom_tool_call_bridge_delta(
+    tool_call: &mut ToolCallState,
+    full_input: &str,
+) -> Option<String> {
+    let emitted_input = tool_call.custom_input_text.as_mut()?;
+    if tool_call.custom_input_done {
+        return None;
+    }
+
+    let mut bridge_delta = String::new();
+    if let Some(remainder) = full_input.strip_prefix(emitted_input.as_str()) {
+        if !remainder.is_empty() {
+            bridge_delta.push_str(&openai_custom_bridge_input_delta_stream(remainder));
+            emitted_input.push_str(remainder);
+        }
+    }
+    bridge_delta.push_str(openai_custom_bridge_done_delta_stream());
+    tool_call.arguments.push_str(&bridge_delta);
+    tool_call.custom_input_done = true;
+    Some(bridge_delta)
+}
+
 fn responses_terminal_custom_tool_bridge_chunk(
     event: &Value,
     state: &mut StreamState,
@@ -38,24 +60,10 @@ fn responses_terminal_custom_tool_bridge_chunk(
             let Some(tool_call) = state.openai_tool_calls.get_mut(&idx) else {
                 continue;
             };
-            if tool_call.bridge_custom_name.is_none() || tool_call.bridge_suffix_emitted {
+            let Some(bridge_delta) = finalize_custom_tool_call_bridge_delta(tool_call, full_input)
+            else {
                 continue;
-            }
-
-            let mut bridge_delta = String::new();
-            if let Some(remainder) =
-                full_input.strip_prefix(tool_call.bridge_decoded_input.as_str())
-            {
-                if !remainder.is_empty() {
-                    bridge_delta.push_str(&openai_responses_custom_bridge_input_delta_stream(
-                        remainder,
-                    ));
-                    tool_call.bridge_decoded_input.push_str(remainder);
-                }
-            }
-            bridge_delta.push_str(openai_responses_custom_bridge_done_delta_stream());
-            tool_call.arguments.push_str(&bridge_delta);
-            tool_call.bridge_suffix_emitted = true;
+            };
             serde_json::json!({
                 "tool_calls": [{
                     "index": idx,
@@ -158,13 +166,9 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
             let is_custom = item_ty == Some("custom_tool_call");
             let tool_type = "function";
             let custom_input = item.get("input").and_then(Value::as_str).unwrap_or("");
-            let name = if is_custom {
-                openai_responses_custom_tool_bridge_name_stream(&raw_name)
-            } else {
-                raw_name.clone()
-            };
+            let name = raw_name.clone();
             let arguments = if is_custom {
-                openai_responses_custom_bridge_start_delta_stream(custom_input)
+                openai_custom_bridge_start_delta_stream(custom_input)
             } else {
                 item.get("arguments")
                     .and_then(Value::as_str)
@@ -187,10 +191,8 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                     id: Some(serde_json::json!(id)),
                     name,
                     arguments,
-                    bridge_custom_name: is_custom.then_some(raw_name),
-                    bridge_decoded_input: custom_input.to_string(),
-                    bridge_prefix_emitted: is_custom,
-                    bridge_suffix_emitted: false,
+                    custom_input_text: is_custom.then_some(custom_input.to_string()),
+                    custom_input_done: false,
                     tool_type: Some(tool_type.to_string()),
                     proxied_tool_kind: item
                         .get("proxied_tool_kind")
@@ -248,9 +250,10 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                         .map(|output_index| output_index as usize);
                 }
                 let emitted_delta = if ty == "response.custom_tool_call_input.delta" {
-                    tc.bridge_prefix_emitted = true;
-                    tc.bridge_decoded_input.push_str(delta);
-                    openai_responses_custom_bridge_input_delta_stream(delta)
+                    tc.custom_input_text
+                        .get_or_insert_with(String::new)
+                        .push_str(delta);
+                    openai_custom_bridge_input_delta_stream(delta)
                 } else {
                     delta.to_string()
                 };
@@ -266,7 +269,7 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                 },
                 "function": {
                     "arguments": if ty == "response.custom_tool_call_input.delta" {
-                        openai_responses_custom_bridge_input_delta_stream(delta)
+                        openai_custom_bridge_input_delta_stream(delta)
                     } else {
                         delta.to_string()
                     }
@@ -291,29 +294,17 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
             let Some(tool_call) = state.openai_tool_calls.get_mut(&idx) else {
                 return out;
             };
-            if tool_call.bridge_custom_name.is_none() || tool_call.bridge_suffix_emitted {
-                return out;
-            }
-
             let full_input = event
                 .get("input")
                 .and_then(Value::as_str)
-                .unwrap_or(tool_call.bridge_decoded_input.as_str())
+                .or_else(|| tool_call.custom_input_text.as_deref())
+                .unwrap_or("")
                 .to_string();
-            let mut bridge_delta = String::new();
-            if let Some(remainder) =
-                full_input.strip_prefix(tool_call.bridge_decoded_input.as_str())
-            {
-                if !remainder.is_empty() {
-                    bridge_delta.push_str(&openai_responses_custom_bridge_input_delta_stream(
-                        remainder,
-                    ));
-                    tool_call.bridge_decoded_input.push_str(remainder);
-                }
-            }
-            bridge_delta.push_str(openai_responses_custom_bridge_done_delta_stream());
-            tool_call.arguments.push_str(&bridge_delta);
-            tool_call.bridge_suffix_emitted = true;
+            let Some(bridge_delta) =
+                finalize_custom_tool_call_bridge_delta(tool_call, full_input.as_str())
+            else {
+                return out;
+            };
             serde_json::json!({
                 "tool_calls": [{
                     "index": idx,

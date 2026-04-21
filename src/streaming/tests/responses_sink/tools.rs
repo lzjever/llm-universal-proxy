@@ -96,6 +96,103 @@ fn openai_chunk_to_responses_sse_preserves_custom_and_proxied_tool_kinds() {
 }
 
 #[test]
+fn openai_chunk_to_responses_sse_decodes_request_scoped_custom_bridge_without_prefix() {
+    let mut state = StreamState::default();
+    state.request_scoped_tool_bridge_context = Some(serde_json::json!({
+        "compatibility_mode": "balanced",
+        "entries": {
+            "code_exec": {
+                "source_kind": "custom_text",
+                "transport_kind": "function_object_wrapper",
+                "wrapper_field": "input",
+                "expected_canonical_shape": "single_required_string"
+            }
+        }
+    }));
+    let tool_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "created": 123,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_custom",
+                    "function": {
+                        "name": "code_exec",
+                        "arguments": "{\"input\":\"print('hi')\"}"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let finish_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "created": 123,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+    });
+
+    let out1 = openai_chunk_to_responses_sse(&tool_chunk, &mut state);
+    let out2 = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+    let joined = out1
+        .into_iter()
+        .chain(out2)
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(joined.contains("response.custom_tool_call_input.delta"));
+    assert!(joined.contains("response.custom_tool_call_input.done"));
+    assert!(joined.contains("\"type\":\"custom_tool_call\""));
+    assert!(joined.contains("\"name\":\"code_exec\""));
+    assert!(!joined.contains("\"type\":\"function_call\""));
+}
+
+#[test]
+fn openai_chunk_to_responses_sse_does_not_decode_legacy_prefixed_function_names() {
+    let mut state = StreamState::default();
+    let tool_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "created": 123,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_custom",
+                    "function": {
+                        "name": "__llmup_custom__code_exec",
+                        "arguments": "{\"input\":\"print('hi')\"}"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let finish_chunk = serde_json::json!({
+        "id": "chatcmpl-msg123",
+        "created": 123,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+    });
+
+    let out1 = openai_chunk_to_responses_sse(&tool_chunk, &mut state);
+    let out2 = openai_chunk_to_responses_sse(&finish_chunk, &mut state);
+    let joined = out1
+        .into_iter()
+        .chain(out2)
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(joined.contains("response.function_call_arguments.delta"));
+    assert!(joined.contains("response.function_call_arguments.done"));
+    assert!(joined.contains("\"type\":\"function_call\""));
+    assert!(joined.contains("\"name\":\"__llmup_custom__code_exec\""));
+    assert!(!joined.contains("response.custom_tool_call_input.delta"));
+}
+
+#[test]
 fn anthropic_tool_use_does_not_duplicate_function_call_in_responses_completed() {
     let mut state = StreamState::default();
     let _ = translate_sse_event(

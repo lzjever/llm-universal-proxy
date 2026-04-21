@@ -123,6 +123,512 @@ async fn live_responses_store_drop_surfaces_warning_header() {
 }
 
 #[tokio::test]
+async fn live_responses_plain_text_custom_tool_bridge_to_openai_balanced_keeps_visible_tool_names_stable(
+) {
+    let response_body = serde_json::json!({
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hi" },
+            "finish_reason": "stop"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "code_exec",
+                "description": "Executes code",
+                "format": { "type": "text" }
+            }],
+            "tool_choice": {
+                "type": "custom",
+                "name": "code_exec"
+            },
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    let upstream_body = &recorded[0];
+    let tools = upstream_body["tools"].as_array().expect("upstream tools");
+    assert_eq!(tools[0]["function"]["name"], "code_exec");
+    assert_eq!(
+        upstream_body["tool_choice"]["function"]["name"],
+        "code_exec"
+    );
+    let serialized = upstream_body.to_string();
+    assert!(
+        !serialized.contains("__llmup_custom__code_exec"),
+        "translated live request leaked prefixed tool name: {upstream_body:?}"
+    );
+    assert!(
+        upstream_body.get("_llmup_tool_bridge_context").is_none(),
+        "internal bridge context must not be sent upstream: {upstream_body:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_custom_tool_bridge_to_openai_strict_rejects_plain_text_custom_tools() {
+    let response_body = serde_json::json!({
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hi" },
+            "finish_reason": "stop"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+    {
+        let mut runtime = state.runtime.write().await;
+        let namespace = runtime
+            .namespaces
+            .get_mut(DEFAULT_NAMESPACE)
+            .expect("default namespace");
+        namespace.config.compatibility_mode = crate::config::CompatibilityMode::Strict;
+    }
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Run this script" }]
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "code_exec",
+                "description": "Executes code",
+                "format": { "type": "text" }
+            }],
+            "tool_choice": {
+                "type": "custom",
+                "name": "code_exec"
+            },
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let recorded = requests.lock().await;
+    assert!(recorded.is_empty(), "requests = {recorded:?}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_grammar_custom_tool_bridge_to_openai_balanced_rejects() {
+    let response_body = serde_json::json!({
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hi" },
+            "finish_reason": "stop"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/"
+                }
+            }],
+            "tool_choice": {
+                "type": "custom",
+                "name": "apply_patch"
+            },
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let recorded = requests.lock().await;
+    assert!(recorded.is_empty(), "requests = {recorded:?}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_grammar_custom_tool_bridge_to_openai_max_compat_allows_with_warning_and_stable_names(
+) {
+    let response_body = serde_json::json!({
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hi" },
+            "finish_reason": "stop"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+    {
+        let mut runtime = state.runtime.write().await;
+        let namespace = runtime
+            .namespaces
+            .get_mut(DEFAULT_NAMESPACE)
+            .expect("default namespace");
+        namespace.config.compatibility_mode = crate::config::CompatibilityMode::MaxCompat;
+    }
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/"
+                }
+            }],
+            "tool_choice": {
+                "type": "custom",
+                "name": "apply_patch"
+            },
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let warnings = response
+        .headers()
+        .get_all("x-proxy-compat-warning")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.contains("apply_patch") && warning.contains("OpenAI Chat Completions")
+        }),
+        "warnings = {warnings:?}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    let upstream_body = &recorded[0];
+    let tools = upstream_body["tools"].as_array().expect("upstream tools");
+    assert_eq!(tools[0]["function"]["name"], "apply_patch");
+    let description = tools[0]["function"]["description"]
+        .as_str()
+        .expect("bridged OpenAI tool description");
+    assert!(
+        description.contains("OpenAI Chat Completions receives this tool"),
+        "description = {description}"
+    );
+    assert!(
+        description.contains("OpenAI Chat Completions will not enforce it structurally"),
+        "description = {description}"
+    );
+    assert!(
+        description.contains("syntax: lark"),
+        "description = {description}"
+    );
+    assert_eq!(
+        upstream_body["tool_choice"]["function"]["name"],
+        "apply_patch"
+    );
+    let serialized = upstream_body.to_string();
+    assert!(
+        !serialized.contains("__llmup_custom__"),
+        "translated live request leaked prefixed tool name: {upstream_body:?}"
+    );
+    assert!(
+        upstream_body.get("_llmup_tool_bridge_context").is_none(),
+        "internal bridge context must not be sent upstream: {upstream_body:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_custom_tool_bridge_to_anthropic_strict_rejects_plain_text_custom_tools() {
+    let response_body = serde_json::json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "Hi" }],
+        "model": "claude-3-7-sonnet",
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    });
+    let (mock_base, requests, server) = spawn_anthropic_messages_mock(response_body).await;
+    let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Anthropic);
+    {
+        let mut runtime = state.runtime.write().await;
+        let namespace = runtime
+            .namespaces
+            .get_mut(DEFAULT_NAMESPACE)
+            .expect("default namespace");
+        namespace.config.compatibility_mode = crate::config::CompatibilityMode::Strict;
+    }
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Run this script" }]
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "code_exec",
+                "description": "Executes code",
+                "format": { "type": "text" }
+            }],
+            "tool_choice": {
+                "type": "custom",
+                "name": "code_exec"
+            },
+            "stream": false
+        }),
+        "claude-3-7-sonnet".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let recorded = requests.lock().await;
+    assert!(recorded.is_empty(), "requests = {recorded:?}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_grammar_custom_tool_bridge_to_anthropic_balanced_rejects() {
+    let response_body = serde_json::json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "Hi" }],
+        "model": "claude-3-7-sonnet",
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    });
+    let (mock_base, requests, server) = spawn_anthropic_messages_mock(response_body).await;
+    let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Anthropic);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/"
+                }
+            }],
+            "tool_choice": {
+                "type": "custom",
+                "name": "apply_patch"
+            },
+            "stream": false
+        }),
+        "claude-3-7-sonnet".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let recorded = requests.lock().await;
+    assert!(recorded.is_empty(), "requests = {recorded:?}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_grammar_custom_tool_bridge_to_anthropic_max_compat_allows_with_warning_and_stable_names(
+) {
+    let response_body = serde_json::json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "Hi" }],
+        "model": "claude-3-7-sonnet",
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    });
+    let (mock_base, requests, server) = spawn_anthropic_messages_mock(response_body).await;
+    let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Anthropic);
+    {
+        let mut runtime = state.runtime.write().await;
+        let namespace = runtime
+            .namespaces
+            .get_mut(DEFAULT_NAMESPACE)
+            .expect("default namespace");
+        namespace.config.compatibility_mode = crate::config::CompatibilityMode::MaxCompat;
+    }
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/"
+                }
+            }],
+            "tool_choice": {
+                "type": "custom",
+                "name": "apply_patch"
+            },
+            "stream": false
+        }),
+        "claude-3-7-sonnet".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let warnings = response
+        .headers()
+        .get_all("x-proxy-compat-warning")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("apply_patch") && warning.contains("Anthropic")),
+        "warnings = {warnings:?}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    let upstream_body = &recorded[0];
+    assert_eq!(upstream_body["tools"][0]["name"], "apply_patch");
+    assert_eq!(upstream_body["tool_choice"]["name"], "apply_patch");
+    let serialized = upstream_body.to_string();
+    assert!(
+        !serialized.contains("__llmup_custom__"),
+        "translated live request leaked prefixed tool name: {upstream_body:?}"
+    );
+    assert!(
+        upstream_body.get("_llmup_tool_bridge_context").is_none(),
+        "internal bridge context must not be sent upstream: {upstream_body:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn live_gemini_top_k_drop_surfaces_warning_header() {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
@@ -221,6 +727,7 @@ async fn live_openai_request_uses_configured_default_output_limit_for_anthropic_
                     context_window: None,
                     max_output_tokens: Some(128_000),
                 }),
+                surface: None,
             },
         );
     }
@@ -260,6 +767,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         upstreams: vec![
             crate::config::UpstreamConfig {
                 name: "a".to_string(),
@@ -271,6 +779,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
                 limits: None,
+                surface_defaults: None,
             },
             crate::config::UpstreamConfig {
                 name: "b".to_string(),
@@ -282,6 +791,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
                 limits: None,
+                surface_defaults: None,
             },
         ],
         model_aliases: Default::default(),
@@ -305,6 +815,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         upstreams: vec![
             crate::config::UpstreamConfig {
                 name: "a".to_string(),
@@ -316,6 +827,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
                 limits: None,
+                surface_defaults: None,
             },
             crate::config::UpstreamConfig {
                 name: "b".to_string(),
@@ -327,6 +839,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
                 limits: None,
+                surface_defaults: None,
             },
         ],
         model_aliases: Default::default(),

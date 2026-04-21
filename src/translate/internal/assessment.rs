@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use crate::config::CompatibilityMode;
 use crate::formats::UpstreamFormat;
 
 use super::messages::{
@@ -16,10 +17,10 @@ use super::models::{
 use super::openai_responses::decode_anthropic_reasoning_carrier;
 use super::request_gemini::gemini_generation_config_field;
 use super::tools::{
-    normalized_responses_tool_definition, openai_custom_tool_format_supports_anthropic_bridge,
-    openai_tool_arguments_to_structured_value, responses_tool_call_item_to_openai_tool_call,
-    responses_tool_call_to_structured_value, semantic_tool_kind_from_value,
-    tool_call_is_marked_non_replayable,
+    normalized_responses_tool_definition, openai_custom_tool_format_is_plain_text,
+    openai_custom_tool_format_supports_anthropic_bridge, openai_tool_arguments_to_structured_value,
+    responses_tool_call_item_to_openai_tool_call, responses_tool_call_to_structured_value,
+    semantic_tool_kind_from_value, tool_call_is_marked_non_replayable,
 };
 use super::{
     anthropic_nonportable_content_block_message, anthropic_protocol_uses_cache_control,
@@ -652,7 +653,10 @@ pub(super) fn responses_custom_tool_format_reject_message(
     body: &Value,
     target_format: UpstreamFormat,
 ) -> Option<String> {
-    if target_format != UpstreamFormat::Anthropic {
+    if !matches!(
+        target_format,
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+    ) {
         return None;
     }
 
@@ -671,6 +675,86 @@ pub(super) fn responses_custom_tool_format_reject_message(
             }
             _ => None,
         })
+}
+
+fn responses_custom_tool_bridge_mode_reject_message(
+    body: &Value,
+    target_format: UpstreamFormat,
+    compatibility_mode: CompatibilityMode,
+) -> Option<String> {
+    if !matches!(
+        target_format,
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+    ) {
+        return None;
+    }
+
+    let tools = body.get("tools").and_then(Value::as_array)?;
+    for tool in tools {
+        let Ok(Some(NormalizedOpenAiFamilyToolDef::Custom(custom))) =
+            normalized_responses_tool_definition(tool)
+        else {
+            continue;
+        };
+        if !openai_custom_tool_format_supports_anthropic_bridge(custom.format.as_ref()) {
+            continue;
+        }
+        match compatibility_mode {
+            CompatibilityMode::Strict => {
+                return Some(custom_tools_not_portable_message(target_format));
+            }
+            CompatibilityMode::Balanced
+                if !openai_custom_tool_format_is_plain_text(custom.format.as_ref()) =>
+            {
+                return Some(custom_tool_format_downgraded_message(
+                    "OpenAI Responses",
+                    &custom.name,
+                    translation_target_label(target_format),
+                ));
+            }
+            CompatibilityMode::Balanced | CompatibilityMode::MaxCompat => {}
+        }
+    }
+    None
+}
+
+fn responses_custom_tool_bridge_mode_warning_messages(
+    body: &Value,
+    target_format: UpstreamFormat,
+    compatibility_mode: CompatibilityMode,
+) -> Vec<String> {
+    if !matches!(
+        target_format,
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
+    ) || compatibility_mode != CompatibilityMode::MaxCompat
+    {
+        return Vec::new();
+    }
+
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| match normalized_responses_tool_definition(tool) {
+                    Ok(Some(NormalizedOpenAiFamilyToolDef::Custom(custom)))
+                        if openai_custom_tool_format_supports_anthropic_bridge(
+                            custom.format.as_ref(),
+                        ) && !openai_custom_tool_format_is_plain_text(
+                            custom.format.as_ref(),
+                        ) =>
+                    {
+                        Some(custom_tool_format_downgraded_message(
+                            "OpenAI Responses",
+                            &custom.name,
+                            translation_target_label(target_format),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub(super) fn responses_hosted_input_item_type(item_type: &str) -> bool {
@@ -979,6 +1063,7 @@ pub(crate) fn assess_request_translation(
     client_format: UpstreamFormat,
     upstream_format: UpstreamFormat,
     body: &Value,
+    compatibility_mode: CompatibilityMode,
 ) -> TranslationAssessment {
     let mut assessment = TranslationAssessment::default();
 
@@ -1040,6 +1125,20 @@ pub(crate) fn assess_request_translation(
         }
         if let Some(message) = responses_custom_tool_format_reject_message(body, upstream_format) {
             assessment.reject(message);
+        }
+        if let Some(message) = responses_custom_tool_bridge_mode_reject_message(
+            body,
+            upstream_format,
+            compatibility_mode,
+        ) {
+            assessment.reject(message);
+        }
+        for warning in responses_custom_tool_bridge_mode_warning_messages(
+            body,
+            upstream_format,
+            compatibility_mode,
+        ) {
+            assessment.warning(warning);
         }
     }
 
@@ -1247,4 +1346,14 @@ pub(crate) fn assess_request_translation(
     }
 
     assessment
+}
+
+#[cfg(test)]
+pub(crate) fn assess_request_translation_with_compatibility_mode(
+    client_format: UpstreamFormat,
+    upstream_format: UpstreamFormat,
+    body: &Value,
+    compatibility_mode: CompatibilityMode,
+) -> TranslationAssessment {
+    assess_request_translation(client_format, upstream_format, body, compatibility_mode)
 }

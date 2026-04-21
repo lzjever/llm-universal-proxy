@@ -65,7 +65,7 @@ The proxy MUST support bidirectional translation between all four protocols:
 | 15 | Google Gemini | Anthropic Messages | Yes |
 | 16 | Google Gemini | Google Gemini | No (passthrough) |
 
-All 16 combinations (4 passthrough + 12 translated) MUST work correctly.
+All 16 combinations (4 passthrough + 12 translated) MUST be supported within documented portability boundaries. Passthrough remains lossless; translated paths may warn or reject non-portable semantics rather than silently approximating them.
 
 ### 2.2 Client Endpoints
 
@@ -103,12 +103,13 @@ The proxy MUST translate the following request fields across protocols:
 | Text messages | Must | Exact preservation across all formats |
 | System instructions | Must | Map between `system` role (OpenAI), top-level `system` (Anthropic), `systemInstruction` (Gemini), `instructions` (Responses) |
 | Function tool definitions | Must | Map `function` tools across all formats |
+| Visible tool identity | Must | The stable tool name supplied by the client is part of the semantic contract and must not be rewritten on model-visible or client-visible surfaces |
 | Tool choice (auto/none/required) | Must | Map between format-specific tool choice objects |
 | `max_output_tokens` / `max_tokens` | Must | Normalize field names |
 | `temperature`, `top_p` | Should | Pass through generation config where applicable |
 | Image content | Should | Map between `image_url` (OpenAI), `source.base64` (Anthropic), `inlineData` (Gemini) |
 | Thinking/reasoning config | May | Preserve where upstream supports it |
-| Built-in / non-function tools | Won't | Dropped during cross-protocol translation with compat warning |
+| Built-in / non-function tools | Won't | Dropped during cross-protocol translation with compat warning unless a documented bridge can preserve the original visible tool identity |
 
 ### 2.5 Response Translation
 
@@ -125,7 +126,23 @@ The proxy MUST translate the following response fields:
 | Cached token details | Should | Map cache-related usage fields |
 | Error responses | Must | Translate upstream errors into client-protocol-appropriate error shapes |
 
-### 2.6 Upstream Configuration
+### 2.6 Compatibility Modes
+
+The proxy MUST support explicit compatibility modes for translated paths:
+
+| Mode | Goal | Expected behavior |
+|------|------|-------------------|
+| `strict` | High-assurance protocol safety | Reject any translation path that would require visible tool renaming, provider-state reconstruction, or other unsafe semantic approximation |
+| `balanced` | Safe interoperability | Preserve portable core semantics, emit compat warnings for allowed degradations, and keep current fail-closed behavior for high-risk surfaces |
+| `max_compat` | Agent-client usability | Prefer client-usable translated paths, but still preserve stable tool identity and never expose proxy-generated synthetic tool names as live tool contracts |
+
+Locked tool identity contract:
+
+- The proxy must not rewrite the visible tool name supplied by the client.
+- `__llmup_custom__*` is an internal transport artifact, not a public contract.
+- `apply_patch` remains a public freeform tool on client-visible surfaces.
+
+### 2.7 Upstream Configuration
 
 The proxy MUST support:
 

@@ -146,6 +146,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         upstreams: vec![crate::config::UpstreamConfig {
             name: "default".to_string(),
             api_root: "https://user:pass@api.openai.com/v1?api_key=inline-secret#frag".to_string(),
@@ -162,6 +163,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
                 ),
             ],
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: Default::default(),
         hooks: crate::config::HookConfig {

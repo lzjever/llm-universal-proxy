@@ -329,6 +329,14 @@ impl<S, E> TranslateSseStream<S, E> {
             _error: std::marker::PhantomData,
         }
     }
+
+    pub fn with_request_scoped_tool_bridge_context(
+        mut self,
+        bridge_context: Option<Value>,
+    ) -> Self {
+        self.state.request_scoped_tool_bridge_context = bridge_context;
+        self
+    }
 }
 
 impl<S, E> Stream for TranslateSseStream<S, E>

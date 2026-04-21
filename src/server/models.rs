@@ -210,6 +210,13 @@ fn effective_limits(
     config.effective_model_limits(target)
 }
 
+fn effective_surface(
+    config: &Config,
+    target: &crate::config::ModelAlias,
+) -> crate::config::ModelSurface {
+    config.effective_model_surface(target)
+}
+
 fn openai_model_list(config: &Config) -> Value {
     serde_json::json!({
         "object": "list",
@@ -226,6 +233,8 @@ fn openai_model_object(config: &Config, id: &str) -> Option<Value> {
 }
 
 fn openai_model_value(config: &Config, id: &str, target: &crate::config::ModelAlias) -> Value {
+    let limits = effective_limits(config, target);
+    let surface = effective_surface(config, target);
     serde_json::json!({
         "id": id,
         "object": "model",
@@ -234,7 +243,8 @@ fn openai_model_value(config: &Config, id: &str, target: &crate::config::ModelAl
         "proxec": {
             "upstream_name": target.upstream_name,
             "upstream_model": target.upstream_model,
-            "limits": effective_limits(config, target),
+            "limits": limits,
+            "surface": surface,
         }
     })
 }
@@ -270,6 +280,8 @@ fn anthropic_model_object(config: &Config, id: &str) -> Option<Value> {
 }
 
 fn anthropic_model_value(config: &Config, id: &str, target: &crate::config::ModelAlias) -> Value {
+    let limits = effective_limits(config, target);
+    let surface = effective_surface(config, target);
     serde_json::json!({
         "id": id,
         "type": "model",
@@ -278,7 +290,8 @@ fn anthropic_model_value(config: &Config, id: &str, target: &crate::config::Mode
         "proxec": {
             "upstream_name": target.upstream_name,
             "upstream_model": target.upstream_model,
-            "limits": effective_limits(config, target),
+            "limits": limits,
+            "surface": surface,
         }
     })
 }
@@ -299,6 +312,7 @@ fn google_model_object(config: &Config, id: &str) -> Option<Value> {
 
 fn google_model_value(config: &Config, id: &str, target: &crate::config::ModelAlias) -> Value {
     let limits = effective_limits(config, target);
+    let surface = effective_surface(config, target);
     serde_json::json!({
         "name": format!("models/{}", id),
         "baseModelId": id,
@@ -313,6 +327,7 @@ fn google_model_value(config: &Config, id: &str, target: &crate::config::ModelAl
             "upstream_name": target.upstream_name,
             "upstream_model": target.upstream_model,
             "limits": limits,
+            "surface": surface,
         }
     })
 }

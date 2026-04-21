@@ -73,7 +73,11 @@ DEFAULT_POST_KILL_WAIT_SECS = 2
 DEFAULT_AUTO_COMPACT_RATIO = 0.85
 DEFAULT_GEMINI_COMPRESSION_THRESHOLD = DEFAULT_AUTO_COMPACT_RATIO
 DEFAULT_CODEX_TRUNCATION_LIMIT_BYTES = 10000
-DEFAULT_CODEX_APPLY_PATCH_TOOL_TYPE = "freeform"
+RESERVED_INTERNAL_TOOL_NAME_PREFIX = "__llmup_custom__"
+INTERNAL_TOOL_ARTIFACT_PATTERN = re.compile(r"__llmup_custom__[A-Za-z0-9_:-]*")
+PUBLIC_APPLY_PATCH_TOOL_NAME = "apply_patch"
+PUBLIC_APPLY_PATCH_TOOL_TYPE = "freeform"
+DEFAULT_CODEX_APPLY_PATCH_TOOL_TYPE = PUBLIC_APPLY_PATCH_TOOL_TYPE
 REPLAY_MARKER_KEY_ENV = "LLMUP_INTERNAL_REPLAY_MARKER_KEY"
 REPLAY_MARKER_KEY_FILENAME = ".llmup-internal-replay-marker-key"
 
@@ -160,7 +164,44 @@ def default_codex_supported_reasoning_levels() -> list[dict[str, str]]:
     ]
 
 
+def find_internal_tool_artifact(value: object) -> str | None:
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, sort_keys=True, default=str)
+    match = INTERNAL_TOOL_ARTIFACT_PATTERN.search(text)
+    if match is None:
+        return None
+    return match.group(0)
+
+
+def ensure_locked_apply_patch_public_contract() -> None:
+    artifact = find_internal_tool_artifact(PUBLIC_APPLY_PATCH_TOOL_NAME)
+    if artifact is not None:
+        raise ValueError(
+            "apply_patch public contract must not expose reserved internal tool artifact "
+            f"{artifact}"
+        )
+    if DEFAULT_CODEX_APPLY_PATCH_TOOL_TYPE != PUBLIC_APPLY_PATCH_TOOL_TYPE:
+        raise ValueError(
+            "apply_patch public contract must remain freeform on client-visible surfaces"
+        )
+
+
+def ensure_no_public_internal_tool_artifacts(
+    value: object, *, context: str
+) -> None:
+    ensure_locked_apply_patch_public_contract()
+    artifact = find_internal_tool_artifact(value)
+    if artifact is None:
+        return
+    raise ValueError(
+        f"{context} must not expose reserved internal tool artifact {artifact}"
+    )
+
+
 def default_codex_catalog_entry(model_name: str) -> dict[str, object]:
+    ensure_locked_apply_patch_public_contract()
     return {
         "slug": model_name,
         "display_name": model_name,
@@ -994,11 +1035,13 @@ def build_codex_model_catalog(
             model_entry["input_modalities"] = list(codex_metadata.input_modalities)
         if codex_metadata.supports_search_tool is not None:
             model_entry["supports_search_tool"] = codex_metadata.supports_search_tool
-    return {
+    payload = {
         "models": [
             model_entry
         ]
     }
+    ensure_no_public_internal_tool_artifacts(payload, context="codex model catalog")
+    return payload
 
 
 def codex_should_disable_view_image(
@@ -1060,6 +1103,7 @@ def build_codex_catalog_args(
                 "tools.view_image=false",
             ]
         )
+    ensure_no_public_internal_tool_artifacts(args, context="codex catalog args")
     return args
 
 
@@ -1562,6 +1606,16 @@ def verify_fixture_output(
         needle = str(fixture.verifier["value"])
         ok = needle.lower() in stdout_text.lower()
         return ok, f"expected output to contain {needle!r}"
+    if verifier_type == "stdout_contract":
+        for needle in fixture.verifier.get("contains", []):
+            expected = str(needle)
+            if expected not in stdout_text:
+                return False, f"expected output to contain {expected!r}"
+        for needle in fixture.verifier.get("not_contains", []):
+            forbidden = str(needle)
+            if forbidden in stdout_text:
+                return False, f"expected output not to contain {forbidden!r}"
+        return True, ""
     if verifier_type == "file_contains":
         if workspace_dir is None:
             return False, "workspace verifier required a workspace directory"
@@ -1685,9 +1739,12 @@ def build_client_command(
                 lane.codex_metadata,
             )
         )
+        ensure_no_public_internal_tool_artifacts(
+            command, context="real CLI command"
+        )
         return command
     if client_name == "claude":
-        return [
+        command = [
             "claude",
             "--bare",
             "--print",
@@ -1702,8 +1759,12 @@ def build_client_command(
             "--add-dir",
             str(workspace_dir),
         ]
+        ensure_no_public_internal_tool_artifacts(
+            command, context="real CLI command"
+        )
+        return command
     if client_name == "gemini":
-        return [
+        command = [
             "gemini",
             "--prompt",
             fixture.prompt,
@@ -1716,6 +1777,10 @@ def build_client_command(
             "--output-format",
             "text",
         ]
+        ensure_no_public_internal_tool_artifacts(
+            command, context="real CLI command"
+        )
+        return command
     raise ValueError(f"unknown client: {client_name}")
 
 

@@ -244,7 +244,7 @@ fn responses_custom_tool_call_events_bridge_into_function_tool_calls_and_done_su
     );
     assert_eq!(
         added_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
-        "__llmup_custom__code_exec"
+        "code_exec"
     );
     assert_eq!(
         added_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
@@ -258,6 +258,9 @@ fn responses_custom_tool_call_events_bridge_into_function_tool_calls_and_done_su
         done_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
         "\"}"
     );
+    let tool_call = state.openai_tool_calls.get(&0).expect("tool call state");
+    assert_eq!(tool_call.name, "code_exec");
+    assert_eq!(tool_call.arguments, "{\"input\":\"print('hi')\"}");
 }
 
 #[test]
@@ -483,7 +486,7 @@ fn translate_sse_event_responses_to_anthropic_bridges_custom_tool_call_successfu
         "{first_joined}"
     );
     assert!(
-        first_joined.contains("\"name\":\"__llmup_custom__code_exec\""),
+        first_joined.contains("\"name\":\"code_exec\""),
         "{first_joined}"
     );
     assert!(
@@ -547,6 +550,17 @@ fn translate_sse_event_responses_to_anthropic_bridges_custom_tool_call_successfu
 #[test]
 fn translate_sse_event_anthropic_to_responses_decodes_bridged_custom_tool_use() {
     let mut state = StreamState::default();
+    state.request_scoped_tool_bridge_context = Some(serde_json::json!({
+        "compatibility_mode": "balanced",
+        "entries": {
+            "code_exec": {
+                "source_kind": "custom_text",
+                "transport_kind": "function_object_wrapper",
+                "wrapper_field": "input",
+                "expected_canonical_shape": "single_required_string"
+            }
+        }
+    }));
     let joined = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
@@ -566,7 +580,7 @@ fn translate_sse_event_anthropic_to_responses_decodes_bridged_custom_tool_use() 
             "content_block": {
                 "type": "tool_use",
                 "id": "call_custom",
-                "name": "__llmup_custom__code_exec",
+                "name": "code_exec",
                 "input": { "input": "print('hi')" }
             }
         }),
@@ -610,6 +624,17 @@ fn translate_sse_event_anthropic_to_responses_decodes_bridged_custom_tool_use() 
 #[test]
 fn translate_sse_event_anthropic_to_responses_malformed_bridged_payload_falls_back_to_function() {
     let mut state = StreamState::default();
+    state.request_scoped_tool_bridge_context = Some(serde_json::json!({
+        "compatibility_mode": "balanced",
+        "entries": {
+            "code_exec": {
+                "source_kind": "custom_text",
+                "transport_kind": "function_object_wrapper",
+                "wrapper_field": "input",
+                "expected_canonical_shape": "single_required_string"
+            }
+        }
+    }));
     let joined = translate_sse_event(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
@@ -629,7 +654,7 @@ fn translate_sse_event_anthropic_to_responses_malformed_bridged_payload_falls_ba
             "content_block": {
                 "type": "tool_use",
                 "id": "call_custom",
-                "name": "__llmup_custom__code_exec",
+                "name": "code_exec",
                 "input": { "output": "missing input" }
             }
         }),
@@ -661,10 +686,7 @@ fn translate_sse_event_anthropic_to_responses_malformed_bridged_payload_falls_ba
         joined.contains("response.function_call_arguments.delta"),
         "{joined}"
     );
-    assert!(
-        joined.contains("\"name\":\"__llmup_custom__code_exec\""),
-        "{joined}"
-    );
+    assert!(joined.contains("\"name\":\"code_exec\""), "{joined}");
     assert!(
         !joined.contains("response.custom_tool_call_input.delta"),
         "{joined}"

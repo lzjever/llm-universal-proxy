@@ -4,6 +4,7 @@
 
 use serde_json::{Map, Value};
 
+use crate::config::CompatibilityMode;
 use crate::formats::UpstreamFormat;
 
 pub(crate) mod assessment;
@@ -12,12 +13,13 @@ pub(crate) mod models;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RequestTranslationPolicy {
+    pub(crate) compatibility_mode: CompatibilityMode,
     pub(crate) max_output_tokens: Option<u64>,
 }
 
 impl RequestTranslationPolicy {
-    pub(crate) const fn is_empty(self) -> bool {
-        self.max_output_tokens.is_none()
+    pub(crate) fn is_empty(self) -> bool {
+        self.max_output_tokens.is_none() && self.compatibility_mode == CompatibilityMode::default()
     }
 }
 
@@ -48,8 +50,13 @@ pub fn translate_request_with_policy(
     policy: RequestTranslationPolicy,
     stream: bool,
 ) -> Result<(), String> {
-    if let TranslationDecision::Reject(message) =
-        assess_request_translation(client_format, upstream_format, body).decision()
+    if let TranslationDecision::Reject(message) = assess_request_translation(
+        client_format,
+        upstream_format,
+        body,
+        policy.compatibility_mode,
+    )
+    .decision()
     {
         return Err(message);
     }
@@ -62,6 +69,7 @@ pub fn translate_request_with_policy(
             apply_openai_completion_compat_overrides(model, body);
         }
         apply_request_translation_policy_defaults(upstream_format, policy, body);
+        apply_request_translation_policy_bridge_context(policy, body);
         return Ok(());
     }
     let translated_from_openai_completion = client_format == UpstreamFormat::OpenAiCompletion;
@@ -89,7 +97,29 @@ pub fn translate_request_with_policy(
         apply_openai_completion_compat_overrides(model, body);
     }
     apply_request_translation_policy_defaults(upstream_format, policy, body);
+    apply_request_translation_policy_bridge_context(policy, body);
     Ok(())
+}
+
+fn apply_request_translation_policy_bridge_context(
+    policy: RequestTranslationPolicy,
+    body: &mut Value,
+) {
+    let Some(bridge_context) = body.get_mut(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD) else {
+        return;
+    };
+    let Some(bridge_context_obj) = bridge_context.as_object_mut() else {
+        return;
+    };
+    let compatibility_mode = match policy.compatibility_mode {
+        CompatibilityMode::Strict => "strict",
+        CompatibilityMode::Balanced => "balanced",
+        CompatibilityMode::MaxCompat => "max_compat",
+    };
+    bridge_context_obj.insert(
+        "compatibility_mode".to_string(),
+        Value::String(compatibility_mode.to_string()),
+    );
 }
 
 fn apply_request_translation_policy_defaults(
@@ -407,11 +437,12 @@ use response_protocols::{
 use tools::{
     anthropic_tool_use_type_for_openai_tool_call,
     openai_responses_custom_tool_input_from_bridge_value,
-    openai_responses_custom_tool_name_from_bridge, openai_tool_arguments_to_structured_value,
-    openai_tool_call_partial_replay_text, semantic_text_part_from_claude_block,
-    semantic_text_part_from_openai_part, semantic_text_part_to_openai_value,
-    semantic_tool_kind_from_value, semantic_tool_result_content_from_value,
-    semantic_tool_result_content_to_value, tool_call_is_marked_non_replayable,
+    openai_tool_arguments_to_structured_value, openai_tool_call_partial_replay_text,
+    request_scoped_openai_custom_bridge_expects_canonical_input_wrapper,
+    semantic_text_part_from_claude_block, semantic_text_part_from_openai_part,
+    semantic_text_part_to_openai_value, semantic_tool_kind_from_value,
+    semantic_tool_result_content_from_value, semantic_tool_result_content_to_value,
+    tool_call_is_marked_non_replayable, REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD,
 };
 
 /// Translate response body from upstream format to client format.
@@ -901,12 +932,14 @@ fn claude_response_to_openai_internal(
     allow_reasoning_replay: bool,
 ) -> Result<Value, String> {
     let content = body.get("content").cloned().ok_or("missing content")?;
-    let mut converted = convert_claude_message_to_openai_with_custom_bridge(
+    let bridge_context = body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
+    let mut converted = convert_claude_message_to_openai_impl(
         &serde_json::json!({
             "role": "assistant",
             "content": content
         }),
         allow_reasoning_replay,
+        bridge_context.as_ref(),
     )?
     .ok_or("missing content")?;
     let mut message = converted
@@ -1009,6 +1042,9 @@ fn claude_response_to_openai_internal(
         );
 
         result["usage"] = usage_json;
+    }
+    if let Some(bridge_context) = bridge_context {
+        result[REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD] = bridge_context;
     }
     Ok(result)
 }
@@ -1168,6 +1204,7 @@ fn openai_usage_to_gemini_usage(usage: Option<&Value>) -> Value {
 }
 
 fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result<(), String> {
+    let bridge_context = body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
     let mut result = serde_json::json!({
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "messages": [],
@@ -1194,9 +1231,11 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
         };
     }
     if let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) {
-        if let Some((mapped_tool_choice, disable_parallel)) =
-            anthropic_tool_choice_to_openai(tool_choice, preserve_reasoning_replay)?
-        {
+        if let Some((mapped_tool_choice, disable_parallel)) = anthropic_tool_choice_to_openai(
+            tool_choice,
+            preserve_reasoning_replay,
+            bridge_context.as_ref(),
+        )? {
             result["tool_choice"] = mapped_tool_choice;
             if disable_parallel {
                 result["parallel_tool_calls"] = Value::Bool(false);
@@ -1231,9 +1270,11 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
             let preserve_message_replay = preserve_reasoning_replay
                 && msg.get("role").and_then(Value::as_str) == Some("assistant")
                 && anthropic_blocks_have_nonportable_thinking_provenance(&thinking_blocks);
-            if let Some(mut openai_msg) =
-                convert_claude_message_to_openai_with_custom_bridge(msg, preserve_reasoning_replay)?
-            {
+            if let Some(mut openai_msg) = convert_claude_message_to_openai_impl(
+                msg,
+                preserve_reasoning_replay,
+                bridge_context.as_ref(),
+            )? {
                 if preserve_message_replay {
                     for translated_msg in openai_msg.iter_mut() {
                         if translated_msg.get("role").and_then(Value::as_str) == Some("assistant") {
@@ -1257,17 +1298,19 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
             .filter_map(|t| {
                 // Skip if no name (invalid tool)
                 let name = t.get("name").and_then(Value::as_str)?;
-                if preserve_reasoning_replay {
-                    if let Some(custom_name) = openai_responses_custom_tool_name_from_bridge(name)
-                    {
-                        return Some(serde_json::json!({
-                            "type": "custom",
-                            "custom": {
-                                "name": custom_name,
-                                "description": t.get("description")
-                            }
-                        }));
-                    }
+                if preserve_reasoning_replay
+                    && request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+                        bridge_context.as_ref(),
+                        name,
+                    )
+                {
+                    return Some(serde_json::json!({
+                        "type": "custom",
+                        "custom": {
+                            "name": name,
+                            "description": t.get("description")
+                        }
+                    }));
                 }
                 Some(serde_json::json!({
                     "type": "function",
@@ -1283,6 +1326,9 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
             result["tools"] = Value::Array(converted_tools);
         }
     }
+    if let Some(bridge_context) = bridge_context {
+        result[REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD] = bridge_context;
+    }
     *body = result;
     Ok(())
 }
@@ -1290,6 +1336,7 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
 fn anthropic_tool_choice_to_openai(
     tool_choice: &Value,
     decode_custom_bridge: bool,
+    bridge_context: Option<&Value>,
 ) -> Result<Option<(Value, bool)>, String> {
     let Some(tool_choice) = tool_choice.as_object() else {
         return Err(
@@ -1319,18 +1366,16 @@ fn anthropic_tool_choice_to_openai(
                     "Anthropic tool_choice.type = tool requires a non-empty `name` field."
                         .to_string(),
                 )?;
-            if decode_custom_bridge {
-                if let Some(custom_name) = openai_responses_custom_tool_name_from_bridge(name) {
-                    serde_json::json!({
-                        "type": "custom",
-                        "custom": { "name": custom_name }
-                    })
-                } else {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": { "name": name }
-                    })
-                }
+            if decode_custom_bridge
+                && request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+                    bridge_context,
+                    name,
+                )
+            {
+                serde_json::json!({
+                    "type": "custom",
+                    "custom": { "name": name }
+                })
             } else {
                 serde_json::json!({
                     "type": "function",
@@ -1348,14 +1393,10 @@ fn anthropic_tool_choice_to_openai(
     Ok(Some((mapped, disable_parallel)))
 }
 
-#[cfg(test)]
-fn convert_claude_message_to_openai(msg: &Value) -> Result<Option<Vec<Value>>, String> {
-    convert_claude_message_to_openai_with_custom_bridge(msg, false)
-}
-
-fn convert_claude_message_to_openai_with_custom_bridge(
+fn convert_claude_message_to_openai_impl(
     msg: &Value,
     decode_custom_bridge: bool,
+    bridge_context: Option<&Value>,
 ) -> Result<Option<Vec<Value>>, String> {
     let Some(role) = msg.get("role").and_then(Value::as_str) else {
         return Ok(None);
@@ -1417,21 +1458,24 @@ fn convert_claude_message_to_openai_with_custom_bridge(
                     .get("input")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                if decode_custom_bridge {
-                    if let Some(custom_name) = openai_responses_custom_tool_name_from_bridge(name) {
-                        if let Some(custom_input) =
-                            openai_responses_custom_tool_input_from_bridge_value(&input)
-                        {
-                            tool_calls.push(serde_json::json!({
-                                "id": block.get("id"),
-                                "type": "custom",
-                                "custom": {
-                                    "name": custom_name,
-                                    "input": custom_input
-                                }
-                            }));
-                            continue;
-                        }
+                if decode_custom_bridge
+                    && request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+                        bridge_context,
+                        name,
+                    )
+                {
+                    if let Some(custom_input) =
+                        openai_responses_custom_tool_input_from_bridge_value(&input)
+                    {
+                        tool_calls.push(serde_json::json!({
+                            "id": block.get("id"),
+                            "type": "custom",
+                            "custom": {
+                                "name": name,
+                                "input": custom_input
+                            }
+                        }));
+                        continue;
                     }
                 }
                 tool_calls.push(serde_json::json!({
@@ -1515,12 +1559,18 @@ fn convert_claude_message_to_openai_with_custom_bridge(
     Ok(Some(vec![m]))
 }
 
+fn convert_claude_message_to_openai(msg: &Value) -> Result<Option<Vec<Value>>, String> {
+    convert_claude_message_to_openai_impl(msg, false, None)
+}
+
 fn collapse_claude_text_parts_for_openai(parts: &[Value]) -> Value {
     collapse_openai_text_parts(parts)
 }
 
 fn openai_to_claude(body: &mut Value) -> Result<(), String> {
     let controls = openai_normalized_request_controls(body)?;
+    let request_scoped_tool_bridge_context =
+        body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
     let mut result = serde_json::json!({
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "max_tokens": body
@@ -1665,6 +1715,9 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
         if !claude_tools.is_empty() {
             result["tools"] = Value::Array(claude_tools);
         }
+    }
+    if let Some(bridge_context) = request_scoped_tool_bridge_context {
+        result[REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD] = bridge_context;
     }
     *body = result;
     Ok(())

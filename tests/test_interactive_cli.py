@@ -174,6 +174,30 @@ class InteractiveCliTests(unittest.TestCase):
         self.assertIn("model_catalog_json", joined)
         self.assertNotIn('tools.view_image=false', joined)
 
+    def test_build_interactive_command_rejects_internal_tool_artifacts_in_public_args(self):
+        module = load_module()
+        workspace = pathlib.Path("/tmp/workspace").resolve()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client_home = pathlib.Path(temp_dir).resolve()
+            with mock.patch.object(
+                module,
+                "build_codex_catalog_args",
+                return_value=[
+                    "-c",
+                    'tool_identity_contract="__llmup_custom__apply_patch"',
+                ],
+            ):
+                with self.assertRaisesRegex(ValueError, "__llmup_custom__apply_patch"):
+                    module.build_interactive_command(
+                        "codex",
+                        workspace,
+                        "minimax-openai",
+                        "http://127.0.0.1:18888",
+                        client_home=client_home,
+                        model_limits=None,
+                    )
+
     def test_run_with_proxy_base_does_not_call_start_proxy(self):
         module = load_module()
 

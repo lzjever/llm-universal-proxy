@@ -9,6 +9,14 @@
 
 Function calling is the only dependable cross-provider core. Everything else should be treated as provider-native capability, not as a guaranteed portable tool abstraction.
 
+For agent clients, visible tool identity is part of that core contract. A proxy may bridge argument shape or result shape, but it must not rename the stable tool identity supplied by the client on any model-visible or client-visible surface.
+
+Locked tool identity contract:
+
+- The proxy must not rewrite the visible tool name supplied by the client.
+- `__llmup_custom__*` is an internal transport artifact, not a public contract.
+- `apply_patch` remains a public freeform tool on client-visible surfaces.
+
 In the table below, provider columns describe the official tool surface. Portability judgment lives in the proxy-guidance column.
 
 ## Provider comparison
@@ -36,3 +44,4 @@ In the table below, provider columns describe the official tool surface. Portabi
 1. Treat function calling as the universal core.
 2. Gate hosted/server tools behind same-provider passthrough or explicit compatibility shims.
 3. Emit compatibility warnings whenever non-function tool capabilities are dropped or approximated.
+4. Never rely on visible synthetic tool renaming as the primary live bridge for agent-facing translated paths. If a function-only bridge is needed, preserve the original visible tool name and carry bridge provenance in request-scoped translator context.

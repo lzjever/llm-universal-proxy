@@ -1,6 +1,40 @@
 use super::*;
 use serde_json::json;
 
+fn assess_request_translation(
+    client_format: UpstreamFormat,
+    upstream_format: UpstreamFormat,
+    body: &serde_json::Value,
+) -> super::models::TranslationAssessment {
+    super::assessment::assess_request_translation(
+        client_format,
+        upstream_format,
+        body,
+        crate::config::CompatibilityMode::Balanced,
+    )
+}
+
+#[test]
+fn request_translation_policy_default_uses_default_compatibility_mode() {
+    assert_eq!(
+        crate::config::CompatibilityMode::default(),
+        crate::config::CompatibilityMode::MaxCompat
+    );
+
+    let default_policy = RequestTranslationPolicy::default();
+    assert_eq!(
+        default_policy.compatibility_mode,
+        crate::config::CompatibilityMode::MaxCompat
+    );
+    assert!(default_policy.is_empty());
+
+    let balanced_policy = RequestTranslationPolicy {
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
+        max_output_tokens: None,
+    };
+    assert!(!balanced_policy.is_empty());
+}
+
 #[test]
 fn responses_to_messages_via_translate() {
     let mut body = json!({
@@ -249,7 +283,6 @@ fn translate_request_chat_to_responses_uses_custom_tool_call_output_for_custom_t
 
 #[test]
 fn translate_request_responses_to_openai_bridges_custom_tool_definition_choice_and_history() {
-    let bridge_name = "__llmup_custom__code_exec";
     let mut body = json!({
         "model": "gpt-4o",
         "tools": [{
@@ -298,7 +331,7 @@ fn translate_request_responses_to_openai_bridges_custom_tool_definition_choice_a
         json!({
             "type": "function",
             "function": {
-                "name": bridge_name,
+                "name": "code_exec",
                 "description": "Executes code",
                 "parameters": {
                     "type": "object",
@@ -316,7 +349,21 @@ fn translate_request_responses_to_openai_bridges_custom_tool_definition_choice_a
         json!({
             "type": "function",
             "function": {
-                "name": bridge_name
+                "name": "code_exec"
+            }
+        })
+    );
+    assert_eq!(
+        body["_llmup_tool_bridge_context"],
+        json!({
+            "compatibility_mode": "max_compat",
+            "entries": {
+                "code_exec": {
+                    "source_kind": "custom_text",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
             }
         })
     );
@@ -330,7 +377,7 @@ fn translate_request_responses_to_openai_bridges_custom_tool_definition_choice_a
             "id": "call_custom",
             "type": "function",
             "function": {
-                "name": bridge_name,
+                "name": "code_exec",
                 "arguments": "{\"input\":\"print('hi')\"}"
             }
         })
@@ -491,7 +538,6 @@ fn translate_request_responses_tool_output_media_arrays_to_openai_rejects() {
 
 #[test]
 fn translate_request_responses_to_openai_bridges_custom_tools_and_tool_choice_variants() {
-    let bridge_name = "__llmup_custom__code_exec";
     let mut body = json!({
         "model": "gpt-4o",
         "input": "run this",
@@ -519,7 +565,7 @@ fn translate_request_responses_to_openai_bridges_custom_tools_and_tool_choice_va
     let tools = body["tools"].as_array().expect("chat tools");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["type"], "function");
-    assert_eq!(tools[0]["function"]["name"], bridge_name);
+    assert_eq!(tools[0]["function"]["name"], "code_exec");
     assert_eq!(tools[0]["function"]["description"], "Executes code");
     assert_eq!(
         tools[0]["function"]["parameters"],
@@ -533,7 +579,7 @@ fn translate_request_responses_to_openai_bridges_custom_tools_and_tool_choice_va
         })
     );
     assert_eq!(body["tool_choice"]["type"], "function");
-    assert_eq!(body["tool_choice"]["function"]["name"], bridge_name);
+    assert_eq!(body["tool_choice"]["function"]["name"], "code_exec");
 
     let mut allowed_tools_body = json!({
         "model": "gpt-4o",
@@ -571,16 +617,48 @@ fn translate_request_responses_to_openai_bridges_custom_tools_and_tool_choice_va
 
     let tools = allowed_tools_body["tools"].as_array().expect("chat tools");
     assert_eq!(tools[0]["type"], "function");
-    assert_eq!(tools[0]["function"]["name"], bridge_name);
+    assert_eq!(tools[0]["function"]["name"], "code_exec");
     assert_eq!(tools[1]["type"], "function");
     assert_eq!(allowed_tools_body["tool_choice"]["type"], "allowed_tools");
     let allowed_tools = allowed_tools_body["tool_choice"]["allowed_tools"]["tools"]
         .as_array()
         .expect("allowed tools");
     assert_eq!(allowed_tools[0]["type"], "function");
-    assert_eq!(allowed_tools[0]["function"]["name"], bridge_name);
+    assert_eq!(allowed_tools[0]["function"]["name"], "code_exec");
     assert_eq!(allowed_tools[1]["type"], "function");
     assert_eq!(allowed_tools[1]["function"]["name"], "lookup_weather");
+}
+
+#[test]
+fn translate_request_responses_to_openai_rejects_same_name_function_and_custom_bridge_conflict() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": "run this",
+        "tools": [
+            {
+                "type": "function",
+                "name": "apply_patch",
+                "parameters": { "type": "object" }
+            },
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "format": { "type": "text" }
+            }
+        ]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        false,
+    )
+    .expect_err("same stable function/custom tool names should reject");
+
+    assert!(err.contains("apply_patch"), "err = {err}");
+    assert!(err.contains("same stable name"), "err = {err}");
 }
 
 #[test]
@@ -2938,6 +3016,216 @@ fn assess_request_translation_responses_custom_tool_to_anthropic_rejects_nonport
 }
 
 #[test]
+fn assess_request_translation_responses_custom_tool_to_anthropic_strict_rejects_any_bridge() {
+    let body = json!({
+        "model": "claude-3-7-sonnet",
+        "tools": [{
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes code",
+            "format": { "type": "text" }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "code_exec"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "run this" }]
+        }]
+    });
+
+    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        &body,
+        crate::config::CompatibilityMode::Strict,
+    );
+
+    let TranslationDecision::Reject(err) = assessment.decision() else {
+        panic!("expected reject policy, got {assessment:?}");
+    };
+    assert_eq!(
+        err,
+        custom_tools_not_portable_message(UpstreamFormat::Anthropic)
+    );
+}
+
+#[test]
+fn assess_request_translation_responses_custom_tool_to_anthropic_balanced_allows_plain_text_but_rejects_grammar(
+) {
+    let plain_text_body = json!({
+        "model": "claude-3-7-sonnet",
+        "tools": [{
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes code",
+            "format": { "type": "text" }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "code_exec"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "run this" }]
+        }]
+    });
+    let plain_text_assessment =
+        super::assessment::assess_request_translation_with_compatibility_mode(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Anthropic,
+            &plain_text_body,
+            crate::config::CompatibilityMode::Balanced,
+        );
+    assert_eq!(plain_text_assessment.decision(), TranslationDecision::Allow);
+
+    let grammar_body = json!({
+        "model": "claude-3-7-sonnet",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /.+/"
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "apply_patch"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "create hello.txt" }]
+        }]
+    });
+    let grammar_assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        &grammar_body,
+        crate::config::CompatibilityMode::Balanced,
+    );
+
+    let TranslationDecision::Reject(err) = grammar_assessment.decision() else {
+        panic!("expected reject policy, got {grammar_assessment:?}");
+    };
+    assert!(
+        err.contains("apply_patch") && err.contains("Anthropic"),
+        "err = {err}"
+    );
+}
+
+#[test]
+fn assess_request_translation_responses_custom_tool_to_openai_strict_rejects_any_bridge() {
+    let body = json!({
+        "model": "gpt-4o",
+        "tools": [{
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes code",
+            "format": { "type": "text" }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "code_exec"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "run this" }]
+        }]
+    });
+
+    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        &body,
+        crate::config::CompatibilityMode::Strict,
+    );
+
+    let TranslationDecision::Reject(err) = assessment.decision() else {
+        panic!("expected reject policy, got {assessment:?}");
+    };
+    assert_eq!(
+        err,
+        custom_tools_not_portable_message(UpstreamFormat::OpenAiCompletion)
+    );
+}
+
+#[test]
+fn assess_request_translation_responses_custom_tool_to_openai_balanced_allows_plain_text_but_rejects_grammar(
+) {
+    let plain_text_body = json!({
+        "model": "gpt-4o",
+        "tools": [{
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes code",
+            "format": { "type": "text" }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "code_exec"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "run this" }]
+        }]
+    });
+    let plain_text_assessment =
+        super::assessment::assess_request_translation_with_compatibility_mode(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            &plain_text_body,
+            crate::config::CompatibilityMode::Balanced,
+        );
+    assert_eq!(plain_text_assessment.decision(), TranslationDecision::Allow);
+
+    let grammar_body = json!({
+        "model": "gpt-4o",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /.+/"
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "apply_patch"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "create hello.txt" }]
+        }]
+    });
+    let grammar_assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        &grammar_body,
+        crate::config::CompatibilityMode::Balanced,
+    );
+
+    let TranslationDecision::Reject(err) = grammar_assessment.decision() else {
+        panic!("expected reject policy, got {grammar_assessment:?}");
+    };
+    assert!(
+        err.contains("apply_patch") && err.contains("OpenAI Chat Completions"),
+        "err = {err}"
+    );
+}
+
+#[test]
 fn translate_request_chat_to_gemini_rejects_audio_format_without_documented_equivalent() {
     let mut body = json!({
         "model": "gemini-2.5-flash",
@@ -3057,6 +3345,7 @@ fn translate_request_openai_to_claude_uses_policy_default_max_output_tokens_when
         "claude-3-7-sonnet",
         &mut body,
         RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::Balanced,
             max_output_tokens: Some(128_000),
         },
         false,
@@ -3080,6 +3369,7 @@ fn translate_request_openai_to_claude_preserves_explicit_max_completion_tokens_o
         "claude-3-7-sonnet",
         &mut body,
         RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::Balanced,
             max_output_tokens: Some(128_000),
         },
         false,
@@ -3103,6 +3393,7 @@ fn translate_request_openai_to_claude_preserves_explicit_max_tokens_over_policy(
         "claude-3-7-sonnet",
         &mut body,
         RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::Balanced,
             max_output_tokens: Some(128_000),
         },
         false,
@@ -3125,6 +3416,7 @@ fn translate_request_openai_to_responses_uses_policy_default_max_output_tokens_w
         "gpt-4o",
         &mut body,
         RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::Balanced,
             max_output_tokens: Some(128_000),
         },
         false,
@@ -3147,6 +3439,7 @@ fn translate_request_responses_to_openai_uses_policy_default_max_completion_toke
         "gpt-4o",
         &mut body,
         RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::Balanced,
             max_output_tokens: Some(128_000),
         },
         false,
@@ -3176,6 +3469,7 @@ fn translate_request_google_passthrough_preserves_explicit_snake_case_max_output
         "gemini-1.5",
         &mut body,
         RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::Balanced,
             max_output_tokens: Some(128_000),
         },
         false,
@@ -5322,11 +5616,25 @@ fn translate_request_responses_custom_tool_to_claude_bridges_definition_choice_a
     )
     .expect("Responses custom tools should bridge to Anthropic");
 
+    assert_eq!(
+        body["_llmup_tool_bridge_context"],
+        json!({
+            "compatibility_mode": "max_compat",
+            "entries": {
+                "code_exec": {
+                    "source_kind": "custom_text",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        })
+    );
     let tools = body["tools"].as_array().expect("anthropic tools");
     assert_eq!(
         tools[0],
         json!({
-            "name": "__llmup_custom__code_exec",
+            "name": "code_exec",
             "description": "Executes code",
             "input_schema": {
                 "type": "object",
@@ -5342,7 +5650,7 @@ fn translate_request_responses_custom_tool_to_claude_bridges_definition_choice_a
         body["tool_choice"],
         json!({
             "type": "tool",
-            "name": "__llmup_custom__code_exec"
+            "name": "code_exec"
         })
     );
 
@@ -5357,7 +5665,7 @@ fn translate_request_responses_custom_tool_to_claude_bridges_definition_choice_a
         json!({
             "type": "tool_use",
             "id": "call_custom",
-            "name": "__llmup_custom__code_exec",
+            "name": "code_exec",
             "input": { "input": "print('hi')" }
         })
     );
@@ -5435,7 +5743,8 @@ fn translate_request_claude_structured_tool_result_content_round_trips() {
 }
 
 #[test]
-fn translate_request_responses_string_grammar_custom_tool_to_claude_bridges_with_text_contract() {
+fn translate_request_responses_string_grammar_custom_tool_to_claude_max_compat_bridges_with_text_contract(
+) {
     let apply_patch_grammar = r#"start: begin_patch hunk+ end_patch
 begin_patch: "*** Begin Patch" LF
 end_patch: "*** End Patch" LF?
@@ -5492,17 +5801,35 @@ eof_line: "*** End of File" LF
         ]
     });
 
-    translate_request(
+    translate_request_with_policy(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
+        RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
+            max_output_tokens: None,
+        },
         false,
     )
-    .expect("string-grammar custom tools should bridge to Anthropic");
+    .expect("string-grammar custom tools should bridge to Anthropic under max_compat");
 
     let tools = body["tools"].as_array().expect("anthropic tools");
-    assert_eq!(tools[0]["name"], "__llmup_custom__apply_patch");
+    assert_eq!(
+        body["_llmup_tool_bridge_context"],
+        json!({
+            "compatibility_mode": "max_compat",
+            "entries": {
+                "apply_patch": {
+                    "source_kind": "custom_grammar",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        })
+    );
+    assert_eq!(tools[0]["name"], "apply_patch");
     assert_eq!(
         tools[0]["input_schema"],
         json!({
@@ -5537,7 +5864,7 @@ eof_line: "*** End of File" LF
         body["tool_choice"],
         json!({
             "type": "tool",
-            "name": "__llmup_custom__apply_patch"
+            "name": "apply_patch"
         })
     );
 
@@ -5551,7 +5878,7 @@ eof_line: "*** End of File" LF
         json!({
             "type": "tool_use",
             "id": "call_apply_patch",
-            "name": "__llmup_custom__apply_patch",
+            "name": "apply_patch",
             "input": { "input": patch_input }
         })
     );
@@ -5561,12 +5888,299 @@ eof_line: "*** End of File" LF
 }
 
 #[test]
-fn translate_request_claude_bridged_custom_tool_history_to_responses_restores_custom_items() {
+fn translate_request_responses_string_grammar_custom_tool_to_claude_max_compat_warns_and_records_mode(
+) {
+    let mut body = json!({
+        "model": "claude-3-7-sonnet",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /.+/"
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "apply_patch"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+        }]
+    });
+
+    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        &body,
+        crate::config::CompatibilityMode::MaxCompat,
+    );
+    let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
+        panic!("expected warning policy, got {assessment:?}");
+    };
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("apply_patch") && warning.contains("Anthropic")),
+        "warnings = {warnings:?}"
+    );
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3-7-sonnet",
+        &mut body,
+        RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
+            max_output_tokens: None,
+        },
+        false,
+    )
+    .expect("max_compat grammar custom tools should bridge to Anthropic");
+
+    assert_eq!(
+        body["_llmup_tool_bridge_context"]["compatibility_mode"],
+        "max_compat"
+    );
+    let tools = body["tools"].as_array().expect("anthropic tools");
+    assert_eq!(tools[0]["name"], "apply_patch");
+    assert_eq!(body["tool_choice"]["name"], "apply_patch");
+}
+
+#[test]
+fn translate_request_responses_string_grammar_custom_tool_to_openai_max_compat_warns_and_records_mode(
+) {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /.+/"
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "apply_patch"
+        },
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+        }]
+    });
+
+    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        &body,
+        crate::config::CompatibilityMode::MaxCompat,
+    );
+    let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
+        panic!("expected warning policy, got {assessment:?}");
+    };
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.contains("apply_patch") && warning.contains("OpenAI Chat Completions")
+        }),
+        "warnings = {warnings:?}"
+    );
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
+            max_output_tokens: None,
+        },
+        false,
+    )
+    .expect("max_compat grammar custom tools should bridge to OpenAI Chat Completions");
+
+    assert_eq!(
+        body["_llmup_tool_bridge_context"]["compatibility_mode"],
+        "max_compat"
+    );
+    assert_eq!(body["tools"][0]["function"]["name"], "apply_patch");
+    assert_eq!(body["tool_choice"]["function"]["name"], "apply_patch");
+    let serialized = body.to_string();
+    assert!(
+        !serialized.contains("__llmup_custom__"),
+        "bridge should keep stable tool names, body = {body:?}"
+    );
+}
+
+#[test]
+fn translate_request_responses_string_grammar_custom_tool_to_openai_max_compat_bridges_with_chat_completions_contract(
+) {
+    let apply_patch_grammar = r#"start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF"#;
+    let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+    let mut body = json!({
+        "model": "gpt-4o",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": apply_patch_grammar
+            }
+        }],
+        "tool_choice": {
+            "type": "custom",
+            "name": "apply_patch"
+        },
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_apply_patch",
+                "name": "apply_patch",
+                "input": patch_input
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_apply_patch",
+                "output": "Success. Updated the following files:\nA hello.txt\n"
+            }
+        ]
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
+            max_output_tokens: None,
+        },
+        false,
+    )
+    .expect(
+        "string-grammar custom tools should bridge to OpenAI Chat Completions under max_compat",
+    );
+
+    assert_eq!(
+        body["_llmup_tool_bridge_context"]["compatibility_mode"],
+        "max_compat"
+    );
+    let tools = body["tools"].as_array().expect("openai tools");
+    assert_eq!(tools[0]["function"]["name"], "apply_patch");
+    assert_eq!(
+        tools[0]["function"]["parameters"],
+        json!({
+            "type": "object",
+            "properties": {
+                "input": { "type": "string" }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        })
+    );
+    let description = tools[0]["function"]["description"]
+        .as_str()
+        .expect("openai tool description");
+    assert!(
+        description.contains("Use the `apply_patch` tool to edit files."),
+        "description = {description}"
+    );
+    assert!(
+        description.contains("OpenAI Chat Completions receives this tool through the canonical `{ \"input\": string }` wrapper"),
+        "description = {description}"
+    );
+    assert!(
+        description.contains("OpenAI Chat Completions will not enforce it structurally"),
+        "description = {description}"
+    );
+    assert!(
+        description.contains("syntax: lark"),
+        "description = {description}"
+    );
+    assert!(
+        description.contains("start: begin_patch hunk+ end_patch"),
+        "description = {description}"
+    );
+    assert_eq!(
+        body["tool_choice"],
+        json!({
+            "type": "function",
+            "function": { "name": "apply_patch" }
+        })
+    );
+
+    let messages = body["messages"].as_array().expect("openai messages");
+    assert_eq!(messages.len(), 3, "body = {body:?}");
+    assert_eq!(
+        messages[1]["tool_calls"][0],
+        json!({
+            "id": "call_apply_patch",
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "arguments": serde_json::to_string(&json!({ "input": patch_input })).unwrap()
+            }
+        })
+    );
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_apply_patch");
+    assert_eq!(
+        messages[2]["content"],
+        "Success. Updated the following files:\nA hello.txt\n"
+    );
+}
+
+#[test]
+fn translate_request_claude_request_scoped_custom_tool_history_to_responses_restores_custom_items()
+{
     let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let mut body = json!({
+        "_llmup_tool_bridge_context": {
+            "compatibility_mode": "balanced",
+            "entries": {
+                "code_exec": {
+                    "source_kind": "custom_text",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        },
         "model": "gpt-5",
         "tools": [{
-            "name": "__llmup_custom__code_exec",
+            "name": "code_exec",
             "description": "Executes code",
             "input_schema": {
                 "type": "object",
@@ -5579,7 +6193,7 @@ fn translate_request_claude_bridged_custom_tool_history_to_responses_restores_cu
         }],
         "tool_choice": {
             "type": "tool",
-            "name": "__llmup_custom__code_exec"
+            "name": "code_exec"
         },
         "messages": [
             {
@@ -5587,7 +6201,7 @@ fn translate_request_claude_bridged_custom_tool_history_to_responses_restores_cu
                 "content": [{
                     "type": "tool_use",
                     "id": "toolu_custom",
-                    "name": "__llmup_custom__code_exec",
+                    "name": "code_exec",
                     "input": { "input": exact_input }
                 }]
             },
@@ -5649,8 +6263,19 @@ fn translate_request_claude_bridged_custom_tool_history_to_responses_restores_cu
 }
 
 #[test]
-fn translate_request_claude_noncanonical_bridged_custom_tool_history_falls_back_open() {
+fn translate_request_claude_request_scoped_noncanonical_custom_tool_history_falls_back_open() {
     let mut body = json!({
+        "_llmup_tool_bridge_context": {
+            "compatibility_mode": "balanced",
+            "entries": {
+                "code_exec": {
+                    "source_kind": "custom_text",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        },
         "model": "gpt-5",
         "messages": [
             {
@@ -5658,7 +6283,7 @@ fn translate_request_claude_noncanonical_bridged_custom_tool_history_falls_back_
                 "content": [{
                     "type": "tool_use",
                     "id": "toolu_custom",
-                    "name": "__llmup_custom__code_exec",
+                    "name": "code_exec",
                     "input": {
                         "input": "print('hi')",
                         "extra": true
@@ -5688,7 +6313,7 @@ fn translate_request_claude_noncanonical_bridged_custom_tool_history_falls_back_
     let input = body["input"].as_array().expect("responses input");
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[0]["call_id"], "toolu_custom");
-    assert_eq!(input[0]["name"], "__llmup_custom__code_exec");
+    assert_eq!(input[0]["name"], "code_exec");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(
             input[0]["arguments"].as_str().expect("function arguments"),
@@ -5720,15 +6345,12 @@ fn responses_custom_tool_bridge_re_attests_non_replayable_marker_for_openai_tool
     super::tools::mark_tool_call_as_non_replayable(&mut item);
 
     let tool_call =
-        super::tools::responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
-            &item,
-            "Anthropic",
-        )
+        super::tools::responses_tool_call_item_to_openai_tool_call_with_request_scoped_custom_bridge_strict(&item, "Anthropic")
         .expect("bridge should succeed")
         .expect("tool call");
 
     assert_eq!(tool_call["type"], "function");
-    assert_eq!(tool_call["function"]["name"], "__llmup_custom__apply_patch");
+    assert_eq!(tool_call["function"]["name"], "apply_patch");
     assert_eq!(
         tool_call["function"]["arguments"],
         "{\"input\":\"*** Begin Patch\\n*** Add File: hello.txt\\n+hello\\n\"}"
@@ -5750,16 +6372,26 @@ fn responses_custom_tool_bridge_round_trip_preserves_trusted_non_replayable_mark
     super::tools::mark_tool_call_as_non_replayable(&mut item);
 
     let tool_call =
-        super::tools::responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
-            &item,
-            "Anthropic",
-        )
+        super::tools::responses_tool_call_item_to_openai_tool_call_with_request_scoped_custom_bridge_strict(&item, "Anthropic")
         .expect("bridge should succeed")
         .expect("tool call");
 
     let round_tripped =
-        super::tools::openai_tool_call_to_responses_item_decoding_custom_bridge(&tool_call)
-            .expect("decode bridge back to custom tool");
+        super::tools::openai_tool_call_to_responses_item_decoding_custom_bridge_with_context(
+            &tool_call,
+            Some(&json!({
+                "compatibility_mode": "balanced",
+                "entries": {
+                    "apply_patch": {
+                        "source_kind": "custom_grammar",
+                        "transport_kind": "function_object_wrapper",
+                        "wrapper_field": "input",
+                        "expected_canonical_shape": "single_required_string"
+                    }
+                }
+            })),
+        )
+        .expect("decode bridge back to custom tool");
 
     assert_eq!(round_tripped["type"], "custom_tool_call");
     assert_eq!(round_tripped["call_id"], "call_apply_patch");
@@ -5784,10 +6416,7 @@ fn translate_request_openai_bridged_marked_custom_tool_call_to_claude_degrades_t
     });
     super::tools::mark_tool_call_as_non_replayable(&mut responses_item);
     let bridged_tool_call =
-        super::tools::responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
-            &responses_item,
-            "Anthropic",
-        )
+        super::tools::responses_tool_call_item_to_openai_tool_call_with_request_scoped_custom_bridge_strict(&responses_item, "Anthropic")
         .expect("bridge should succeed")
         .expect("tool call");
 
@@ -9215,10 +9844,21 @@ fn translate_response_openai_to_claude_restores_server_tool_use_from_marker() {
 }
 
 #[test]
-fn translate_response_openai_to_responses_decodes_bridged_function_call_to_custom_tool_call_with_exact_input(
+fn translate_response_openai_to_responses_decodes_request_scoped_function_call_to_custom_tool_call_with_exact_input(
 ) {
     let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let body = json!({
+        "_llmup_tool_bridge_context": {
+            "compatibility_mode": "balanced",
+            "entries": {
+                "code_exec": {
+                    "source_kind": "custom_text",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        },
         "id": "chatcmpl_tools",
         "object": "chat.completion",
         "choices": [{
@@ -9230,7 +9870,7 @@ fn translate_response_openai_to_responses_decodes_bridged_function_call_to_custo
                         "id": "call_custom",
                         "type": "function",
                         "function": {
-                            "name": "__llmup_custom__code_exec",
+                            "name": "code_exec",
                             "arguments": serde_json::to_string(&json!({ "input": exact_input }))
                                 .expect("bridge args")
                         }
@@ -9261,7 +9901,162 @@ fn translate_response_openai_to_responses_decodes_bridged_function_call_to_custo
 }
 
 #[test]
-fn translate_response_openai_to_responses_falls_back_when_bridged_arguments_are_noncanonical() {
+fn translate_response_openai_to_responses_decodes_request_scoped_custom_bridge_without_prefix_leak()
+{
+    let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+    let body = json!({
+        "_llmup_tool_bridge_context": {
+            "compatibility_mode": "balanced",
+            "entries": {
+                "apply_patch": {
+                    "source_kind": "custom_grammar",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        },
+        "id": "chatcmpl_tools",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_apply_patch",
+                        "type": "function",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": serde_json::to_string(&json!({ "input": patch_input }))
+                                .expect("bridge args")
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+
+    let out = translate_response(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .unwrap();
+
+    let output = out["output"].as_array().expect("responses output");
+    assert_eq!(
+        output[0],
+        json!({
+            "type": "custom_tool_call",
+            "call_id": "call_apply_patch",
+            "name": "apply_patch",
+            "input": patch_input
+        })
+    );
+}
+
+#[test]
+fn translate_response_openai_to_responses_request_scoped_custom_bridge_falls_back_without_prefix_leak(
+) {
+    let raw_arguments = serde_json::to_string(&json!({ "input": 5, "extra": true })).expect("json");
+    let body = json!({
+        "_llmup_tool_bridge_context": {
+            "compatibility_mode": "balanced",
+            "entries": {
+                "apply_patch": {
+                    "source_kind": "custom_grammar",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        },
+        "id": "chatcmpl_tools",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_apply_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": raw_arguments
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+
+    let out = translate_response(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect("noncanonical request-scoped bridge args should fall back to function_call");
+
+    let output = out["output"].as_array().expect("responses output");
+    assert_eq!(
+        output[0],
+        json!({
+            "type": "function_call",
+            "call_id": "call_apply_patch",
+            "name": "apply_patch",
+            "arguments": raw_arguments
+        })
+    );
+}
+
+#[test]
+fn translate_response_openai_to_responses_does_not_decode_reserved_prefix_function_call_without_request_context(
+) {
+    let raw_arguments = serde_json::to_string(&json!({ "input": "print('hi')" })).expect("json");
+    let body = json!({
+        "id": "chatcmpl_tools",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_custom",
+                    "type": "function",
+                    "function": {
+                        "name": "__llmup_custom__code_exec",
+                        "arguments": raw_arguments
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+
+    let out = translate_response(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect("reserved-prefix names should not decode without request context");
+
+    let output = out["output"].as_array().expect("responses output");
+    assert_eq!(
+        output[0],
+        json!({
+            "type": "function_call",
+            "call_id": "call_custom",
+            "name": "__llmup_custom__code_exec",
+            "arguments": raw_arguments
+        })
+    );
+}
+
+#[test]
+fn translate_response_openai_to_responses_request_scoped_bridge_falls_back_when_arguments_are_noncanonical(
+) {
     let bad_arguments = [
         "not valid json".to_string(),
         serde_json::to_string(&json!({ "output": "missing input" })).expect("json"),
@@ -9271,6 +10066,17 @@ fn translate_response_openai_to_responses_falls_back_when_bridged_arguments_are_
 
     for raw_arguments in bad_arguments {
         let body = json!({
+            "_llmup_tool_bridge_context": {
+                "compatibility_mode": "balanced",
+                "entries": {
+                    "code_exec": {
+                        "source_kind": "custom_text",
+                        "transport_kind": "function_object_wrapper",
+                        "wrapper_field": "input",
+                        "expected_canonical_shape": "single_required_string"
+                    }
+                }
+            },
             "id": "chatcmpl_tools",
             "object": "chat.completion",
             "choices": [{
@@ -9281,7 +10087,7 @@ fn translate_response_openai_to_responses_falls_back_when_bridged_arguments_are_
                         "id": "call_custom",
                         "type": "function",
                         "function": {
-                            "name": "__llmup_custom__code_exec",
+                            "name": "code_exec",
                             "arguments": raw_arguments
                         }
                     }]
@@ -9303,7 +10109,7 @@ fn translate_response_openai_to_responses_falls_back_when_bridged_arguments_are_
             json!({
                 "type": "function_call",
                 "call_id": "call_custom",
-                "name": "__llmup_custom__code_exec",
+                "name": "code_exec",
                 "arguments": raw_arguments
             })
         );
@@ -10338,14 +11144,25 @@ fn translate_response_claude_thinking_signature_provenance_maps_to_responses_car
 }
 
 #[test]
-fn translate_response_claude_bridged_tool_use_restores_responses_custom_tool_call() {
+fn translate_response_claude_request_scoped_tool_use_restores_responses_custom_tool_call() {
     let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let body = json!({
+        "_llmup_tool_bridge_context": {
+            "compatibility_mode": "balanced",
+            "entries": {
+                "code_exec": {
+                    "source_kind": "custom_text",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        },
         "id": "msg_custom_tool",
         "content": [{
             "type": "tool_use",
             "id": "toolu_custom",
-            "name": "__llmup_custom__code_exec",
+            "name": "code_exec",
             "input": { "input": exact_input }
         }],
         "stop_reason": "tool_use",

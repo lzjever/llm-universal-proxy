@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use serde_json::Value;
@@ -287,7 +288,8 @@ pub(crate) fn openai_custom_tool_format_supports_anthropic_bridge(format: Option
         || openai_custom_tool_string_constraint_format_parts(format).is_some()
 }
 
-pub(crate) fn openai_custom_tool_bridge_description_for_anthropic(
+pub(crate) fn openai_custom_tool_bridge_description_for_target(
+    target_format: UpstreamFormat,
     description: Option<&Value>,
     format: Option<&Value>,
 ) -> Option<Value> {
@@ -295,6 +297,7 @@ pub(crate) fn openai_custom_tool_bridge_description_for_anthropic(
     else {
         return description.cloned();
     };
+    let target_label = translation_target_label(target_format);
 
     let mut bridged = description
         .and_then(Value::as_str)
@@ -304,27 +307,23 @@ pub(crate) fn openai_custom_tool_bridge_description_for_anthropic(
         bridged.push_str("\n\n");
     }
     bridged.push_str(
-        "Bridge note: Anthropic receives this tool through the canonical `{ \"input\": string }` wrapper. ",
+        &format!(
+            "Bridge note: {target_label} receives this tool through the canonical `{{ \"input\": string }}` wrapper. "
+        ),
     );
     bridged.push_str(
         "The original OpenAI custom tool constrained that single string input with the following format contract. ",
     );
-    bridged.push_str("Anthropic will not enforce it structurally, so follow it exactly.\n");
+    bridged.push_str(&format!(
+        "{target_label} will not enforce it structurally, so follow it exactly.\n"
+    ));
     bridged.push_str(&format!("syntax: {syntax}\n"));
     bridged.push_str(definition);
     Some(Value::String(bridged))
 }
 
 pub(crate) const OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX: &str = "__llmup_custom__";
-
-pub(crate) fn openai_responses_custom_tool_bridge_name(name: &str) -> String {
-    format!("{OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX}{name}")
-}
-
-pub(crate) fn openai_responses_custom_tool_name_from_bridge(name: &str) -> Option<&str> {
-    name.strip_prefix(OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX)
-        .filter(|name| !name.is_empty())
-}
+pub(crate) const REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD: &str = "_llmup_tool_bridge_context";
 
 pub(crate) fn openai_responses_custom_tool_bridge_arguments(input: &str) -> Result<String, String> {
     serde_json::to_string(&serde_json::json!({ "input": input }))
@@ -356,7 +355,71 @@ pub(crate) fn openai_responses_custom_tool_input_from_bridge_arguments(
 }
 
 pub(crate) fn openai_responses_custom_tool_bridge_prefix_is_reserved(name: &str) -> bool {
-    openai_responses_custom_tool_name_from_bridge(name).is_some()
+    name.strip_prefix(OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX)
+        .is_some_and(|suffix| !suffix.is_empty())
+}
+
+fn request_scoped_custom_bridge_source_kind(
+    custom: &NormalizedOpenAiFamilyCustomTool,
+) -> &'static str {
+    if openai_custom_tool_format_is_plain_text(custom.format.as_ref()) {
+        "custom_text"
+    } else {
+        "custom_grammar"
+    }
+}
+
+fn request_scoped_custom_bridge_entry(custom: &NormalizedOpenAiFamilyCustomTool) -> Value {
+    serde_json::json!({
+        "source_kind": request_scoped_custom_bridge_source_kind(custom),
+        "transport_kind": "function_object_wrapper",
+        "wrapper_field": "input",
+        "expected_canonical_shape": "single_required_string"
+    })
+}
+
+pub(crate) fn request_scoped_openai_custom_bridge_context(
+    tools: &[NormalizedOpenAiFamilyToolDef],
+) -> Option<Value> {
+    let mut entries = serde_json::Map::new();
+    for tool in tools {
+        let NormalizedOpenAiFamilyToolDef::Custom(custom) = tool else {
+            continue;
+        };
+        entries.insert(
+            custom.name.clone(),
+            request_scoped_custom_bridge_entry(custom),
+        );
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({
+            "compatibility_mode": "balanced",
+            "entries": entries
+        }))
+    }
+}
+
+pub(crate) fn request_scoped_openai_custom_bridge_conflict_name(
+    tools: &[NormalizedOpenAiFamilyToolDef],
+) -> Option<String> {
+    let mut function_names = BTreeSet::new();
+    let mut custom_names = BTreeSet::new();
+    for tool in tools {
+        match tool {
+            NormalizedOpenAiFamilyToolDef::Function(function) => {
+                function_names.insert(function.name.clone());
+            }
+            NormalizedOpenAiFamilyToolDef::Custom(custom) => {
+                custom_names.insert(custom.name.clone());
+            }
+            NormalizedOpenAiFamilyToolDef::Namespace(_) => {}
+        }
+    }
+    function_names
+        .into_iter()
+        .find(|name| custom_names.contains(name))
 }
 
 pub(crate) fn openai_tool_arguments_raw(tool_call: &Value) -> Option<&str> {
@@ -628,16 +691,47 @@ pub(crate) fn normalized_responses_tool_definition(
     }
 }
 
-pub(crate) fn normalized_openai_tool_definitions_from_request(
+fn openai_function_uses_canonical_custom_bridge_wrapper(
+    function: &NormalizedOpenAiFamilyFunctionTool,
+) -> bool {
+    function.parameters.as_ref()
+        == Some(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "input": { "type": "string" }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        }))
+}
+
+pub(crate) fn normalized_openai_tool_definitions_from_request_with_request_scoped_custom_bridge(
     body: &Value,
+    bridge_context: Option<&Value>,
 ) -> Result<Vec<NormalizedOpenAiFamilyToolDef>, String> {
     body.get("tools")
         .and_then(Value::as_array)
         .map(|tools| {
             tools.iter().try_fold(Vec::new(), |mut normalized, tool| {
-                if let Some(tool) = normalized_openai_tool_definition(tool)? {
-                    normalized.push(tool);
-                }
+                let Some(tool) = normalized_openai_tool_definition(tool)? else {
+                    return Ok(normalized);
+                };
+                let tool = match tool {
+                    NormalizedOpenAiFamilyToolDef::Function(function)
+                        if request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+                            bridge_context,
+                            &function.name,
+                        ) && openai_function_uses_canonical_custom_bridge_wrapper(&function) =>
+                    {
+                        NormalizedOpenAiFamilyToolDef::Custom(NormalizedOpenAiFamilyCustomTool {
+                            name: function.name,
+                            description: function.description,
+                            format: None,
+                        })
+                    }
+                    other => other,
+                };
+                normalized.push(tool);
                 Ok(normalized)
             })
         })
@@ -702,25 +796,19 @@ pub(crate) fn normalized_tool_definition_to_openai(
     }
 }
 
-pub(crate) fn normalized_tool_definition_to_openai_with_custom_bridge(
+pub(crate) fn normalized_tool_definition_to_openai_with_request_scoped_custom_bridge(
     tool: &NormalizedOpenAiFamilyToolDef,
     target_format: UpstreamFormat,
 ) -> Result<Value, String> {
     match tool {
         NormalizedOpenAiFamilyToolDef::Custom(custom) => {
             let mut payload = serde_json::Map::new();
-            payload.insert(
-                "name".to_string(),
-                Value::String(openai_responses_custom_tool_bridge_name(&custom.name)),
+            payload.insert("name".to_string(), Value::String(custom.name.clone()));
+            let description = openai_custom_tool_bridge_description_for_target(
+                target_format,
+                custom.description.as_ref(),
+                custom.format.as_ref(),
             );
-            let description = if target_format == UpstreamFormat::Anthropic {
-                openai_custom_tool_bridge_description_for_anthropic(
-                    custom.description.as_ref(),
-                    custom.format.as_ref(),
-                )
-            } else {
-                custom.description.clone()
-            };
             if let Some(description) = description {
                 payload.insert("description".to_string(), description);
             }
@@ -971,7 +1059,7 @@ pub(crate) fn responses_tool_call_item_to_openai_tool_call_strict(
     }
 }
 
-pub(crate) fn responses_tool_call_item_to_openai_tool_call_with_custom_bridge_strict(
+pub(crate) fn responses_tool_call_item_to_openai_tool_call_with_request_scoped_custom_bridge_strict(
     item: &Value,
     target_label: &str,
 ) -> Result<Option<Value>, String> {
@@ -1004,7 +1092,7 @@ pub(crate) fn responses_tool_call_item_to_openai_tool_call_with_custom_bridge_st
                 "id": id,
                 "type": "function",
                 "function": {
-                    "name": openai_responses_custom_tool_bridge_name(&name),
+                    "name": name,
                     "arguments": openai_responses_custom_tool_bridge_arguments(&input)?
                 }
             });
@@ -1080,8 +1168,37 @@ pub(crate) fn openai_tool_call_to_responses_item(tool_call: &Value) -> Value {
     item
 }
 
-pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge(
+fn request_scoped_custom_bridge_entry_for_name<'a>(
+    bridge_context: &'a Value,
+    name: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    bridge_context
+        .get("entries")
+        .and_then(Value::as_object)?
+        .get(name)?
+        .as_object()
+}
+
+pub(crate) fn request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+    bridge_context: Option<&Value>,
+    name: &str,
+) -> bool {
+    let Some(entry) =
+        bridge_context.and_then(|ctx| request_scoped_custom_bridge_entry_for_name(ctx, name))
+    else {
+        return false;
+    };
+    entry.get("transport_kind").and_then(Value::as_str) == Some("function_object_wrapper")
+        && entry.get("wrapper_field").and_then(Value::as_str) == Some("input")
+        && entry
+            .get("expected_canonical_shape")
+            .and_then(Value::as_str)
+            == Some("single_required_string")
+}
+
+pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge_with_context(
     tool_call: &Value,
+    bridge_context: Option<&Value>,
 ) -> Result<Value, String> {
     let call = match normalized_openai_tool_call(tool_call) {
         Ok(Some(call)) => call,
@@ -1098,13 +1215,16 @@ pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge(
             namespace,
             proxied_tool_kind,
         } => {
-            if let Some(custom_name) = openai_responses_custom_tool_name_from_bridge(&name) {
+            if request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+                bridge_context,
+                &name,
+            ) {
                 match openai_responses_custom_tool_input_from_bridge_arguments(&arguments) {
                     Ok(input) => {
                         let mut item = serde_json::json!({
                             "type": "custom_tool_call",
                             "call_id": id,
-                            "name": custom_name,
+                            "name": name,
                             "input": input
                         });
                         if let Some(proxied_tool_kind) = proxied_tool_kind {

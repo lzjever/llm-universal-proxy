@@ -57,12 +57,33 @@ Use the namespace that matches the client protocol instead of the upstream vendo
 | Claude Code | `/anthropic/v1` | Anthropic Messages client in front of Anthropic-compatible upstreams |
 | Gemini CLI | `/google/v1beta` | Gemini-native client in front of Google-style or translated upstreams |
 
+## Compatibility Modes And Tool Identity
+
+This project is moving toward a client-first `max_compat` posture for translated agent-facing paths while staying protocol-first in the core architecture.
+
+- `strict` is the boundary-checking mode: prefer native semantics, reject high-risk translation, and never invent provider-owned state.
+- `balanced` is the current compatibility style for many translated paths: preserve the portable core, warning when non-portable fields are dropped or degraded.
+- `max_compat` is the intended common operating mode for real agent clients: preserve the portable core, preserve stable client-facing contracts, and add explicit shims where that can be done safely.
+
+Locked contract:
+
+- The proxy must not rewrite the visible tool name supplied by the client. Tool names are part of the semantic contract for both the client and the model. The model must see the original tool name, not a proxy-generated surrogate.
+- `__llmup_custom__*` is an internal transport artifact, not a public contract.
+- `apply_patch` remains a public freeform tool on client-visible surfaces.
+
+Enforcement:
+
+- Reserved synthetic names such as `__llmup_custom__apply_patch` are not part of the public surface. Client-visible output and model-visible tool definitions must reject or clear them instead of treating them as an acceptable translated-path artifact.
+- The current design note and rollout plan for fixing that behavior live in [docs/max-compat-design.md](/home/percy/works/mbos-v1/llm-universal-proxy/docs/max-compat-design.md:1).
+- The phased implementation plan lives in [docs/max-compat-development-plan.md](/home/percy/works/mbos-v1/llm-universal-proxy/docs/max-compat-development-plan.md:1).
+
 ## Codex Metadata And Compact Caveat
 
 When Codex uses a proxy-backed local alias that is not present in Codex's built-in model catalog, Codex falls back to unknown-model metadata. That fallback is not good enough for serious manual testing of custom proxy-backed coding models.
 
 Important practical consequence:
 - Bare `codex` with only `model_provider`, `base_url`, and `wire_api="responses"` can miss `apply_patch`, use the wrong compact threshold, and treat a text-only proxy-backed model as image-capable, which leaves `view_image` enabled when it should be off.
+- Treat any surfaced `__llmup_custom__*` name as a contract failure. Manual and automated checks should validate public tool execution and public tool naming against the original client-facing name such as `apply_patch`.
 
 Prefer the wrapper flow in [Recommended Manual Interactive Testing](#recommended-manual-interactive-testing). The wrapper scripts generate a temporary `model_catalog_json` from your proxy source config, pass it to Codex automatically, and inject `-c 'tools.view_image=false'` for text-only Codex lanes.
 
@@ -172,11 +193,18 @@ bash scripts/test_cli_clients.sh --skip-slow
 bash scripts/test_cli_clients.sh --proxy-only
 ```
 
+Targeted regression case:
+
+```bash
+python3 scripts/real_cli_matrix.py --case codex__minimax-openai__tool_identity_public_contract
+```
+
 Notes:
 - `proxy-test-minimax-and-local.yaml` is the source config for this matrix. The runner derives a temporary runtime config from it instead of editing the file in place.
 - `.env.test` is optional local developer input only and should not be committed. When present, the runner loads it into the proxy subprocess only; it does not become persistent shell state or a shared global client config. Use `--env-file` to point at a different dotenv file.
 - `qwen-local` is optional coverage. It is enabled only when `LOCAL_QWEN_BASE_URL` and `LOCAL_QWEN_MODEL` are both configured; otherwise that lane is skipped. When enabled, the default matrix still limits it to smoke coverage and excludes long-horizon code-edit fixtures.
 - Use this matrix for real end-to-end CLI behavior. For lower-level protocol/HTTP smoke without real CLI processes, use `scripts/real_endpoint_matrix.py` as described below.
+- The `tool_identity_public_contract` smoke fixture is a runnable acceptance harness for this contract. It verifies that CLI-visible output rejects or clears `__llmup_custom__*`; deeper live request-shape assertions still belong in translator/integration coverage.
 
 ## Recommended Manual Interactive Testing
 

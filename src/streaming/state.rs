@@ -47,6 +47,7 @@ pub(super) struct ResponsesMessagePartState {
 pub struct StreamState {
     pub message_id: Option<String>,
     pub model: Option<String>,
+    pub request_scoped_tool_bridge_context: Option<Value>,
     pub openai_tool_call_index: usize,
     pub claude_tool_use_index: usize,
     pub openai_tool_calls: std::collections::HashMap<usize, ToolCallState>,
@@ -107,10 +108,8 @@ pub struct ToolCallState {
     pub name: String,
     pub arguments: String,
     pub non_replayable_marker: Option<Value>,
-    pub bridge_custom_name: Option<String>,
-    pub bridge_decoded_input: String,
-    pub bridge_prefix_emitted: bool,
-    pub bridge_suffix_emitted: bool,
+    pub custom_input_text: Option<String>,
+    pub custom_input_done: bool,
     pub tool_type: Option<String>,
     pub proxied_tool_kind: Option<String>,
     pub gemini_emitted_arguments: Option<String>,
@@ -168,14 +167,10 @@ pub(super) fn dedupe_tool_call_state_by_call_id(
             if entry.non_replayable_marker.is_none() {
                 entry.non_replayable_marker = existing_entry.non_replayable_marker.clone();
             }
-            if entry.bridge_custom_name.is_none() {
-                entry.bridge_custom_name = existing_entry.bridge_custom_name.clone();
+            if entry.custom_input_text.is_none() {
+                entry.custom_input_text = existing_entry.custom_input_text.clone();
             }
-            if entry.bridge_decoded_input.is_empty() {
-                entry.bridge_decoded_input = existing_entry.bridge_decoded_input.clone();
-            }
-            entry.bridge_prefix_emitted |= existing_entry.bridge_prefix_emitted;
-            entry.bridge_suffix_emitted |= existing_entry.bridge_suffix_emitted;
+            entry.custom_input_done |= existing_entry.custom_input_done;
             if entry.tool_type.is_none() {
                 entry.tool_type = existing_entry.tool_type.clone();
             }
@@ -223,38 +218,25 @@ pub(super) fn openai_stream_tool_call_type(value: &Value) -> &'static str {
     }
 }
 
-pub(super) const OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX_STREAM: &str = "__llmup_custom__";
-
-pub(super) fn openai_responses_custom_tool_bridge_name_stream(name: &str) -> String {
-    format!("{OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX_STREAM}{name}")
-}
-
-pub(super) fn openai_responses_custom_tool_name_from_bridge_stream(name: &str) -> Option<&str> {
-    name.strip_prefix(OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX_STREAM)
-        .filter(|name| !name.is_empty())
-}
-
 pub(super) fn escape_json_string_content_stream(value: &str) -> String {
     serde_json::to_string(value)
         .map(|quoted| quoted[1..quoted.len().saturating_sub(1)].to_string())
         .unwrap_or_default()
 }
 
-pub(super) fn openai_responses_custom_bridge_start_delta_stream(input: &str) -> String {
+pub(super) fn openai_custom_bridge_start_delta_stream(input: &str) -> String {
     format!("{{\"input\":\"{}", escape_json_string_content_stream(input))
 }
 
-pub(super) fn openai_responses_custom_bridge_input_delta_stream(input: &str) -> String {
+pub(super) fn openai_custom_bridge_input_delta_stream(input: &str) -> String {
     escape_json_string_content_stream(input)
 }
 
-pub(super) fn openai_responses_custom_bridge_done_delta_stream() -> &'static str {
+pub(super) fn openai_custom_bridge_done_delta_stream() -> &'static str {
     "\"}"
 }
 
-pub(super) fn openai_responses_custom_bridge_decode_arguments_stream(
-    arguments: &str,
-) -> Option<String> {
+pub(super) fn openai_custom_bridge_decode_arguments_stream(arguments: &str) -> Option<String> {
     let value: Value = serde_json::from_str(arguments).ok()?;
     let object = value.as_object()?;
     if object.len() != 1 {
@@ -264,6 +246,27 @@ pub(super) fn openai_responses_custom_bridge_decode_arguments_stream(
         .get("input")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+pub(super) fn request_scoped_openai_custom_bridge_expects_canonical_input_wrapper_stream(
+    bridge_context: Option<&Value>,
+    name: &str,
+) -> bool {
+    let Some(entry) = bridge_context
+        .and_then(|ctx| ctx.get("entries"))
+        .and_then(Value::as_object)
+        .and_then(|entries| entries.get(name))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+
+    entry.get("transport_kind").and_then(Value::as_str) == Some("function_object_wrapper")
+        && entry.get("wrapper_field").and_then(Value::as_str) == Some("input")
+        && entry
+            .get("expected_canonical_shape")
+            .and_then(Value::as_str)
+            == Some("single_required_string")
 }
 
 pub(super) fn gemini_candidate_index(candidate: &Value) -> usize {

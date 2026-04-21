@@ -1411,28 +1411,26 @@ fn flush_pending_responses_tool_call(
             .unwrap_or("")
             .to_string();
         let mut tool_type = tool_call_state_type(entry).to_string();
-        let mut name = entry.name.clone();
+        let name = entry.name.clone();
         let mut arguments = entry.arguments.clone();
         let proxied_tool_kind = entry.proxied_tool_kind.clone();
 
-        if tool_type != "custom" && proxied_tool_kind.is_none() {
-            if let Some(custom_name) =
-                openai_responses_custom_tool_name_from_bridge_stream(&entry.name)
+        if tool_type != "custom"
+            && proxied_tool_kind.is_none()
+            && request_scoped_openai_custom_bridge_expects_canonical_input_wrapper_stream(
+                state.request_scoped_tool_bridge_context.as_ref(),
+                &entry.name,
+            )
+        {
+            if let Some(decoded_input) =
+                openai_custom_bridge_decode_arguments_stream(&entry.arguments)
             {
-                if let Some(decoded_input) =
-                    openai_responses_custom_bridge_decode_arguments_stream(&entry.arguments)
-                {
-                    tool_type = "custom".to_string();
-                    name = custom_name.to_string();
-                    arguments = decoded_input.clone();
-                    entry.tool_type = Some(tool_type.clone());
-                    entry.name = name.clone();
-                    entry.arguments = arguments.clone();
-                    entry.bridge_custom_name = Some(name.clone());
-                    entry.bridge_decoded_input = decoded_input;
-                } else if !finalize {
-                    return;
-                }
+                tool_type = "custom".to_string();
+                arguments = decoded_input;
+                entry.tool_type = Some(tool_type.clone());
+                entry.arguments = arguments.clone();
+            } else if !finalize {
+                return;
             }
         }
 

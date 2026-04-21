@@ -235,7 +235,7 @@ fn openai_chunk_to_claude_sse_translates_bridged_custom_tool_calls_without_rejec
                     "index": 0,
                     "id": "call_custom",
                     "function": {
-                        "name": "__llmup_custom__code_exec",
+                        "name": "code_exec",
                         "arguments": "{\"input\":\"print('hi')\"}"
                     }
                 }]
@@ -259,10 +259,7 @@ fn openai_chunk_to_claude_sse_translates_bridged_custom_tool_calls_without_rejec
 
     assert!(joined.contains("\"type\":\"message_start\""), "{joined}");
     assert!(joined.contains("\"type\":\"tool_use\""), "{joined}");
-    assert!(
-        joined.contains("\"name\":\"__llmup_custom__code_exec\""),
-        "{joined}"
-    );
+    assert!(joined.contains("\"name\":\"code_exec\""), "{joined}");
     assert!(joined.contains("input_json_delta"), "{joined}");
     assert!(
         joined.contains("{\\\"input\\\":\\\"print('hi')\\\"}"),

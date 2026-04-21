@@ -5,6 +5,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
     let mut config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         upstreams: vec![crate::config::UpstreamConfig {
             name: "auto".to_string(),
             api_root: "https://example.com/v1".to_string(),
@@ -15,6 +16,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
             auth_policy: crate::config::AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
             limits: None,
+            surface_defaults: None,
         }],
         model_aliases: Default::default(),
         hooks: crate::config::HookConfig {
@@ -32,6 +34,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
             upstream_name: "auto".to_string(),
             upstream_model: "model-a".to_string(),
             limits: None,
+            surface: None,
         },
     );
     let initial_hooks = crate::hooks::HookDispatcher::new(&config.hooks);
@@ -86,6 +89,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
                 upstream_name: "auto".to_string(),
                 upstream_model: "model-b".to_string(),
                 limits: None,
+                surface: None,
             },
         );
         namespace.upstreams.get_mut("auto").unwrap().availability =

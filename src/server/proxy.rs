@@ -40,6 +40,8 @@ use super::responses_resources::{
 };
 use super::state::{AppState, RuntimeNamespaceState, DEFAULT_NAMESPACE};
 
+const REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD: &str = "_llmup_tool_bridge_context";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RequestBoundaryDecision {
     Allow,
@@ -399,15 +401,19 @@ pub(super) async fn handle_request_core(
         }
     }
 
-    let compatibility_warnings =
-        match classify_request_boundary(client_format, upstream_format, &original_body) {
-            RequestBoundaryDecision::Allow => Vec::new(),
-            RequestBoundaryDecision::AllowWithWarnings(warnings) => warnings,
-            RequestBoundaryDecision::Reject(message) => {
-                tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-                return error_response(client_format, StatusCode::BAD_REQUEST, &message);
-            }
-        };
+    let compatibility_warnings = match classify_request_boundary_with_compatibility_mode(
+        client_format,
+        upstream_format,
+        &original_body,
+        request_translation_policy.compatibility_mode,
+    ) {
+        RequestBoundaryDecision::Allow => Vec::new(),
+        RequestBoundaryDecision::AllowWithWarnings(warnings) => warnings,
+        RequestBoundaryDecision::Reject(message) => {
+            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+            return error_response(client_format, StatusCode::BAD_REQUEST, &message);
+        }
+    };
     for warning in &compatibility_warnings {
         warn!(
             "compatibility downgrade: client_format={} upstream_format={} warning={}",
@@ -452,9 +458,17 @@ pub(super) async fn handle_request_core(
         }
     }
 
+    let request_scoped_tool_bridge_context =
+        body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
+    let mut upstream_request_body = body.clone();
+    if let Some(obj) = upstream_request_body.as_object_mut() {
+        obj.remove(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD);
+    }
+
     debug!(
         "Translated body for upstream: {}",
-        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
+        serde_json::to_string_pretty(&upstream_request_body)
+            .unwrap_or_else(|_| upstream_request_body.to_string())
     );
 
     let (mut auth_headers, effective_credential) =
@@ -496,7 +510,7 @@ pub(super) async fn handle_request_core(
         });
     if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref())
     {
-        recorder.record_request_with_upstream(ctx, &original_body, &body);
+        recorder.record_request_with_upstream(ctx, &original_body, &upstream_request_body);
     }
 
     let url = upstream::upstream_url(
@@ -516,18 +530,25 @@ pub(super) async fn handle_request_core(
     } else {
         &namespace_state.client
     };
-    let res =
-        match upstream::call_upstream(upstream_client, &url, &body, stream, &auth_headers).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-                return if stream {
-                    streaming_error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
-                } else {
-                    error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
-                };
-            }
-        };
+    let res = match upstream::call_upstream(
+        upstream_client,
+        &url,
+        &upstream_request_body,
+        stream,
+        &auth_headers,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+            return if stream {
+                streaming_error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
+            } else {
+                error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
+            };
+        }
+    };
     let preserve_native_upstream_protocol_headers = upstream_format == client_format;
 
     if stream {
@@ -562,7 +583,10 @@ pub(super) async fn handle_request_core(
             Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
         > = if needs_stream_translation(upstream_format, client_format) {
             let translated =
-                TranslateSseStream::new(upstream_stream, upstream_format, client_format);
+                TranslateSseStream::new(upstream_stream, upstream_format, client_format)
+                    .with_request_scoped_tool_bridge_context(
+                        request_scoped_tool_bridge_context.clone(),
+                    );
             Box::pin(translated.map(|r| r.map_err(std::io::Error::other)))
         } else {
             Box::pin(upstream_stream.map(|r| r.map_err(std::io::Error::other)))
@@ -648,7 +672,19 @@ pub(super) async fn handle_request_core(
         }
         return response;
     }
-    let out = match translate_response(upstream_format, client_format, &upstream_body) {
+    let translation_body = if let Some(bridge_context) = request_scoped_tool_bridge_context {
+        let mut translation_body = upstream_body.clone();
+        if let Some(obj) = translation_body.as_object_mut() {
+            obj.insert(
+                REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD.to_string(),
+                bridge_context,
+            );
+        }
+        translation_body
+    } else {
+        upstream_body.clone()
+    };
+    let out = match translate_response(upstream_format, client_format, &translation_body) {
         Ok(v) => v,
         Err(e) => {
             tracker.finish_error(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
@@ -687,12 +723,29 @@ pub(super) async fn handle_request_core(
     response
 }
 
+#[cfg(test)]
 pub(super) fn classify_request_boundary(
     client_format: UpstreamFormat,
     upstream_format: UpstreamFormat,
     body: &Value,
 ) -> RequestBoundaryDecision {
-    match assess_request_translation(client_format, upstream_format, body).decision() {
+    classify_request_boundary_with_compatibility_mode(
+        client_format,
+        upstream_format,
+        body,
+        crate::config::CompatibilityMode::Balanced,
+    )
+}
+
+fn classify_request_boundary_with_compatibility_mode(
+    client_format: UpstreamFormat,
+    upstream_format: UpstreamFormat,
+    body: &Value,
+    compatibility_mode: crate::config::CompatibilityMode,
+) -> RequestBoundaryDecision {
+    match assess_request_translation(client_format, upstream_format, body, compatibility_mode)
+        .decision()
+    {
         TranslationDecision::Allow => RequestBoundaryDecision::Allow,
         TranslationDecision::AllowWithWarnings(warnings) => {
             RequestBoundaryDecision::AllowWithWarnings(warnings)
@@ -766,5 +819,8 @@ fn request_translation_policy(
                 .and_then(|limits| limits.max_output_tokens)
         });
 
-    RequestTranslationPolicy { max_output_tokens }
+    RequestTranslationPolicy {
+        compatibility_mode: namespace_config.compatibility_mode,
+        max_output_tokens,
+    }
 }

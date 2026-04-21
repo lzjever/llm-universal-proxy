@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::formats::UpstreamFormat;
 
+mod model_surface;
+
+pub use self::model_surface::{
+    ApplyPatchTransport, CompatibilityMode, ModelModalities, ModelModality, ModelSurface,
+    ModelSurfacePatch, ModelToolSurface,
+};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum AuthPolicy {
     #[serde(rename = "client_or_fallback", alias = "client-or-fallback")]
@@ -138,6 +145,9 @@ pub struct UpstreamConfig {
     /// Optional default limits for models routed through this upstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ModelLimits>,
+    /// Optional default client-visible surface for aliases on this upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_defaults: Option<ModelSurfacePatch>,
 }
 
 /// One local model alias that resolves to a named upstream and upstream model.
@@ -147,6 +157,8 @@ pub struct ModelAlias {
     pub upstream_model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ModelLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<ModelSurfacePatch>,
 }
 
 /// Resolved model routing decision for one request.
@@ -163,6 +175,8 @@ pub struct Config {
     pub listen: String,
     /// Request timeout to upstream.
     pub upstream_timeout: Duration,
+    /// Compatibility posture for translated request paths in this namespace.
+    pub compatibility_mode: CompatibilityMode,
     /// Named upstreams available to the proxy.
     pub upstreams: Vec<UpstreamConfig>,
     /// Local unique model names mapped to named upstream models.
@@ -225,6 +239,8 @@ pub struct RuntimeUpstreamConfig {
     pub upstream_headers: Vec<(String, String)>,
     #[serde(default)]
     pub limits: Option<ModelLimits>,
+    #[serde(default)]
+    pub surface_defaults: Option<ModelSurfacePatch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -233,6 +249,8 @@ pub struct RuntimeConfigPayload {
     pub listen: String,
     #[serde(default = "default_upstream_timeout_secs")]
     pub upstream_timeout_secs: u64,
+    #[serde(default)]
+    pub compatibility_mode: CompatibilityMode,
     #[serde(default)]
     pub upstreams: Vec<RuntimeUpstreamConfig>,
     #[serde(default)]
@@ -254,6 +272,7 @@ pub struct AdminModelAliasView {
     pub upstream_name: String,
     pub upstream_model: String,
     pub limits: Option<ModelLimits>,
+    pub surface: Option<ModelSurfacePatch>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -295,12 +314,14 @@ pub struct AdminUpstreamConfigView {
     pub auth_policy: AuthPolicy,
     pub upstream_headers: Vec<AdminHeaderValueView>,
     pub limits: Option<ModelLimits>,
+    pub surface_defaults: Option<ModelSurfacePatch>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AdminConfigView {
     pub listen: String,
     pub upstream_timeout_secs: u64,
+    pub compatibility_mode: CompatibilityMode,
     pub upstreams: Vec<AdminUpstreamConfigView>,
     pub model_aliases: BTreeMap<String, AdminModelAliasView>,
     pub hooks: AdminHookConfigView,
@@ -313,6 +334,8 @@ struct FileConfig {
     listen: String,
     #[serde(default = "default_upstream_timeout_secs")]
     upstream_timeout_secs: u64,
+    #[serde(default)]
+    compatibility_mode: CompatibilityMode,
     #[serde(default)]
     upstreams: BTreeMap<String, UpstreamConfigFile>,
     #[serde(default)]
@@ -350,6 +373,8 @@ struct UpstreamConfigFile {
     upstream_headers: BTreeMap<String, String>,
     #[serde(default)]
     limits: Option<ModelLimits>,
+    #[serde(default)]
+    surface_defaults: Option<ModelSurfacePatch>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -364,6 +389,8 @@ struct StructuredModelAliasFile {
     target: String,
     #[serde(default)]
     limits: Option<ModelLimits>,
+    #[serde(default)]
+    surface: Option<ModelSurfacePatch>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -394,6 +421,7 @@ impl Default for Config {
         Self {
             listen: default_listen(),
             upstream_timeout: Duration::from_secs(default_upstream_timeout_secs()),
+            compatibility_mode: CompatibilityMode::default(),
             upstreams: Vec::new(),
             model_aliases: BTreeMap::new(),
             hooks: HookConfig::default(),
@@ -436,6 +464,7 @@ impl Config {
                     auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers.into_iter().collect(),
                     limits: item.limits,
+                    surface_defaults: item.surface_defaults,
                 }
             })
             .collect();
@@ -444,9 +473,9 @@ impl Config {
             .model_aliases
             .into_iter()
             .filter_map(|(alias, item)| {
-                let (target, limits) = match item {
-                    ModelAliasFile::Target(target) => (target, None),
-                    ModelAliasFile::Structured(item) => (item.target, item.limits),
+                let (target, limits, surface) = match item {
+                    ModelAliasFile::Target(target) => (target, None, None),
+                    ModelAliasFile::Structured(item) => (item.target, item.limits, item.surface),
                 };
                 let (upstream_name, upstream_model) = target.split_once(':')?;
                 Some((
@@ -455,6 +484,7 @@ impl Config {
                         upstream_name: upstream_name.to_string(),
                         upstream_model: upstream_model.to_string(),
                         limits,
+                        surface,
                     },
                 ))
             })
@@ -463,6 +493,7 @@ impl Config {
         Ok(Self {
             listen: parsed.listen,
             upstream_timeout: Duration::from_secs(parsed.upstream_timeout_secs),
+            compatibility_mode: parsed.compatibility_mode,
             upstreams,
             model_aliases,
             hooks: HookConfig {
@@ -549,6 +580,9 @@ impl Config {
             if let Some(limits) = &upstream.limits {
                 limits.validate(&format!("upstream `{}`", upstream.name))?;
             }
+            if let Some(surface_defaults) = &upstream.surface_defaults {
+                surface_defaults.validate(&format!("upstream `{}`", upstream.name))?;
+            }
         }
 
         self.validate_hook("exchange", self.hooks.exchange.as_ref())?;
@@ -582,6 +616,9 @@ impl Config {
             }
             if let Some(limits) = &target.limits {
                 limits.validate(&format!("model alias `{alias}`"))?;
+            }
+            if let Some(surface) = &target.surface {
+                surface.validate(&format!("model alias `{alias}`"))?;
             }
         }
 
@@ -626,6 +663,19 @@ impl Config {
         match upstream_limits {
             Some(base) => base.merged_with(alias.limits.as_ref()),
             None => alias.limits.clone(),
+        }
+    }
+
+    pub fn effective_model_surface(&self, alias: &ModelAlias) -> ModelSurface {
+        let merged_surface = self
+            .upstream(&alias.upstream_name)
+            .and_then(|item| item.surface_defaults.clone())
+            .unwrap_or_default()
+            .merged_with(alias.surface.as_ref());
+        ModelSurface {
+            limits: self.effective_model_limits(alias),
+            modalities: merged_surface.modalities,
+            tools: merged_surface.tools,
         }
     }
 
@@ -699,6 +749,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
                     auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers,
                     limits: item.limits,
+                    surface_defaults: item.surface_defaults,
                 }
             })
             .collect::<Vec<_>>();
@@ -706,6 +757,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
         let config = Self {
             listen: value.listen,
             upstream_timeout: Duration::from_secs(value.upstream_timeout_secs),
+            compatibility_mode: value.compatibility_mode,
             upstreams,
             model_aliases: value.model_aliases,
             hooks: HookConfig {
@@ -734,6 +786,7 @@ impl From<&Config> for RuntimeConfigPayload {
         Self {
             listen: value.listen.clone(),
             upstream_timeout_secs: value.upstream_timeout.as_secs(),
+            compatibility_mode: value.compatibility_mode,
             upstreams: value
                 .upstreams
                 .iter()
@@ -746,6 +799,7 @@ impl From<&Config> for RuntimeConfigPayload {
                     auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers.clone(),
                     limits: item.limits.clone(),
+                    surface_defaults: item.surface_defaults.clone(),
                 })
                 .collect(),
             model_aliases: value.model_aliases.clone(),
@@ -781,6 +835,7 @@ impl From<&Config> for AdminConfigView {
         Self {
             listen: value.listen.clone(),
             upstream_timeout_secs: value.upstream_timeout.as_secs(),
+            compatibility_mode: value.compatibility_mode,
             upstreams: value
                 .upstreams
                 .iter()
@@ -798,6 +853,7 @@ impl From<&Config> for AdminConfigView {
                         .map(|(name, value)| admin_header_view(name, value))
                         .collect(),
                     limits: item.limits.clone(),
+                    surface_defaults: item.surface_defaults.clone(),
                 })
                 .collect(),
             model_aliases: value
@@ -810,6 +866,7 @@ impl From<&Config> for AdminConfigView {
                             upstream_name: model.upstream_name.clone(),
                             upstream_model: model.upstream_model.clone(),
                             limits: model.limits.clone(),
+                            surface: model.surface.clone(),
                         },
                     )
                 })
@@ -1123,6 +1180,30 @@ model_aliases:
     }
 
     #[test]
+    fn config_defaults_compatibility_mode_to_max_compat() {
+        assert_eq!(CompatibilityMode::default(), CompatibilityMode::MaxCompat);
+        assert_eq!(
+            Config::default().compatibility_mode,
+            CompatibilityMode::MaxCompat
+        );
+    }
+
+    #[test]
+    fn config_from_yaml_str_defaults_compatibility_mode_when_omitted() {
+        let c = Config::from_yaml_str(
+            r#"
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(c.compatibility_mode, CompatibilityMode::MaxCompat);
+    }
+
+    #[test]
     fn config_from_yaml_requires_upstreams() {
         let c = Config::from_yaml_str("listen: 127.0.0.1:8080").unwrap();
         assert!(c.validate().is_err());
@@ -1141,6 +1222,7 @@ model_aliases:
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
                 limits: None,
+                surface_defaults: None,
             }],
             ..Config::default()
         };
@@ -1175,6 +1257,7 @@ model_aliases:
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
                     limits: None,
+                    surface_defaults: None,
                 },
                 UpstreamConfig {
                     name: "openai".to_string(),
@@ -1186,6 +1269,7 @@ model_aliases:
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
                     limits: None,
+                    surface_defaults: None,
                 },
             ],
             ..Config::default()
@@ -1208,6 +1292,7 @@ model_aliases:
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
                 limits: None,
+                surface_defaults: None,
             }],
             ..Config::default()
         };
@@ -1217,6 +1302,7 @@ model_aliases:
                 upstream_name: "glm".to_string(),
                 upstream_model: "GLM-5".to_string(),
                 limits: None,
+                surface: None,
             },
         );
         let resolved = c.resolve_model("GLM-5").unwrap();
@@ -1237,6 +1323,7 @@ model_aliases:
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
                 limits: None,
+                surface_defaults: None,
             }],
             ..Config::default()
         };
@@ -1259,6 +1346,7 @@ model_aliases:
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
                     limits: None,
+                    surface_defaults: None,
                 },
                 UpstreamConfig {
                     name: "b".to_string(),
@@ -1270,6 +1358,7 @@ model_aliases:
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
                     limits: None,
+                    surface_defaults: None,
                 },
             ],
             ..Config::default()
@@ -1286,6 +1375,7 @@ model_aliases:
                 upstream_name: "missing".to_string(),
                 upstream_model: "GLM-5".to_string(),
                 limits: None,
+                surface: None,
             },
         );
         assert!(c.validate().is_err());
@@ -1400,6 +1490,7 @@ upstreams:
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             upstream_timeout: Duration::from_secs(30),
+            compatibility_mode: CompatibilityMode::Balanced,
             upstreams: vec![UpstreamConfig {
                 name: "default".to_string(),
                 api_root: "https://user:pass@api.openai.com/v1?api_key=inline-secret#frag"
@@ -1430,6 +1521,7 @@ upstreams:
                     ("x-service-apikey".to_string(), "apikey-secret".to_string()),
                 ],
                 limits: None,
+                surface_defaults: None,
             }],
             model_aliases: Default::default(),
             hooks: HookConfig {
