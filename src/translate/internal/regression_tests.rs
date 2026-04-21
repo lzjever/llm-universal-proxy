@@ -1,5 +1,5 @@
 use super::{
-    can_attach_cache_control_to_content_block, convert_claude_message_to_openai,
+    can_attach_cache_control_to_content_block, convert_claude_message_to_openai_impl,
     openai_message_to_claude_blocks, openai_to_claude,
 };
 use serde_json::json;
@@ -74,7 +74,7 @@ fn claude_server_tool_use_is_preserved_as_marked_openai_tool_call() {
         }]
     });
 
-    let translated = convert_claude_message_to_openai(&message)
+    let translated = convert_claude_message_to_openai_impl(&message, false, None)
         .expect("translated message")
         .expect("openai messages");
     assert_eq!(translated.len(), 1);

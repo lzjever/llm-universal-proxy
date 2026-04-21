@@ -1559,10 +1559,6 @@ fn convert_claude_message_to_openai_impl(
     Ok(Some(vec![m]))
 }
 
-fn convert_claude_message_to_openai(msg: &Value) -> Result<Option<Vec<Value>>, String> {
-    convert_claude_message_to_openai_impl(msg, false, None)
-}
-
 fn collapse_claude_text_parts_for_openai(parts: &[Value]) -> Value {
     collapse_openai_text_parts(parts)
 }
