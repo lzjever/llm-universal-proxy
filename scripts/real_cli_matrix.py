@@ -771,6 +771,29 @@ def _render_model_limits(lines: list[str], indent: str, limits: ModelLimits | No
         lines.append(f"{indent}  max_output_tokens: {limits.max_output_tokens}")
 
 
+def _render_surface_metadata(
+    lines: list[str],
+    indent: str,
+    section_name: str,
+    surface: SurfaceMetadata | None,
+) -> None:
+    if surface is None:
+        return
+    if surface.input_modalities is None and surface.supports_search is None:
+        return
+    lines.append(f"{indent}{section_name}:")
+    if surface.input_modalities is not None:
+        lines.append(f"{indent}  modalities:")
+        lines.append(
+            f"{indent}    input: {render_scalar(list(surface.input_modalities))}"
+        )
+    if surface.supports_search is not None:
+        lines.append(f"{indent}  tools:")
+        lines.append(
+            f"{indent}    supports_search: {render_scalar(surface.supports_search)}"
+        )
+
+
 def _target_upstream_name(target: str) -> str | None:
     if ":" not in target:
         return None
@@ -784,6 +807,15 @@ def _merged_codex_metadata(
     if base is None:
         return override
     return base.merged_with(override)
+
+
+def _effective_surface_metadata(
+    upstream_surface: SurfaceMetadata | None,
+    alias_surface: SurfaceMetadata | None = None,
+) -> SurfaceMetadata | None:
+    if upstream_surface is None:
+        return alias_surface
+    return upstream_surface.merged_with(alias_surface)
 
 
 def _codex_metadata_from_surface(
@@ -823,31 +855,34 @@ def resolve_codex_model_metadata(
         upstream_name = _target_upstream_name(model_name)
         if upstream_name is None:
             return None
+        legacy_metadata = config.upstream_codex_metadata.get(upstream_name)
+        surface_metadata = _codex_metadata_from_surface(
+            _effective_surface_metadata(config.upstream_surface_defaults.get(upstream_name))
+        )
         metadata = _merged_codex_metadata(
-            _codex_metadata_from_surface(
-                config.upstream_surface_defaults.get(upstream_name)
-            ),
-            config.upstream_codex_metadata.get(upstream_name),
+            legacy_metadata,
+            surface_metadata,
         )
         return metadata if metadata is not None else DEFAULT_PROXY_CODEX_METADATA
 
     upstream_name = _target_upstream_name(alias_config.target)
-    surface_metadata = _merged_codex_metadata(
-        _codex_metadata_from_surface(
+    surface_metadata = _codex_metadata_from_surface(
+        _effective_surface_metadata(
             config.upstream_surface_defaults.get(upstream_name)
             if upstream_name is not None
-            else None
-        ),
-        _codex_metadata_from_surface(alias_config.surface),
+            else None,
+            alias_config.surface,
+        )
+    )
+    legacy_metadata = _merged_codex_metadata(
+        config.upstream_codex_metadata.get(upstream_name)
+        if upstream_name is not None
+        else None,
+        alias_config.codex_metadata,
     )
     metadata = _merged_codex_metadata(
+        legacy_metadata,
         surface_metadata,
-        _merged_codex_metadata(
-            config.upstream_codex_metadata.get(upstream_name)
-            if upstream_name is not None
-            else None,
-            alias_config.codex_metadata,
-        ),
     )
     return metadata if metadata is not None else DEFAULT_PROXY_CODEX_METADATA
 
@@ -915,6 +950,12 @@ def _render_runtime_upstreams_section(
         for key, value in values.items():
             lines.append(f"    {key}: {render_scalar(value)}")
         _render_model_limits(lines, "    ", config.upstream_limits.get(upstream_name))
+        _render_surface_metadata(
+            lines,
+            "    ",
+            "surface_defaults",
+            config.upstream_surface_defaults.get(upstream_name),
+        )
     return lines
 
 
@@ -923,12 +964,13 @@ def _render_runtime_aliases_section(
 ) -> list[str]:
     lines = ["model_aliases:"]
     for alias_name, alias_config in _runtime_alias_configs(config, dotenv_env).items():
-        if alias_config.limits is None:
+        if alias_config.limits is None and alias_config.surface is None:
             lines.append(f"  {alias_name}: {json.dumps(alias_config.target)}")
             continue
         lines.append(f"  {alias_name}:")
         lines.append(f"    target: {json.dumps(alias_config.target)}")
         _render_model_limits(lines, "    ", alias_config.limits)
+        _render_surface_metadata(lines, "    ", "surface", alias_config.surface)
     return lines
 
 
@@ -1867,8 +1909,7 @@ def build_client_command(
             "--ephemeral",
             "--json",
             "--skip-git-repo-check",
-            "--sandbox",
-            "workspace-write" if fixture.kind == "long_horizon" else "read-only",
+            "--dangerously-bypass-approvals-and-sandbox",
             "-C",
             str(workspace_dir),
             "-c",

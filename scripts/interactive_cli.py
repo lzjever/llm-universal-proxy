@@ -112,6 +112,7 @@ def build_interactive_command(
             str(workspace),
             "-m",
             model,
+            "--dangerously-bypass-approvals-and-sandbox",
             "-c",
             'model_provider="proxy"',
             "-c",
@@ -139,6 +140,7 @@ def build_interactive_command(
             "user",
             "--model",
             model,
+            "--dangerously-skip-permissions",
             "--add-dir",
             str(workspace),
         ]
@@ -152,6 +154,8 @@ def build_interactive_command(
             "gemini",
             "--model",
             model,
+            "--sandbox=false",
+            "--yolo",
             "--include-directories",
             str(workspace),
         ]

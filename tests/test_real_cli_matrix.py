@@ -429,6 +429,50 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertIn("context_window: 200000", rendered)
         self.assertIn("max_output_tokens: 64000", rendered)
 
+    def test_build_runtime_config_serializes_upstream_surface_defaults_and_alias_surface(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    surface_defaults:
+                      modalities:
+                        input: ["text"]
+                      tools:
+                        supports_search: false
+                model_aliases:
+                  vision-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-Vision"
+                    surface:
+                      modalities:
+                        input: ["text", "image"]
+                      tools:
+                        supports_search: true
+                """
+            )
+        )
+
+        rendered = module.build_runtime_config_text(
+            parsed,
+            {},
+            listen_host="127.0.0.1",
+            listen_port=19999,
+            trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
+        )
+
+        self.assertIn("surface_defaults:", rendered)
+        self.assertIn('input: ["text"]', rendered)
+        self.assertIn("supports_search: false", rendered)
+        self.assertIn("surface:", rendered)
+        self.assertIn('input: ["text", "image"]', rendered)
+        self.assertIn("supports_search: true", rendered)
+
     def test_resolve_model_limits_inherits_upstream_defaults_and_alias_overrides(self):
         module = load_module()
         parsed = module.parse_proxy_source(
@@ -997,7 +1041,7 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(payload["models"][0]["input_modalities"], ["text", "image"])
         self.assertTrue(payload["models"][0]["supports_search_tool"])
 
-    def test_resolve_codex_model_metadata_merges_legacy_codex_over_surface_derived_values(self):
+    def test_resolve_codex_model_metadata_uses_legacy_codex_only_for_surface_gaps(self):
         module = load_module()
         parsed = module.parse_proxy_source(
             textwrap.dedent(
@@ -1020,8 +1064,6 @@ class RealCliMatrixTests(unittest.TestCase):
                     surface:
                       modalities:
                         input: ["text", "image"]
-                      tools:
-                        supports_search: true
                     codex:
                       supports_search_tool: false
                 """
@@ -1032,6 +1074,48 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertEqual(metadata.input_modalities, ("text", "image"))
         self.assertFalse(metadata.supports_search_tool)
+
+    def test_resolve_codex_model_metadata_prefers_effective_surface_over_upstream_legacy_codex(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    surface_defaults:
+                      modalities:
+                        input: ["text"]
+                      tools:
+                        supports_search: false
+                    codex:
+                      input_modalities: ["text", "image"]
+                      supports_search_tool: true
+                model_aliases:
+                  vision-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-Vision"
+                    surface:
+                      modalities:
+                        input: ["text", "image"]
+                      tools:
+                        supports_search: false
+                """
+            )
+        )
+
+        direct_metadata = module.resolve_codex_model_metadata(
+            parsed, "MINIMAX-OPENAI:MiniMax-Vision"
+        )
+        alias_metadata = module.resolve_codex_model_metadata(parsed, "vision-openai")
+
+        self.assertEqual(direct_metadata.input_modalities, ("text",))
+        self.assertFalse(direct_metadata.supports_search_tool)
+        self.assertEqual(alias_metadata.input_modalities, ("text", "image"))
+        self.assertFalse(alias_metadata.supports_search_tool)
 
     def test_build_client_command_uses_known_good_gemini_sandbox_flag_form(self):
         module = load_module()
@@ -1048,6 +1132,39 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertIn("--sandbox=false", command)
         self.assertNotIn("--sandbox", command)
+        self.assertIn("--yolo", command)
+
+    def test_build_client_command_uses_codex_dangerous_bypass_mode(self):
+        module = load_module()
+        lane = make_lane(module, name="minimax-openai", proxy_model="minimax-openai")
+        fixture = make_fixture(module)
+
+        command = module.build_client_command(
+            "codex",
+            "http://127.0.0.1:18888",
+            lane,
+            fixture,
+            pathlib.Path("/tmp/workspace").resolve(),
+            client_home=pathlib.Path("/tmp/codex-home").resolve(),
+        )
+
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertNotIn("--sandbox", command)
+
+    def test_build_client_command_uses_claude_dangerous_skip_permissions(self):
+        module = load_module()
+        lane = make_lane(module, name="claude-haiku-4-5", proxy_model="claude-haiku-4-5")
+        fixture = make_fixture(module)
+
+        command = module.build_client_command(
+            "claude",
+            "http://127.0.0.1:18888",
+            lane,
+            fixture,
+            pathlib.Path("/tmp/workspace").resolve(),
+        )
+
+        self.assertIn("--dangerously-skip-permissions", command)
 
     def test_build_client_command_injects_codex_model_catalog_for_capacity_aware_alias(self):
         module = load_module()
@@ -1074,6 +1191,8 @@ class RealCliMatrixTests(unittest.TestCase):
         )
 
         joined = " ".join(command)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertNotIn("--sandbox", command)
         self.assertIn("model_catalog_json", joined)
         self.assertIn(str(home_dir / ".codex" / "catalog.json"), joined)
         self.assertIn('web_search="disabled"', joined)

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.2.9 - 2026-04-21
+
+- Fixed wrapper-generated runtime config serialization so managed proxy launches now preserve upstream `surface_defaults` and structured alias `surface` overrides instead of silently dropping model-surface metadata when rewriting the source config for test and interactive runs.
+- Corrected Codex metadata resolution to follow the proxy's effective-surface precedence: alias `surface` now overrides upstream surface defaults on client-facing metadata, while legacy `codex` fields only fill gaps instead of incorrectly overriding the effective model surface.
+- Updated the interactive client wrappers and their regression coverage around maximum-permission / yolo startup flags so Codex, Claude, and Gemini launch with the intended non-interactive approval posture for these proxy-driven harnesses.
+
 ## v0.2.8 - 2026-04-20
 
 - Switched the default compatibility posture to `max_compat`, so translated agent-facing paths now prefer the safer client-usable bridge behavior by default while still keeping `strict` and `balanced` available for tighter boundary control.

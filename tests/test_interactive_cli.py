@@ -67,6 +67,7 @@ class InteractiveCliTests(unittest.TestCase):
                 str(workspace),
                 "-m",
                 "minimax-openai",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "-c",
                 'model_provider="proxy"',
                 "-c",
@@ -93,6 +94,7 @@ class InteractiveCliTests(unittest.TestCase):
                 "user",
                 "--model",
                 "claude-haiku-4-5",
+                "--dangerously-skip-permissions",
                 "--add-dir",
                 str(workspace),
             ],
@@ -110,6 +112,8 @@ class InteractiveCliTests(unittest.TestCase):
                 "gemini",
                 "--model",
                 "minimax-openai",
+                "--sandbox=false",
+                "--yolo",
                 "--include-directories",
                 str(workspace),
             ],
@@ -293,6 +297,83 @@ class InteractiveCliTests(unittest.TestCase):
         start_proxy.assert_called_once()
         wait_for_health.assert_called_once_with("http://127.0.0.1:18888", timeout_secs=65)
         stop_proxy.assert_called_once_with(fake_process, terminate_grace_secs=15)
+
+    def test_start_managed_proxy_serializes_surface_fields_into_runtime_config(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            config_source = root / "proxy.yaml"
+            config_source.write_text(
+                """
+listen: 127.0.0.1:18888
+upstreams:
+  MINIMAX-OPENAI:
+    api_root: "https://api.minimaxi.com/v1"
+    format: openai-completion
+    credential_actual: "secret"
+    auth_policy: force_server
+    surface_defaults:
+      modalities:
+        input: ["text"]
+      tools:
+        supports_search: false
+model_aliases:
+  vision-openai:
+    target: "MINIMAX-OPENAI:MiniMax-Vision"
+    surface:
+      modalities:
+        input: ["text", "image"]
+      tools:
+        supports_search: true
+""".lstrip(),
+                encoding="utf-8",
+            )
+            env_file = root / ".env.test"
+            env_file.write_text("", encoding="utf-8")
+            args = module.parse_args(
+                [
+                    "--client",
+                    "codex",
+                    "--config-source",
+                    str(config_source),
+                    "--env-file",
+                    str(env_file),
+                    "--binary",
+                    str(root / "llm-universal-proxy"),
+                ]
+            )
+
+            fake_process = object()
+            with mock.patch.object(
+                module, "ensure_proxy_binary"
+            ), mock.patch.object(
+                module, "prepare_proxy_env", return_value={"PATH": os.environ.get("PATH", "")}
+            ), mock.patch.object(
+                module,
+                "start_proxy",
+                return_value=(
+                    fake_process,
+                    root / "runtime-config.yaml",
+                    root / "proxy.stdout.log",
+                    root / "proxy.stderr.log",
+                ),
+            ) as start_proxy:
+                proxy_base, process = module.start_managed_proxy(
+                    args,
+                    {"PATH": os.environ.get("PATH", "")},
+                    root / "runtime-root",
+                )
+
+        self.assertEqual(proxy_base, "http://127.0.0.1:18888")
+        self.assertIs(process, fake_process)
+        runtime_config_text = start_proxy.call_args.args[1]
+        self.assertIn("surface_defaults:", runtime_config_text)
+        self.assertIn('input: ["text"]', runtime_config_text)
+        self.assertIn("supports_search: false", runtime_config_text)
+        self.assertIn("surface:", runtime_config_text)
+        self.assertIn('input: ["text", "image"]', runtime_config_text)
+        self.assertIn("supports_search: true", runtime_config_text)
 
     def test_parse_args_exposes_structured_timeout_policy(self):
         module = load_module()
