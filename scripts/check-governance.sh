@@ -59,7 +59,13 @@ check_contains "Makefile" "check --locked"
 
 check_contains "scripts/test-and-report.sh" "test --locked --no-fail-fast"
 check_contains "scripts/test_cli_clients.sh" "real_cli_matrix.py"
-check_contains "scripts/real_cli_matrix.py" 'DEFAULT_PROXY_BINARY = REPO_ROOT / "target" / "release" / "llm-universal-proxy"'
+check_contains "scripts/real_cli_matrix.py" "def default_proxy_binary_path("
+check_contains "scripts/real_cli_matrix.py" 'DEFAULT_RELEASE_PROXY_BINARY = REPO_ROOT / "target" / "release" / "llm-universal-proxy"'
+check_contains "scripts/real_cli_matrix.py" 'DEFAULT_DEBUG_PROXY_BINARY = REPO_ROOT / "target" / "debug" / "llm-universal-proxy"'
+check_contains "scripts/real_cli_matrix.py" 'DEFAULT_PROXY_BINARY = default_proxy_binary_path()'
+check_contains "scripts/real_cli_matrix.py" 'default=str(default_proxy_binary_path())'
+check_contains "scripts/interactive_cli.py" 'default=str(default_proxy_binary_path())'
+check_absent "scripts/real_cli_matrix.py" 'DEFAULT_PROXY_BINARY = REPO_ROOT / "target" / "release" / "llm-universal-proxy"'
 check_contains "scripts/test_compatibility.sh" "cargo build --locked --release"
 
 check_contains ".github/workflows/ci.yml" "bash scripts/check-governance.sh"

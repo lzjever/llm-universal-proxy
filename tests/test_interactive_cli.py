@@ -28,6 +28,18 @@ def load_module():
 
 
 class InteractiveCliTests(unittest.TestCase):
+    def test_parse_args_uses_resolved_default_proxy_binary(self):
+        module = load_module()
+
+        with mock.patch.object(
+            module,
+            "default_proxy_binary_path",
+            return_value=pathlib.Path("/tmp/fresh-proxy"),
+        ):
+            args = module.parse_args(["--client", "codex"])
+
+        self.assertEqual(args.binary, "/tmp/fresh-proxy")
+
     def test_wrapper_scripts_resolve_interactive_cli_relative_to_script_dir(self):
         for wrapper_path in WRAPPER_PATHS:
             with self.subTest(wrapper=wrapper_path.name):

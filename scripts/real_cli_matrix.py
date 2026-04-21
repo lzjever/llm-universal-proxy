@@ -30,7 +30,8 @@ DEFAULT_CONFIG_SOURCE = REPO_ROOT / "proxy-test-minimax-and-local.yaml"
 DEFAULT_ENV_FILE = REPO_ROOT / ".env.test"
 DEFAULT_FIXTURES_ROOT = REPO_ROOT / "scripts" / "fixtures" / "cli_matrix"
 DEFAULT_REPORTS_ROOT = REPO_ROOT / "test-reports" / "cli-matrix"
-DEFAULT_PROXY_BINARY = REPO_ROOT / "target" / "release" / "llm-universal-proxy"
+DEFAULT_RELEASE_PROXY_BINARY = REPO_ROOT / "target" / "release" / "llm-universal-proxy"
+DEFAULT_DEBUG_PROXY_BINARY = REPO_ROOT / "target" / "debug" / "llm-universal-proxy"
 VALID_PHASES = {
     "all",
     "basic",
@@ -245,6 +246,26 @@ DEFAULT_CODEX_BASE_INSTRUCTIONS = (
 
 def normalize_proxy_base(proxy_base: str) -> str:
     return proxy_base.rstrip("/")
+
+
+def default_proxy_binary_path(
+    *,
+    release_binary: pathlib.Path = DEFAULT_RELEASE_PROXY_BINARY,
+    debug_binary: pathlib.Path = DEFAULT_DEBUG_PROXY_BINARY,
+) -> pathlib.Path:
+    candidates = [binary for binary in (release_binary, debug_binary) if binary.exists()]
+    if not candidates:
+        return release_binary
+    return max(
+        candidates,
+        key=lambda binary: (
+            binary.stat().st_mtime_ns,
+            1 if binary == debug_binary else 0,
+        ),
+    )
+
+
+DEFAULT_PROXY_BINARY = default_proxy_binary_path()
 
 
 def _parse_surface_metadata_value(
@@ -2469,7 +2490,7 @@ def resolve_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))
     parser.add_argument("--fixtures-root", default=str(DEFAULT_FIXTURES_ROOT))
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
-    parser.add_argument("--binary", default=str(DEFAULT_PROXY_BINARY))
+    parser.add_argument("--binary", default=str(default_proxy_binary_path()))
     parser.add_argument("--proxy-host", default="127.0.0.1")
     parser.add_argument("--proxy-port", type=int, default=int(os.environ.get("PROXY_PORT", "18888")))
     add_timeout_policy_args(parser, include_case_thresholds=True)

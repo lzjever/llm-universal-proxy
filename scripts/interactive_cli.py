@@ -21,12 +21,12 @@ from real_cli_matrix import (  # noqa: E402
     CodexModelMetadata,
     DEFAULT_CONFIG_SOURCE,
     DEFAULT_ENV_FILE,
-    DEFAULT_PROXY_BINARY,
     ModelLimits,
     add_timeout_policy_args,
     build_client_env,
     build_codex_catalog_args,
     build_runtime_config_text,
+    default_proxy_binary_path,
     ensure_no_public_internal_tool_artifacts,
     fetch_live_model_profile,
     load_dotenv_file,
@@ -67,7 +67,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--proxy-base")
     parser.add_argument("--config-source", default=str(DEFAULT_CONFIG_SOURCE))
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE))
-    parser.add_argument("--binary", default=str(DEFAULT_PROXY_BINARY))
+    parser.add_argument("--binary", default=str(default_proxy_binary_path()))
     parser.add_argument("--proxy-host", default="127.0.0.1")
     parser.add_argument(
         "--proxy-port",

@@ -174,6 +174,39 @@ def make_case(module, *, client_name, lane=None, fixture=None, case_id=None):
 
 
 class RealCliMatrixTests(unittest.TestCase):
+    def test_default_proxy_binary_path_prefers_newer_debug_build(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            release_binary = root / "target" / "release" / "llm-universal-proxy"
+            debug_binary = root / "target" / "debug" / "llm-universal-proxy"
+            release_binary.parent.mkdir(parents=True, exist_ok=True)
+            debug_binary.parent.mkdir(parents=True, exist_ok=True)
+            release_binary.write_text("", encoding="utf-8")
+            debug_binary.write_text("", encoding="utf-8")
+            os.utime(release_binary, (100, 100))
+            os.utime(debug_binary, (200, 200))
+
+            resolved = module.default_proxy_binary_path(
+                release_binary=release_binary,
+                debug_binary=debug_binary,
+            )
+
+        self.assertEqual(resolved, debug_binary)
+
+    def test_resolve_cli_args_uses_resolved_default_proxy_binary(self):
+        module = load_module()
+
+        with mock.patch.object(
+            module,
+            "default_proxy_binary_path",
+            return_value=pathlib.Path("/tmp/fresh-proxy"),
+        ):
+            args = module.resolve_cli_args([])
+
+        self.assertEqual(args.binary, "/tmp/fresh-proxy")
+
     def test_parse_dotenv_exports_reads_export_lines(self):
         module = load_module()
 
