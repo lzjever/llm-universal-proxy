@@ -12,12 +12,14 @@ use axum::{
     Json, Router,
 };
 use bytes::Bytes;
-use common::*;
+use common::mock_upstream::*;
+use common::proxy_helpers::proxy_config;
+use common::runtime_proxy::{start_proxy, upstream_api_root};
 use futures_util::{future::join_all, stream, StreamExt};
 use llm_universal_proxy::config::{
     ApplyPatchTransport, AuthPolicy, CompatibilityMode, Config, DebugTraceConfig, HookConfig,
     HookEndpointConfig, ModelAlias, ModelLimits, ModelModalities, ModelModality, ModelSurface,
-    ModelSurfacePatch, ModelToolSurface, RuntimeConfigPayload, RuntimeHookConfig,
+    ModelSurfacePatch, ModelToolSurface, ProxyConfig, RuntimeConfigPayload, RuntimeHookConfig,
     RuntimeUpstreamConfig, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
@@ -84,6 +86,7 @@ fn named_upstream(
         fallback_api_key: fallback_api_key.map(ToString::to_string),
         auth_policy: AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
+        proxy: None,
         limits: None,
         surface_defaults: None,
     }
@@ -128,6 +131,7 @@ fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout_secs: 30,
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![RuntimeUpstreamConfig {
             name: "default".to_string(),
             api_root: upstream_api_root(mock_base, UpstreamFormat::OpenAiCompletion),
@@ -136,6 +140,7 @@ fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
             fallback_credential_actual: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            proxy: None,
             limits: None,
             surface_defaults: None,
         }],
@@ -232,10 +237,15 @@ model_aliases:
 fn runtime_config_round_trip_preserves_model_alias_limits() {
     let mut payload = demo_runtime_config("http://example.com");
     payload.compatibility_mode = CompatibilityMode::MaxCompat;
+    payload.proxy = Some(ProxyConfig::Proxy {
+        url: "http://global-user:global-pass@proxy.example:8080/global-hop?token=secret#frag"
+            .to_string(),
+    });
     payload.upstreams[0].limits = Some(ModelLimits {
         context_window: Some(200_000),
         max_output_tokens: Some(128_000),
     });
+    payload.upstreams[0].proxy = Some(ProxyConfig::Direct);
     payload.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
         modalities: Some(ModelModalities {
             input: Some(vec![ModelModality::Text]),
@@ -276,6 +286,14 @@ fn runtime_config_round_trip_preserves_model_alias_limits() {
     let round_trip = RuntimeConfigPayload::from(&config);
 
     assert_eq!(round_trip.compatibility_mode, CompatibilityMode::MaxCompat);
+    assert_eq!(
+        round_trip.proxy,
+        Some(ProxyConfig::Proxy {
+            url: "http://global-user:global-pass@proxy.example:8080/global-hop?token=secret#frag"
+                .to_string(),
+        })
+    );
+    assert_eq!(round_trip.upstreams[0].proxy, Some(ProxyConfig::Direct));
     assert_eq!(
         round_trip.upstreams[0].limits,
         Some(ModelLimits {
@@ -392,6 +410,7 @@ fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
             api_root: upstream_api_root(upstream_base, api_root_format),
@@ -401,6 +420,7 @@ fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -
             fallback_api_key: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            proxy: None,
             limits: None,
             surface_defaults: None,
         }],
@@ -621,6 +641,7 @@ fn multi_native_responses_config(first_base: &str, second_base: &str) -> Config 
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream(
                 "RESPONSES_A",
@@ -649,6 +670,7 @@ fn pinned_responses_plus_auto_discovery_config(
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream(
                 "RESPONSES_A",
@@ -665,6 +687,7 @@ fn pinned_responses_plus_auto_discovery_config(
                 fallback_api_key: None,
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                proxy: None,
                 limits: None,
                 surface_defaults: None,
             },
@@ -855,6 +878,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout_secs: 30,
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![RuntimeUpstreamConfig {
             name: "default".to_string(),
             api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
@@ -877,6 +901,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
                 ("x-session-token".to_string(), "session-secret".to_string()),
                 ("x-api-key".to_string(), "api-secret".to_string()),
             ],
+            proxy: None,
             limits: None,
             surface_defaults: None,
         }],
@@ -1180,6 +1205,9 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
                 listen: "127.0.0.1:0".to_string(),
                 upstream_timeout_secs: 30,
                 compatibility_mode: CompatibilityMode::Balanced,
+                proxy: Some(ProxyConfig::Proxy {
+                    url: "http://global-user:global-pass@proxy.example:8080/global-hop?token=global-secret#frag".to_string(),
+                }),
                 upstreams: vec![RuntimeUpstreamConfig {
                     name: "default".to_string(),
                     api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
@@ -1202,6 +1230,9 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
                         ),
                         ("x-service-apikey".to_string(), "apikey-secret".to_string()),
                     ],
+                    proxy: Some(ProxyConfig::Proxy {
+                        url: "socks5h://up-user:up-pass@regional-proxy.example:1080/egress?sig=proxy-secret#frag".to_string(),
+                    }),
                     limits: None,
                     surface_defaults: None,
                 }],
@@ -1246,8 +1277,23 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
         upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion)
     );
     assert_eq!(
+        state["config"]["proxy"]["url"],
+        "http://proxy.example:8080/global-hop"
+    );
+    assert!(state["config"].get("upstream_proxy").is_none());
+    assert_eq!(
+        state["config"]["upstreams"][0]["proxy"]["url"],
+        "socks5h://regional-proxy.example:1080/egress"
+    );
+    assert_eq!(
         state["upstreams"][0]["api_root"],
         upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion)
+    );
+    assert_eq!(state["upstreams"][0]["proxy_source"], "upstream");
+    assert_eq!(state["upstreams"][0]["proxy_mode"], "proxy");
+    assert_eq!(
+        state["upstreams"][0]["proxy_url"],
+        "socks5h://regional-proxy.example:1080/egress"
     );
     assert_eq!(
         state["config"]["upstreams"][0]["fallback_credential_configured"],
@@ -1363,9 +1409,75 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
     assert!(!body.contains("upstream-secret"));
     assert!(!body.contains("session-secret"));
     assert!(!body.contains("proxy-secret"));
+    assert!(!body.contains("global-secret"));
     assert!(!body.contains("secret-secret"));
     assert!(!body.contains("credential-secret"));
     assert!(!body.contains("apikey-secret"));
+    assert!(!body.contains("global-user:global-pass@"));
+    assert!(!body.contains("up-user:up-pass@"));
+    assert!(!body.contains("sig="));
+}
+
+#[tokio::test]
+async fn admin_namespace_state_reports_namespace_proxy_source_over_http() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+    let client = Client::new();
+
+    let apply = client
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
+        .json(&json!({
+            "if_revision": null,
+            "config": RuntimeConfigPayload {
+                listen: "127.0.0.1:0".to_string(),
+                upstream_timeout_secs: 30,
+                compatibility_mode: CompatibilityMode::Balanced,
+                proxy: Some(ProxyConfig::Proxy {
+                    url: "http://global-user:global-pass@proxy.example:8080/global-hop?token=global-secret#frag".to_string(),
+                }),
+                upstreams: vec![RuntimeUpstreamConfig {
+                    name: "default".to_string(),
+                    api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
+                    fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+                    fallback_credential_env: None,
+                    fallback_credential_actual: None,
+                    auth_policy: AuthPolicy::ClientOrFallback,
+                    upstream_headers: Vec::new(),
+                    proxy: None,
+                    limits: None,
+                    surface_defaults: None,
+                }],
+                model_aliases: std::collections::BTreeMap::new(),
+                hooks: RuntimeHookConfig::default(),
+                debug_trace: DebugTraceConfig::default(),
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(apply.status().is_success());
+
+    let state: Value = client
+        .get(format!("{proxy_base}/admin/namespaces/demo/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(state["upstreams"][0]["proxy_source"], "namespace");
+    assert_eq!(state["upstreams"][0]["proxy_mode"], "proxy");
+    assert_eq!(
+        state["upstreams"][0]["proxy_url"],
+        "http://proxy.example:8080/global-hop"
+    );
+
+    let body = serde_json::to_string(&state).expect("namespace state body");
+    assert!(!body.contains("\"proxy_source\":\"llmup\""));
 }
 
 #[tokio::test]
@@ -2021,6 +2133,7 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
             api_root: mock_base.clone(),
@@ -2030,6 +2143,7 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
             fallback_api_key: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            proxy: None,
             limits: None,
             surface_defaults: None,
         }],
@@ -2166,6 +2280,7 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
             api_root: mock_base,
@@ -2175,6 +2290,7 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
             fallback_api_key: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            proxy: None,
             limits: None,
             surface_defaults: None,
         }],
@@ -2223,6 +2339,7 @@ async fn openai_responses_create_with_alias_routes_to_configured_upstream() {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream(
                 "RESPONSES_A",
@@ -2466,6 +2583,7 @@ async fn responses_stateful_request_without_model_routes_to_unique_native_respon
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream(
                 "RESPONSES_A",
@@ -2514,6 +2632,7 @@ async fn stateful_model_less_create_returns_503_when_unique_configured_native_ow
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![named_upstream(
             "RESPONSES_A",
             &responses_base,
@@ -4286,6 +4405,7 @@ async fn multi_upstream_supports_explicit_upstream_model_selector() {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
             named_upstream(
@@ -4336,6 +4456,7 @@ async fn multi_upstream_supports_local_model_alias() {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
             named_upstream(
@@ -4376,6 +4497,7 @@ async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
             named_upstream(
@@ -4412,6 +4534,7 @@ async fn multi_upstream_uses_per_upstream_fallback_credential() {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![named_upstream(
             "GLM-OFFICIAL",
             &glm_base,
@@ -4454,6 +4577,7 @@ async fn force_server_auth_policy_ignores_client_key() {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "GLM-OFFICIAL".to_string(),
             api_root: upstream_api_root(&glm_base, UpstreamFormat::Anthropic),
@@ -4463,6 +4587,7 @@ async fn force_server_auth_policy_ignores_client_key() {
             fallback_api_key: Some("server-secret".to_string()),
             auth_policy: AuthPolicy::ForceServer,
             upstream_headers: Vec::new(),
+            proxy: None,
             limits: None,
             surface_defaults: None,
         }],
@@ -5439,6 +5564,7 @@ async fn upstream_unreachable_returns_502() {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_millis(100),
         compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "default".to_string(),
             api_root: "http://127.0.0.1:31999/v1".to_string(),
@@ -5448,6 +5574,7 @@ async fn upstream_unreachable_returns_502() {
             fallback_api_key: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: Vec::new(),
+            proxy: None,
             limits: None,
             surface_defaults: None,
         }],

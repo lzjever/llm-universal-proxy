@@ -12,11 +12,12 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
-use common::{start_proxy, upstream_api_root};
+use common::proxy_helpers::proxy_config;
+use common::runtime_proxy::{start_proxy, upstream_api_root};
 use futures_util::{future::join_all, Stream, StreamExt};
 use llm_universal_proxy::config::{
-    AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, RuntimeConfigPayload,
-    RuntimeHookConfig, RuntimeUpstreamConfig,
+    AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ProxyConfig,
+    RuntimeConfigPayload, RuntimeHookConfig, RuntimeUpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
 use reqwest::Client;
@@ -767,6 +768,7 @@ fn runtime_namespace_config(
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout_secs: 30,
         compatibility_mode: llm_universal_proxy::config::CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
         upstreams: vec![RuntimeUpstreamConfig {
             name: "default".to_string(),
             api_root: upstream_api_root(upstream_base, format),
@@ -775,6 +777,7 @@ fn runtime_namespace_config(
             fallback_credential_actual: None,
             auth_policy: AuthPolicy::ClientOrFallback,
             upstream_headers: vec![("x-namespace-tag".to_string(), namespace_tag.to_string())],
+            proxy: None,
             limits: None,
             surface_defaults: None,
         }],
@@ -802,9 +805,9 @@ async fn apply_namespace_config(
 
 #[tokio::test]
 async fn translated_stream_delivers_first_chunk_incrementally() {
-    let _ = common::spawn_openai_completion_mock;
+    let _ = common::mock_upstream::spawn_openai_completion_mock;
     let (mock_base, _mock) = spawn_incremental_anthropic_stream_mock().await;
-    let config = common::proxy_helpers::proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let response = Client::new()
@@ -860,7 +863,7 @@ async fn translated_stream_delivers_first_chunk_incrementally() {
 #[tokio::test]
 async fn downstream_disconnect_stops_upstream_stream_promptly() {
     let (mock_base, _mock, drop_notify) = spawn_disconnect_observing_openai_mock().await;
-    let config = common::proxy_helpers::proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let response = Client::new()
@@ -989,7 +992,7 @@ async fn concurrent_live_requests_keep_namespaces_and_sessions_isolated() {
 #[tokio::test]
 async fn fatal_translated_stream_rejection_returns_prompt_failure_and_finishes() {
     let (mock_base, _mock) = spawn_prompt_fatal_anthropic_unsupported_block_mock().await;
-    let config = common::proxy_helpers::proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let response = Client::new()
@@ -1033,8 +1036,7 @@ async fn failed_terminal_then_disconnect_is_not_recorded_completed_in_hooks_or_d
     let (hook_base, _hook_mock, exchange, usage) = spawn_hook_capture_mock().await;
     let trace_path = unique_temp_path("failed-terminal-trace", "jsonl");
 
-    let mut config =
-        common::proxy_helpers::proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     config.hooks = HookConfig {
         max_pending_bytes: 4 * 1024 * 1024,
         timeout: Duration::from_secs(5),
@@ -1134,8 +1136,7 @@ async fn slow_debug_trace_sink_does_not_delay_stream_teardown() {
     let (mock_base, _mock, drop_notify) =
         spawn_large_openai_stream_mock(200_000, Duration::from_secs(30)).await;
 
-    let mut config =
-        common::proxy_helpers::proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     config.debug_trace = DebugTraceConfig {
         path: Some(slow_sink.path_string()),
         max_text_chars: 200_000,
@@ -1178,8 +1179,7 @@ async fn debug_trace_background_writer_does_not_silent_drop_under_blocked_sink()
     let (mock_base, _mock, _drop_notify) =
         spawn_large_openai_stream_mock(8_192, Duration::ZERO).await;
 
-    let mut config =
-        common::proxy_helpers::proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     config.debug_trace = DebugTraceConfig {
         path: Some(trace_capture.path_string()),
         max_text_chars: 256,
@@ -1259,8 +1259,7 @@ async fn exchange_capture_for_long_stream_is_bounded_by_capture_budget() {
     let (hook_base, _hook_mock, exchange, _usage) = spawn_hook_capture_mock().await;
     let capture_budget_bytes = 16 * 1024usize;
 
-    let mut config =
-        common::proxy_helpers::proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     config.hooks = HookConfig {
         max_pending_bytes: capture_budget_bytes,
         timeout: Duration::from_secs(5),
@@ -1297,7 +1296,9 @@ async fn exchange_capture_for_long_stream_is_bounded_by_capture_budget() {
         .expect("exchange payload should include response body");
 
     assert_eq!(
-        response_body.get("capture_truncated").and_then(Value::as_bool),
+        response_body
+            .get("capture_truncated")
+            .and_then(Value::as_bool),
         Some(true),
         "exchange capture should report truncation instead of replaying an unbounded long stream body: {exchange_payload}"
     );

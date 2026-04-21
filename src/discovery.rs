@@ -156,15 +156,11 @@ fn minimal_probe_body(format: UpstreamFormat) -> serde_json::Value {
 /// If response is not 404 and not a connection error, consider that format supported.
 /// Returns supported set; caller uses UpstreamCapability::from_supported.
 pub async fn discover_supported_formats(
+    client: &reqwest::Client,
     base_url: &str,
-    timeout: std::time::Duration,
     api_key: Option<&str>,
     extra_headers: &[(String, String)],
 ) -> HashSet<UpstreamFormat> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
     let mut supported = HashSet::new();
     for &format in &DEFAULT_TARGET_ORDER {
         let url = build_upstream_url(base_url, format, None, false);
@@ -217,6 +213,77 @@ fn status_indicates_support(status: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+    use reqwest::Client;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn discover_supported_formats_uses_prebuilt_client() {
+        #[derive(Clone)]
+        struct ProbeState {
+            paths: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn handle_probe(
+            uri: axum::http::Uri,
+            State(state): State<ProbeState>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            state
+                .paths
+                .lock()
+                .await
+                .push(uri.path().trim_start_matches('/').to_string());
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "probe" })),
+            )
+        }
+
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/*path", post(handle_probe))
+            .with_state(ProbeState {
+                paths: paths.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind discovery probe server");
+        let addr = listener.local_addr().expect("probe local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("discovery probe server");
+        });
+
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let supported =
+            discover_supported_formats(&client, &format!("http://{addr}"), None, &[]).await;
+
+        assert!(supported.contains(&UpstreamFormat::OpenAiCompletion));
+        assert!(supported.contains(&UpstreamFormat::OpenAiResponses));
+        assert!(supported.contains(&UpstreamFormat::Anthropic));
+        assert!(supported.contains(&UpstreamFormat::Google));
+
+        let recorded = paths.lock().await;
+        assert!(
+            recorded
+                .iter()
+                .any(|path| path.ends_with("chat/completions")),
+            "paths = {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|path| path.ends_with("responses")),
+            "paths = {recorded:?}"
+        );
+
+        server.abort();
+    }
 
     #[test]
     fn capability_fixed_single_format() {

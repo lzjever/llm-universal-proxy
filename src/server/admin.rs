@@ -47,6 +47,10 @@ struct NamespaceUpstreamStateResponse {
     fixed_upstream_format: Option<crate::formats::UpstreamFormat>,
     supported_formats: Vec<crate::formats::UpstreamFormat>,
     availability: UpstreamAvailabilityResponse,
+    proxy_source: &'static str,
+    proxy_mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +66,34 @@ impl From<&UpstreamAvailability> for UpstreamAvailabilityResponse {
             status: value.status_label(),
             reason: value.reason().map(ToString::to_string),
         }
+    }
+}
+
+fn proxy_source_label(source: &crate::upstream::ResolvedProxySource) -> &'static str {
+    match source {
+        crate::upstream::ResolvedProxySource::Upstream => "upstream",
+        crate::upstream::ResolvedProxySource::Namespace => "namespace",
+        crate::upstream::ResolvedProxySource::Environment => "env",
+        crate::upstream::ResolvedProxySource::None => "none",
+    }
+}
+
+fn proxy_mode_label(target: &crate::upstream::ResolvedProxyTarget) -> &'static str {
+    match target {
+        crate::upstream::ResolvedProxyTarget::Proxy { .. } => "proxy",
+        crate::upstream::ResolvedProxyTarget::Direct => "direct",
+        crate::upstream::ResolvedProxyTarget::Inherited => "inherited",
+    }
+}
+
+fn admin_proxy_url(metadata: &crate::upstream::ResolvedProxyMetadata) -> Option<String> {
+    match (&metadata.source, &metadata.target) {
+        (
+            crate::upstream::ResolvedProxySource::Upstream
+            | crate::upstream::ResolvedProxySource::Namespace,
+            crate::upstream::ResolvedProxyTarget::Proxy { url },
+        ) => Some(sanitize_url_for_admin(url)),
+        _ => None,
     }
 }
 
@@ -272,6 +304,9 @@ pub(super) async fn handle_admin_namespace_state(
                 .map(|capability| capability.supported.iter().copied().collect())
                 .unwrap_or_default(),
             availability: UpstreamAvailabilityResponse::from(&upstream.availability),
+            proxy_source: proxy_source_label(&upstream.resolved_proxy.source),
+            proxy_mode: proxy_mode_label(&upstream.resolved_proxy.target),
+            proxy_url: admin_proxy_url(&upstream.resolved_proxy),
         })
         .collect::<Vec<_>>();
     (

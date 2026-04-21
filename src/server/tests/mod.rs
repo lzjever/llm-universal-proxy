@@ -1,5 +1,6 @@
 pub(super) use std::collections::BTreeMap;
 pub(super) use std::sync::Arc;
+pub(super) use std::sync::LazyLock;
 
 pub(super) use axum::{
     body::Body,
@@ -9,7 +10,6 @@ pub(super) use axum::{
     routing::post,
     Json, Router,
 };
-pub(super) use reqwest::Client;
 pub(super) use serde_json::Value;
 pub(super) use tokio::sync::{Mutex, RwLock};
 
@@ -22,6 +22,9 @@ mod proxy;
 mod responses_resources;
 mod state;
 
+pub(super) static UPSTREAM_PROXY_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 pub(super) struct ScopedEnvVar {
     key: &'static str,
     previous: Option<String>,
@@ -31,6 +34,12 @@ impl ScopedEnvVar {
     pub(super) fn set(key: &'static str, value: impl AsRef<str>) -> Self {
         let previous = std::env::var(key).ok();
         std::env::set_var(key, value.as_ref());
+        Self { key, previous }
+    }
+
+    pub(super) fn remove(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
         Self { key, previous }
     }
 }
@@ -65,6 +74,7 @@ pub(super) fn test_upstream_config_with_fixed_format(
         fallback_api_key: None,
         auth_policy: crate::config::AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
+        proxy: None,
         limits: None,
         surface_defaults: None,
     }
@@ -77,6 +87,7 @@ pub(super) fn runtime_namespace_state_for_tests(
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
         compatibility_mode: crate::config::CompatibilityMode::Balanced,
+        proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: upstreams
             .iter()
             .map(|(name, format, _)| test_upstream_config(name, *format))
@@ -88,16 +99,27 @@ pub(super) fn runtime_namespace_state_for_tests(
     let upstream_states = upstreams
         .iter()
         .map(|(name, format, available)| {
+            let upstream_config = test_upstream_config(name, *format);
+            let (client, streaming_client, resolved_proxy) =
+                crate::upstream::build_upstream_clients(
+                    &config,
+                    upstream_config.proxy.as_ref(),
+                    config.proxy.as_ref(),
+                )
+                .expect("build test upstream clients");
             (
                 (*name).to_string(),
                 UpstreamState {
-                    config: test_upstream_config(name, *format),
+                    config: upstream_config,
                     capability: Some(crate::discovery::UpstreamCapability::fixed(*format)),
                     availability: if *available {
                         crate::discovery::UpstreamAvailability::available()
                     } else {
                         crate::discovery::UpstreamAvailability::unavailable("test outage")
                     },
+                    client,
+                    streaming_client,
+                    resolved_proxy,
                 },
             )
         })
@@ -107,8 +129,6 @@ pub(super) fn runtime_namespace_state_for_tests(
         revision: "test-revision".to_string(),
         config,
         upstreams: upstream_states,
-        client: Client::new(),
-        streaming_client: Client::new(),
         hooks: None,
         debug_trace: None,
     }
@@ -283,6 +303,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         fallback_api_key: None,
         auth_policy: crate::config::AuthPolicy::ClientOrFallback,
         upstream_headers: Vec::new(),
+        proxy: None,
         limits: None,
         surface_defaults: None,
     };
@@ -290,11 +311,18 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout,
         compatibility_mode: crate::config::CompatibilityMode::Balanced,
+        proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![upstream.clone()],
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
     };
+    let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
+        &config,
+        upstream.proxy.as_ref(),
+        config.proxy.as_ref(),
+    )
+    .expect("build single upstream clients");
     let runtime = RuntimeState {
         namespaces: BTreeMap::from([(
             DEFAULT_NAMESPACE.to_string(),
@@ -309,10 +337,11 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
                             upstream_format,
                         )),
                         availability: crate::discovery::UpstreamAvailability::available(),
+                        client,
+                        streaming_client,
+                        resolved_proxy,
                     },
                 )]),
-                client: crate::upstream::build_client(&config),
-                streaming_client: crate::upstream::build_streaming_client(&config),
                 hooks: None,
                 debug_trace: None,
             },

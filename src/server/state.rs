@@ -5,7 +5,7 @@ use reqwest::Client;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::config::{Config, UpstreamConfig};
+use crate::config::{Config, ProxyConfig, UpstreamConfig};
 use crate::debug_trace::DebugTraceRecorder;
 use crate::discovery::{DiscoveredUpstream, UpstreamAvailability, UpstreamCapability};
 use crate::hooks::{HookDispatcher, HookSnapshot};
@@ -50,6 +50,9 @@ pub(super) struct UpstreamState {
     pub(super) config: UpstreamConfig,
     pub(super) capability: Option<UpstreamCapability>,
     pub(super) availability: UpstreamAvailability,
+    pub(super) client: Client,
+    pub(super) streaming_client: Client,
+    pub(crate) resolved_proxy: upstream::ResolvedProxyMetadata,
 }
 
 #[derive(Clone)]
@@ -57,8 +60,6 @@ pub(super) struct RuntimeNamespaceState {
     pub(super) revision: String,
     pub(super) config: Config,
     pub(super) upstreams: BTreeMap<String, UpstreamState>,
-    pub(super) client: Client,
-    pub(super) streaming_client: Client,
     pub(super) hooks: Option<HookDispatcher>,
     pub(super) debug_trace: Option<DebugTraceRecorder>,
 }
@@ -139,17 +140,13 @@ pub(super) async fn build_runtime_namespace_state(
     if !config.upstreams.is_empty() {
         config.validate()?;
     }
-    let upstreams = resolve_upstreams(&config).await;
-    let client = upstream::build_client(&config);
-    let streaming_client = upstream::build_streaming_client(&config);
+    let upstreams = resolve_upstreams(&config).await?;
     let hooks = HookDispatcher::new(&config.hooks);
     let debug_trace = DebugTraceRecorder::new(&config.debug_trace);
     Ok(RuntimeNamespaceState {
         revision,
         config,
         upstreams,
-        client,
-        streaming_client,
         hooks,
         debug_trace,
     })
@@ -170,15 +167,21 @@ pub(super) fn generate_admin_revision() -> String {
     Uuid::new_v4().to_string()
 }
 
-pub(super) async fn resolve_upstreams(config: &Config) -> BTreeMap<String, UpstreamState> {
+pub(super) async fn resolve_upstreams(
+    config: &Config,
+) -> Result<BTreeMap<String, UpstreamState>, String> {
     let mut upstreams = BTreeMap::new();
     for upstream in &config.upstreams {
+        let namespace_proxy = namespace_proxy_config(config);
+        let upstream_proxy = upstream_proxy_config(upstream);
+        let (client, streaming_client, resolved_proxy) =
+            upstream::build_upstream_clients(config, upstream_proxy, namespace_proxy)?;
         let mut discovered = if let Some(f) = upstream.fixed_upstream_format {
             DiscoveredUpstream::fixed(f)
         } else {
             let supported = crate::discovery::discover_supported_formats(
+                &client,
                 &upstream.api_root,
-                config.upstream_timeout,
                 upstream.fallback_api_key.as_deref(),
                 &upstream.upstream_headers,
             )
@@ -195,10 +198,13 @@ pub(super) async fn resolve_upstreams(config: &Config) -> BTreeMap<String, Upstr
                 config: upstream.clone(),
                 capability: discovered.capability,
                 availability: discovered.availability,
+                client,
+                streaming_client,
+                resolved_proxy,
             },
         );
     }
-    upstreams
+    Ok(upstreams)
 }
 
 fn test_forced_upstream_unavailable(name: &str) -> bool {
@@ -211,4 +217,12 @@ fn test_forced_upstream_unavailable(name: &str) -> bool {
                 .any(|candidate| !candidate.is_empty() && candidate == name)
         })
         .unwrap_or(false)
+}
+
+fn namespace_proxy_config(config: &Config) -> Option<&ProxyConfig> {
+    config.proxy.as_ref()
+}
+
+fn upstream_proxy_config(upstream: &UpstreamConfig) -> Option<&ProxyConfig> {
+    upstream.proxy.as_ref()
 }

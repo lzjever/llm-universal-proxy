@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::formats::UpstreamFormat;
 
@@ -83,6 +83,87 @@ pub struct HookEndpointConfig {
     pub authorization: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyConfig {
+    Direct,
+    Proxy { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ProxyConfigSerde {
+    Direct(String),
+    Proxy { url: String },
+}
+
+impl Serialize for ProxyConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Direct => ProxyConfigSerde::Direct("direct".to_string()).serialize(serializer),
+            Self::Proxy { url } => {
+                ProxyConfigSerde::Proxy { url: url.clone() }.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProxyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match ProxyConfigSerde::deserialize(deserializer)? {
+            ProxyConfigSerde::Direct(value) if value == "direct" => Ok(Self::Direct),
+            ProxyConfigSerde::Direct(value) => Err(serde::de::Error::custom(format!(
+                "proxy config string must be `direct`, got `{value}`"
+            ))),
+            ProxyConfigSerde::Proxy { url } => Ok(Self::Proxy { url }),
+        }
+    }
+}
+
+impl ProxyConfig {
+    fn validate(&self, owner: &str) -> Result<(), String> {
+        let Self::Proxy { url } = self else {
+            return Ok(());
+        };
+        if url.trim().is_empty() {
+            return Err(format!("{owner} url must not be empty"));
+        }
+        let parsed = url::Url::parse(url)
+            .map_err(|error| format!("{owner} url must be a valid absolute URL: {error}"))?;
+        match parsed.scheme() {
+            "http" | "https" | "socks5" | "socks5h" => {}
+            scheme => {
+                return Err(format!(
+                    "{owner} url must use http, https, socks5, or socks5h, got `{scheme}`"
+                ));
+            }
+        }
+        if !url_has_explicit_authority(url) {
+            return Err(format!("{owner} url must include a host"));
+        }
+        if parsed.host_str().is_none() {
+            return Err(format!("{owner} url must include a host"));
+        }
+        Ok(())
+    }
+}
+
+fn url_has_explicit_authority(value: &str) -> bool {
+    let Some(scheme_end) = value.find("://") else {
+        return false;
+    };
+    let authority_start = scheme_end + 3;
+    value
+        .as_bytes()
+        .get(authority_start)
+        .is_some_and(|byte| !matches!(byte, b'/' | b'?' | b'#'))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,6 +223,9 @@ pub struct UpstreamConfig {
     pub auth_policy: AuthPolicy,
     /// Optional static headers to inject into every upstream request.
     pub upstream_headers: Vec<(String, String)>,
+    /// Optional per-upstream proxy override. When unset, the namespace default is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxyConfig>,
     /// Optional default limits for models routed through this upstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ModelLimits>,
@@ -177,6 +261,8 @@ pub struct Config {
     pub upstream_timeout: Duration,
     /// Compatibility posture for translated request paths in this namespace.
     pub compatibility_mode: CompatibilityMode,
+    /// Default upstream proxy policy for this namespace. When unset, environment proxy resolution is used.
+    pub proxy: Option<ProxyConfig>,
     /// Named upstreams available to the proxy.
     pub upstreams: Vec<UpstreamConfig>,
     /// Local unique model names mapped to named upstream models.
@@ -237,6 +323,8 @@ pub struct RuntimeUpstreamConfig {
     pub auth_policy: AuthPolicy,
     #[serde(default)]
     pub upstream_headers: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxyConfig>,
     #[serde(default)]
     pub limits: Option<ModelLimits>,
     #[serde(default)]
@@ -251,6 +339,12 @@ pub struct RuntimeConfigPayload {
     pub upstream_timeout_secs: u64,
     #[serde(default)]
     pub compatibility_mode: CompatibilityMode,
+    #[serde(
+        default,
+        alias = "upstream_proxy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub proxy: Option<ProxyConfig>,
     #[serde(default)]
     pub upstreams: Vec<RuntimeUpstreamConfig>,
     #[serde(default)]
@@ -313,6 +407,7 @@ pub struct AdminUpstreamConfigView {
     pub fallback_credential_configured: bool,
     pub auth_policy: AuthPolicy,
     pub upstream_headers: Vec<AdminHeaderValueView>,
+    pub proxy: Option<ProxyConfig>,
     pub limits: Option<ModelLimits>,
     pub surface_defaults: Option<ModelSurfacePatch>,
 }
@@ -322,6 +417,8 @@ pub struct AdminConfigView {
     pub listen: String,
     pub upstream_timeout_secs: u64,
     pub compatibility_mode: CompatibilityMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxyConfig>,
     pub upstreams: Vec<AdminUpstreamConfigView>,
     pub model_aliases: BTreeMap<String, AdminModelAliasView>,
     pub hooks: AdminHookConfigView,
@@ -336,6 +433,8 @@ struct FileConfig {
     upstream_timeout_secs: u64,
     #[serde(default)]
     compatibility_mode: CompatibilityMode,
+    #[serde(default, alias = "upstream_proxy")]
+    proxy: Option<ProxyConfig>,
     #[serde(default)]
     upstreams: BTreeMap<String, UpstreamConfigFile>,
     #[serde(default)]
@@ -371,6 +470,8 @@ struct UpstreamConfigFile {
     auth_policy: AuthPolicy,
     #[serde(default, alias = "headers", alias = "upstream_headers")]
     upstream_headers: BTreeMap<String, String>,
+    #[serde(default)]
+    proxy: Option<ProxyConfig>,
     #[serde(default)]
     limits: Option<ModelLimits>,
     #[serde(default)]
@@ -422,6 +523,7 @@ impl Default for Config {
             listen: default_listen(),
             upstream_timeout: Duration::from_secs(default_upstream_timeout_secs()),
             compatibility_mode: CompatibilityMode::default(),
+            proxy: None,
             upstreams: Vec::new(),
             model_aliases: BTreeMap::new(),
             hooks: HookConfig::default(),
@@ -463,6 +565,7 @@ impl Config {
                     fallback_api_key,
                     auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers.into_iter().collect(),
+                    proxy: item.proxy,
                     limits: item.limits,
                     surface_defaults: item.surface_defaults,
                 }
@@ -494,6 +597,7 @@ impl Config {
             listen: parsed.listen,
             upstream_timeout: Duration::from_secs(parsed.upstream_timeout_secs),
             compatibility_mode: parsed.compatibility_mode,
+            proxy: parsed.proxy,
             upstreams,
             model_aliases,
             hooks: HookConfig {
@@ -518,6 +622,9 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if self.upstreams.is_empty() {
             return Err("at least one upstream must be configured".to_string());
+        }
+        if let Some(proxy) = &self.proxy {
+            proxy.validate("proxy")?;
         }
 
         let mut seen = BTreeSet::new();
@@ -576,6 +683,9 @@ impl Config {
             }
             if !seen.insert(upstream.name.clone()) {
                 return Err(format!("duplicate upstream name `{}`", upstream.name));
+            }
+            if let Some(proxy) = &upstream.proxy {
+                proxy.validate(&format!("upstream `{}` proxy", upstream.name))?;
             }
             if let Some(limits) = &upstream.limits {
                 limits.validate(&format!("upstream `{}`", upstream.name))?;
@@ -748,6 +858,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
                     fallback_api_key,
                     auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers,
+                    proxy: item.proxy,
                     limits: item.limits,
                     surface_defaults: item.surface_defaults,
                 }
@@ -758,6 +869,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
             listen: value.listen,
             upstream_timeout: Duration::from_secs(value.upstream_timeout_secs),
             compatibility_mode: value.compatibility_mode,
+            proxy: value.proxy,
             upstreams,
             model_aliases: value.model_aliases,
             hooks: HookConfig {
@@ -787,6 +899,7 @@ impl From<&Config> for RuntimeConfigPayload {
             listen: value.listen.clone(),
             upstream_timeout_secs: value.upstream_timeout.as_secs(),
             compatibility_mode: value.compatibility_mode,
+            proxy: value.proxy.clone(),
             upstreams: value
                 .upstreams
                 .iter()
@@ -798,6 +911,7 @@ impl From<&Config> for RuntimeConfigPayload {
                     fallback_credential_actual: item.fallback_credential_actual.clone(),
                     auth_policy: item.auth_policy,
                     upstream_headers: item.upstream_headers.clone(),
+                    proxy: item.proxy.clone(),
                     limits: item.limits.clone(),
                     surface_defaults: item.surface_defaults.clone(),
                 })
@@ -836,6 +950,7 @@ impl From<&Config> for AdminConfigView {
             listen: value.listen.clone(),
             upstream_timeout_secs: value.upstream_timeout.as_secs(),
             compatibility_mode: value.compatibility_mode,
+            proxy: value.proxy.as_ref().map(sanitize_proxy_config_for_admin),
             upstreams: value
                 .upstreams
                 .iter()
@@ -852,6 +967,7 @@ impl From<&Config> for AdminConfigView {
                         .iter()
                         .map(|(name, value)| admin_header_view(name, value))
                         .collect(),
+                    proxy: item.proxy.as_ref().map(sanitize_proxy_config_for_admin),
                     limits: item.limits.clone(),
                     surface_defaults: item.surface_defaults.clone(),
                 })
@@ -898,6 +1014,15 @@ impl From<&Config> for AdminConfigView {
                 max_text_chars: value.debug_trace.max_text_chars,
             },
         }
+    }
+}
+
+fn sanitize_proxy_config_for_admin(value: &ProxyConfig) -> ProxyConfig {
+    match value {
+        ProxyConfig::Direct => ProxyConfig::Direct,
+        ProxyConfig::Proxy { url } => ProxyConfig::Proxy {
+            url: sanitize_url_for_admin(url),
+        },
     }
 }
 
@@ -1180,6 +1305,97 @@ model_aliases:
     }
 
     #[test]
+    fn config_from_yaml_str_parses_namespace_and_upstream_proxy_config() {
+        let c = Config::from_yaml_str(
+            r#"
+proxy:
+  url: socks5h://global-user:global-pass@global-proxy.example:1080/global-hop?token=secret#frag
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+    proxy: direct
+  proxied:
+    api_root: https://api.anthropic.com/v1
+    format: anthropic
+    proxy:
+      url: https://up-user:up-pass@regional-proxy.example:8443/egress?sig=secret#frag
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            c.proxy,
+            Some(ProxyConfig::Proxy {
+                url: "socks5h://global-user:global-pass@global-proxy.example:1080/global-hop?token=secret#frag".to_string(),
+            })
+        );
+        assert_eq!(c.upstream("demo").unwrap().proxy, Some(ProxyConfig::Direct));
+        assert_eq!(
+            c.upstream("proxied").unwrap().proxy,
+            Some(ProxyConfig::Proxy {
+                url: "https://up-user:up-pass@regional-proxy.example:8443/egress?sig=secret#frag"
+                    .to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn config_defaults_proxy_to_inherit_env_when_omitted() {
+        let c = Config::from_yaml_str(
+            r#"
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(Config::default().proxy, None);
+        assert_eq!(c.proxy, None);
+        assert_eq!(c.upstream("demo").unwrap().proxy, None);
+    }
+
+    #[test]
+    fn runtime_config_round_trip_preserves_optional_proxy_layers() {
+        let payload = RuntimeConfigPayload {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout_secs: 30,
+            compatibility_mode: CompatibilityMode::Balanced,
+            proxy: Some(ProxyConfig::Direct),
+            upstreams: vec![RuntimeUpstreamConfig {
+                name: "default".to_string(),
+                api_root: "https://api.openai.com/v1".to_string(),
+                fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+                fallback_credential_env: None,
+                fallback_credential_actual: None,
+                auth_policy: AuthPolicy::ClientOrFallback,
+                upstream_headers: Vec::new(),
+                proxy: Some(ProxyConfig::Proxy {
+                    url: "http://regional-proxy.example:8080".to_string(),
+                }),
+                limits: None,
+                surface_defaults: None,
+            }],
+            model_aliases: BTreeMap::new(),
+            hooks: RuntimeHookConfig::default(),
+            debug_trace: DebugTraceConfig::default(),
+        };
+
+        let config = Config::try_from(payload).unwrap();
+        let round_trip = RuntimeConfigPayload::from(&config);
+
+        assert_eq!(round_trip.proxy, Some(ProxyConfig::Direct));
+        assert_eq!(
+            round_trip.upstreams[0].proxy,
+            Some(ProxyConfig::Proxy {
+                url: "http://regional-proxy.example:8080".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn config_defaults_compatibility_mode_to_max_compat() {
         assert_eq!(CompatibilityMode::default(), CompatibilityMode::MaxCompat);
         assert_eq!(
@@ -1221,6 +1437,7 @@ upstreams:
                 fallback_api_key: None,
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                proxy: None,
                 limits: None,
                 surface_defaults: None,
             }],
@@ -1256,6 +1473,7 @@ upstreams:
                     fallback_api_key: None,
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
+                    proxy: None,
                     limits: None,
                     surface_defaults: None,
                 },
@@ -1268,6 +1486,7 @@ upstreams:
                     fallback_api_key: None,
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
+                    proxy: None,
                     limits: None,
                     surface_defaults: None,
                 },
@@ -1291,6 +1510,7 @@ upstreams:
                 fallback_api_key: None,
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                proxy: None,
                 limits: None,
                 surface_defaults: None,
             }],
@@ -1322,6 +1542,7 @@ upstreams:
                 fallback_api_key: None,
                 auth_policy: AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                proxy: None,
                 limits: None,
                 surface_defaults: None,
             }],
@@ -1345,6 +1566,7 @@ upstreams:
                     fallback_api_key: None,
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
+                    proxy: None,
                     limits: None,
                     surface_defaults: None,
                 },
@@ -1357,6 +1579,7 @@ upstreams:
                     fallback_api_key: None,
                     auth_policy: AuthPolicy::ClientOrFallback,
                     upstream_headers: Vec::new(),
+                    proxy: None,
                     limits: None,
                     surface_defaults: None,
                 },
@@ -1458,6 +1681,41 @@ upstreams:
     }
 
     #[test]
+    fn validate_rejects_invalid_proxy_urls() {
+        let invalid_scheme = Config::from_yaml_str(
+            r#"
+proxy:
+  url: ftp://proxy.example:21/egress
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            invalid_scheme.validate().unwrap_err(),
+            "proxy url must use http, https, socks5, or socks5h, got `ftp`"
+        );
+
+        let missing_host = Config::from_yaml_str(
+            r#"
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+    proxy:
+      url: http:///missing-host
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            missing_host.validate().unwrap_err(),
+            "upstream `demo` proxy url must include a host"
+        );
+    }
+
+    #[test]
     fn validate_rejects_userinfo_in_upstream_api_root_and_hook_url() {
         let upstream = Config::from_yaml_str(
             r#"
@@ -1491,6 +1749,9 @@ upstreams:
             listen: "127.0.0.1:0".to_string(),
             upstream_timeout: Duration::from_secs(30),
             compatibility_mode: CompatibilityMode::Balanced,
+            proxy: Some(ProxyConfig::Proxy {
+                url: "http://global-user:global-pass@proxy.example:8080/global-hop?api_key=proxy-secret#frag".to_string(),
+            }),
             upstreams: vec![UpstreamConfig {
                 name: "default".to_string(),
                 api_root: "https://user:pass@api.openai.com/v1?api_key=inline-secret#frag"
@@ -1520,6 +1781,9 @@ upstreams:
                     ),
                     ("x-service-apikey".to_string(), "apikey-secret".to_string()),
                 ],
+                proxy: Some(ProxyConfig::Proxy {
+                    url: "socks5h://up-user:up-pass@regional-proxy.example:1080/egress?sig=proxy-secret#frag".to_string(),
+                }),
                 limits: None,
                 surface_defaults: None,
             }],
@@ -1548,6 +1812,18 @@ upstreams:
         );
         assert!(view.upstreams[0].fallback_credential_configured);
         assert_eq!(view.upstreams[0].api_root, "https://api.openai.com/v1");
+        assert_eq!(
+            view.proxy,
+            Some(ProxyConfig::Proxy {
+                url: "http://proxy.example:8080/global-hop".to_string(),
+            })
+        );
+        assert_eq!(
+            view.upstreams[0].proxy,
+            Some(ProxyConfig::Proxy {
+                url: "socks5h://regional-proxy.example:1080/egress".to_string(),
+            })
+        );
         assert!(
             view.hooks
                 .exchange
@@ -1608,6 +1884,11 @@ upstreams:
         assert!(json["upstreams"][0]
             .get("fallback_credential_actual")
             .is_none());
+        assert_eq!(json["proxy"]["url"], "http://proxy.example:8080/global-hop");
+        assert_eq!(
+            json["upstreams"][0]["proxy"]["url"],
+            "socks5h://regional-proxy.example:1080/egress"
+        );
         assert!(json["hooks"]["exchange"].get("authorization").is_none());
         assert!(json["upstreams"][0]["upstream_headers"][1]["value"].is_null());
         assert!(!json.to_string().contains("inline-secret"));
@@ -1620,6 +1901,8 @@ upstreams:
         assert!(!json.to_string().contains("credential-secret"));
         assert!(!json.to_string().contains("apikey-secret"));
         assert!(!json.to_string().contains("user:pass@"));
+        assert!(!json.to_string().contains("global-user:global-pass@"));
+        assert!(!json.to_string().contains("up-user:up-pass@"));
         assert!(!json.to_string().contains("api_key="));
         assert!(!json.to_string().contains("token="));
         assert!(!json.to_string().contains("sig="));

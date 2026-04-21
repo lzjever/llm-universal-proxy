@@ -254,7 +254,7 @@ pub(super) async fn handle_openai_responses_resource(
     }
 
     let response = match upstream::call_upstream_resource(
-        &namespace_state.client,
+        &upstream_state.client,
         method,
         &url,
         body.as_ref(),

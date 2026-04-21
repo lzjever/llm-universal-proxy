@@ -983,8 +983,7 @@ async fn live_openai_request_uses_configured_default_output_limit_for_anthropic_
     assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
     assert_eq!(recorded[0]["model"], "claude-3-7-sonnet");
     assert_eq!(
-        recorded[0]["max_tokens"],
-        128_000,
+        recorded[0]["max_tokens"], 128_000,
         "configured default output limit should propagate to real Anthropic upstream body when the client omits it: {:?}",
         recorded[0]
     );
@@ -998,6 +997,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
         compatibility_mode: crate::config::CompatibilityMode::Balanced,
+        proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![
             crate::config::UpstreamConfig {
                 name: "a".to_string(),
@@ -1008,6 +1008,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
                 fallback_api_key: None,
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                proxy: None,
                 limits: None,
                 surface_defaults: None,
             },
@@ -1020,6 +1021,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
                 fallback_api_key: None,
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                proxy: None,
                 limits: None,
                 surface_defaults: None,
             },
@@ -1046,6 +1048,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
         compatibility_mode: crate::config::CompatibilityMode::Balanced,
+        proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![
             crate::config::UpstreamConfig {
                 name: "a".to_string(),
@@ -1056,6 +1059,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
                 fallback_api_key: None,
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                proxy: None,
                 limits: None,
                 surface_defaults: None,
             },
@@ -1068,6 +1072,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
                 fallback_api_key: None,
                 auth_policy: crate::config::AuthPolicy::ClientOrFallback,
                 upstream_headers: Vec::new(),
+                proxy: None,
                 limits: None,
                 surface_defaults: None,
             },

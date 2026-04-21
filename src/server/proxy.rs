@@ -530,12 +530,12 @@ pub(super) async fn handle_request_core(
     );
     debug!("Calling upstream URL: {}", url);
     let upstream_client = if stream {
-        &namespace_state.streaming_client
+        upstream_state.streaming_client.clone()
     } else {
-        &namespace_state.client
+        upstream_state.client.clone()
     };
     let res = match upstream::call_upstream(
-        upstream_client,
+        &upstream_client,
         &url,
         &upstream_request_body,
         stream,
