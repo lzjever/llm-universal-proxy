@@ -13,6 +13,50 @@ fn anthropic_tool_use_partial_replay_text(name: &str, raw: &str) -> String {
     }
 }
 
+fn emit_claude_reasoning_delta(state: &mut StreamState, reasoning: &str, out: &mut Vec<Value>) {
+    if reasoning.is_empty() {
+        return;
+    }
+    emit_openai_assistant_role_if_needed(state, out);
+    out.push(openai_chunk(
+        state,
+        serde_json::json!({ "reasoning_content": reasoning }),
+        None,
+    ));
+}
+
+fn emit_structured_claude_tool_use_delta(
+    state: &mut StreamState,
+    openai_index: usize,
+    id: Option<Value>,
+    name: &str,
+    arguments: &str,
+    proxied_tool_kind: Option<&str>,
+    out: &mut Vec<Value>,
+) {
+    if arguments.is_empty() {
+        return;
+    }
+    emit_openai_assistant_role_if_needed(state, out);
+    let mut tool_call = serde_json::json!({
+        "index": openai_index,
+        "id": id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments
+        }
+    });
+    if let Some(proxied_tool_kind) = proxied_tool_kind {
+        tool_call["proxied_tool_kind"] = Value::String(proxied_tool_kind.to_string());
+    }
+    out.push(openai_chunk(
+        state,
+        serde_json::json!({ "tool_calls": [tool_call] }),
+        None,
+    ));
+}
+
 fn finalize_claude_tool_use_block(
     state: &mut StreamState,
     block_index: usize,
@@ -38,32 +82,33 @@ fn finalize_claude_tool_use_block(
         if tool_use.finalized {
             return;
         }
-        if tool_use.zero_arg_candidate
+        let is_structured_final = if tool_use.zero_arg_candidate
             && !tool_use.saw_input_json_delta
             && tool_use.arguments.trim().is_empty()
         {
-            Some(FinalizedToolUse::Structured {
-                openai_index: tool_use.openai_index,
-                id: tool_use.id.clone(),
-                name: tool_use.name.clone(),
-                arguments: "{}".to_string(),
-                proxied_tool_kind: tool_use.proxied_tool_kind.clone(),
-            })
+            Some("{}".to_string())
         } else if raw_json_is_valid_object_anthropic_source(&tool_use.arguments) {
-            Some(FinalizedToolUse::Structured {
-                openai_index: tool_use.openai_index,
-                id: tool_use.id.clone(),
-                name: tool_use.name.clone(),
-                arguments: tool_use.arguments.clone(),
-                proxied_tool_kind: tool_use.proxied_tool_kind.clone(),
-            })
+            Some(tool_use.arguments.clone())
         } else {
-            Some(FinalizedToolUse::Text {
+            None
+        };
+        match is_structured_final {
+            Some(arguments) if !tool_use.start_arguments_emitted => {
+                Some(FinalizedToolUse::Structured {
+                    openai_index: tool_use.openai_index,
+                    id: tool_use.id.clone(),
+                    name: tool_use.name.clone(),
+                    arguments,
+                    proxied_tool_kind: tool_use.proxied_tool_kind.clone(),
+                })
+            }
+            Some(_) => None,
+            None => Some(FinalizedToolUse::Text {
                 message: anthropic_tool_use_partial_replay_text(
                     &tool_use.name,
                     &tool_use.arguments,
                 ),
-            })
+            }),
         }
     };
 
@@ -75,24 +120,15 @@ fn finalize_claude_tool_use_block(
             arguments,
             proxied_tool_kind,
         }) => {
-            emit_openai_assistant_role_if_needed(state, out);
-            let mut tool_call = serde_json::json!({
-                "index": openai_index,
-                "id": id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": arguments
-                }
-            });
-            if let Some(proxied_tool_kind) = proxied_tool_kind {
-                tool_call["proxied_tool_kind"] = Value::String(proxied_tool_kind);
-            }
-            out.push(openai_chunk(
+            emit_structured_claude_tool_use_delta(
                 state,
-                serde_json::json!({ "tool_calls": [tool_call] }),
-                None,
-            ));
+                openai_index,
+                id,
+                &name,
+                &arguments,
+                proxied_tool_kind.as_deref(),
+                out,
+            );
             if let Some(tool_use) = state.claude_tool_uses.get_mut(&block_index) {
                 tool_use.arguments = arguments;
                 tool_use.zero_arg_candidate = false;
@@ -114,7 +150,13 @@ fn finalize_claude_tool_use_block(
                 tool_use.arguments_seeded_from_start = false;
             }
         }
-        None => {}
+        None => {
+            if let Some(tool_use) = state.claude_tool_uses.get_mut(&block_index) {
+                tool_use.zero_arg_candidate = false;
+                tool_use.arguments_seeded_from_start = false;
+                tool_use.finalized = true;
+            }
+        }
     }
 }
 
@@ -177,12 +219,15 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                         idx,
                         ClaudeBlockState {
                             kind: Some(ClaudeBlockKind::Thinking),
-                            thinking: seeded_thinking,
+                            thinking: String::new(),
                             signature,
                             omitted,
                             ..Default::default()
                         },
                     );
+                    if !omitted {
+                        emit_claude_reasoning_delta(state, &seeded_thinking, &mut out);
+                    }
                     state.in_thinking_block = true;
                     state.current_block_index = event
                         .get("index")
@@ -311,7 +356,11 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                     };
                     if let Some(t) = delta.and_then(|d| d.get("thinking").and_then(Value::as_str)) {
                         if !t.is_empty() {
-                            block_state.thinking.push_str(t);
+                            if block_state.omitted {
+                                block_state.thinking.push_str(t);
+                            } else {
+                                emit_claude_reasoning_delta(state, t, &mut out);
+                            }
                         }
                     }
                 }
@@ -446,12 +495,7 @@ pub fn claude_event_to_openai_chunks(event: &Value, state: &mut StreamState) -> 
                     }
                 });
                 if let Some(reasoning) = buffered_reasoning {
-                    emit_openai_assistant_role_if_needed(state, &mut out);
-                    out.push(openai_chunk(
-                        state,
-                        serde_json::json!({ "reasoning_content": reasoning }),
-                        None,
-                    ));
+                    emit_claude_reasoning_delta(state, &reasoning, &mut out);
                 }
                 if let Some(block_state) = state.claude_blocks.get(&i) {
                     if block_state.kind == Some(ClaudeBlockKind::Thinking) {

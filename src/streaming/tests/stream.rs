@@ -422,3 +422,102 @@ async fn translate_sse_stream_gemini_to_responses_bridges_custom_tool_calls_with
     assert!(!joined.contains("\"type\":\"function_call\""), "{joined}");
     assert!(!joined.contains("__llmup_custom__"), "{joined}");
 }
+
+#[test]
+fn translate_sse_event_anthropic_to_responses_preserves_commentary_in_completed_output_at_tool_boundary(
+) {
+    let mut state = StreamState::default();
+    let mut out = Vec::new();
+    for event in [
+        serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-test" }
+        }),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "text", "text": "" }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": "I will inspect the file first." }
+        }),
+        serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "exec_command",
+                "input": {}
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": { "type": "input_json_delta", "partial_json": "{\"cmd\":\"pwd\"}" }
+        }),
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "tool_use" },
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        }),
+        serde_json::json!({ "type": "message_stop" }),
+    ] {
+        out.extend(translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &event,
+            &mut state,
+        ));
+    }
+
+    let events = out
+        .iter()
+        .map(|bytes| parse_sse_json_frame(bytes))
+        .collect::<Vec<_>>();
+    let commentary_done_index = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+                && event["item"]["type"] == "message"
+        })
+        .expect("commentary done event");
+    let tool_added_index = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+                && event["item"]["type"] == "function_call"
+        })
+        .expect("tool call added event");
+    assert!(
+        commentary_done_index < tool_added_index,
+        "events = {events:?}"
+    );
+    assert_eq!(events[commentary_done_index]["item"]["phase"], "commentary");
+
+    let terminal = events
+        .iter()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("response.completed"))
+        .expect("response.completed event");
+    let output = terminal["response"]["output"]
+        .as_array()
+        .expect("response output");
+    assert_eq!(output.len(), 2, "output = {output:?}");
+    assert_eq!(output[0]["type"], "message");
+    assert_eq!(output[0]["phase"], "commentary");
+    assert_eq!(
+        output[0]["content"][0]["text"],
+        "I will inspect the file first."
+    );
+    assert_eq!(output[1]["type"], "function_call");
+    assert_eq!(output[1]["call_id"], "call_1");
+    assert!(
+        output
+            .iter()
+            .all(|item| item.get("phase").and_then(Value::as_str) != Some("final_answer")),
+        "tool-boundary terminal should not mislabel commentary as final_answer: {output:?}"
+    );
+}

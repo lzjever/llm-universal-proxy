@@ -42,6 +42,12 @@ pub(super) struct ResponsesMessagePartState {
     pub(super) annotations: Vec<Value>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ResponsesCompletedMessageState {
+    pub(super) output_index: u64,
+    pub(super) item: Value,
+}
+
 /// Stream transformer state (per 9router initState).
 #[derive(Debug, Default)]
 pub struct StreamState {
@@ -84,6 +90,7 @@ pub struct StreamState {
     pub responses_content_part_added: bool,
     pub responses_output_text: String,
     pub(super) responses_message_parts: Vec<ResponsesMessagePartState>,
+    pub(super) responses_completed_message_items: Vec<ResponsesCompletedMessageState>,
     pub(super) responses_text_part_index: Option<usize>,
     pub(super) responses_refusal_part_index: Option<usize>,
     pub responses_reasoning_id: Option<String>,

@@ -432,6 +432,134 @@ pub(super) fn ensure_responses_message_part(
     index
 }
 
+fn responses_message_part_has_meaningful_content(part: &ResponsesMessagePartState) -> bool {
+    !part.text.is_empty() || !part.annotations.is_empty()
+}
+
+fn responses_message_has_meaningful_content(state: &StreamState) -> bool {
+    state
+        .responses_message_parts
+        .iter()
+        .any(responses_message_part_has_meaningful_content)
+}
+
+fn reset_responses_message_segment(state: &mut StreamState) {
+    state.output_item_id = None;
+    state.output_item_added = false;
+    state.responses_content_part_added = false;
+    state.responses_output_text.clear();
+    state.responses_message_parts.clear();
+    state.responses_text_part_index = None;
+    state.responses_refusal_part_index = None;
+    state.responses_message_output_index = None;
+}
+
+fn responses_terminal_message_phase(finish_reason: Option<&str>) -> Option<&'static str> {
+    match finish_reason {
+        Some("stop") => Some("final_answer"),
+        Some("tool_calls") => Some("commentary"),
+        _ => None,
+    }
+}
+
+fn emit_responses_message_done(
+    state: &mut StreamState,
+    response_id: &str,
+    phase: Option<&str>,
+    out: &mut Vec<Vec<u8>>,
+) -> Option<ResponsesCompletedMessageState> {
+    if !state.output_item_added || !responses_message_has_meaningful_content(state) {
+        return None;
+    }
+
+    let output_index = if let Some(idx) = state.responses_message_output_index {
+        idx
+    } else {
+        responses_message_output_index(state)
+    };
+    let item_id = state
+        .output_item_id
+        .clone()
+        .unwrap_or_else(|| "msg_0".to_string());
+    let message_parts = state.responses_message_parts.clone();
+    let mut content = Vec::with_capacity(message_parts.len());
+    for (content_index, part) in message_parts.iter().enumerate() {
+        let part_value = responses_message_part_value(part);
+        match part.kind.unwrap_or(ResponsesMessagePartKind::OutputText) {
+            ResponsesMessagePartKind::OutputText => {
+                let done_ev = serde_json::json!({
+                    "type": responses_message_part_done_event_type(ResponsesMessagePartKind::OutputText),
+                    "sequence_number": next_responses_seq(state),
+                    "response_id": response_id,
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "item_id": item_id,
+                    "text": part.text
+                });
+                out.push(format_sse_event(
+                    responses_message_part_done_event_type(ResponsesMessagePartKind::OutputText),
+                    &done_ev,
+                ));
+            }
+            ResponsesMessagePartKind::Refusal => {
+                let done_ev = serde_json::json!({
+                    "type": responses_message_part_done_event_type(ResponsesMessagePartKind::Refusal),
+                    "sequence_number": next_responses_seq(state),
+                    "response_id": response_id,
+                    "output_index": output_index,
+                    "content_index": content_index,
+                    "item_id": item_id,
+                    "refusal": part.text
+                });
+                out.push(format_sse_event(
+                    responses_message_part_done_event_type(ResponsesMessagePartKind::Refusal),
+                    &done_ev,
+                ));
+            }
+        }
+        let part_done_ev = serde_json::json!({
+            "type": "response.content_part.done",
+            "sequence_number": next_responses_seq(state),
+            "response_id": response_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "item_id": item_id,
+            "part": part_value
+        });
+        out.push(format_sse_event(
+            "response.content_part.done",
+            &part_done_ev,
+        ));
+        content.push(part_value);
+    }
+
+    let mut item = serde_json::json!({
+        "id": item_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": content
+    });
+    if let Some(phase) = phase {
+        item["phase"] = Value::String(phase.to_string());
+    }
+    let output_item_done_ev = serde_json::json!({
+        "type": "response.output_item.done",
+        "sequence_number": next_responses_seq(state),
+        "response_id": response_id,
+        "output_index": output_index,
+        "item": item
+    });
+    out.push(format_sse_event(
+        "response.output_item.done",
+        &output_item_done_ev,
+    ));
+
+    let item = output_item_done_ev["item"].clone();
+    reset_responses_message_segment(state);
+    Some(ResponsesCompletedMessageState { output_index, item })
+}
+
 pub(super) fn emit_openai_responses_terminal(
     state: &mut StreamState,
     response_id: &str,
@@ -554,109 +682,35 @@ pub(super) fn emit_openai_responses_terminal(
         }
     }
 
-    if state.output_item_added {
-        let output_index = if let Some(idx) = state.responses_message_output_index {
-            idx
-        } else {
-            responses_message_output_index(state)
-        };
-        let item_id = state
-            .output_item_id
-            .clone()
-            .unwrap_or_else(|| "msg_0".to_string());
-        let message_parts = state.responses_message_parts.clone();
-        let mut content = Vec::with_capacity(message_parts.len());
-        for (content_index, part) in message_parts.iter().enumerate() {
-            let part_value = responses_message_part_value(part);
-            match part.kind.unwrap_or(ResponsesMessagePartKind::OutputText) {
-                ResponsesMessagePartKind::OutputText => {
-                    let done_ev = serde_json::json!({
-                        "type": responses_message_part_done_event_type(ResponsesMessagePartKind::OutputText),
-                        "sequence_number": next_responses_seq(state),
-                        "response_id": response_id,
-                        "output_index": output_index,
-                        "content_index": content_index,
-                        "item_id": item_id,
-                        "text": part.text
-                    });
-                    out.push(format_sse_event(
-                        responses_message_part_done_event_type(
-                            ResponsesMessagePartKind::OutputText,
-                        ),
-                        &done_ev,
-                    ));
-                }
-                ResponsesMessagePartKind::Refusal => {
-                    let done_ev = serde_json::json!({
-                        "type": responses_message_part_done_event_type(ResponsesMessagePartKind::Refusal),
-                        "sequence_number": next_responses_seq(state),
-                        "response_id": response_id,
-                        "output_index": output_index,
-                        "content_index": content_index,
-                        "item_id": item_id,
-                        "refusal": part.text
-                    });
-                    out.push(format_sse_event(
-                        responses_message_part_done_event_type(ResponsesMessagePartKind::Refusal),
-                        &done_ev,
-                    ));
-                }
-            }
-            let part_done_ev = serde_json::json!({
-                "type": "response.content_part.done",
-                "sequence_number": next_responses_seq(state),
-                "response_id": response_id,
-                "output_index": output_index,
-                "content_index": content_index,
-                "item_id": item_id,
-                "part": part_value
-            });
-            out.push(format_sse_event(
-                "response.content_part.done",
-                &part_done_ev,
-            ));
-            content.push(part_value);
-        }
-        let output_item_done_ev = serde_json::json!({
-            "type": "response.output_item.done",
-            "sequence_number": next_responses_seq(state),
-            "response_id": response_id,
-            "output_index": output_index,
-            "item": {
-                "id": item_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": content
-            }
-        });
-        out.push(format_sse_event(
-            "response.output_item.done",
-            &output_item_done_ev,
-        ));
+    if let Some(message_item) = emit_responses_message_done(
+        state,
+        response_id,
+        responses_terminal_message_phase(finish_reason),
+        &mut out,
+    ) {
+        state.responses_completed_message_items.push(message_item);
     }
 
-    let mut output = Vec::new();
+    let mut output_items: Vec<(u64, Value)> = Vec::new();
     if state.responses_reasoning_added {
-        output.push(serde_json::json!({
-            "id": state.responses_reasoning_id,
-            "type": "reasoning",
-            "summary": [{ "type": "summary_text", "text": state.responses_reasoning_text }]
-        }));
+        let output_index = state
+            .responses_reasoning_output_index
+            .unwrap_or_else(|| responses_reasoning_output_index(state));
+        output_items.push((
+            output_index,
+            serde_json::json!({
+                "id": state.responses_reasoning_id,
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": state.responses_reasoning_text }]
+            }),
+        ));
     }
-    if state.output_item_added {
-        output.push(serde_json::json!({
-            "id": state.output_item_id.clone().unwrap_or_else(|| "msg_0".to_string()),
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": state
-                .responses_message_parts
-                .iter()
-                .map(responses_message_part_value)
-                .collect::<Vec<_>>()
-        }));
-    }
+    output_items.extend(
+        state
+            .responses_completed_message_items
+            .iter()
+            .map(|message| (message.output_index, message.item.clone())),
+    );
     let mut tool_call_output = state.openai_tool_calls.values().collect::<Vec<_>>();
     tool_call_output.sort_by_key(|tc| tc.index);
     for tool_call in tool_call_output {
@@ -691,9 +745,17 @@ pub(super) fn emit_openai_responses_terminal(
                 incomplete_reason,
                 terminated_without_finish_reason,
             );
-            output.push(item);
+            output_items.push((
+                tool_call.block_index.unwrap_or(tool_call.index) as u64,
+                item,
+            ));
         }
     }
+    output_items.sort_by_key(|(output_index, _)| *output_index);
+    let output = output_items
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
 
     let mut resp = serde_json::json!({
         "id": response_id,
@@ -1498,6 +1560,7 @@ pub(super) fn openai_chunk_to_responses_sse(
 
     if !state.responses_started {
         state.responses_started = true;
+        state.responses_completed_message_items.clear();
         state.openai_terminal_error = chunk.get("error").cloned();
         state.message_id = chunk
             .get("id")
@@ -1678,6 +1741,11 @@ pub(super) fn openai_chunk_to_responses_sse(
         }
     }
     if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+        if let Some(message_item) =
+            emit_responses_message_done(state, &response_id, Some("commentary"), &mut out)
+        {
+            state.responses_completed_message_items.push(message_item);
+        }
         for tc in tcs {
             let tc_idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             dedupe_tool_call_state_by_call_id(&mut state.openai_tool_calls, tc_idx, tc.get("id"));

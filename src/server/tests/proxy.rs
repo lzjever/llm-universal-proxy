@@ -11,6 +11,134 @@ fn parse_sse_events(body: &[u8]) -> Vec<Value> {
     events
 }
 
+async fn spawn_anthropic_messages_stream_mock(
+    response_events: Vec<Value>,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    #[derive(Clone)]
+    struct MockState {
+        requests: Arc<Mutex<Vec<Value>>>,
+        response_events: Vec<Value>,
+    }
+
+    async fn handle_messages(
+        State(state): State<MockState>,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        state.requests.lock().await.push(body);
+
+        let pieces = state
+            .response_events
+            .iter()
+            .flat_map(|event| {
+                let event_type = event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message_delta")
+                    .to_string();
+                let event_bytes =
+                    serde_json::to_vec(event).expect("serialize anthropic streaming payload");
+                vec![
+                    Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: {event_type}\n"))),
+                    Ok(Bytes::from_static(b"data: ")),
+                    Ok(Bytes::from(event_bytes)),
+                    Ok(Bytes::from_static(b"\n\n")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let body_stream = stream::iter(pieces);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from_stream(body_stream))
+            .expect("streaming response")
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1/messages", post(handle_messages))
+        .route("/messages", post(handle_messages))
+        .with_state(MockState {
+            requests: requests.clone(),
+            response_events,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind anthropic stream mock upstream");
+    let addr = listener
+        .local_addr()
+        .expect("anthropic stream mock local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("anthropic stream mock server");
+    });
+
+    (format!("http://{addr}"), requests, server)
+}
+
+fn anthropic_commentary_then_tool_use_events() -> Vec<Value> {
+    vec![
+        serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_commentary",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-7-sonnet",
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "text", "text": "" }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": "Preamble line\\n" }
+        }),
+        serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "exec_command",
+                "input": {}
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": { "type": "input_json_delta", "partial_json": "{\"cmd\":\"pwd\"}" }
+        }),
+        serde_json::json!({
+            "type": "content_block_stop",
+            "index": 1
+        }),
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "tool_use" },
+            "usage": { "input_tokens": 12, "output_tokens": 4 }
+        }),
+        serde_json::json!({
+            "type": "message_stop"
+        }),
+    ]
+}
+
 #[test]
 fn classify_request_boundary_rejects_translated_stateful_responses_controls() {
     let decision = classify_request_boundary(
@@ -853,6 +981,240 @@ async fn live_responses_gemini_custom_tool_stream_preserves_sse_and_stable_tool_
         !serialized.contains("__llmup_custom__"),
         "Gemini bridge must not leak prefixed tool names upstream: {:?}",
         recorded[0].1
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_anthropic_stream_emits_commentary_message_done_before_tool_item() {
+    let (mock_base, requests, server) =
+        spawn_anthropic_messages_stream_mock(anthropic_commentary_then_tool_use_events()).await;
+    let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Anthropic);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Run pwd" }]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": { "type": "string" }
+                    },
+                    "required": ["cmd"],
+                    "additionalProperties": false
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "name": "exec_command"
+            },
+            "stream": true
+        }),
+        "claude-3-7-sonnet".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("stream body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("stream body utf8");
+    let events = parse_sse_events(&body);
+
+    let commentary_done_idx = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+                && event["item"]["type"] == "message"
+        })
+        .expect("completed assistant message item");
+    let commentary_done = &events[commentary_done_idx];
+    assert_eq!(
+        commentary_done["item"]["phase"], "commentary",
+        "body = {body_text}"
+    );
+    assert_eq!(commentary_done["item"]["status"], "completed");
+    assert!(
+        commentary_done["item"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("output_text")
+                    && part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .contains("Preamble line")
+            }),
+        "body = {body_text}"
+    );
+
+    let tool_added_idx = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+                && event["item"]["type"] == "function_call"
+                && event["item"]["name"] == "exec_command"
+        })
+        .expect("function-call item added");
+    assert!(
+        commentary_done_idx < tool_added_idx,
+        "commentary message should complete before tool work begins: {body_text}"
+    );
+
+    let tool_args_delta_idx = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str)
+                == Some("response.function_call_arguments.delta")
+                && event["name"] == "exec_command"
+        })
+        .expect("function-call arguments delta");
+    let tool_done_idx = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+                && event["item"]["type"] == "function_call"
+                && event["item"]["name"] == "exec_command"
+        })
+        .expect("function-call item done");
+    assert!(
+        tool_added_idx < tool_args_delta_idx && tool_args_delta_idx < tool_done_idx,
+        "tool item lifecycle should stay intact: {body_text}"
+    );
+    assert_eq!(
+        events[tool_done_idx]["item"]["arguments"],
+        "{\"cmd\":\"pwd\"}"
+    );
+    assert!(
+        !body_text.contains("__llmup_custom__"),
+        "translated stream must not leak internal bridge artifacts: {body_text}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    assert_eq!(recorded[0]["tools"][0]["name"], "exec_command");
+    assert_eq!(recorded[0]["stream"], true);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_responses_anthropic_stream_keeps_tool_item_lifecycle_after_commentary_preamble() {
+    let (mock_base, _requests, server) =
+        spawn_anthropic_messages_stream_mock(anthropic_commentary_then_tool_use_events()).await;
+    let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Anthropic);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Run pwd" }]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": { "type": "string" }
+                    },
+                    "required": ["cmd"],
+                    "additionalProperties": false
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "name": "exec_command"
+            },
+            "stream": true
+        }),
+        "claude-3-7-sonnet".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("stream body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("stream body utf8");
+    let events = parse_sse_events(&body);
+
+    let tool_added_idx = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+                && event["item"]["type"] == "function_call"
+                && event["item"]["name"] == "exec_command"
+        })
+        .expect("function-call item added");
+    let tool_args_delta_idx = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str)
+                == Some("response.function_call_arguments.delta")
+                && event["name"] == "exec_command"
+        })
+        .expect("function-call arguments delta");
+    let tool_args_done_idx = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str)
+                == Some("response.function_call_arguments.done")
+                && event["name"] == "exec_command"
+        })
+        .expect("function-call arguments done");
+    let tool_done_idx = events
+        .iter()
+        .position(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+                && event["item"]["type"] == "function_call"
+                && event["item"]["name"] == "exec_command"
+        })
+        .expect("function-call item done");
+
+    assert!(
+        tool_added_idx < tool_args_delta_idx
+            && tool_args_delta_idx < tool_args_done_idx
+            && tool_args_done_idx < tool_done_idx,
+        "tool item lifecycle should stay intact: {body_text}"
+    );
+    assert_eq!(
+        events[tool_done_idx]["item"]["arguments"],
+        "{\"cmd\":\"pwd\"}"
     );
 
     server.abort();

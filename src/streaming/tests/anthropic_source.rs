@@ -40,7 +40,9 @@ fn claude_plain_thinking_is_buffered_until_block_stop() {
         }),
         &mut state,
     );
-    assert!(delta_chunks.is_empty(), "delta_chunks = {delta_chunks:?}");
+    assert!(delta_chunks
+        .iter()
+        .any(|chunk| chunk["choices"][0]["delta"]["reasoning_content"] == "think"));
 
     let stop_chunks = claude_event_to_openai_chunks(
         &serde_json::json!({
@@ -51,7 +53,62 @@ fn claude_plain_thinking_is_buffered_until_block_stop() {
     );
     assert!(stop_chunks
         .iter()
-        .any(|chunk| chunk["choices"][0]["delta"]["reasoning_content"] == "think"));
+        .all(|chunk| chunk["choices"][0]["delta"]["reasoning_content"].is_null()));
+}
+
+#[test]
+fn claude_thinking_start_and_delta_emit_incremental_reasoning_before_block_stop() {
+    let mut state = StreamState::default();
+    let _ = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-3" }
+        }),
+        &mut state,
+    );
+
+    let start_chunks = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "thinking", "thinking": "ponder" }
+        }),
+        &mut state,
+    );
+    let delta_chunks = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "thinking_delta", "thinking": "hidden" }
+        }),
+        &mut state,
+    );
+    let stop_chunks = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+        &mut state,
+    );
+
+    assert!(
+        start_chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["delta"]["reasoning_content"] == "ponder"),
+        "start_chunks = {start_chunks:?}"
+    );
+    assert!(
+        delta_chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["delta"]["reasoning_content"] == "hidden"),
+        "delta_chunks = {delta_chunks:?}"
+    );
+    assert!(
+        stop_chunks
+            .iter()
+            .all(|chunk| chunk["choices"][0]["delta"]["reasoning_content"].is_null()),
+        "stop_chunks = {stop_chunks:?}"
+    );
 }
 
 #[test]
@@ -232,11 +289,27 @@ fn translate_sse_event_anthropic_plain_thinking_to_openai_buffers_until_stop_and
         !first.is_empty(),
         "message_start should still initialize stream"
     );
-    assert!(second.is_empty(), "second = {second:?}");
-    assert!(third.is_empty(), "third = {third:?}");
+    let second_joined = second
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let third_joined = third
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        second_joined.contains("\"reasoning_content\":\"ponder\""),
+        "{second_joined}"
+    );
+    assert!(
+        third_joined.contains("\"reasoning_content\":\"hidden\""),
+        "{third_joined}"
+    );
     assert!(fifth.is_empty(), "fifth = {fifth:?}");
     assert!(
-        fourth_joined.contains("reasoning_content"),
+        !fourth_joined.contains("reasoning_content"),
         "fourth_joined = {fourth_joined}"
     );
     assert!(
@@ -306,24 +379,126 @@ fn translate_sse_event_anthropic_plain_thinking_to_responses_buffers_until_stop_
         .collect::<Vec<_>>()
         .join("\n");
 
+    let started_joined = started
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffered_joined = buffered_reasoning
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let reasoning_done_joined = reasoning_done
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        joined.contains("response.reasoning_summary_text.delta"),
+        started_joined.contains("response.reasoning_summary_text.delta"),
+        "started_joined = {started_joined}"
+    );
+    assert!(
+        started_joined.contains("\"delta\":\"ponder\""),
+        "started_joined = {started_joined}"
+    );
+    assert!(
+        buffered_joined.contains("\"delta\":\"hidden\""),
+        "buffered_joined = {buffered_joined}"
+    );
+    assert!(
+        reasoning_done_joined.contains("\"delta\":\"hidden\""),
+        "reasoning_done_joined = {reasoning_done_joined}"
+    );
+    assert!(
+        !joined.contains("response.reasoning_summary_text.delta"),
         "joined = {joined}"
-    );
-    assert!(
-        joined.contains("\"delta\":\"ponderhiddenhidden\""),
-        "joined = {joined}"
-    );
-    assert!(started.is_empty(), "started = {started:?}");
-    assert!(
-        buffered_reasoning.is_empty(),
-        "buffered_reasoning = {buffered_reasoning:?}"
-    );
-    assert!(
-        reasoning_done.is_empty(),
-        "reasoning_done = {reasoning_done:?}"
     );
     assert!(state.fatal_rejection.is_none(), "state = {state:?}");
+}
+
+#[test]
+fn translate_sse_event_anthropic_thinking_to_responses_emits_reasoning_before_block_stop() {
+    let mut state = StreamState::default();
+    let _ = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-3" }
+        }),
+        &mut state,
+    );
+
+    let started = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "thinking",
+                "thinking": "ponder"
+            }
+        }),
+        &mut state,
+    );
+    let delta = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "thinking_delta", "thinking": "hidden" }
+        }),
+        &mut state,
+    );
+    let stopped = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+        &mut state,
+    );
+
+    let started_events = started
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .collect::<Vec<_>>();
+    let delta_events = delta
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .collect::<Vec<_>>();
+    let stopped_events = stopped
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .collect::<Vec<_>>();
+
+    assert!(
+        started_events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str)
+                == Some("response.reasoning_summary_text.delta")
+                && event.get("delta").and_then(Value::as_str) == Some("ponder")
+        }),
+        "started_events = {started_events:?}"
+    );
+    assert!(
+        delta_events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str)
+                == Some("response.reasoning_summary_text.delta")
+                && event.get("delta").and_then(Value::as_str) == Some("hidden")
+        }),
+        "delta_events = {delta_events:?}"
+    );
+    assert!(
+        stopped_events.iter().all(|event| {
+            event.get("type").and_then(Value::as_str)
+                != Some("response.reasoning_summary_text.delta")
+        }),
+        "stopped_events = {stopped_events:?}"
+    );
 }
 
 #[test]
@@ -380,10 +555,25 @@ fn translate_sse_event_anthropic_plain_thinking_to_gemini_buffers_until_stop_and
         first.is_empty(),
         "message_start alone should not emit Gemini content"
     );
-    assert!(started.is_empty(), "started = {started:?}");
-    assert!(buffered.is_empty(), "buffered = {buffered:?}");
-    assert!(!flushed.is_empty(), "{joined}");
-    assert!(joined.contains("\"thought\":true"), "{joined}");
+    let started_joined = started
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffered_joined = buffered
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        started_joined.contains("\"thought\":true"),
+        "{started_joined}"
+    );
+    assert!(
+        buffered_joined.contains("\"thought\":true"),
+        "{buffered_joined}"
+    );
+    assert!(flushed.is_empty(), "{joined}");
     assert!(state.fatal_rejection.is_none(), "state = {state:?}");
 }
 
@@ -447,13 +637,20 @@ fn translate_sse_event_anthropic_signature_delta_to_openai_drops_signature_and_f
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(buffered.is_empty(), "buffered = {buffered:?}");
+    let buffered_joined = buffered
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        buffered_joined.contains("reasoning_content"),
+        "{buffered_joined}"
+    );
     assert!(
         dropped_signature.is_empty(),
         "dropped_signature = {dropped_signature:?}"
     );
-    assert!(joined.contains("reasoning_content"), "{joined}");
-    assert!(joined.contains("\"hidden\""), "{joined}");
+    assert!(!joined.contains("reasoning_content"), "{joined}");
     assert!(state.fatal_rejection.is_none(), "state = {state:?}");
 }
 
@@ -723,10 +920,7 @@ fn claude_tool_use_seeded_input_and_json_delta_are_both_preserved() {
             .arguments,
         "{\"cmd\":\"pwd\"}"
     );
-    assert!(
-        delta_chunks.is_empty(),
-        "tool_use arguments should stay buffered until content_block_stop"
-    );
+    assert!(delta_chunks.is_empty(), "{delta_chunks:?}");
     let stop_tool_calls = stop_chunks[0]["choices"][0]["delta"]["tool_calls"]
         .as_array()
         .expect("stop tool_calls");
@@ -734,6 +928,62 @@ fn claude_tool_use_seeded_input_and_json_delta_are_both_preserved() {
         stop_tool_calls[0]["function"]["arguments"],
         "{\"cmd\":\"pwd\"}"
     );
+}
+
+#[test]
+fn claude_tool_use_keeps_arguments_buffered_until_block_stop_even_if_json_becomes_valid_early() {
+    let mut state = StreamState::default();
+    let _ = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-test" }
+        }),
+        &mut state,
+    );
+    let _ = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 2,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "exec_command",
+                "input": {}
+            }
+        }),
+        &mut state,
+    );
+
+    let invalid_delta_chunks = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": { "type": "input_json_delta", "partial_json": "{\"cmd\":\"pw" }
+        }),
+        &mut state,
+    );
+    let valid_delta_chunks = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 2,
+            "delta": { "type": "input_json_delta", "partial_json": "d\"}" }
+        }),
+        &mut state,
+    );
+    let stop_chunks = claude_event_to_openai_chunks(
+        &serde_json::json!({
+            "type": "content_block_stop",
+            "index": 2
+        }),
+        &mut state,
+    );
+
+    assert!(invalid_delta_chunks.is_empty(), "{invalid_delta_chunks:?}");
+    assert!(valid_delta_chunks.is_empty(), "{valid_delta_chunks:?}");
+    let tool_calls = stop_chunks[0]["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .expect("stop tool_calls");
+    assert_eq!(tool_calls[0]["function"]["arguments"], "{\"cmd\":\"pwd\"}");
 }
 
 #[test]
@@ -826,10 +1076,7 @@ fn claude_empty_tool_input_waits_for_delta_arguments() {
         start_chunks.is_empty(),
         "empty Anthropic tool inputs should stay buffered until the JSON object is complete"
     );
-    assert!(
-        delta_chunks.is_empty(),
-        "tool_use arguments should stay buffered until content_block_stop"
-    );
+    assert!(delta_chunks.is_empty(), "{delta_chunks:?}");
     let stop_tool_calls = stop_chunks[0]["choices"][0]["delta"]["tool_calls"]
         .as_array()
         .expect("stop tool_calls");
@@ -894,7 +1141,7 @@ fn claude_empty_tool_input_with_multiple_json_deltas_finalizes_as_structured_too
 
     assert!(start_chunks.is_empty());
     assert!(delta_chunks_1.is_empty());
-    assert!(delta_chunks_2.is_empty());
+    assert!(delta_chunks_2.is_empty(), "{delta_chunks_2:?}");
     let stop_tool_calls = stop_chunks[0]["choices"][0]["delta"]["tool_calls"]
         .as_array()
         .expect("stop tool_calls");
@@ -960,7 +1207,7 @@ fn claude_server_tool_use_empty_input_with_multiple_json_deltas_is_preserved() {
 
     assert!(start_chunks.is_empty());
     assert!(delta_chunks_1.is_empty());
-    assert!(delta_chunks_2.is_empty());
+    assert!(delta_chunks_2.is_empty(), "{delta_chunks_2:?}");
     let stop_tool_calls = stop_chunks[0]["choices"][0]["delta"]["tool_calls"]
         .as_array()
         .expect("stop tool_calls");
@@ -1109,6 +1356,298 @@ fn translate_sse_event_anthropic_complete_tool_use_to_responses_still_lands_as_f
         .expect("function_call item");
     assert_eq!(function_call["name"], "exec_command");
     assert_eq!(function_call["arguments"], "{\"cmd\":\"pwd\"}");
+}
+
+#[test]
+fn translate_sse_event_anthropic_complete_tool_use_to_responses_emits_delta_at_block_stop_only() {
+    let mut state = StreamState::default();
+    let _ = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-test" }
+        }),
+        &mut state,
+    );
+    let _ = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "exec_command",
+                "input": {}
+            }
+        }),
+        &mut state,
+    );
+
+    let buffered = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"cmd\":\"pw"
+            }
+        }),
+        &mut state,
+    );
+    let emitted = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "d\"}"
+            }
+        }),
+        &mut state,
+    );
+    let stopped = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        &serde_json::json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+        &mut state,
+    );
+
+    let emitted_events = emitted
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .collect::<Vec<_>>();
+    let stopped_events = stopped
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .collect::<Vec<_>>();
+
+    assert!(buffered.is_empty(), "buffered = {buffered:?}");
+    assert!(
+        emitted_events.is_empty(),
+        "emitted_events = {emitted_events:?}"
+    );
+    assert!(
+        stopped_events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str)
+                == Some("response.function_call_arguments.delta")
+                && event.get("delta").and_then(Value::as_str) == Some("{\"cmd\":\"pwd\"}")
+        }),
+        "stopped_events = {stopped_events:?}"
+    );
+}
+
+#[test]
+fn translate_sse_event_anthropic_valid_then_invalid_tool_use_to_responses_does_not_complete_as_function_call(
+) {
+    let mut state = StreamState::default();
+    let mut out = Vec::new();
+    for event in [
+        serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-test" }
+        }),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "exec_command",
+                "input": {}
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"cmd\":\"pwd\"}"
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": " trailing"
+            }
+        }),
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "tool_use" },
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        }),
+        serde_json::json!({ "type": "message_stop" }),
+    ] {
+        out.extend(translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &event,
+            &mut state,
+        ));
+    }
+
+    let events = out
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .collect::<Vec<_>>();
+    assert!(
+        events.iter().all(|event| {
+            !(event.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+                && event
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("function_call"))
+        }),
+        "events = {events:?}"
+    );
+    assert!(
+        events.iter().all(|event| {
+            !(event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+                && event
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("function_call"))
+        }),
+        "events = {events:?}"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event.get("type").and_then(Value::as_str)
+                != Some("response.function_call_arguments.done")
+        }),
+        "events = {events:?}"
+    );
+    let terminal = events
+        .iter()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("response.completed"))
+        .expect("response.completed event");
+    let output = terminal["response"]["output"]
+        .as_array()
+        .expect("response output");
+    assert!(
+        output
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("function_call")),
+        "terminal = {terminal:?}"
+    );
+    assert_eq!(output[0]["type"], "message");
+    let content = output[0]["content"].as_array().expect("message content");
+    let text = content[0]["text"].as_str().expect("output text");
+    assert!(text.contains("exec_command"), "text = {text}");
+    assert!(text.contains("\"cmd\":\"pwd\"} trailing"), "text = {text}");
+}
+
+#[test]
+fn translate_sse_event_anthropic_valid_then_invalid_server_tool_use_to_responses_does_not_complete_as_function_call(
+) {
+    let mut state = StreamState::default();
+    let mut out = Vec::new();
+    for event in [
+        serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-test" }
+        }),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "server_1",
+                "name": "web_search",
+                "input": {}
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"query\":\"rust\"}"
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": " trailing"
+            }
+        }),
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "tool_use" },
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        }),
+        serde_json::json!({ "type": "message_stop" }),
+    ] {
+        out.extend(translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiResponses,
+            &event,
+            &mut state,
+        ));
+    }
+
+    let events = out
+        .iter()
+        .map(|bytes| parse_sse_json(bytes))
+        .collect::<Vec<_>>();
+    assert!(
+        events.iter().all(|event| {
+            !(event.get("type").and_then(Value::as_str) == Some("response.output_item.added")
+                && event
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("function_call"))
+        }),
+        "events = {events:?}"
+    );
+    assert!(
+        events.iter().all(|event| {
+            !(event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+                && event
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("function_call"))
+        }),
+        "events = {events:?}"
+    );
+    let terminal = events
+        .iter()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("response.completed"))
+        .expect("response.completed event");
+    let output = terminal["response"]["output"]
+        .as_array()
+        .expect("response output");
+    assert!(
+        output
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("function_call")),
+        "terminal = {terminal:?}"
+    );
+    assert_eq!(output[0]["type"], "message");
+    let content = output[0]["content"].as_array().expect("message content");
+    let text = content[0]["text"].as_str().expect("output text");
+    assert!(text.contains("web_search"), "text = {text}");
+    assert!(
+        text.contains("\"query\":\"rust\"} trailing"),
+        "text = {text}"
+    );
 }
 
 #[test]
@@ -1408,6 +1947,140 @@ fn translate_sse_event_anthropic_incomplete_tool_use_to_openai_completion_degrad
         "{joined}"
     );
     assert!(joined.contains("\"finish_reason\":\"stop\""), "{joined}");
+}
+
+#[test]
+fn translate_sse_event_anthropic_valid_then_invalid_tool_use_to_openai_completion_never_exposes_tool_calls(
+) {
+    let mut state = StreamState::default();
+    let mut out = Vec::new();
+    for event in [
+        serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-test" }
+        }),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "exec_command",
+                "input": {}
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"cmd\":\"pwd\"}"
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": " trailing"
+            }
+        }),
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "tool_use" }
+        }),
+        serde_json::json!({ "type": "message_stop" }),
+    ] {
+        out.extend(translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &event,
+            &mut state,
+        ));
+    }
+
+    let joined = out
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!joined.contains("\"tool_calls\""), "{joined}");
+    assert!(joined.contains("\"finish_reason\":\"stop\""), "{joined}");
+    assert!(
+        !joined.contains("\"finish_reason\":\"tool_calls\""),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("Tool call `exec_command` with partial arguments"),
+        "{joined}"
+    );
+}
+
+#[test]
+fn translate_sse_event_anthropic_valid_then_invalid_server_tool_use_to_openai_completion_never_exposes_tool_calls(
+) {
+    let mut state = StreamState::default();
+    let mut out = Vec::new();
+    for event in [
+        serde_json::json!({
+            "type": "message_start",
+            "message": { "id": "msg_1", "model": "claude-test" }
+        }),
+        serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "server_1",
+                "name": "web_search",
+                "input": {}
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": "{\"query\":\"rust\"}"
+            }
+        }),
+        serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": " trailing"
+            }
+        }),
+        serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "tool_use" }
+        }),
+        serde_json::json!({ "type": "message_stop" }),
+    ] {
+        out.extend(translate_sse_event(
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::OpenAiCompletion,
+            &event,
+            &mut state,
+        ));
+    }
+
+    let joined = out
+        .iter()
+        .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!joined.contains("\"tool_calls\""), "{joined}");
+    assert!(joined.contains("\"finish_reason\":\"stop\""), "{joined}");
+    assert!(
+        !joined.contains("\"finish_reason\":\"tool_calls\""),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("Tool call `web_search` with partial arguments"),
+        "{joined}"
+    );
 }
 
 #[test]

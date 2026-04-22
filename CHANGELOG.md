@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.2.12 - 2026-04-21
+
+- Fixed translated Responses commentary message lifecycle and `phase` semantics used by Codex `Working` state recovery, so mid-turn preambles now close as `commentary` and terminal text after tool-boundary finishes is no longer mislabeled as `final_answer`.
+- Preserved completed Responses `response.output` ordering across commentary, tool calls, and final answers, so terminal payloads keep mid-turn commentary instead of dropping it after the stream-level `done` event.
+- Tightened Anthropic translated streaming semantics: reasoning deltas now stay incremental, while generic OpenAI chat / Responses structured tool calls are only finalized when the block's final JSON remains valid, avoiding exposure of revocable tool calls to general clients.
+- Added focused streaming and proxy integration regressions around commentary/tool boundaries, terminal output ordering, and translated Anthropic tool-call validity transitions.
+
 ## v0.2.11 - 2026-04-21
 
 ### Configuration And Routing
