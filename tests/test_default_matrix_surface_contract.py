@@ -7,7 +7,13 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "real_cli_matrix.py"
-CONFIG_PATH = REPO_ROOT / "proxy-test-minimax-and-local.yaml"
+CONFIG_PATH = (
+    REPO_ROOT
+    / "scripts"
+    / "fixtures"
+    / "cli_matrix"
+    / "default_proxy_test_matrix.yaml"
+)
 
 
 def load_module():
@@ -50,9 +56,14 @@ class DefaultMatrixSurfaceContractTests(unittest.TestCase):
         for model_name in ("minimax-anth", "minimax-openai", "claude-haiku-4-5"):
             with self.subTest(model_name=model_name):
                 surface = effective_surface_for_model(module, parsed, model_name)
-                module._validate_live_surface_codex_requirements(surface)
+                module._validate_live_surface_codex_requirements(
+                    surface,
+                    require_tool_flags=True,
+                )
                 self.assertEqual(surface.input_modalities, ("text",))
                 self.assertFalse(surface.supports_search)
+                self.assertFalse(surface.supports_view_image)
+                self.assertFalse(surface.supports_parallel_calls)
 
     def test_runtime_config_preserves_primary_lane_surface_contracts(self):
         module = load_module()
@@ -66,14 +77,20 @@ class DefaultMatrixSurfaceContractTests(unittest.TestCase):
                 listen_port=19999,
                 trace_path=pathlib.Path(temp_dir) / "trace.jsonl",
             )
+        self.assertIn("supports_parallel_calls: false", runtime_text)
 
         runtime_parsed = module.parse_proxy_source(runtime_text)
         for model_name in ("minimax-anth", "minimax-openai", "claude-haiku-4-5"):
             with self.subTest(model_name=model_name):
                 surface = effective_surface_for_model(module, runtime_parsed, model_name)
-                module._validate_live_surface_codex_requirements(surface)
+                module._validate_live_surface_codex_requirements(
+                    surface,
+                    require_tool_flags=True,
+                )
                 self.assertEqual(surface.input_modalities, ("text",))
                 self.assertFalse(surface.supports_search)
+                self.assertFalse(surface.supports_view_image)
+                self.assertFalse(surface.supports_parallel_calls)
 
 
 if __name__ == "__main__":

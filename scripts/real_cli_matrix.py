@@ -26,7 +26,9 @@ from typing import Iterable
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG_SOURCE = REPO_ROOT / "proxy-test-minimax-and-local.yaml"
+DEFAULT_CONFIG_SOURCE = (
+    REPO_ROOT / "scripts" / "fixtures" / "cli_matrix" / "default_proxy_test_matrix.yaml"
+)
 DEFAULT_ENV_FILE = REPO_ROOT / ".env.test"
 DEFAULT_FIXTURES_ROOT = REPO_ROOT / "scripts" / "fixtures" / "cli_matrix"
 DEFAULT_REPORTS_ROOT = REPO_ROOT / "test-reports" / "cli-matrix"
@@ -480,6 +482,7 @@ class TaskFixture:
     timeout_secs: int
     workspace_template: pathlib.Path | None
     description: str = ""
+    unsupported_lanes: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -1386,6 +1389,9 @@ def load_fixtures(fixtures_root: pathlib.Path) -> list[TaskFixture]:
                     if workspace_template
                     else None
                 ),
+                unsupported_lanes=tuple(
+                    str(lane_name) for lane_name in payload.get("unsupported_lanes", [])
+                ),
             )
         )
     return fixtures
@@ -1408,6 +1414,8 @@ def phase_matches(client_name: str, fixture_kind: str, phase: str) -> bool:
 
 
 def lane_supports_fixture(lane: Lane, fixture: TaskFixture) -> bool:
+    if lane.name in fixture.unsupported_lanes:
+        return False
     if lane.name == "qwen-local" and fixture.kind == "long_horizon":
         return False
     return True
@@ -2033,12 +2041,20 @@ def _surface_metadata_from_live_surface(
 
 def _validate_live_surface_codex_requirements(
     surface: SurfaceMetadata | None,
+    *,
+    require_tool_flags: bool = False,
 ) -> None:
     missing: list[str] = []
     if surface is None or surface.input_modalities is None:
         missing.append("llmup.surface.modalities.input")
     if surface is None or surface.supports_search is None:
         missing.append("llmup.surface.tools.supports_search")
+    if require_tool_flags and (surface is None or surface.supports_view_image is None):
+        missing.append("llmup.surface.tools.supports_view_image")
+    if require_tool_flags and (
+        surface is None or surface.supports_parallel_calls is None
+    ):
+        missing.append("llmup.surface.tools.supports_parallel_calls")
     if missing:
         raise RuntimeError(
             "live model lookup omitted critical llmup surface fields: "
@@ -2068,7 +2084,10 @@ def fetch_live_model_profile(
 
     limits = _model_limits_from_live_surface(surface_payload)
     live_surface_metadata = _surface_metadata_from_live_surface(surface_payload)
-    _validate_live_surface_codex_requirements(live_surface_metadata)
+    _validate_live_surface_codex_requirements(
+        live_surface_metadata,
+        require_tool_flags=True,
+    )
     codex_metadata = (
         live_surface_metadata.to_codex_metadata()
         if live_surface_metadata is not None
@@ -2291,24 +2310,26 @@ def _verify_python_entrypoint(
     return True, ""
 
 
-def verify_fixture_output(
-    fixture: TaskFixture, stdout_text: str, workspace_dir: pathlib.Path | None
+def _verify_verifier_output(
+    verifier: dict[str, object],
+    stdout_text: str,
+    workspace_dir: pathlib.Path | None,
 ) -> tuple[bool, str]:
-    verifier_type = fixture.verifier["type"]
+    verifier_type = verifier["type"]
     if verifier_type == "contains":
-        needle = str(fixture.verifier["value"])
+        needle = str(verifier["value"])
         ok = needle.lower() in stdout_text.lower()
         return ok, f"expected output to contain {needle!r}"
     if verifier_type == "stdout_contract":
-        for needle in fixture.verifier.get("contains", []):
+        for needle in verifier.get("contains", []):
             expected = str(needle)
             if expected not in stdout_text:
                 return False, f"expected output to contain {expected!r}"
-        contains_any = [str(needle) for needle in fixture.verifier.get("contains_any", [])]
+        contains_any = [str(needle) for needle in verifier.get("contains_any", [])]
         if contains_any and not any(expected in stdout_text for expected in contains_any):
             options = ", ".join(repr(expected) for expected in contains_any)
             return False, f"expected output to contain at least one of {options}"
-        for needle in fixture.verifier.get("not_contains", []):
+        for needle in verifier.get("not_contains", []):
             forbidden = str(needle)
             if forbidden in stdout_text:
                 return False, f"expected output not to contain {forbidden!r}"
@@ -2316,25 +2337,38 @@ def verify_fixture_output(
     if verifier_type == "file_contains":
         if workspace_dir is None:
             return False, "workspace verifier required a workspace directory"
-        relative_path = pathlib.Path(str(fixture.verifier["path"]))
+        relative_path = pathlib.Path(str(verifier["path"]))
         target = workspace_dir / relative_path
         if not target.exists():
             return False, f"expected file {relative_path} to exist"
-        needle = str(fixture.verifier["needle"])
+        needle = str(verifier["needle"])
         ok = needle in target.read_text(encoding="utf-8")
         return ok, f"expected {relative_path} to contain {needle!r}"
     if verifier_type == "python_source_and_output":
         if workspace_dir is None:
             return False, "workspace verifier required a workspace directory"
-        ok, message = _verify_python_source_contract(
-            workspace_dir, dict(fixture.verifier["source"])
-        )
+        ok, message = _verify_python_source_contract(workspace_dir, dict(verifier["source"]))
         if not ok:
             return False, message
-        return _verify_python_entrypoint(
-            workspace_dir, dict(fixture.verifier["entrypoint"])
-        )
+        return _verify_python_entrypoint(workspace_dir, dict(verifier["entrypoint"]))
+    if verifier_type == "all_of":
+        nested_verifiers = verifier.get("verifiers", [])
+        if not isinstance(nested_verifiers, list) or not nested_verifiers:
+            return False, "all_of verifier requires a non-empty verifiers list"
+        for index, nested in enumerate(nested_verifiers):
+            if not isinstance(nested, dict):
+                return False, f"all_of[{index}] must be a verifier object"
+            ok, message = _verify_verifier_output(nested, stdout_text, workspace_dir)
+            if not ok:
+                return False, f"all_of[{index}]: {message}"
+        return True, ""
     return False, f"unsupported verifier type: {verifier_type}"
+
+
+def verify_fixture_output(
+    fixture: TaskFixture, stdout_text: str, workspace_dir: pathlib.Path | None
+) -> tuple[bool, str]:
+    return _verify_verifier_output(fixture.verifier, stdout_text, workspace_dir)
 
 
 def prepare_workspace(

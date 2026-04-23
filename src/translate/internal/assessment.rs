@@ -15,7 +15,7 @@ use super::models::{
     SemanticToolKind, SharedControlProfile, TranslationAssessment,
 };
 use super::openai_responses::decode_anthropic_reasoning_carrier;
-use super::request_gemini::gemini_generation_config_field;
+use super::request_gemini::{gemini_generation_config_field, gemini_part_field};
 use super::tools::{
     normalized_responses_tool_definition, openai_custom_tool_format_is_plain_text,
     openai_custom_tool_format_supports_anthropic_bridge, openai_tool_arguments_to_structured_value,
@@ -1056,46 +1056,36 @@ fn assess_surface_request_policy(
         );
     }
 
-    if !surface_allows_modality(
-        surface
-            .modalities
-            .as_ref()
-            .and_then(|modalities| modalities.input.as_ref()),
-        ModelModality::Image,
-    ) && request_uses_input_modality(client_format, body, ModelModality::Image)
-    {
-        assessment.reject(
-            "request uses image input, but model surface `modalities.input` does not include `image`"
-                .to_string(),
-        );
-    }
+    for modality in [ModelModality::Image, ModelModality::Audio] {
+        if !surface_allows_modality(
+            surface
+                .modalities
+                .as_ref()
+                .and_then(|modalities| modalities.input.as_ref()),
+            modality,
+        ) && request_uses_input_modality(client_format, body, modality)
+        {
+            assessment.reject(format!(
+                "request uses {} input, but model surface `modalities.input` does not include `{}`",
+                modality_label(modality),
+                modality_label(modality),
+            ));
+        }
 
-    if !surface_allows_modality(
-        surface
-            .modalities
-            .as_ref()
-            .and_then(|modalities| modalities.input.as_ref()),
-        ModelModality::Audio,
-    ) && request_uses_input_modality(client_format, body, ModelModality::Audio)
-    {
-        assessment.reject(
-            "request uses audio input, but model surface `modalities.input` does not include `audio`"
-                .to_string(),
-        );
-    }
-
-    if !surface_allows_modality(
-        surface
-            .modalities
-            .as_ref()
-            .and_then(|modalities| modalities.output.as_ref()),
-        ModelModality::Audio,
-    ) && request_uses_output_audio_modality(client_format, body)
-    {
-        assessment.reject(
-            "request asks for audio output, but model surface `modalities.output` does not include `audio`"
-                .to_string(),
-        );
+        if !surface_allows_modality(
+            surface
+                .modalities
+                .as_ref()
+                .and_then(|modalities| modalities.output.as_ref()),
+            modality,
+        ) && request_uses_output_modality(client_format, body, modality)
+        {
+            assessment.reject(format!(
+                "request asks for {} output, but model surface `modalities.output` does not include `{}`",
+                modality_label(modality),
+                modality_label(modality),
+            ));
+        }
     }
 }
 
@@ -1103,6 +1093,14 @@ fn surface_allows_modality(allowed: Option<&Vec<ModelModality>>, modality: Model
     allowed
         .map(|allowed| allowed.contains(&modality))
         .unwrap_or(true)
+}
+
+fn modality_label(modality: ModelModality) -> &'static str {
+    match modality {
+        ModelModality::Text => "text",
+        ModelModality::Image => "image",
+        ModelModality::Audio => "audio",
+    }
 }
 
 fn request_has_surface_tooling(client_format: UpstreamFormat, body: &Value) -> bool {
@@ -1148,8 +1146,44 @@ fn request_uses_input_modality(
         UpstreamFormat::OpenAiResponses => {
             openai_responses_request_uses_input_modality(body, modality)
         }
-        UpstreamFormat::Anthropic | UpstreamFormat::Google => false,
+        UpstreamFormat::Anthropic => anthropic_request_uses_input_modality(body, modality),
+        UpstreamFormat::Google => google_request_uses_input_modality(body, modality),
     }
+}
+
+fn anthropic_request_uses_input_modality(body: &Value, modality: ModelModality) -> bool {
+    anthropic_content_uses_input_modality(body.get("system"), modality)
+        || body
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    anthropic_content_uses_input_modality(message.get("content"), modality)
+                })
+            })
+}
+
+fn anthropic_content_uses_input_modality(content: Option<&Value>, modality: ModelModality) -> bool {
+    match content {
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .any(|block| anthropic_block_uses_input_modality(block, modality)),
+        Some(Value::Object(_)) => {
+            content.is_some_and(|block| anthropic_block_uses_input_modality(block, modality))
+        }
+        _ => false,
+    }
+}
+
+fn anthropic_block_uses_input_modality(block: &Value, modality: ModelModality) -> bool {
+    matches!(
+        (modality, block.get("type").and_then(Value::as_str)),
+        (ModelModality::Image, Some("image")) | (ModelModality::Audio, Some("audio"))
+    ) || block
+        .get("source")
+        .and_then(|source| source.get("media_type"))
+        .and_then(Value::as_str)
+        .is_some_and(|mime_type| mime_type_matches_modality(mime_type, modality))
 }
 
 fn openai_completion_request_uses_input_modality(body: &Value, modality: ModelModality) -> bool {
@@ -1220,21 +1254,102 @@ fn openai_input_part_uses_modality(part: &Value, modality: ModelModality) -> boo
     )
 }
 
-fn request_uses_output_audio_modality(client_format: UpstreamFormat, body: &Value) -> bool {
-    matches!(
-        client_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses
-    ) && (body.get("audio").is_some()
-        || body
-            .get("modalities")
-            .and_then(Value::as_array)
-            .is_some_and(|modalities| {
-                modalities.iter().any(|modality| {
-                    modality
-                        .as_str()
-                        .is_some_and(|modality| modality.eq_ignore_ascii_case("audio"))
-                })
-            }))
+fn google_request_uses_input_modality(body: &Value, modality: ModelModality) -> bool {
+    google_content_uses_input_modality(
+        body.get("systemInstruction")
+            .or_else(|| body.get("system_instruction")),
+        modality,
+    ) || body
+        .get("contents")
+        .and_then(Value::as_array)
+        .is_some_and(|contents| {
+            contents
+                .iter()
+                .any(|content| google_content_uses_input_modality(Some(content), modality))
+        })
+}
+
+fn google_content_uses_input_modality(content: Option<&Value>, modality: ModelModality) -> bool {
+    content
+        .and_then(|content| content.get("parts").and_then(Value::as_array))
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| google_part_uses_input_modality(part, modality))
+        })
+}
+
+fn google_part_uses_input_modality(part: &Value, modality: ModelModality) -> bool {
+    google_part_data_uses_input_modality(part, "inlineData", "inline_data", modality)
+        || google_part_data_uses_input_modality(part, "fileData", "file_data", modality)
+}
+
+fn google_part_data_uses_input_modality(
+    part: &Value,
+    camel: &str,
+    snake: &str,
+    modality: ModelModality,
+) -> bool {
+    gemini_part_field(part, camel, snake)
+        .and_then(|data| data.get("mimeType").or_else(|| data.get("mime_type")))
+        .and_then(Value::as_str)
+        .is_some_and(|mime_type| mime_type_matches_modality(mime_type, modality))
+}
+
+fn mime_type_matches_modality(mime_type: &str, modality: ModelModality) -> bool {
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+    match modality {
+        ModelModality::Text => mime_type.starts_with("text/"),
+        ModelModality::Image => mime_type.starts_with("image/"),
+        ModelModality::Audio => mime_type.starts_with("audio/"),
+    }
+}
+
+fn request_uses_output_modality(
+    client_format: UpstreamFormat,
+    body: &Value,
+    modality: ModelModality,
+) -> bool {
+    match client_format {
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses => {
+            openai_request_uses_output_modality(body, modality)
+        }
+        UpstreamFormat::Anthropic => false,
+        UpstreamFormat::Google => google_request_uses_output_modality(body, modality),
+    }
+}
+
+fn openai_request_uses_output_modality(body: &Value, modality: ModelModality) -> bool {
+    modality == ModelModality::Audio
+        && (body.get("audio").is_some()
+            || body
+                .get("modalities")
+                .and_then(Value::as_array)
+                .is_some_and(|modalities| {
+                    modalities.iter().any(|requested_modality| {
+                        requested_modality
+                            .as_str()
+                            .is_some_and(|requested_modality| {
+                                requested_modality.eq_ignore_ascii_case("audio")
+                            })
+                    })
+                }))
+}
+
+fn google_request_uses_output_modality(body: &Value, modality: ModelModality) -> bool {
+    gemini_generation_config_field(body, "responseModalities", "response_modalities")
+        .and_then(Value::as_array)
+        .is_some_and(|modalities| {
+            modalities.iter().any(|requested_modality| {
+                requested_modality
+                    .as_str()
+                    .is_some_and(|requested_modality| {
+                        requested_modality.eq_ignore_ascii_case(modality_label(modality))
+                    })
+            })
+        })
+        || (modality == ModelModality::Audio
+            && gemini_generation_config_field(body, "speechConfig", "speech_config").is_some())
 }
 
 pub(crate) fn assess_request_translation_with_surface(

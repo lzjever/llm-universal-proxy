@@ -234,6 +234,326 @@ fn translate_request_openai_passthrough_rejects_audio_output_when_surface_is_tex
 }
 
 #[test]
+fn translate_request_anthropic_passthrough_rejects_image_input_when_surface_is_text_only() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Describe this" },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "AAAA"
+                    }
+                }
+            ]
+        }]
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: Some(crate::config::ModelModalities {
+                    input: Some(vec![crate::config::ModelModality::Text]),
+                    output: None,
+                }),
+                tools: None,
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject unsupported image input on Anthropic passthrough");
+
+    assert!(err.contains("modalities.input"), "err = {err}");
+    assert!(err.contains("image"), "err = {err}");
+}
+
+#[test]
+fn translate_request_anthropic_passthrough_rejects_audio_input_when_surface_is_text_only() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "audio",
+                "source": {
+                    "type": "base64",
+                    "media_type": "audio/wav",
+                    "data": "AAAA"
+                }
+            }]
+        }]
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: Some(crate::config::ModelModalities {
+                    input: Some(vec![crate::config::ModelModality::Text]),
+                    output: None,
+                }),
+                tools: None,
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject unsupported audio input on Anthropic passthrough");
+
+    assert!(err.contains("modalities.input"), "err = {err}");
+    assert!(err.contains("audio"), "err = {err}");
+}
+
+#[test]
+fn translate_request_anthropic_passthrough_defaults_disable_parallel_tool_use_when_surface_disables_it(
+) {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "tools": [{
+            "name": "lookup_weather",
+            "input_schema": { "type": "object", "properties": {} }
+        }]
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: None,
+                tools: Some(crate::config::ModelToolSurface {
+                    supports_search: None,
+                    supports_view_image: None,
+                    apply_patch_transport: None,
+                    supports_parallel_calls: Some(false),
+                }),
+            },
+        ),
+        false,
+    )
+    .expect("surface should force serial tool execution for native Anthropic passthrough");
+
+    assert_eq!(body["tool_choice"]["type"], "auto");
+    assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+}
+
+#[test]
+fn translate_request_anthropic_passthrough_rejects_parallel_tool_use_override_when_surface_disables_it(
+) {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "tools": [{
+            "name": "lookup_weather",
+            "input_schema": { "type": "object", "properties": {} }
+        }],
+        "tool_choice": {
+            "type": "auto",
+            "disable_parallel_tool_use": false
+        }
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: None,
+                tools: Some(crate::config::ModelToolSurface {
+                    supports_search: None,
+                    supports_view_image: None,
+                    apply_patch_transport: None,
+                    supports_parallel_calls: Some(false),
+                }),
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject explicit Anthropic parallel tool override");
+
+    assert!(err.contains("disable_parallel_tool_use"), "err = {err}");
+    assert!(err.contains("supports_parallel_calls"), "err = {err}");
+}
+
+#[test]
+fn translate_request_google_passthrough_rejects_image_input_when_surface_is_text_only() {
+    let mut body = json!({
+        "model": "gemini-1.5",
+        "contents": [{
+            "role": "user",
+            "parts": [
+                { "text": "Describe this" },
+                {
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": "AAAA"
+                    }
+                }
+            ]
+        }]
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::Google,
+        UpstreamFormat::Google,
+        "gemini-1.5",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: Some(crate::config::ModelModalities {
+                    input: Some(vec![crate::config::ModelModality::Text]),
+                    output: None,
+                }),
+                tools: None,
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject unsupported image input on Google passthrough");
+
+    assert!(err.contains("modalities.input"), "err = {err}");
+    assert!(err.contains("image"), "err = {err}");
+}
+
+#[test]
+fn translate_request_google_passthrough_rejects_audio_input_when_surface_is_text_only() {
+    let mut body = json!({
+        "model": "gemini-1.5",
+        "contents": [{
+            "role": "user",
+            "parts": [{
+                "inlineData": {
+                    "mimeType": "audio/wav",
+                    "data": "AAAA"
+                }
+            }]
+        }]
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::Google,
+        UpstreamFormat::Google,
+        "gemini-1.5",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: Some(crate::config::ModelModalities {
+                    input: Some(vec![crate::config::ModelModality::Text]),
+                    output: None,
+                }),
+                tools: None,
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject unsupported audio input on Google passthrough");
+
+    assert!(err.contains("modalities.input"), "err = {err}");
+    assert!(err.contains("audio"), "err = {err}");
+}
+
+#[test]
+fn translate_request_google_passthrough_rejects_audio_output_when_surface_is_text_only() {
+    let mut body = json!({
+        "model": "gemini-1.5",
+        "contents": [{
+            "role": "user",
+            "parts": [{ "text": "Read this aloud" }]
+        }],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "AUDIO"]
+        }
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::Google,
+        UpstreamFormat::Google,
+        "gemini-1.5",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: Some(crate::config::ModelModalities {
+                    input: None,
+                    output: Some(vec![crate::config::ModelModality::Text]),
+                }),
+                tools: None,
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject unsupported audio output on Google passthrough");
+
+    assert!(err.contains("modalities.output"), "err = {err}");
+    assert!(err.contains("audio"), "err = {err}");
+}
+
+#[test]
+fn translate_request_google_passthrough_rejects_image_output_when_surface_is_text_only() {
+    let mut body = json!({
+        "model": "gemini-1.5",
+        "contents": [{
+            "role": "user",
+            "parts": [{ "text": "Generate a cat picture" }]
+        }],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"]
+        }
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::Google,
+        UpstreamFormat::Google,
+        "gemini-1.5",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: Some(crate::config::ModelModalities {
+                    input: None,
+                    output: Some(vec![crate::config::ModelModality::Text]),
+                }),
+                tools: None,
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject unsupported image output on Google passthrough");
+
+    assert!(err.contains("modalities.output"), "err = {err}");
+    assert!(err.contains("image"), "err = {err}");
+}
+
+#[test]
 fn responses_to_messages_via_translate() {
     let mut body = json!({
         "model": "gpt-4o",

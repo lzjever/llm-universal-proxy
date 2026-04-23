@@ -14,6 +14,13 @@ from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "real_cli_matrix.py"
+DEFAULT_CONFIG_PATH = (
+    REPO_ROOT
+    / "scripts"
+    / "fixtures"
+    / "cli_matrix"
+    / "default_proxy_test_matrix.yaml"
+)
 TOOL_IDENTITY_FIXTURE_PATH = (
     REPO_ROOT
     / "scripts"
@@ -404,7 +411,7 @@ class RealCliMatrixTests(unittest.TestCase):
     def test_resolve_lanes_marks_qwen_optional_when_env_missing(self):
         module = load_module()
         parsed = module.parse_proxy_source(
-            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
 
         lanes = {lane.name: lane for lane in module.resolve_lanes(parsed, {})}
@@ -425,7 +432,7 @@ class RealCliMatrixTests(unittest.TestCase):
     def test_resolve_lanes_enables_qwen_when_env_present(self):
         module = load_module()
         parsed = module.parse_proxy_source(
-            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
 
         lanes = {
@@ -447,7 +454,7 @@ class RealCliMatrixTests(unittest.TestCase):
     def test_build_runtime_config_overrides_listen_and_injects_qwen(self):
         module = load_module()
         parsed = module.parse_proxy_source(
-            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
 
         rendered = module.build_runtime_config_text(
@@ -470,7 +477,7 @@ class RealCliMatrixTests(unittest.TestCase):
     def test_build_runtime_config_injects_qwen_surface_defaults_for_live_profile_truth_chain(self):
         module = load_module()
         parsed = module.parse_proxy_source(
-            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
 
         rendered = module.build_runtime_config_text(
@@ -804,7 +811,7 @@ class RealCliMatrixTests(unittest.TestCase):
     def test_build_runtime_config_omits_local_qwen_aliases_when_env_missing(self):
         module = load_module()
         parsed = module.parse_proxy_source(
-            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
 
         rendered = module.build_runtime_config_text(
@@ -1350,7 +1357,7 @@ class RealCliMatrixTests(unittest.TestCase):
     def test_default_config_codex_catalog_injects_85_percent_compact_limit(self):
         module = load_module()
         parsed = module.parse_proxy_source(
-            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
         model_limits = module.resolve_model_limits(parsed, "minimax-openai")
         codex_metadata = module.resolve_codex_model_metadata(parsed, "minimax-openai")
@@ -1384,7 +1391,7 @@ class RealCliMatrixTests(unittest.TestCase):
     def test_default_config_codex_catalog_compacts_before_observed_live_failure_tokens(self):
         module = load_module()
         parsed = module.parse_proxy_source(
-            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
         model_limits = module.resolve_model_limits(parsed, "minimax-openai")
         codex_metadata = module.resolve_codex_model_metadata(parsed, "minimax-openai")
@@ -2597,7 +2604,7 @@ class RealCliMatrixTests(unittest.TestCase):
                     [
                         "--proxy-only",
                         "--config-source",
-                        str(REPO_ROOT / "proxy-test-minimax-and-local.yaml"),
+                        str(DEFAULT_CONFIG_PATH),
                         "--env-file",
                         str(pathlib.Path(temp_dir) / "missing.env"),
                         "--fixtures-root",

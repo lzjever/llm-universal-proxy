@@ -1,0 +1,56 @@
+# ============================================================
+# LLM Universal Proxy — Default tracked test configuration
+# Upstreams: MiniMax (Anthropic + OpenAI) + optional local qwen3.5-9b-awq
+# ============================================================
+
+listen: 127.0.0.1:18888
+upstream_timeout_secs: 120
+
+upstreams:
+  MINIMAX-ANTHROPIC:
+    api_root: "https://api.minimaxi.com/anthropic/v1"
+    format: anthropic
+    credential_actual: "sk-cp-3Iu7RGNidGRx7dv4fD5HuePsBNSxxzrrXzPW3xkJHIbmNqbl3IC0t3JIfR3CwnspiZroUWLkRIl0eV7Siyvw3X6hdAHU8pT253erOaPyDMDTgDiutunRb9U"
+    auth_policy: force_server
+    limits:
+      context_window: 200000
+      max_output_tokens: 128000
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
+
+  MINIMAX-OPENAI:
+    api_root: "https://api.minimaxi.com/v1"
+    format: openai-completion
+    credential_actual: "sk-cp-3Iu7RGNidGRx7dv4fD5HuePsBNSxxzrrXzPW3xkJHIbmNqbl3IC0t3JIfR3CwnspiZroUWLkRIl0eV7Siyvw3X6hdAHU8pT253erOaPyDMDTgDiutunRb9U"
+    auth_policy: force_server
+    limits:
+      context_window: 200000
+      max_output_tokens: 128000
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
+
+model_aliases:
+  minimax-anth: "MINIMAX-ANTHROPIC:MiniMax-M2.7-highspeed"
+  minimax-openai: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+
+  claude-sonnet-4-6: "MINIMAX-ANTHROPIC:MiniMax-M2.7-highspeed"
+  claude-haiku-4-5: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+  claude-opus-4-6: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+
+debug_trace:
+  path: /tmp/llm-proxy-test-debug.jsonl
+  max_text_chars: 16384

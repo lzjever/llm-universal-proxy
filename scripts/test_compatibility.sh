@@ -7,7 +7,7 @@
 # Prerequisites:
 #   1. Build the proxy: cargo build --release
 #   2. Start the proxy:
-#        ./target/release/llm-universal-proxy --config proxy-test-minimax-and-local.yaml
+#        ./target/release/llm-universal-proxy --config scripts/fixtures/cli_matrix/default_proxy_test_matrix.yaml
 #   3. Run this script: bash scripts/test_compatibility.sh
 #
 # Or run with auto-start (script starts/stops proxy for you):
@@ -17,6 +17,7 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:18888}"
+DEFAULT_CONFIG="scripts/fixtures/cli_matrix/default_proxy_test_matrix.yaml"
 PASS=0
 FAIL=0
 SKIP=0
@@ -331,7 +332,7 @@ main() {
     if [ "${1:-}" = "--auto-start" ]; then
         echo "Auto-starting proxy..."
         BINARY="${BINARY:-./target/release/llm-universal-proxy}"
-        CONFIG="${CONFIG:-proxy-test-minimax-and-local.yaml}"
+        CONFIG="${CONFIG:-$DEFAULT_CONFIG}"
         if [ ! -f "$BINARY" ]; then
             echo "Building proxy..."
             cargo build --locked --release
