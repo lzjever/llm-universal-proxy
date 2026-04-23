@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::config::CompatibilityMode;
+use crate::config::{CompatibilityMode, ModelModality, ModelSurface};
 use crate::formats::UpstreamFormat;
 
 use super::messages::{
@@ -1034,6 +1034,222 @@ pub(super) fn request_invalid_structured_tool_arguments_message(
         }
         _ => None,
     }
+}
+
+fn assess_surface_request_policy(
+    assessment: &mut TranslationAssessment,
+    client_format: UpstreamFormat,
+    body: &Value,
+    surface: &ModelSurface,
+) {
+    if surface
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.supports_parallel_calls)
+        == Some(false)
+        && request_has_surface_tooling(client_format, body)
+        && request_explicitly_enables_parallel_tool_calls(client_format, body)
+    {
+        assessment.reject(
+            "request explicitly enables parallel tool execution (`parallel_tool_calls=true` or `tool_choice.disable_parallel_tool_use=false`), but model surface `tools.supports_parallel_calls=false`"
+                .to_string(),
+        );
+    }
+
+    if !surface_allows_modality(
+        surface
+            .modalities
+            .as_ref()
+            .and_then(|modalities| modalities.input.as_ref()),
+        ModelModality::Image,
+    ) && request_uses_input_modality(client_format, body, ModelModality::Image)
+    {
+        assessment.reject(
+            "request uses image input, but model surface `modalities.input` does not include `image`"
+                .to_string(),
+        );
+    }
+
+    if !surface_allows_modality(
+        surface
+            .modalities
+            .as_ref()
+            .and_then(|modalities| modalities.input.as_ref()),
+        ModelModality::Audio,
+    ) && request_uses_input_modality(client_format, body, ModelModality::Audio)
+    {
+        assessment.reject(
+            "request uses audio input, but model surface `modalities.input` does not include `audio`"
+                .to_string(),
+        );
+    }
+
+    if !surface_allows_modality(
+        surface
+            .modalities
+            .as_ref()
+            .and_then(|modalities| modalities.output.as_ref()),
+        ModelModality::Audio,
+    ) && request_uses_output_audio_modality(client_format, body)
+    {
+        assessment.reject(
+            "request asks for audio output, but model surface `modalities.output` does not include `audio`"
+                .to_string(),
+        );
+    }
+}
+
+fn surface_allows_modality(allowed: Option<&Vec<ModelModality>>, modality: ModelModality) -> bool {
+    allowed
+        .map(|allowed| allowed.contains(&modality))
+        .unwrap_or(true)
+}
+
+fn request_has_surface_tooling(client_format: UpstreamFormat, body: &Value) -> bool {
+    match client_format {
+        UpstreamFormat::OpenAiCompletion
+        | UpstreamFormat::OpenAiResponses
+        | UpstreamFormat::Anthropic
+        | UpstreamFormat::Google => body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty()),
+    }
+}
+
+fn request_explicitly_enables_parallel_tool_calls(
+    client_format: UpstreamFormat,
+    body: &Value,
+) -> bool {
+    match client_format {
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses => {
+            body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(true)
+        }
+        UpstreamFormat::Anthropic => {
+            body.get("tool_choice")
+                .and_then(Value::as_object)
+                .and_then(|tool_choice| tool_choice.get("disable_parallel_tool_use"))
+                .and_then(Value::as_bool)
+                == Some(false)
+        }
+        UpstreamFormat::Google => false,
+    }
+}
+
+fn request_uses_input_modality(
+    client_format: UpstreamFormat,
+    body: &Value,
+    modality: ModelModality,
+) -> bool {
+    match client_format {
+        UpstreamFormat::OpenAiCompletion => {
+            openai_completion_request_uses_input_modality(body, modality)
+        }
+        UpstreamFormat::OpenAiResponses => {
+            openai_responses_request_uses_input_modality(body, modality)
+        }
+        UpstreamFormat::Anthropic | UpstreamFormat::Google => false,
+    }
+}
+
+fn openai_completion_request_uses_input_modality(body: &Value, modality: ModelModality) -> bool {
+    if modality == ModelModality::Audio && openai_assistant_history_audio_present(body) {
+        return true;
+    }
+
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| openai_completion_message_uses_input_modality(message, modality))
+        })
+}
+
+fn openai_completion_message_uses_input_modality(message: &Value, modality: ModelModality) -> bool {
+    if modality == ModelModality::Audio
+        && message
+            .get("audio")
+            .filter(|audio| !audio.is_null())
+            .is_some()
+    {
+        return true;
+    }
+
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| openai_input_part_uses_modality(part, modality))
+        })
+}
+
+fn openai_responses_request_uses_input_modality(body: &Value, modality: ModelModality) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| openai_responses_input_item_uses_modality(item, modality))
+        })
+}
+
+fn openai_responses_input_item_uses_modality(item: &Value, modality: ModelModality) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| openai_input_part_uses_modality(part, modality))
+            }),
+        Some("output_audio") => modality == ModelModality::Audio,
+        _ => false,
+    }
+}
+
+fn openai_input_part_uses_modality(part: &Value, modality: ModelModality) -> bool {
+    matches!(
+        (modality, part.get("type").and_then(Value::as_str)),
+        (ModelModality::Image, Some("image_url"))
+            | (ModelModality::Image, Some("input_image"))
+            | (ModelModality::Audio, Some("input_audio"))
+    )
+}
+
+fn request_uses_output_audio_modality(client_format: UpstreamFormat, body: &Value) -> bool {
+    matches!(
+        client_format,
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses
+    ) && (body.get("audio").is_some()
+        || body
+            .get("modalities")
+            .and_then(Value::as_array)
+            .is_some_and(|modalities| {
+                modalities.iter().any(|modality| {
+                    modality
+                        .as_str()
+                        .is_some_and(|modality| modality.eq_ignore_ascii_case("audio"))
+                })
+            }))
+}
+
+pub(crate) fn assess_request_translation_with_surface(
+    client_format: UpstreamFormat,
+    upstream_format: UpstreamFormat,
+    body: &Value,
+    compatibility_mode: CompatibilityMode,
+    surface: &ModelSurface,
+) -> TranslationAssessment {
+    let mut assessment = TranslationAssessment::default();
+    assess_surface_request_policy(&mut assessment, client_format, body, surface);
+    assessment.issues.extend(
+        assess_request_translation(client_format, upstream_format, body, compatibility_mode).issues,
+    );
+    assessment
 }
 
 pub(super) fn anthropic_warning_only_request_controls_for_translate(

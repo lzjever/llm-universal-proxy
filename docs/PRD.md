@@ -2,7 +2,7 @@
 
 **Version**: 1.0
 **Status**: Active
-**Last Updated**: 2026-04-07
+**Last Updated**: 2026-04-23
 
 ---
 
@@ -379,6 +379,8 @@ For each upstream, test all applicable client entrypoints:
 | Gemini CLI | Google Gemini | `gemini --prompt` with proxy base URL |
 | curl (OpenAI) | OpenAI Chat Completions | Direct HTTP request |
 | curl (Anthropic) | Anthropic Messages | Direct HTTP request |
+
+Current real-client regression coverage is intentionally narrow: smoke cases assert public tool identity by requiring `apply_patch` to appear and `__llmup_custom__*` to stay absent from public output, and long-horizon cases validate workspace-edit execution on supported lanes. This is not yet a full matrix of arbitrary structured tool behavior.
 
 ---
 

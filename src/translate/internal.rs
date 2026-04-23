@@ -19,7 +19,7 @@ pub(crate) struct RequestTranslationPolicy {
 
 impl RequestTranslationPolicy {
     pub(crate) fn is_empty(&self) -> bool {
-        self.max_output_tokens().is_none()
+        !self.has_native_request_policy_hooks()
             && self.compatibility_mode == CompatibilityMode::default()
     }
 
@@ -28,6 +28,18 @@ impl RequestTranslationPolicy {
             .limits
             .as_ref()
             .and_then(|limits| limits.max_output_tokens)
+    }
+
+    fn disables_parallel_tool_calls(&self) -> bool {
+        self.surface
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.supports_parallel_calls)
+            == Some(false)
+    }
+
+    fn has_native_request_policy_hooks(&self) -> bool {
+        self.max_output_tokens().is_some() || self.disables_parallel_tool_calls()
     }
 }
 
@@ -58,13 +70,15 @@ pub fn translate_request_with_policy(
     policy: RequestTranslationPolicy,
     stream: bool,
 ) -> Result<(), String> {
-    if let TranslationDecision::Reject(message) = assess_request_translation(
-        client_format,
-        upstream_format,
-        body,
-        policy.compatibility_mode,
-    )
-    .decision()
+    if let TranslationDecision::Reject(message) =
+        assessment::assess_request_translation_with_surface(
+            client_format,
+            upstream_format,
+            body,
+            policy.compatibility_mode,
+            &policy.surface,
+        )
+        .decision()
     {
         return Err(message);
     }
@@ -320,6 +334,15 @@ fn apply_request_translation_policy_defaults(
     policy: &RequestTranslationPolicy,
     body: &mut Value,
 ) {
+    apply_request_translation_policy_default_output_limit(target_format, policy, body);
+    apply_request_translation_policy_parallel_tool_gate(target_format, policy, body);
+}
+
+fn apply_request_translation_policy_default_output_limit(
+    target_format: UpstreamFormat,
+    policy: &RequestTranslationPolicy,
+    body: &mut Value,
+) {
     let Some(max_output_tokens) = policy.max_output_tokens() else {
         return;
     };
@@ -363,6 +386,45 @@ fn apply_request_translation_policy_defaults(
     }
 }
 
+fn apply_request_translation_policy_parallel_tool_gate(
+    target_format: UpstreamFormat,
+    policy: &RequestTranslationPolicy,
+    body: &mut Value,
+) {
+    if !policy.disables_parallel_tool_calls()
+        || request_body_has_explicit_parallel_tool_calls_preference(target_format, body)
+        || !request_body_has_tool_definitions(target_format, body)
+    {
+        return;
+    }
+
+    match target_format {
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("parallel_tool_calls".to_string(), Value::Bool(false));
+            }
+        }
+        UpstreamFormat::Anthropic => {
+            let Some(obj) = body.as_object_mut() else {
+                return;
+            };
+            let tool_choice = obj
+                .entry("tool_choice".to_string())
+                .or_insert_with(|| serde_json::json!({ "type": "auto" }));
+            let Some(tool_choice_obj) = tool_choice.as_object_mut() else {
+                return;
+            };
+            if tool_choice_obj.get("type").and_then(Value::as_str) == Some("none") {
+                return;
+            }
+            tool_choice_obj
+                .entry("disable_parallel_tool_use".to_string())
+                .or_insert(Value::Bool(true));
+        }
+        UpstreamFormat::Google => {}
+    }
+}
+
 fn request_body_has_explicit_output_limit(target_format: UpstreamFormat, body: &Value) -> bool {
     let Some(obj) = body.as_object() else {
         return false;
@@ -385,6 +447,40 @@ fn google_generation_config_has_output_limit(config: Option<&Value>) -> bool {
     config.and_then(Value::as_object).is_some_and(|config| {
         config.get("maxOutputTokens").is_some() || config.get("max_output_tokens").is_some()
     })
+}
+
+fn request_body_has_explicit_parallel_tool_calls_preference(
+    target_format: UpstreamFormat,
+    body: &Value,
+) -> bool {
+    match target_format {
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses => body
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .is_some(),
+        UpstreamFormat::Anthropic => body
+            .get("tool_choice")
+            .and_then(Value::as_object)
+            .and_then(|tool_choice| tool_choice.get("disable_parallel_tool_use"))
+            .and_then(Value::as_bool)
+            .is_some(),
+        UpstreamFormat::Google => false,
+    }
+}
+
+fn request_body_has_tool_definitions(target_format: UpstreamFormat, body: &Value) -> bool {
+    match target_format {
+        UpstreamFormat::OpenAiCompletion
+        | UpstreamFormat::OpenAiResponses
+        | UpstreamFormat::Anthropic => body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty()),
+        UpstreamFormat::Google => body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty()),
+    }
 }
 
 fn apply_openai_completion_compat_overrides(model: &str, body: &mut Value) {
@@ -587,7 +683,6 @@ mod response_logprobs;
 pub(crate) mod response_protocols;
 pub(crate) mod tools;
 
-use assessment::assess_request_translation;
 use messages::{
     anthropic_request_tool_definition_not_portable_message,
     anthropic_tool_result_order_not_portable_message, custom_tools_not_portable_message,

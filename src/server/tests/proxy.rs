@@ -1353,6 +1353,86 @@ async fn live_openai_request_uses_configured_default_output_limit_for_anthropic_
     server.abort();
 }
 
+#[tokio::test]
+async fn live_openai_same_format_request_applies_surface_parallel_tool_gate() {
+    let response_body = serde_json::json!({
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hi" },
+            "finish_reason": "stop"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+    {
+        let mut runtime = state.runtime.write().await;
+        let namespace = runtime
+            .namespaces
+            .get_mut(DEFAULT_NAMESPACE)
+            .expect("default namespace");
+        namespace.config.compatibility_mode = crate::config::CompatibilityMode::MaxCompat;
+        namespace.config.model_aliases.insert(
+            "serial-openai".to_string(),
+            crate::config::ModelAlias {
+                upstream_name: "primary".to_string(),
+                upstream_model: "gpt-4o-mini".to_string(),
+                limits: None,
+                surface: Some(crate::config::ModelSurfacePatch {
+                    modalities: None,
+                    tools: Some(crate::config::ModelToolSurface {
+                        supports_search: None,
+                        supports_view_image: None,
+                        apply_patch_transport: None,
+                        supports_parallel_calls: Some(false),
+                    }),
+                }),
+            },
+        );
+    }
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/chat/completions".to_string(),
+        serde_json::json!({
+            "model": "serial-openai",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }],
+            "stream": false
+        }),
+        "serial-openai".to_string(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    assert_eq!(recorded[0]["model"], "gpt-4o-mini");
+    assert_eq!(
+        recorded[0]["parallel_tool_calls"],
+        false,
+        "same-format request should still inherit ModelSurface parallel-call policy before hitting the upstream: {:?}",
+        recorded[0]
+    );
+
+    server.abort();
+}
+
 #[test]
 fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace() {
     let config = crate::config::Config {

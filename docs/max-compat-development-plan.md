@@ -1,7 +1,7 @@
 # Maximum Compatibility Development Plan
 
 Status: active  
-Last updated: 2026-04-20
+Last updated: 2026-04-23
 
 ## Goal
 
@@ -137,13 +137,16 @@ Work items:
 - add translator tests for visible tool identity preservation
 - add streaming tests for bridge decoding with request-scoped context
 - add integration tests for translated live request shapes
-- add real-client matrix coverage for tool enumeration and structured tool execution
-- keep a runnable CLI smoke verifier that fails if public output surfaces `__llmup_custom__*`
+- add real-client matrix coverage for the public tool enumeration contract and workspace-edit execution on supported lanes
+- keep a runnable CLI smoke verifier that fails if public output omits `apply_patch` or surfaces `__llmup_custom__*`
 
 Exit criteria:
 
 - the prefixed bridge-name leak is covered by automated tests
+- the public tool enumeration contract asserts `apply_patch`, not just the absence of reserved prefixes
 - translated `apply_patch` remains usable on supported live paths
+
+Current real-client matrix coverage here is intentionally narrow: the public tool enumeration contract proves the stable public name is surfaced, and workspace-edit execution proves the edit path still works on supported lanes. It is not yet a full behavioral matrix for arbitrary structured tool use.
 
 ## Suggested Delivery Order
 

@@ -22,7 +22,7 @@ use crate::hooks::{
 };
 use crate::streaming::{needs_stream_translation, TranslateSseStream};
 use crate::translate::{
-    assess_request_translation, translate_request_with_policy, translate_response,
+    assess_request_translation_with_surface, translate_request_with_policy, translate_response,
     RequestTranslationPolicy, TranslationDecision,
 };
 use crate::upstream;
@@ -405,11 +405,11 @@ pub(super) async fn handle_request_core(
         }
     }
 
-    let compatibility_warnings = match classify_request_boundary_with_compatibility_mode(
+    let compatibility_warnings = match classify_request_boundary_with_policy(
         client_format,
         upstream_format,
         &original_body,
-        request_translation_policy.compatibility_mode,
+        &request_translation_policy,
     ) {
         RequestBoundaryDecision::Allow => Vec::new(),
         RequestBoundaryDecision::AllowWithWarnings(warnings) => warnings,
@@ -733,11 +733,14 @@ pub(super) fn classify_request_boundary(
     upstream_format: UpstreamFormat,
     body: &Value,
 ) -> RequestBoundaryDecision {
-    classify_request_boundary_with_compatibility_mode(
+    classify_request_boundary_with_policy(
         client_format,
         upstream_format,
         body,
-        crate::config::CompatibilityMode::Balanced,
+        &RequestTranslationPolicy {
+            compatibility_mode: crate::config::CompatibilityMode::Balanced,
+            surface: crate::config::ModelSurface::default(),
+        },
     )
 }
 
@@ -749,14 +752,20 @@ fn reject_internal_request_scoped_tool_bridge_context(body: &Value) -> Option<St
     })
 }
 
-fn classify_request_boundary_with_compatibility_mode(
+fn classify_request_boundary_with_policy(
     client_format: UpstreamFormat,
     upstream_format: UpstreamFormat,
     body: &Value,
-    compatibility_mode: crate::config::CompatibilityMode,
+    policy: &RequestTranslationPolicy,
 ) -> RequestBoundaryDecision {
-    match assess_request_translation(client_format, upstream_format, body, compatibility_mode)
-        .decision()
+    match assess_request_translation_with_surface(
+        client_format,
+        upstream_format,
+        body,
+        policy.compatibility_mode,
+        &policy.surface,
+    )
+    .decision()
     {
         TranslationDecision::Allow => RequestBoundaryDecision::Allow,
         TranslationDecision::AllowWithWarnings(warnings) => {

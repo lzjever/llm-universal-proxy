@@ -467,6 +467,35 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertIn('qwen-local: "LOCAL-QWEN:qwen3.5-9b-awq"', rendered)
         self.assertIn("path: /tmp/cli-matrix-trace.jsonl", rendered)
 
+    def test_build_runtime_config_injects_qwen_surface_defaults_for_live_profile_truth_chain(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            (REPO_ROOT / "proxy-test-minimax-and-local.yaml").read_text(encoding="utf-8")
+        )
+
+        rendered = module.build_runtime_config_text(
+            parsed,
+            {
+                "LOCAL_QWEN_BASE_URL": "http://127.0.0.1:9997/v1",
+                "LOCAL_QWEN_MODEL": "qwen3.5-9b-awq",
+                "LOCAL_QWEN_API_KEY": "not-needed",
+            },
+            listen_host="127.0.0.1",
+            listen_port=19999,
+            trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
+        )
+        reparsed = module.parse_proxy_source(rendered)
+        qwen_surface = reparsed.upstream_surface_defaults["LOCAL-QWEN"]
+        qwen_metadata = module.resolve_codex_model_metadata(reparsed, "qwen-local")
+
+        self.assertEqual(qwen_surface.input_modalities, ("text",))
+        self.assertEqual(qwen_surface.output_modalities, ("text",))
+        self.assertFalse(qwen_surface.supports_search)
+        self.assertFalse(qwen_surface.supports_view_image)
+        self.assertEqual(qwen_surface.apply_patch_transport, "freeform")
+        self.assertEqual(qwen_metadata.input_modalities, ("text",))
+        self.assertFalse(qwen_metadata.supports_search_tool)
+
     def test_build_runtime_config_preserves_structured_model_alias_limits(self):
         module = load_module()
         parsed = module.parse_proxy_source(
@@ -567,6 +596,98 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertIn("supports_view_image: true", rendered)
         self.assertIn("apply_patch_transport: freeform", rendered)
         self.assertIn("supports_parallel_calls: false", rendered)
+
+    def test_parse_and_render_round_trip_nested_proxy_objects_and_full_codex_fields(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                proxy:
+                  url: http://corp-proxy.example:8080
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_actual: "secret"
+                    auth_policy: force_server
+                    proxy:
+                      url: http://upstream-proxy.example:8080
+                    codex:
+                      input_modalities: ["text"]
+                      supports_search_tool: false
+                      supports_view_image: false
+                      apply_patch_tool_type: freeform
+                      supports_parallel_tool_calls: true
+                model_aliases:
+                  vision-openai:
+                    target: "MINIMAX-OPENAI:MiniMax-Vision"
+                    codex:
+                      input_modalities: ["text", "image"]
+                      supports_search_tool: true
+                      supports_view_image: true
+                      apply_patch_tool_type: freeform
+                      supports_parallel_tool_calls: false
+                debug_trace:
+                  path: /tmp/trace.jsonl
+                """
+            )
+        )
+
+        self.assertEqual(parsed.proxy["url"], "http://corp-proxy.example:8080")
+        self.assertEqual(
+            parsed.upstreams["MINIMAX-OPENAI"]["proxy"]["url"],
+            "http://upstream-proxy.example:8080",
+        )
+        self.assertFalse(
+            parsed.upstream_codex_metadata["MINIMAX-OPENAI"].supports_view_image
+        )
+        self.assertEqual(
+            parsed.upstream_codex_metadata["MINIMAX-OPENAI"].apply_patch_tool_type,
+            "freeform",
+        )
+        self.assertTrue(
+            parsed.upstream_codex_metadata[
+                "MINIMAX-OPENAI"
+            ].supports_parallel_tool_calls
+        )
+        self.assertTrue(
+            parsed.model_alias_configs["vision-openai"].codex_metadata.supports_view_image
+        )
+        self.assertEqual(
+            parsed.model_alias_configs["vision-openai"].codex_metadata.apply_patch_tool_type,
+            "freeform",
+        )
+        self.assertFalse(
+            parsed.model_alias_configs[
+                "vision-openai"
+            ].codex_metadata.supports_parallel_tool_calls
+        )
+
+        rendered = module.build_runtime_config_text(
+            parsed,
+            {},
+            listen_host="127.0.0.1",
+            listen_port=19999,
+            trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
+        )
+        reparsed = module.parse_proxy_source(rendered)
+
+        self.assertIn("proxy:", rendered)
+        self.assertIn("url: http://corp-proxy.example:8080", rendered)
+        self.assertIn("url: http://upstream-proxy.example:8080", rendered)
+        self.assertIn("supports_view_image: false", rendered)
+        self.assertIn("apply_patch_tool_type: freeform", rendered)
+        self.assertIn("supports_parallel_tool_calls: true", rendered)
+        self.assertEqual(reparsed.proxy["url"], "http://corp-proxy.example:8080")
+        self.assertEqual(
+            reparsed.upstreams["MINIMAX-OPENAI"]["proxy"]["url"],
+            "http://upstream-proxy.example:8080",
+        )
+        self.assertEqual(
+            reparsed.model_alias_configs["vision-openai"].codex_metadata.input_modalities,
+            ("text", "image"),
+        )
 
     def test_resolve_model_limits_inherits_upstream_defaults_and_alias_overrides(self):
         module = load_module()
@@ -1024,6 +1145,35 @@ class RealCliMatrixTests(unittest.TestCase):
                     "minimax-openai",
                 )
 
+    def test_fetch_live_model_profile_rejects_missing_critical_surface_fields(self):
+        module = load_module()
+
+        with mock.patch.object(
+            module,
+            "http_get_json",
+            return_value={
+                "id": "minimax-openai",
+                "llmup": {
+                    "surface": {
+                        "modalities": {},
+                        "tools": {
+                            "supports_view_image": True,
+                            "apply_patch_transport": "function",
+                            "supports_parallel_calls": True,
+                        },
+                    },
+                },
+            },
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "llmup\\.surface\\.modalities\\.input.*llmup\\.surface\\.tools\\.supports_search",
+            ):
+                module.fetch_live_model_profile(
+                    "http://127.0.0.1:18888",
+                    "minimax-openai",
+                )
+
     def test_refresh_lane_model_profiles_uses_live_models_for_enabled_lanes(self):
         module = load_module()
         enabled_lane = make_lane(
@@ -1269,6 +1419,9 @@ class RealCliMatrixTests(unittest.TestCase):
                         input: ["text"]
                       tools:
                         supports_search: false
+                        supports_view_image: false
+                        apply_patch_transport: function
+                        supports_parallel_calls: true
                 model_aliases:
                   vision-openai:
                     target: "MINIMAX-OPENAI:MiniMax-Vision"
@@ -1277,6 +1430,9 @@ class RealCliMatrixTests(unittest.TestCase):
                         input: ["text", "image"]
                       tools:
                         supports_search: true
+                        supports_view_image: true
+                        apply_patch_transport: freeform
+                        supports_parallel_calls: false
                 """
             )
         )
@@ -1285,6 +1441,9 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertEqual(codex_metadata.input_modalities, ("text", "image"))
         self.assertTrue(codex_metadata.supports_search_tool)
+        self.assertTrue(codex_metadata.supports_view_image)
+        self.assertEqual(codex_metadata.apply_patch_tool_type, "freeform")
+        self.assertFalse(codex_metadata.supports_parallel_tool_calls)
         self.assertFalse(module.codex_should_disable_view_image(codex_metadata))
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1304,6 +1463,8 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertNotIn("tools.view_image=false", " ".join(args))
         self.assertEqual(payload["models"][0]["input_modalities"], ["text", "image"])
         self.assertTrue(payload["models"][0]["supports_search_tool"])
+        self.assertEqual(payload["models"][0]["apply_patch_tool_type"], "freeform")
+        self.assertFalse(payload["models"][0]["supports_parallel_tool_calls"])
 
     def test_resolve_codex_model_metadata_uses_legacy_codex_only_for_surface_gaps(self):
         module = load_module()

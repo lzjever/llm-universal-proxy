@@ -18,9 +18,9 @@ fn request_translation_policy(
     compatibility_mode: crate::config::CompatibilityMode,
     max_output_tokens: Option<u64>,
 ) -> RequestTranslationPolicy {
-    RequestTranslationPolicy {
+    request_translation_policy_with_surface(
         compatibility_mode,
-        surface: crate::config::ModelSurface {
+        crate::config::ModelSurface {
             limits: max_output_tokens.map(|max_output_tokens| crate::config::ModelLimits {
                 context_window: None,
                 max_output_tokens: Some(max_output_tokens),
@@ -28,6 +28,16 @@ fn request_translation_policy(
             modalities: None,
             tools: None,
         },
+    )
+}
+
+fn request_translation_policy_with_surface(
+    compatibility_mode: crate::config::CompatibilityMode,
+    surface: crate::config::ModelSurface,
+) -> RequestTranslationPolicy {
+    RequestTranslationPolicy {
+        compatibility_mode,
+        surface,
     }
 }
 
@@ -50,6 +60,177 @@ fn request_translation_policy_default_uses_default_compatibility_mode() {
         surface: crate::config::ModelSurface::default(),
     };
     assert!(!balanced_policy.is_empty());
+
+    let serial_tool_policy = request_translation_policy_with_surface(
+        crate::config::CompatibilityMode::MaxCompat,
+        crate::config::ModelSurface {
+            limits: None,
+            modalities: None,
+            tools: Some(crate::config::ModelToolSurface {
+                supports_search: None,
+                supports_view_image: None,
+                apply_patch_transport: None,
+                supports_parallel_calls: Some(false),
+            }),
+        },
+    );
+    assert!(!serial_tool_policy.is_empty());
+}
+
+#[test]
+fn translate_request_openai_passthrough_defaults_parallel_tool_calls_when_surface_disables_it() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }]
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: None,
+                tools: Some(crate::config::ModelToolSurface {
+                    supports_search: None,
+                    supports_view_image: None,
+                    apply_patch_transport: None,
+                    supports_parallel_calls: Some(false),
+                }),
+            },
+        ),
+        false,
+    )
+    .expect("surface should force serial tool execution for native OpenAI passthrough");
+
+    assert_eq!(body["parallel_tool_calls"], false, "body = {body:?}");
+}
+
+#[test]
+fn translate_request_openai_passthrough_rejects_parallel_tool_calls_override_when_surface_disables_it(
+) {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }],
+        "parallel_tool_calls": true
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: None,
+                tools: Some(crate::config::ModelToolSurface {
+                    supports_search: None,
+                    supports_view_image: None,
+                    apply_patch_transport: None,
+                    supports_parallel_calls: Some(false),
+                }),
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject explicit parallel tool execution override");
+
+    assert!(err.contains("parallel_tool_calls"), "err = {err}");
+    assert!(err.contains("supports_parallel_calls"), "err = {err}");
+}
+
+#[test]
+fn translate_request_openai_passthrough_rejects_image_input_when_surface_is_text_only() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Describe this" },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": "https://example.com/cat.png" }
+                }
+            ]
+        }]
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: Some(crate::config::ModelModalities {
+                    input: Some(vec![crate::config::ModelModality::Text]),
+                    output: None,
+                }),
+                tools: None,
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject unsupported image input");
+
+    assert!(err.contains("modalities.input"), "err = {err}");
+    assert!(err.contains("image"), "err = {err}");
+}
+
+#[test]
+fn translate_request_openai_passthrough_rejects_audio_output_when_surface_is_text_only() {
+    let mut body = json!({
+        "model": "gpt-4o-audio-preview",
+        "messages": [{ "role": "user", "content": "Read this aloud" }],
+        "modalities": ["text", "audio"],
+        "audio": {
+            "voice": "alloy"
+        }
+    });
+
+    let err = translate_request_with_policy(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o-audio-preview",
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: Some(crate::config::ModelModalities {
+                    input: None,
+                    output: Some(vec![crate::config::ModelModality::Text]),
+                }),
+                tools: None,
+            },
+        ),
+        false,
+    )
+    .expect_err("surface should reject unsupported audio output");
+
+    assert!(err.contains("modalities.output"), "err = {err}");
+    assert!(err.contains("audio"), "err = {err}");
 }
 
 #[test]

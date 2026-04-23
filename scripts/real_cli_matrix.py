@@ -212,6 +212,11 @@ class SurfaceMetadata:
             input_modalities=self.input_modalities,
             supports_search_tool=self.supports_search,
             supports_view_image=self.supports_view_image,
+            apply_patch_tool_type=(
+                PUBLIC_APPLY_PATCH_TOOL_TYPE
+                if self.apply_patch_transport is not None
+                else None
+            ),
             supports_parallel_tool_calls=self.supports_parallel_calls,
         )
         if (
@@ -229,6 +234,14 @@ DEFAULT_PROXY_CODEX_METADATA = CodexModelMetadata(
     input_modalities=("text",),
     supports_search_tool=False,
     apply_patch_tool_type=PUBLIC_APPLY_PATCH_TOOL_TYPE,
+)
+DEFAULT_PROXY_SURFACE_METADATA = SurfaceMetadata(
+    input_modalities=("text",),
+    output_modalities=("text",),
+    supports_search=False,
+    supports_view_image=False,
+    apply_patch_transport=PUBLIC_APPLY_PATCH_TOOL_TYPE,
+    supports_parallel_calls=False,
 )
 
 
@@ -292,6 +305,24 @@ def _parse_surface_metadata_value(
         surface.apply_patch_transport = parsed_value
     elif key == "supports_parallel_calls":
         surface.supports_parallel_calls = bool(parsed_value)
+
+
+def _parse_codex_metadata_value(
+    codex_metadata: CodexModelMetadata,
+    key: str,
+    value: str,
+    parsed_value: object,
+) -> None:
+    if key == "supports_search_tool":
+        codex_metadata.supports_search_tool = bool(parsed_value)
+    elif key == "input_modalities":
+        codex_metadata.input_modalities = parse_string_list(value)
+    elif key == "supports_view_image":
+        codex_metadata.supports_view_image = bool(parsed_value)
+    elif key == "apply_patch_tool_type" and isinstance(parsed_value, str):
+        codex_metadata.apply_patch_tool_type = parsed_value
+    elif key == "supports_parallel_tool_calls":
+        codex_metadata.supports_parallel_tool_calls = bool(parsed_value)
 
 
 def default_codex_supported_reasoning_levels() -> list[dict[str, str]]:
@@ -414,6 +445,7 @@ class SourceConfigSection:
 @dataclasses.dataclass
 class ProxySourceConfig:
     listen: str
+    proxy: object | None
     upstream_timeout_secs: int | None
     upstreams: collections.OrderedDict[str, collections.OrderedDict[str, object]]
     upstream_limits: collections.OrderedDict[str, ModelLimits]
@@ -539,6 +571,7 @@ def _split_top_level_sections(text: str) -> tuple[SourceConfigSection, ...]:
 
 def parse_proxy_source(text: str) -> ProxySourceConfig:
     listen = ""
+    proxy: object | None = None
     upstream_timeout_secs = None
     upstreams: collections.OrderedDict[str, collections.OrderedDict[str, object]] = (
         collections.OrderedDict()
@@ -559,6 +592,7 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
     section: str | None = None
     current_upstream: str | None = None
     current_upstream_subsection: str | None = None
+    current_upstream_nested_key: str | None = None
     current_upstream_surface_section: str | None = None
     current_alias: str | None = None
     current_alias_subsection: str | None = None
@@ -573,10 +607,16 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
         if indent == 0:
             current_upstream = None
             current_upstream_subsection = None
+            current_upstream_nested_key = None
             current_upstream_surface_section = None
             current_alias = None
             current_alias_subsection = None
             current_alias_surface_section = None
+            if stripped == "proxy:":
+                section = "proxy"
+                if not isinstance(proxy, collections.OrderedDict):
+                    proxy = collections.OrderedDict()
+                continue
             if stripped == "upstreams:":
                 section = "upstreams"
                 continue
@@ -591,19 +631,30 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
             parsed_value = parse_scalar(value)
             if key == "listen":
                 listen = str(parsed_value)
+            elif key == "proxy":
+                proxy = parsed_value
             elif key == "upstream_timeout_secs":
                 upstream_timeout_secs = int(parsed_value)
+            continue
+
+        if section == "proxy" and indent == 2:
+            key, value = stripped.split(":", 1)
+            if not isinstance(proxy, collections.OrderedDict):
+                proxy = collections.OrderedDict()
+            proxy[key] = parse_scalar(value)
             continue
 
         if section == "upstreams":
             if indent == 2 and stripped.endswith(":"):
                 current_upstream = stripped[:-1]
                 current_upstream_subsection = None
+                current_upstream_nested_key = None
                 current_upstream_surface_section = None
                 upstreams[current_upstream] = collections.OrderedDict()
                 continue
             if indent == 4 and current_upstream is not None and stripped == "limits:":
                 current_upstream_subsection = "limits"
+                current_upstream_nested_key = None
                 current_upstream_surface_section = None
                 upstream_limits[current_upstream] = ModelLimits()
                 continue
@@ -613,11 +664,13 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
                 and stripped == "surface_defaults:"
             ):
                 current_upstream_subsection = "surface_defaults"
+                current_upstream_nested_key = None
                 current_upstream_surface_section = None
                 upstream_surface_defaults[current_upstream] = SurfaceMetadata()
                 continue
             if indent == 4 and current_upstream is not None and stripped == "codex:":
                 current_upstream_subsection = "codex"
+                current_upstream_nested_key = None
                 current_upstream_surface_section = None
                 upstream_codex_metadata[current_upstream] = CodexModelMetadata()
                 continue
@@ -665,19 +718,34 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
             ):
                 key, value = stripped.split(":", 1)
                 parsed_value = parse_scalar(value)
-                if key == "supports_search_tool":
-                    upstream_codex_metadata[current_upstream].supports_search_tool = bool(
-                        parsed_value
-                    )
-                elif key == "input_modalities":
-                    upstream_codex_metadata[current_upstream].input_modalities = (
-                        parse_string_list(value)
-                    )
+                _parse_codex_metadata_value(
+                    upstream_codex_metadata[current_upstream],
+                    key,
+                    value,
+                    parsed_value,
+                )
+                continue
+            if (
+                indent == 6
+                and current_upstream is not None
+                and current_upstream_nested_key is not None
+            ):
+                key, value = stripped.split(":", 1)
+                nested_mapping = upstreams[current_upstream].get(current_upstream_nested_key)
+                if not isinstance(nested_mapping, collections.OrderedDict):
+                    nested_mapping = collections.OrderedDict()
+                    upstreams[current_upstream][current_upstream_nested_key] = nested_mapping
+                nested_mapping[key] = parse_scalar(value)
                 continue
             if indent >= 4 and current_upstream is not None:
                 current_upstream_subsection = None
+                current_upstream_nested_key = None
                 current_upstream_surface_section = None
                 key, value = stripped.split(":", 1)
+                if not value.strip():
+                    current_upstream_nested_key = key
+                    upstreams[current_upstream][key] = collections.OrderedDict()
+                    continue
                 upstreams[current_upstream][key] = parse_scalar(value)
                 continue
 
@@ -784,10 +852,12 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
                     codex_metadata = CodexModelMetadata()
                     model_alias_configs[current_alias].codex_metadata = codex_metadata
                 parsed_value = parse_scalar(value)
-                if key == "supports_search_tool":
-                    codex_metadata.supports_search_tool = bool(parsed_value)
-                elif key == "input_modalities":
-                    codex_metadata.input_modalities = parse_string_list(value)
+                _parse_codex_metadata_value(
+                    codex_metadata,
+                    key,
+                    value,
+                    parsed_value,
+                )
                 continue
 
         if section == "debug_trace" and indent == 2:
@@ -796,6 +866,7 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
 
     return ProxySourceConfig(
         listen=listen,
+        proxy=proxy,
         upstream_timeout_secs=upstream_timeout_secs,
         upstreams=upstreams,
         upstream_limits=upstream_limits,
@@ -842,6 +913,10 @@ def resolve_lanes(
             enabled = True
             upstream_name = "LOCAL-QWEN"
             upstream_model = dotenv_env["LOCAL_QWEN_MODEL"]
+            if codex_metadata is None:
+                codex_metadata = _codex_metadata_from_surface(
+                    _copy_surface_metadata(DEFAULT_PROXY_SURFACE_METADATA)
+                )
 
         if not enabled:
             if lane_name == "qwen-local":
@@ -885,6 +960,21 @@ def _runtime_upstreams(
             ]
         )
     return upstreams
+
+
+def _runtime_upstream_surface_defaults(
+    config: ProxySourceConfig, dotenv_env: dict[str, str]
+) -> collections.OrderedDict[str, SurfaceMetadata]:
+    surface_defaults = collections.OrderedDict(
+        (name, _copy_surface_metadata(surface))
+        for name, surface in config.upstream_surface_defaults.items()
+        if surface is not None
+    )
+    if has_local_qwen(dotenv_env) and "LOCAL-QWEN" not in surface_defaults:
+        surface_defaults["LOCAL-QWEN"] = _copy_surface_metadata(
+            DEFAULT_PROXY_SURFACE_METADATA
+        )
+    return surface_defaults
 
 
 def _render_model_limits(lines: list[str], indent: str, limits: ModelLimits | None) -> None:
@@ -950,6 +1040,44 @@ def _render_surface_metadata(
         )
 
 
+def _render_codex_metadata(
+    lines: list[str],
+    indent: str,
+    codex_metadata: CodexModelMetadata | None,
+) -> None:
+    if codex_metadata is None:
+        return
+    if (
+        codex_metadata.input_modalities is None
+        and codex_metadata.supports_search_tool is None
+        and codex_metadata.supports_view_image is None
+        and codex_metadata.apply_patch_tool_type is None
+        and codex_metadata.supports_parallel_tool_calls is None
+    ):
+        return
+    lines.append(f"{indent}codex:")
+    if codex_metadata.input_modalities is not None:
+        lines.append(
+            f"{indent}  input_modalities: {render_scalar(list(codex_metadata.input_modalities))}"
+        )
+    if codex_metadata.supports_search_tool is not None:
+        lines.append(
+            f"{indent}  supports_search_tool: {render_scalar(codex_metadata.supports_search_tool)}"
+        )
+    if codex_metadata.supports_view_image is not None:
+        lines.append(
+            f"{indent}  supports_view_image: {render_scalar(codex_metadata.supports_view_image)}"
+        )
+    if codex_metadata.apply_patch_tool_type is not None:
+        lines.append(
+            f"{indent}  apply_patch_tool_type: {render_scalar(codex_metadata.apply_patch_tool_type)}"
+        )
+    if codex_metadata.supports_parallel_tool_calls is not None:
+        lines.append(
+            f"{indent}  supports_parallel_tool_calls: {render_scalar(codex_metadata.supports_parallel_tool_calls)}"
+        )
+
+
 def _target_upstream_name(target: str) -> str | None:
     if ":" not in target:
         return None
@@ -972,6 +1100,12 @@ def _effective_surface_metadata(
     if upstream_surface is None:
         return alias_surface
     return upstream_surface.merged_with(alias_surface)
+
+
+def _copy_surface_metadata(surface: SurfaceMetadata | None) -> SurfaceMetadata | None:
+    if surface is None:
+        return None
+    return dataclasses.replace(surface)
 
 
 def _codex_metadata_from_surface(
@@ -1087,8 +1221,31 @@ def render_scalar(value: object) -> str:
     return json.dumps(value)
 
 
+def _render_mapping_entries(
+    lines: list[str],
+    indent: str,
+    values: collections.abc.Mapping[str, object],
+) -> None:
+    for key, value in values.items():
+        if isinstance(value, dict):
+            lines.append(f"{indent}{key}:")
+            _render_mapping_entries(lines, f"{indent}  ", value)
+            continue
+        lines.append(f"{indent}{key}: {render_scalar(value)}")
+
+
 def _render_runtime_listen_section(listen_host: str, listen_port: int) -> list[str]:
     return [f"listen: {listen_host}:{listen_port}"]
+
+
+def _render_runtime_proxy_section(config: ProxySourceConfig) -> list[str]:
+    if config.proxy is None:
+        return []
+    if isinstance(config.proxy, dict):
+        lines = ["proxy:"]
+        _render_mapping_entries(lines, "  ", config.proxy)
+        return lines
+    return [f"proxy: {render_scalar(config.proxy)}"]
 
 
 def _render_runtime_timeout_section(config: ProxySourceConfig) -> list[str]:
@@ -1101,16 +1258,21 @@ def _render_runtime_upstreams_section(
     config: ProxySourceConfig, dotenv_env: dict[str, str]
 ) -> list[str]:
     lines = ["upstreams:"]
+    runtime_surface_defaults = _runtime_upstream_surface_defaults(config, dotenv_env)
     for upstream_name, values in _runtime_upstreams(config, dotenv_env).items():
         lines.append(f"  {upstream_name}:")
-        for key, value in values.items():
-            lines.append(f"    {key}: {render_scalar(value)}")
+        _render_mapping_entries(lines, "    ", values)
         _render_model_limits(lines, "    ", config.upstream_limits.get(upstream_name))
         _render_surface_metadata(
             lines,
             "    ",
             "surface_defaults",
-            config.upstream_surface_defaults.get(upstream_name),
+            runtime_surface_defaults.get(upstream_name),
+        )
+        _render_codex_metadata(
+            lines,
+            "    ",
+            config.upstream_codex_metadata.get(upstream_name),
         )
     return lines
 
@@ -1120,13 +1282,18 @@ def _render_runtime_aliases_section(
 ) -> list[str]:
     lines = ["model_aliases:"]
     for alias_name, alias_config in _runtime_alias_configs(config, dotenv_env).items():
-        if alias_config.limits is None and alias_config.surface is None:
+        if (
+            alias_config.limits is None
+            and alias_config.surface is None
+            and alias_config.codex_metadata is None
+        ):
             lines.append(f"  {alias_name}: {json.dumps(alias_config.target)}")
             continue
         lines.append(f"  {alias_name}:")
         lines.append(f"    target: {json.dumps(alias_config.target)}")
         _render_model_limits(lines, "    ", alias_config.limits)
         _render_surface_metadata(lines, "    ", "surface", alias_config.surface)
+        _render_codex_metadata(lines, "    ", alias_config.codex_metadata)
     return lines
 
 
@@ -1165,6 +1332,7 @@ def build_runtime_config_text(
     section_renderers = collections.OrderedDict(
         [
             ("listen", lambda: _render_runtime_listen_section(listen_host, listen_port)),
+            ("proxy", lambda: _render_runtime_proxy_section(config)),
             ("upstream_timeout_secs", lambda: _render_runtime_timeout_section(config)),
             ("upstreams", lambda: _render_runtime_upstreams_section(config, dotenv_env)),
             ("model_aliases", lambda: _render_runtime_aliases_section(config, dotenv_env)),
@@ -1793,6 +1961,12 @@ def _optional_bool(value: object) -> bool | None:
     return None
 
 
+def _optional_string(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    return None
+
+
 def _optional_string_tuple(value: object) -> tuple[str, ...] | None:
     if not isinstance(value, list):
         return None
@@ -1815,18 +1989,23 @@ def _model_limits_from_live_surface(
     return limits
 
 
-def _codex_metadata_from_live_surface(
+def _surface_metadata_from_live_surface(
     surface_payload: dict[str, object],
-) -> CodexModelMetadata | None:
+) -> SurfaceMetadata | None:
     modalities = surface_payload.get("modalities")
     tools = surface_payload.get("tools")
-    metadata = CodexModelMetadata(
+    surface = SurfaceMetadata(
         input_modalities=(
             _optional_string_tuple(modalities.get("input"))
             if isinstance(modalities, dict)
             else None
         ),
-        supports_search_tool=(
+        output_modalities=(
+            _optional_string_tuple(modalities.get("output"))
+            if isinstance(modalities, dict)
+            else None
+        ),
+        supports_search=(
             _optional_bool(tools.get("supports_search"))
             if isinstance(tools, dict)
             else None
@@ -1836,15 +2015,35 @@ def _codex_metadata_from_live_surface(
             if isinstance(tools, dict)
             else None
         ),
-        supports_parallel_tool_calls=(
+        apply_patch_transport=(
+            _optional_string(tools.get("apply_patch_transport"))
+            if isinstance(tools, dict)
+            else None
+        ),
+        supports_parallel_calls=(
             _optional_bool(tools.get("supports_parallel_calls"))
             if isinstance(tools, dict)
             else None
         ),
     )
-    if metadata.merged_with(None) is None:
+    if surface.merged_with(None) is None:
         return None
-    return metadata
+    return surface
+
+
+def _validate_live_surface_codex_requirements(
+    surface: SurfaceMetadata | None,
+) -> None:
+    missing: list[str] = []
+    if surface is None or surface.input_modalities is None:
+        missing.append("llmup.surface.modalities.input")
+    if surface is None or surface.supports_search is None:
+        missing.append("llmup.surface.tools.supports_search")
+    if missing:
+        raise RuntimeError(
+            "live model lookup omitted critical llmup surface fields: "
+            + ", ".join(missing)
+        )
 
 
 def fetch_live_model_profile(
@@ -1868,12 +2067,13 @@ def fetch_live_model_profile(
         raise RuntimeError("live model lookup did not include llmup.surface metadata")
 
     limits = _model_limits_from_live_surface(surface_payload)
-    live_surface_metadata = _codex_metadata_from_live_surface(surface_payload)
-    codex_metadata = DEFAULT_PROXY_CODEX_METADATA
-    if live_surface_metadata is not None:
-        merged = codex_metadata.merged_with(live_surface_metadata)
-        if merged is not None:
-            codex_metadata = merged
+    live_surface_metadata = _surface_metadata_from_live_surface(surface_payload)
+    _validate_live_surface_codex_requirements(live_surface_metadata)
+    codex_metadata = (
+        live_surface_metadata.to_codex_metadata()
+        if live_surface_metadata is not None
+        else None
+    )
 
     return LiveModelProfile(
         limits=limits,
@@ -2104,6 +2304,10 @@ def verify_fixture_output(
             expected = str(needle)
             if expected not in stdout_text:
                 return False, f"expected output to contain {expected!r}"
+        contains_any = [str(needle) for needle in fixture.verifier.get("contains_any", [])]
+        if contains_any and not any(expected in stdout_text for expected in contains_any):
+            options = ", ".join(repr(expected) for expected in contains_any)
+            return False, f"expected output to contain at least one of {options}"
         for needle in fixture.verifier.get("not_contains", []):
             forbidden = str(needle)
             if forbidden in stdout_text:

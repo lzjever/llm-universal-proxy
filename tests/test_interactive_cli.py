@@ -493,6 +493,160 @@ model_aliases:
         self.assertIn("apply_patch_transport: freeform", runtime_config_text)
         self.assertIn("supports_parallel_calls: false", runtime_config_text)
 
+    def test_start_managed_proxy_round_trips_namespace_and_upstream_proxy_objects(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            config_source = root / "proxy.yaml"
+            config_source.write_text(
+                """
+listen: 127.0.0.1:18888
+proxy:
+  url: http://corp-proxy.example:8080
+upstreams:
+  MINIMAX-OPENAI:
+    api_root: "https://api.minimaxi.com/v1"
+    format: openai-completion
+    credential_actual: "secret"
+    auth_policy: force_server
+    proxy:
+      url: http://upstream-proxy.example:8080
+model_aliases:
+  minimax-openai: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+""".lstrip(),
+                encoding="utf-8",
+            )
+            env_file = root / ".env.test"
+            env_file.write_text("", encoding="utf-8")
+            args = module.parse_args(
+                [
+                    "--client",
+                    "codex",
+                    "--config-source",
+                    str(config_source),
+                    "--env-file",
+                    str(env_file),
+                    "--binary",
+                    str(root / "llm-universal-proxy"),
+                ]
+            )
+
+            fake_process = object()
+            with mock.patch.object(
+                module, "ensure_proxy_binary"
+            ), mock.patch.object(
+                module, "prepare_proxy_env", return_value={"PATH": os.environ.get("PATH", "")}
+            ), mock.patch.object(
+                module,
+                "start_proxy",
+                return_value=(
+                    fake_process,
+                    root / "runtime-config.yaml",
+                    root / "proxy.stdout.log",
+                    root / "proxy.stderr.log",
+                ),
+            ) as start_proxy:
+                module.start_managed_proxy(
+                    args,
+                    {"PATH": os.environ.get("PATH", "")},
+                    root / "runtime-root",
+                )
+
+        runtime_config_text = start_proxy.call_args.args[1]
+        reparsed = module.parse_proxy_source(runtime_config_text)
+
+        self.assertEqual(reparsed.proxy["url"], "http://corp-proxy.example:8080")
+        self.assertEqual(
+            reparsed.upstreams["MINIMAX-OPENAI"]["proxy"]["url"],
+            "http://upstream-proxy.example:8080",
+        )
+
+    def test_start_managed_proxy_injects_qwen_surface_defaults_when_env_enables_local_lane(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            config_source = root / "proxy.yaml"
+            config_source.write_text(
+                """
+listen: 127.0.0.1:18888
+upstreams:
+  MINIMAX-OPENAI:
+    api_root: "https://api.minimaxi.com/v1"
+    format: openai-completion
+    credential_actual: "secret"
+    auth_policy: force_server
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+model_aliases:
+  minimax-openai: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+""".lstrip(),
+                encoding="utf-8",
+            )
+            env_file = root / ".env.test"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        "LOCAL_QWEN_BASE_URL=http://127.0.0.1:9997/v1",
+                        "LOCAL_QWEN_MODEL=qwen3.5-9b-awq",
+                        "LOCAL_QWEN_API_KEY=not-needed",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            args = module.parse_args(
+                [
+                    "--client",
+                    "codex",
+                    "--config-source",
+                    str(config_source),
+                    "--env-file",
+                    str(env_file),
+                    "--binary",
+                    str(root / "llm-universal-proxy"),
+                ]
+            )
+
+            fake_process = object()
+            with mock.patch.object(
+                module, "ensure_proxy_binary"
+            ), mock.patch.object(
+                module, "prepare_proxy_env", return_value={"PATH": os.environ.get("PATH", "")}
+            ), mock.patch.object(
+                module,
+                "start_proxy",
+                return_value=(
+                    fake_process,
+                    root / "runtime-config.yaml",
+                    root / "proxy.stdout.log",
+                    root / "proxy.stderr.log",
+                ),
+            ) as start_proxy:
+                module.start_managed_proxy(
+                    args,
+                    {"PATH": os.environ.get("PATH", "")},
+                    root / "runtime-root",
+                )
+
+        runtime_config_text = start_proxy.call_args.args[1]
+        reparsed = module.parse_proxy_source(runtime_config_text)
+        qwen_surface = reparsed.upstream_surface_defaults["LOCAL-QWEN"]
+
+        self.assertEqual(
+            reparsed.upstreams["LOCAL-QWEN"]["api_root"],
+            "http://127.0.0.1:9997/v1",
+        )
+        self.assertEqual(qwen_surface.input_modalities, ("text",))
+        self.assertFalse(qwen_surface.supports_search)
+
     def test_parse_args_exposes_structured_timeout_policy(self):
         module = load_module()
 

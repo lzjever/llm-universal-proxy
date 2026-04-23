@@ -49,7 +49,7 @@ Managed mode, where the wrapper starts the proxy for you:
   --model gpt-5-4
 ```
 
-Codex benefits the most from the wrapper because it injects temporary model metadata for proxy-backed aliases instead of leaving Codex in its unknown-model fallback path.
+Codex benefits the most from the wrapper because it fetches live `llmup.surface` metadata from the proxy model catalog and writes the temporary catalog payload from that runtime truth, instead of relying on legacy hard-coded Codex assumptions or the unknown-model fallback path.
 
 ### Claude Code
 

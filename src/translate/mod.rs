@@ -12,7 +12,7 @@ mod shared;
 pub use request::translate_request;
 pub use response::translate_response;
 
-pub(crate) use assessment::{assess_request_translation, TranslationDecision};
+pub(crate) use assessment::{assess_request_translation_with_surface, TranslationDecision};
 pub(crate) use request::{translate_request_with_policy, RequestTranslationPolicy};
 pub(crate) use response::{
     classify_openai_finish_for_anthropic, classify_portable_non_success_terminal,
