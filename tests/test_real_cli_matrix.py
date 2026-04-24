@@ -164,6 +164,7 @@ def make_fixture(
     *,
     fixture_id="smoke_pong",
     prompt="Reply with PONG",
+    prompt_template=None,
     verifier=None,
     timeout_secs=5,
 ):
@@ -171,6 +172,7 @@ def make_fixture(
         fixture_id=fixture_id,
         kind="smoke",
         prompt=prompt,
+        prompt_template=prompt_template,
         verifier=verifier or {"type": "contains", "value": "PONG"},
         timeout_secs=timeout_secs,
         workspace_template=None,
@@ -193,6 +195,94 @@ def make_case(module, *, client_name, lane=None, fixture=None, case_id=None):
 
 
 class RealCliMatrixTests(unittest.TestCase):
+    def assert_path_not_within(self, path: pathlib.Path, root: pathlib.Path) -> None:
+        resolved_path = pathlib.Path(path).resolve()
+        resolved_root = pathlib.Path(root).resolve()
+        self.assertFalse(
+            resolved_path == resolved_root or resolved_root in resolved_path.parents,
+            f"expected {resolved_path} not to be within {resolved_root}",
+        )
+
+    def assert_path_uses_opaque_case_token(
+        self,
+        path: pathlib.Path,
+        case,
+    ) -> None:
+        resolved_path = pathlib.Path(path).resolve()
+        basename = resolved_path.name
+        self.assertNotIn(case.case_id, str(resolved_path))
+        self.assertNotIn(case.client_name, basename)
+        self.assertNotIn(case.lane.name, basename)
+        self.assertNotIn(case.fixture.fixture_id, basename)
+
+    def test_load_fixtures_rejects_prompt_template_with_unsupported_placeholder(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixtures_root = pathlib.Path(temp_dir)
+            (fixtures_root / "bad.json").write_text(
+                json.dumps(
+                    {
+                        "id": "bad_prompt_template",
+                        "kind": "smoke",
+                        "prompt": "Fallback prompt",
+                        "prompt_template": "Current lane: {lane_name}",
+                        "verifier": {"type": "contains", "value": "PONG"},
+                        "timeout_secs": 30,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "unsupported placeholder .*lane_name.*client_name",
+            ):
+                module.load_fixtures(fixtures_root)
+
+    def test_load_fixtures_rejects_prompt_template_with_invalid_format_syntax(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixtures_root = pathlib.Path(temp_dir)
+            (fixtures_root / "bad.json").write_text(
+                json.dumps(
+                    {
+                        "id": "bad_prompt_template",
+                        "kind": "smoke",
+                        "prompt": "Fallback prompt",
+                        "prompt_template": "Current client: {client_name",
+                        "verifier": {"type": "contains", "value": "PONG"},
+                        "timeout_secs": 30,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "invalid prompt_template.*bad.json",
+            ):
+                module.load_fixtures(fixtures_root)
+
+    def test_render_fixture_prompt_prefers_prompt_template_with_client_name(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            prompt="Generic prompt",
+            prompt_template=(
+                "Current client: {client_name}. "
+                "Reply with only the exact public editing tool names visible here."
+            ),
+        )
+
+        rendered = module.render_fixture_prompt(fixture, "claude")
+
+        self.assertEqual(
+            rendered,
+            "Current client: claude. Reply with only the exact public editing tool names visible here.",
+        )
+
     def test_default_proxy_binary_path_prefers_newer_debug_build(self):
         module = load_module()
 
@@ -2194,19 +2284,116 @@ class RealCliMatrixTests(unittest.TestCase):
             verifier={
                 "type": "stdout_contract",
                 "contains_any_by_client": {"claude": ["Edit"]},
+                "contains_any_by_client_match_mode": "presented_tool_name",
                 "not_contains": ["__llmup_custom__"],
             },
         )
 
         ok, message = module.verify_fixture_output(
             fixture,
-            "Public tools include Edit.",
+            "**Public editing tool used:** `Edit`.",
             workspace_dir=None,
             context=make_context(module, "claude"),
         )
 
         self.assertTrue(ok, message)
         self.assertEqual(message, "")
+
+    def test_verify_fixture_output_accepts_codex_json_completed_agent_message_for_tool_identity_contract(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="tool_identity_public_contract",
+            verifier={
+                "type": "stdout_contract",
+                "contains_any_by_client": {"codex": ["apply_patch"]},
+                "contains_any_by_client_match_mode": "presented_tool_name",
+                "reject_other_client_contains_any_by_client": True,
+            },
+        )
+        stdout_text = "\n".join(
+            [
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_1",
+                            "type": "agent_message",
+                            "text": "apply_patch",
+                        },
+                    }
+                ),
+                json.dumps({"type": "turn.completed"}),
+            ]
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            stdout_text,
+            workspace_dir=None,
+            context=make_context(module, "codex"),
+        )
+
+        self.assertTrue(ok, message)
+        self.assertEqual(message, "")
+
+    def test_verify_fixture_output_accepts_gemini_single_line_tool_list_for_tool_identity_contract(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="tool_identity_public_contract",
+            verifier={
+                "type": "stdout_contract",
+                "contains_any_by_client": {"gemini": ["replace"]},
+                "contains_any_by_client_match_mode": "presented_tool_name",
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "`replace`, `write_file`",
+            workspace_dir=None,
+            context=make_context(module, "gemini"),
+        )
+
+        self.assertTrue(ok, message)
+        self.assertEqual(message, "")
+
+    def test_verify_fixture_output_rejects_other_client_public_tool_names_when_tool_identity_scope_is_strict(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="tool_identity_public_contract",
+            verifier={
+                "type": "stdout_contract",
+                "contains_any_by_client": {
+                    "codex": ["apply_patch"],
+                    "claude": ["Edit"],
+                    "gemini": ["replace"],
+                },
+                "contains_any_by_client_match_mode": "presented_tool_name",
+                "reject_other_client_contains_any_by_client": True,
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Available public editing tools:\n- `Edit`\n- `apply_patch`\n- `replace`\n",
+            workspace_dir=None,
+            context=make_context(module, "claude"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("other clients", message)
+        self.assertIn("apply_patch", message)
+        self.assertIn("replace", message)
 
     def test_verify_fixture_output_rejects_stdout_contract_internal_tool_artifacts(self):
         module = load_module()
@@ -2236,12 +2423,13 @@ class RealCliMatrixTests(unittest.TestCase):
             verifier={
                 "type": "stdout_contract",
                 "contains_any_by_client": {"gemini": ["replace"]},
+                "contains_any_by_client_match_mode": "presented_tool_name",
             },
         )
 
         ok, message = module.verify_fixture_output(
             fixture,
-            "Public tools include replace.",
+            "The public editing tool used was `replace`.",
             workspace_dir=None,
         )
 
@@ -2262,8 +2450,49 @@ class RealCliMatrixTests(unittest.TestCase):
                 "gemini": ["replace"],
             },
         )
+        self.assertEqual(
+            payload["verifier"]["contains_any_by_client_match_mode"],
+            "presented_tool_name",
+        )
+        self.assertTrue(payload["verifier"]["reject_other_client_contains_any_by_client"])
+        self.assertIn("{client_name}", payload["prompt_template"])
+        self.assertIn("exactly one line", payload["prompt_template"])
+        self.assertIn("Do not mention any other clients", payload["prompt_template"])
+        self.assertIn("do not use any client names as answers", payload["prompt_template"])
+        self.assertIn(
+            "Do not answer with task IDs, fixture IDs, contract names, workspace/path words, or filenames.",
+            payload["prompt_template"],
+        )
         self.assertIn("__llmup_custom__", payload["verifier"]["not_contains"])
-        self.assertIn("exact public names", payload["prompt"])
+        self.assertIn("current client surface", payload["prompt"])
+        self.assertIn("Do not list tools from other clients", payload["prompt"])
+        self.assertIn("Do not use any client names as answers", payload["prompt"])
+        self.assertIn(
+            "Do not answer with task IDs, fixture IDs, contract names, workspace/path words, or filenames.",
+            payload["prompt"],
+        )
+        self.assertIn("you cannot actually use here", payload["prompt"])
+
+    def test_tool_identity_fixture_prompt_template_renders_client_and_exclusion_constraints(self):
+        module = load_module()
+        fixture = next(
+            fixture
+            for fixture in module.load_fixtures(TOOL_IDENTITY_FIXTURE_PATH.parent)
+            if fixture.fixture_id == "tool_identity_public_contract"
+        )
+
+        rendered = module.render_fixture_prompt(fixture, "claude")
+
+        self.assertEqual(fixture.fixture_id, "tool_identity_public_contract")
+        self.assertIn("Current client: claude.", rendered)
+        self.assertIn("Reply with exactly one line", rendered)
+        self.assertIn("Do not mention any other clients", rendered)
+        self.assertIn("do not use any client names as answers", rendered)
+        self.assertIn(
+            "Do not answer with task IDs, fixture IDs, contract names, workspace/path words, or filenames.",
+            rendered,
+        )
+        self.assertNotIn("{client_name}", rendered)
 
     def test_run_matrix_case_passes_verifier_context_with_client_name(self):
         module = load_module()
@@ -2331,6 +2560,177 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertNotIn(case.fixture.prompt, captured["command"])
         self.assertEqual(captured["kwargs"]["input"], case.fixture.prompt)
         self.assertNotIn("stdin", captured["kwargs"])
+
+    def test_run_matrix_case_feeds_claude_rendered_prompt_template_via_stdin(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            prompt="Generic fallback prompt",
+            prompt_template=(
+                "Current client: {client_name}. "
+                "Reply with exactly one line containing only that client's public editing tool names."
+            ),
+        )
+        case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(module),
+            fixture=fixture,
+        )
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(command, 0, stdout="PONG\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = pathlib.Path(temp_dir)
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(
+            captured["kwargs"]["input"],
+            "Current client: claude. Reply with exactly one line containing only that client's public editing tool names.",
+        )
+
+    def test_run_matrix_case_uses_external_runtime_paths_for_claude(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(module, name="minimax-anth", proxy_model="minimax-anth"),
+            fixture=make_fixture(module, fixture_id="tool_identity_public_contract"),
+        )
+        observed = {}
+
+        def fake_run(command, **kwargs):
+            add_dir_index = command.index("--add-dir")
+            observed["add_dir"] = pathlib.Path(command[add_dir_index + 1]).resolve()
+            observed["cwd"] = pathlib.Path(kwargs["cwd"]).resolve()
+            observed["home"] = pathlib.Path(kwargs["env"]["HOME"]).resolve()
+            return subprocess.CompletedProcess(command, 0, stdout="PONG\n", stderr="")
+
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
+            report_dir = pathlib.Path(temp_dir) / "reports" / "run-001"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "passed", result["message"])
+        self.assertEqual(observed["add_dir"], observed["cwd"])
+        self.assert_path_not_within(observed["cwd"], report_dir)
+        self.assert_path_not_within(observed["home"], report_dir)
+        self.assert_path_not_within(observed["cwd"], module.REPO_ROOT)
+        self.assert_path_not_within(observed["home"], module.REPO_ROOT)
+        self.assert_path_uses_opaque_case_token(observed["cwd"], case)
+        self.assert_path_uses_opaque_case_token(observed["home"], case)
+
+    def test_run_matrix_case_uses_external_runtime_paths_for_codex(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="codex",
+            lane=make_lane(module, name="minimax-openai", proxy_model="minimax-openai"),
+            fixture=make_fixture(module, fixture_id="tool_identity_public_contract"),
+        )
+        observed = {}
+
+        def fake_run(command, **kwargs):
+            workspace_index = command.index("-C")
+            observed["workspace"] = pathlib.Path(command[workspace_index + 1]).resolve()
+            observed["cwd"] = pathlib.Path(kwargs["cwd"]).resolve()
+            observed["home"] = pathlib.Path(kwargs["env"]["HOME"]).resolve()
+            return subprocess.CompletedProcess(command, 0, stdout="PONG\n", stderr="")
+
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
+            report_dir = pathlib.Path(temp_dir) / "reports" / "run-001"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "passed", result["message"])
+        self.assertEqual(observed["workspace"], observed["cwd"])
+        self.assert_path_not_within(observed["cwd"], report_dir)
+        self.assert_path_not_within(observed["home"], report_dir)
+        self.assert_path_not_within(observed["cwd"], module.REPO_ROOT)
+        self.assert_path_not_within(observed["home"], module.REPO_ROOT)
+        self.assert_path_uses_opaque_case_token(observed["cwd"], case)
+        self.assert_path_uses_opaque_case_token(observed["home"], case)
+
+    def test_run_matrix_case_uses_external_runtime_paths_for_gemini(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="gemini",
+            lane=make_lane(module, name="minimax-openai", proxy_model="minimax-openai"),
+            fixture=make_fixture(module, fixture_id="tool_identity_public_contract"),
+        )
+        observed = {}
+
+        def fake_run(command, **kwargs):
+            include_index = command.index("--include-directories")
+            observed["include_dir"] = pathlib.Path(command[include_index + 1]).resolve()
+            observed["cwd"] = pathlib.Path(kwargs["cwd"]).resolve()
+            observed["home"] = pathlib.Path(kwargs["env"]["HOME"]).resolve()
+            return subprocess.CompletedProcess(command, 0, stdout="PONG\n", stderr="")
+
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
+            report_dir = pathlib.Path(temp_dir) / "reports" / "run-001"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "passed", result["message"])
+        self.assertEqual(observed["include_dir"], observed["cwd"])
+        self.assert_path_not_within(observed["cwd"], report_dir)
+        self.assert_path_not_within(observed["home"], report_dir)
+        self.assert_path_not_within(observed["cwd"], module.REPO_ROOT)
+        self.assert_path_not_within(observed["home"], module.REPO_ROOT)
+        self.assert_path_uses_opaque_case_token(observed["cwd"], case)
+        self.assertNotIn(case.case_id, str(observed["home"]))
+        self.assertIn("_runner_state", str(observed["home"]))
+
+    def test_build_client_command_renders_prompt_template_for_gemini(self):
+        module = load_module()
+        lane = make_lane(module, name="minimax-openai", proxy_model="minimax-openai")
+        fixture = make_fixture(
+            module,
+            prompt="Generic prompt",
+            prompt_template="Current client: {client_name}. Reply with only current-client tools.",
+        )
+
+        command = module.build_client_command(
+            "gemini",
+            "http://127.0.0.1:18888",
+            lane,
+            fixture,
+            pathlib.Path("/tmp/workspace"),
+        )
+
+        self.assertIn("Current client: gemini. Reply with only current-client tools.", command)
+        self.assertNotIn("Generic prompt", command)
 
     def test_run_matrix_case_detaches_stdin_for_headless_gemini_runs(self):
         module = load_module()

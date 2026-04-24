@@ -2,9 +2,14 @@
   "id": "public_editing_tool_workspace_edit_contract",
   "kind": "smoke",
   "description": "Cross-client workspace-edit smoke that requires each client's real public editing tool name in user-visible output and verifies the edit actually landed.",
-  "prompt": "Inspect calc.py and main.py. There is a regression in add(): it currently subtracts instead of adding. Fix the implementation so add(a, b) returns a + b without changing the function name, argument list, or multiply() behavior. Validate the workspace by running main.py and make sure the printed output is correct. In your final response, explicitly include the exact public editing tool name you used if this client exposes one, and never mention internal transport prefixes or proxy-private tool names.",
+  "prompt": "Inspect calc.py and main.py. There is a regression in add(): it currently subtracts instead of adding. Fix the implementation so add(a, b) returns a + b without changing the function name, argument list, or multiply() behavior. Validate the workspace by running main.py and make sure the printed output is correct. In the last line of your final response, explicitly include the exact public editing tool name you actually used on the current client surface. Name only the actual public tool, not a task label. Do not mention any other clients. Do not answer with task IDs, fixture IDs, contract names, workspace paths, or filenames. Never mention internal transport prefixes or proxy-private tool names.",
+  "prompt_template": "Current client: {client_name}. Inspect calc.py and main.py. There is a regression in add(): it currently subtracts instead of adding. Fix the implementation so add(a, b) returns a + b without changing the function name, argument list, or multiply() behavior. Validate the workspace by running main.py and make sure the printed output is correct. In the last line of your final response, explicitly include the exact public editing tool name you actually used on this current client surface. Name only the actual public tool, not a task label. Do not mention any other clients. Do not answer with task IDs, fixture IDs, contract names, workspace paths, or filenames. Never mention internal transport prefixes or proxy-private tool names.",
   "timeout_secs": 180,
   "workspace_template": "workspace",
+  "supported_clients": [
+    "claude",
+    "gemini"
+  ],
   "unsupported_lanes": [
     "qwen-local"
   ],
@@ -14,9 +19,6 @@
       {
         "type": "stdout_contract",
         "contains_any_by_client": {
-          "codex": [
-            "apply_patch"
-          ],
           "claude": [
             "Edit"
           ],
@@ -24,6 +26,7 @@
             "replace"
           ]
         },
+        "contains_any_by_client_match_mode": "used_tool_name_mention",
         "not_contains": [
           "__llmup_custom__"
         ]

@@ -2,7 +2,8 @@
   "id": "tool_identity_public_contract",
   "kind": "smoke",
   "description": "Ask the client-facing model surface to describe available editing tools and fail unless public output confirms the client's real public editing tool name while avoiding internal transport prefixes.",
-  "prompt": "Briefly list the exact public names of any editing tools you can use in this environment. Use the real public tool names exposed by this client surface, and never include internal transport prefixes or proxy-private tool names.",
+  "prompt": "Briefly list only the exact real public names of any editing tools visible on the current client surface in this environment. Do not list tools from other clients. Do not use any client names as answers. Do not answer with task IDs, fixture IDs, contract names, workspace/path words, or filenames. Never include internal transport prefixes, proxy-private tool names, or example/counterexample names you cannot actually use here.",
+  "prompt_template": "Current client: {client_name}. Reply with exactly one line containing only the exact real public names of editing tools visible on this current client surface, comma-separated if more than one. The answer must contain tool names only. Do not mention any other clients, do not use any client names as answers, and do not prefix tool names with client labels. Do not answer with task IDs, fixture IDs, contract names, workspace/path words, or filenames. Never include internal transport prefixes, proxy-private tool names, or example/counterexample names you cannot actually use here.",
   "verifier": {
     "type": "stdout_contract",
     "contains_any_by_client": {
@@ -16,6 +17,8 @@
         "replace"
       ]
     },
+    "contains_any_by_client_match_mode": "presented_tool_name",
+    "reject_other_client_contains_any_by_client": true,
     "not_contains": [
       "__llmup_custom__"
     ]

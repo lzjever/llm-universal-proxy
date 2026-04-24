@@ -1,7 +1,7 @@
 {
   "id": "codex_observable_edit_contract",
   "kind": "smoke",
-  "description": "Codex-only observable edit contract that reads the JSON event stream and requires reasoning, user-facing messaging, and a provable edit signal before workspace verification passes.",
+  "description": "Codex-only observable edit contract that reads the JSON event stream and requires completed work, a post-work final summary, and a provable edit signal before workspace verification passes.",
   "prompt": "Inspect calc.py and main.py. There is a regression in add(): it currently subtracts instead of adding. Fix the implementation so add(a, b) returns a + b without changing the function name, argument list, or multiply() behavior. Validate the workspace by running main.py and make sure the printed output is correct. In your final response, briefly summarize what changed and how you verified it.",
   "timeout_secs": 180,
   "workspace_template": "workspace",
@@ -20,10 +20,12 @@
           "turn.started",
           "turn.completed"
         ],
-        "completed_item_types": [
-          "reasoning",
-          "agent_message"
-        ],
+        "work_summary_contract": {
+          "work_item_types": [
+            "file_change",
+            "command_execution"
+          ]
+        },
         "completed_edit_targets": [
           {
             "path_suffix": "calc.py",

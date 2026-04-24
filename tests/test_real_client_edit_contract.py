@@ -44,6 +44,7 @@ def make_fixture(module, verifier):
         verifier=verifier,
         timeout_secs=90,
         workspace_template=pathlib.Path("/tmp/workspace"),
+        supported_clients=("claude", "gemini"),
         unsupported_lanes=("qwen-local",),
     )
 
@@ -104,10 +105,10 @@ def public_editing_tool_workspace_edit_verifier():
             {
                 "type": "stdout_contract",
                 "contains_any_by_client": {
-                    "codex": ["apply_patch"],
                     "claude": ["Edit"],
                     "gemini": ["replace"],
                 },
+                "contains_any_by_client_match_mode": "used_tool_name_mention",
                 "not_contains": ["__llmup_custom__"],
             },
             {
@@ -138,6 +139,29 @@ def public_editing_tool_workspace_edit_verifier():
 
 
 class RealClientEditContractTests(unittest.TestCase):
+    def test_public_editing_tool_workspace_fixture_prompt_template_anchors_current_client_tool_name(
+        self,
+    ):
+        module = load_module()
+        [fixture] = module.load_fixtures(PUBLIC_EDITING_TOOL_WORKSPACE_FIXTURE_PATH.parent)
+
+        rendered_prompt = module.render_fixture_prompt(fixture, "claude")
+
+        self.assertEqual(fixture.fixture_id, "public_editing_tool_workspace_edit_contract")
+        self.assertIsNotNone(fixture.prompt_template)
+        self.assertIn("Current client: claude.", rendered_prompt)
+        self.assertIn(
+            "exact public editing tool name you actually used on this current client surface",
+            rendered_prompt,
+        )
+        self.assertIn("Name only the actual public tool, not a task label.", rendered_prompt)
+        self.assertIn(
+            "Do not answer with task IDs, fixture IDs, contract names, workspace paths, or filenames.",
+            rendered_prompt,
+        )
+        self.assertIn("Do not mention any other clients.", rendered_prompt)
+        self.assertNotIn("{client_name}", rendered_prompt)
+
     def test_verify_fixture_output_all_of_requires_real_workspace_edit(self):
         module = load_module()
         fixture = make_fixture(module, public_editing_tool_workspace_edit_verifier())
@@ -148,7 +172,7 @@ class RealClientEditContractTests(unittest.TestCase):
 
             ok, message = module.verify_fixture_output(
                 fixture,
-                "I used replace and verified the result.",
+                "The public editing tool used was `replace`.",
                 workspace_dir,
                 context=make_context(module, "gemini"),
             )
@@ -162,9 +186,22 @@ class RealClientEditContractTests(unittest.TestCase):
         fixture = make_fixture(module, public_editing_tool_workspace_edit_verifier())
 
         for client_name, stdout_text in (
-            ("codex", "I used apply_patch and verified the result with main.py."),
-            ("claude", "I used Edit and verified the result with main.py."),
-            ("gemini", "I used replace and verified the result with main.py."),
+            (
+                "claude",
+                "**Public editing tool used:** The `Edit` tool.",
+            ),
+            (
+                "gemini",
+                "**Tool used:** `Replace` (workspace file editing tool)",
+            ),
+            (
+                "gemini",
+                "The tool I used was `replace`.",
+            ),
+            (
+                "gemini",
+                "I fixed the regression, validated the workspace, and used `replace`.",
+            ),
         ):
             with self.subTest(client_name=client_name):
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -198,12 +235,35 @@ class RealClientEditContractTests(unittest.TestCase):
         self.assertEqual(
             payload["verifier"]["verifiers"][0]["contains_any_by_client"],
             {
-                "codex": ["apply_patch"],
                 "claude": ["Edit"],
                 "gemini": ["replace"],
             },
         )
-        self.assertNotIn("supported_clients", payload)
+        self.assertEqual(
+            payload["verifier"]["verifiers"][0]["contains_any_by_client_match_mode"],
+            "used_tool_name_mention",
+        )
+        self.assertNotIn(
+            "reject_other_client_contains_any_by_client",
+            payload["verifier"]["verifiers"][0],
+        )
+        self.assertIn("{client_name}", payload["prompt_template"])
+        self.assertIn(
+            "exact public editing tool name you actually used on this current client surface",
+            payload["prompt_template"],
+        )
+        self.assertIn(
+            "Do not answer with task IDs, fixture IDs, contract names, workspace paths, or filenames.",
+            payload["prompt_template"],
+        )
+        self.assertIn("Do not mention any other clients.", payload["prompt_template"])
+        self.assertEqual(payload["supported_clients"], ["claude", "gemini"])
+        self.assertIn("current client surface", payload["prompt"])
+        self.assertIn("Name only the actual public tool, not a task label.", payload["prompt"])
+        self.assertIn(
+            "Do not answer with task IDs, fixture IDs, contract names, workspace paths, or filenames.",
+            payload["prompt"],
+        )
 
     def test_lane_supports_fixture_respects_fixture_unsupported_lanes(self):
         module = load_module()
@@ -218,6 +278,36 @@ class RealClientEditContractTests(unittest.TestCase):
         )
 
         self.assertFalse(module.lane_supports_fixture(qwen_lane, fixture))
+
+    def test_client_supports_fixture_excludes_codex_for_public_editing_tool_workspace_contract(self):
+        module = load_module()
+        fixture = make_fixture(module, public_editing_tool_workspace_edit_verifier())
+
+        self.assertFalse(module.client_supports_fixture("codex", fixture))
+        self.assertTrue(module.client_supports_fixture("claude", fixture))
+        self.assertTrue(module.client_supports_fixture("gemini", fixture))
+
+    def test_expand_matrix_excludes_codex_for_public_editing_tool_workspace_contract(self):
+        module = load_module()
+        fixture = make_fixture(module, public_editing_tool_workspace_edit_verifier())
+        lane = module.Lane(
+            name="minimax-openai",
+            required=True,
+            enabled=True,
+            proxy_model="minimax-openai",
+            upstream_name="MINIMAX-OPENAI",
+            skip_reason=None,
+        )
+
+        cases = module.expand_matrix(
+            clients=["codex", "claude", "gemini"],
+            lanes=[lane],
+            fixtures=[fixture],
+            phase="basic",
+            skip_slow=False,
+        )
+
+        self.assertEqual([case.client_name for case in cases], ["claude", "gemini"])
 
 
 if __name__ == "__main__":

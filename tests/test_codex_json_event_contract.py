@@ -101,10 +101,9 @@ def codex_observable_edit_verifier():
             {
                 "type": "codex_json_event_contract",
                 "event_types": ["turn.started", "turn.completed"],
-                "completed_item_types": [
-                    "reasoning",
-                    "agent_message",
-                ],
+                "work_summary_contract": {
+                    "work_item_types": ["file_change", "command_execution"],
+                },
                 "completed_edit_targets": [
                     {
                         "path_suffix": "calc.py",
@@ -145,10 +144,6 @@ def codex_stdout_with_file_change() -> str:
         {"type": "turn.started"},
         {
             "type": "item.completed",
-            "item": {"id": "item_0", "type": "reasoning", "text": "Need to inspect and edit."},
-        },
-        {
-            "type": "item.completed",
             "item": {"id": "item_1", "type": "agent_message", "text": "I'll fix the regression."},
         },
         {
@@ -173,14 +168,6 @@ def codex_stdout_false_positive_shell_write() -> str:
     events = [
         {"type": "thread.started", "thread_id": "thread_1"},
         {"type": "turn.started"},
-        {
-            "type": "item.completed",
-            "item": {
-                "id": "item_0",
-                "type": "reasoning",
-                "text": "I should use apply_patch for this edit.",
-            },
-        },
         {
             "type": "item.completed",
             "item": {
@@ -219,10 +206,6 @@ def codex_stdout_with_sed_edit() -> str:
         {"type": "turn.started"},
         {
             "type": "item.completed",
-            "item": {"id": "item_0", "type": "reasoning", "text": "Need to inspect and edit."},
-        },
-        {
-            "type": "item.completed",
             "item": {"id": "item_1", "type": "agent_message", "text": "Found the bug."},
         },
         {
@@ -236,6 +219,14 @@ def codex_stdout_with_sed_edit() -> str:
                 "status": "completed",
             },
         },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_3",
+                "type": "agent_message",
+                "text": "I fixed calc.py and verified the output with main.py.",
+            },
+        },
         {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
     ]
     return "\n".join(json.dumps(event) for event in events) + "\n"
@@ -245,10 +236,6 @@ def codex_stdout_with_shell_write_edit() -> str:
     events = [
         {"type": "thread.started", "thread_id": "thread_1"},
         {"type": "turn.started"},
-        {
-            "type": "item.completed",
-            "item": {"id": "item_0", "type": "reasoning", "text": "Need to inspect and edit."},
-        },
         {
             "type": "item.completed",
             "item": {"id": "item_1", "type": "agent_message", "text": "Writing the fixed file."},
@@ -264,6 +251,36 @@ def codex_stdout_with_shell_write_edit() -> str:
                 "status": "completed",
             },
         },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_3",
+                "type": "agent_message",
+                "text": "I rewrote calc.py and verified the result.",
+            },
+        },
+        {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+def codex_stdout_with_completed_work_but_no_post_work_summary() -> str:
+    events = [
+        {"type": "thread.started", "thread_id": "thread_1"},
+        {"type": "turn.started"},
+        {
+            "type": "item.completed",
+            "item": {"id": "item_1", "type": "agent_message", "text": "I'll fix the regression."},
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_2",
+                "type": "file_change",
+                "changes": [{"path": "/tmp/workspace/calc.py", "kind": "update"}],
+                "status": "completed",
+            },
+        },
         {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
     ]
     return "\n".join(json.dumps(event) for event in events) + "\n"
@@ -273,14 +290,6 @@ def codex_stdout_with_read_only_commands() -> str:
     events = [
         {"type": "thread.started", "thread_id": "thread_1"},
         {"type": "turn.started"},
-        {
-            "type": "item.completed",
-            "item": {
-                "id": "item_0",
-                "type": "reasoning",
-                "text": "I should edit calc.py and verify it.",
-            },
-        },
         {
             "type": "item.completed",
             "item": {
@@ -376,6 +385,23 @@ class CodexJsonEventContractTests(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertEqual(message, "")
 
+    def test_verify_fixture_output_rejects_completed_work_without_post_work_summary(self):
+        module = load_module()
+        fixture = make_fixture(module, codex_observable_edit_verifier())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = pathlib.Path(temp_dir)
+            write_fixed_workspace(workspace_dir)
+
+            ok, message = module.verify_fixture_output(
+                fixture,
+                codex_stdout_with_completed_work_but_no_post_work_summary(),
+                workspace_dir,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("post-work final agent_message", message)
+
     def test_verify_fixture_output_rejects_read_only_command_execution_false_positive(self):
         module = load_module()
         fixture = make_fixture(module, codex_observable_edit_verifier())
@@ -421,6 +447,10 @@ class CodexJsonEventContractTests(unittest.TestCase):
         self.assertEqual(
             [entry["type"] for entry in payload["verifier"]["verifiers"]],
             ["codex_json_event_contract", "python_source_and_output"],
+        )
+        self.assertEqual(
+            payload["verifier"]["verifiers"][0]["work_summary_contract"],
+            {"work_item_types": ["file_change", "command_execution"]},
         )
         self.assertEqual(
             payload["verifier"]["verifiers"][0]["completed_edit_targets"],

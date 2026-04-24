@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import atexit
 import argparse
 import ast
 import collections
@@ -15,6 +16,7 @@ import secrets
 import shutil
 import signal
 import socket
+import string
 import subprocess
 import sys
 import tempfile
@@ -82,8 +84,16 @@ INTERNAL_TOOL_ARTIFACT_PATTERN = re.compile(r"__llmup_custom__[A-Za-z0-9_:-]*")
 PUBLIC_APPLY_PATCH_TOOL_NAME = "apply_patch"
 PUBLIC_APPLY_PATCH_TOOL_TYPE = "freeform"
 DEFAULT_CODEX_APPLY_PATCH_TOOL_TYPE = PUBLIC_APPLY_PATCH_TOOL_TYPE
+SUPPORTED_PROMPT_TEMPLATE_FIELDS = frozenset({"client_name"})
 REPLAY_MARKER_KEY_ENV = "LLMUP_INTERNAL_REPLAY_MARKER_KEY"
 REPLAY_MARKER_KEY_FILENAME = ".llmup-internal-replay-marker-key"
+CLIENT_RUNTIME_ROOT_PREFIX = "llmup-real-cli-runtime-"
+
+_CLIENT_RUNTIME_ROOTS_BY_REPORT_DIR: dict[str, pathlib.Path] = {}
+_CLIENT_RUNTIME_CASE_TOKENS: dict[tuple[str, str], str] = {}
+_CLIENT_RUNTIME_CASE_COUNTERS: dict[str, int] = {}
+_CLIENT_RUNTIME_ROOTS_TO_CLEANUP: set[pathlib.Path] = set()
+_CLIENT_RUNTIME_CLEANUP_REGISTERED = False
 
 
 @dataclasses.dataclass
@@ -481,9 +491,19 @@ class TaskFixture:
     verifier: dict[str, object]
     timeout_secs: int
     workspace_template: pathlib.Path | None
+    prompt_template: str | None = None
     description: str = ""
     supported_clients: tuple[str, ...] = ()
     unsupported_lanes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.prompt_template is None:
+            return
+        if not isinstance(self.prompt_template, str):
+            raise ValueError(
+                f"invalid prompt_template for fixture {self.fixture_id!r}: must be a string"
+            )
+        validate_prompt_template(self.fixture_id, self.prompt_template)
 
 
 @dataclasses.dataclass
@@ -1381,33 +1401,77 @@ def build_runtime_config_text(
     return "\n".join(lines) + "\n"
 
 
+def _prompt_template_placeholder_token(field_name: str | None) -> str:
+    if field_name in (None, ""):
+        return "{}"
+    return "{" + field_name + "}"
+
+
+def validate_prompt_template(fixture_id: str, prompt_template: str) -> None:
+    try:
+        parsed_fields = list(string.Formatter().parse(prompt_template))
+    except ValueError as error:
+        raise ValueError(
+            f"invalid prompt_template for fixture {fixture_id!r}: {error}"
+        ) from error
+
+    supported_placeholders = ", ".join(
+        "{" + field_name + "}" for field_name in sorted(SUPPORTED_PROMPT_TEMPLATE_FIELDS)
+    )
+
+    for _, field_name, format_spec, conversion in parsed_fields:
+        if field_name is None:
+            continue
+        if field_name not in SUPPORTED_PROMPT_TEMPLATE_FIELDS:
+            raise ValueError(
+                f"invalid prompt_template for fixture {fixture_id!r}: unsupported placeholder "
+                f"{_prompt_template_placeholder_token(field_name)}; supported placeholders: "
+                f"{supported_placeholders}"
+            )
+        if conversion is not None or format_spec:
+            raise ValueError(
+                f"invalid prompt_template for fixture {fixture_id!r}: placeholder "
+                f"{_prompt_template_placeholder_token(field_name)} must not use conversion "
+                "or format specifiers"
+            )
+
+
 def load_fixtures(fixtures_root: pathlib.Path) -> list[TaskFixture]:
     fixtures: list[TaskFixture] = []
     for path in sorted(fixtures_root.rglob("*.json")):
         payload = json.loads(path.read_text(encoding="utf-8"))
         workspace_template = payload.get("workspace_template")
-        fixtures.append(
-            TaskFixture(
-                fixture_id=payload["id"],
-                kind=payload["kind"],
-                description=payload.get("description", ""),
-                prompt=payload["prompt"],
-                verifier=payload["verifier"],
-                timeout_secs=int(payload["timeout_secs"]),
-                workspace_template=(
-                    (path.parent / workspace_template).resolve()
-                    if workspace_template
-                    else None
-                ),
-                supported_clients=tuple(
-                    str(client_name)
-                    for client_name in payload.get("supported_clients", [])
-                ),
-                unsupported_lanes=tuple(
-                    str(lane_name) for lane_name in payload.get("unsupported_lanes", [])
-                ),
+        try:
+            fixtures.append(
+                TaskFixture(
+                    fixture_id=payload["id"],
+                    kind=payload["kind"],
+                    description=payload.get("description", ""),
+                    prompt=payload["prompt"],
+                    prompt_template=payload.get("prompt_template"),
+                    verifier=payload["verifier"],
+                    timeout_secs=int(payload["timeout_secs"]),
+                    workspace_template=(
+                        (path.parent / workspace_template).resolve()
+                        if workspace_template
+                        else None
+                    ),
+                    supported_clients=tuple(
+                        str(client_name)
+                        for client_name in payload.get("supported_clients", [])
+                    ),
+                    unsupported_lanes=tuple(
+                        str(lane_name) for lane_name in payload.get("unsupported_lanes", [])
+                    ),
+                )
             )
-        )
+        except ValueError as error:
+            message = str(error)
+            if "invalid prompt_template" in message:
+                raise ValueError(
+                    f"invalid prompt_template in fixture {path}: {message}"
+                ) from error
+            raise ValueError(f"invalid fixture {path}: {message}") from error
     return fixtures
 
 
@@ -2191,9 +2255,20 @@ def probe_lane(proxy_base: str, lane: Lane) -> str | None:
     return "lane probe succeeded but did not return a valid response shape"
 
 
+def render_fixture_prompt(fixture: TaskFixture, client_name: str) -> str:
+    if fixture.prompt_template is None:
+        return fixture.prompt
+    try:
+        return fixture.prompt_template.format(client_name=client_name)
+    except (KeyError, ValueError) as error:
+        raise ValueError(
+            f"invalid prompt_template for fixture {fixture.fixture_id!r}: {error}"
+        ) from error
+
+
 def client_stdin_text(client_name: str, fixture: TaskFixture) -> str | None:
     if client_name == "claude":
-        return fixture.prompt
+        return render_fixture_prompt(fixture, client_name)
     return None
 
 
@@ -2536,6 +2611,45 @@ def _verify_codex_phase_contract(
     return True, ""
 
 
+def _verify_codex_work_summary_contract(
+    events: list[dict[str, object]],
+    work_summary_contract: dict[str, object],
+) -> tuple[bool, str]:
+    raw_work_item_types = work_summary_contract.get(
+        "work_item_types", ["file_change", "command_execution"]
+    )
+    if not isinstance(raw_work_item_types, list) or not raw_work_item_types:
+        return False, "work_summary_contract.work_item_types must be a non-empty list"
+    work_item_types = {str(item_type) for item_type in raw_work_item_types}
+
+    completed_work_indexes = _codex_phase_item_indexes(
+        events,
+        event_types=("item.completed",),
+        item_types=work_item_types,
+    )
+    if not completed_work_indexes:
+        return (
+            False,
+            "expected codex event stream to include completed work item "
+            "before final agent_message",
+        )
+
+    agent_message_indexes = _codex_phase_item_indexes(
+        events,
+        event_types=("item.completed",),
+        item_types={"agent_message"},
+    )
+    last_completed_work_index = completed_work_indexes[-1]
+    if not any(index > last_completed_work_index for index in agent_message_indexes):
+        return (
+            False,
+            "expected codex event stream to include post-work final agent_message "
+            "after completed work",
+        )
+
+    return True, ""
+
+
 def _client_specific_verifier_values(
     verifier: dict[str, object],
     key: str,
@@ -2559,11 +2673,319 @@ def _client_specific_verifier_values(
     return [str(value) for value in client_values], ""
 
 
-def _client_specific_term_present(stdout_text: str, expected: str) -> bool:
-    pattern = re.compile(
-        rf"(?<![A-Za-z0-9_:-]){re.escape(expected)}(?![A-Za-z0-9_:-])"
+def _other_client_specific_verifier_values(
+    verifier: dict[str, object],
+    key: str,
+    context: VerifierContext | None,
+) -> tuple[list[str] | None, str]:
+    by_client_key = f"{key}_by_client"
+    raw_values = verifier.get(by_client_key)
+    if raw_values is None:
+        return [], ""
+    if not isinstance(raw_values, dict):
+        return None, f"{by_client_key} must be an object"
+    client_name = context.client_name if context is not None else None
+    if not client_name:
+        return (
+            None,
+            "stdout_contract requires verifier context with client_name for client-specific expectations",
+        )
+
+    current_client_values = raw_values.get(client_name, [])
+    if not isinstance(current_client_values, list):
+        return None, f"{by_client_key}.{client_name} must be a list"
+    current_terms = {str(value) for value in current_client_values}
+
+    other_values: list[str] = []
+    for other_client_name, other_client_values in raw_values.items():
+        if other_client_name == client_name:
+            continue
+        if not isinstance(other_client_values, list):
+            return None, f"{by_client_key}.{other_client_name} must be a list"
+        for value in other_client_values:
+            normalized = str(value)
+            if normalized not in current_terms:
+                other_values.append(normalized)
+    return other_values, ""
+
+
+def _client_specific_match_mode(
+    verifier: dict[str, object],
+    key: str,
+) -> tuple[str | None, str]:
+    match_mode_key = f"{key}_by_client_match_mode"
+    raw_match_mode = verifier.get(match_mode_key, "token")
+    if not isinstance(raw_match_mode, str):
+        return None, f"{match_mode_key} must be a string"
+    match_mode = raw_match_mode.strip()
+    if match_mode not in {"token", "presented_tool_name", "used_tool_name_mention"}:
+        return (
+            None,
+            f"{match_mode_key} must be one of 'token', 'presented_tool_name', "
+            "'used_tool_name_mention'",
+        )
+    return match_mode, ""
+
+
+def _client_specific_term_pattern(expected: str) -> str:
+    return rf"(?<![A-Za-z0-9_:-]){re.escape(expected)}(?![A-Za-z0-9_:-])"
+
+
+def _presented_tool_name_token_pattern(expected: str) -> str:
+    term_pattern = _client_specific_term_pattern(expected)
+    return rf"(?:[`*_]+\s*)*{term_pattern}(?:\s*[`*_]+)*"
+
+
+def _presented_tool_name_list_token_pattern() -> str:
+    return r"(?:[`*_]+\s*)*[A-Za-z][A-Za-z0-9_:-]*(?:\s*[`*_]+)*"
+
+
+def _plain_presented_tool_name_line(line: str) -> str:
+    plain_line = re.sub(r"[`*]+", "", line)
+    plain_line = re.sub(r"\s+", " ", plain_line)
+    return plain_line.strip()
+
+
+def _displayed_presented_tool_name_token(line: str, expected: str) -> bool:
+    return (
+        re.search(_presented_tool_name_token_pattern(expected), line, re.IGNORECASE)
+        is not None
     )
+
+
+def _plain_presented_tool_name_context_patterns(expected: str) -> tuple[str, ...]:
+    term_pattern = _client_specific_term_pattern(expected)
+    labeled_context = (
+        r"(?:exact\s+public editing tool name|public editing tool name|editing tool name|"
+        r"public tool name|tool name|public editing tool|editing tool|tool used|"
+        r"public editing tool used|editing tool used)"
+    )
+    subject_context = (
+        r"(?:exact\s+public editing tool name|public editing tool name|editing tool name|"
+        r"public tool name|tool name|public editing tool|editing tool)"
+    )
+    trailing_description = r"(?:\s*(?:\([^)]+\)|[-–—:]\s*.*))?[.!?]?\s*$"
+    return (
+        rf"^\s*(?:the\s+)?{labeled_context}(?:\s+i\s+(?:actually\s+)?used)?"
+        rf"\s*(?::|=)\s*{term_pattern}{trailing_description}",
+        rf"^\s*(?:the\s+)?{subject_context}"
+        rf"(?:\s+i\s+(?:actually\s+)?used|\s+used)?"
+        rf"\s+(?:was|is)\s*:?\s*{term_pattern}{trailing_description}",
+        rf"^\s*(?:the\s+)?tool(?:\s+i\s+(?:actually\s+)?used|\s+used)"
+        rf"\s+(?:was|is)\s*:?\s*{term_pattern}{trailing_description}",
+    )
+
+
+def _plain_presented_tool_name_context(line: str, expected: str) -> bool:
+    plain_line = _plain_presented_tool_name_line(line)
+    if not plain_line:
+        return False
+
+    plain_term = re.search(_client_specific_term_pattern(expected), plain_line, re.IGNORECASE)
+    if plain_term is None:
+        return False
+
+    for pattern in _plain_presented_tool_name_context_patterns(expected):
+        if re.search(pattern, plain_line, re.IGNORECASE):
+            return True
+
+    lower_line = plain_line.lower()
+    context_phrases = (
+        "exact public editing tool name i used",
+        "exact public editing tool name used",
+        "exact public editing tool name",
+        "public editing tool name i used",
+        "public editing tool name used",
+        "public editing tool name",
+        "editing tool name used",
+        "editing tool name",
+        "public tool name",
+        "tool name",
+        "public editing tool i used",
+        "public editing tool used",
+        "editing tool used",
+        "tool used",
+    )
+    direct_assignment_pattern = re.compile(
+        r"^\s*(?:(?::|=)\s*(?:the\s+)?|(?:was|is)\s*:?\s*(?:the\s+)?)$",
+        re.IGNORECASE,
+    )
+
+    for phrase in context_phrases:
+        phrase_index = lower_line.find(phrase)
+        if phrase_index < 0:
+            continue
+        if plain_term.start() <= phrase_index + len(phrase):
+            continue
+        between = lower_line[phrase_index + len(phrase) : plain_term.start()]
+        if direct_assignment_pattern.fullmatch(between) is not None:
+            return True
+
+    return False
+
+
+def _presented_tool_name_present(stdout_text: str, expected: str) -> bool:
+    normalized_text = stdout_text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    term_pattern = _presented_tool_name_token_pattern(expected)
+    client_label_pattern = r"(?:[`*_]+\s*)*(?:codex|claude|gemini)(?:\s*[`*_]+)*"
+    list_token_pattern = _presented_tool_name_list_token_pattern()
+
+    for raw_line in normalized_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if _plain_presented_tool_name_context(line, expected) and _displayed_presented_tool_name_token(
+            line, expected
+        ):
+            return True
+
+        if re.search(
+            rf"^\s*(?:the\s+)?{term_pattern}\s+tool\b"
+            rf"(?:\s*(?:\([^)]+\)|[-–—:]\s*.*))?[.!?]?\s*$",
+            line,
+            re.IGNORECASE,
+        ):
+            return True
+
+        if _displayed_presented_tool_name_token(line, expected) and re.search(
+            rf"^\s*(?:[-*+]\s+|\d+[.)]\s+)?"
+            rf"(?:{client_label_pattern}\s*:\s*)?"
+            rf"{list_token_pattern}(?:\s*,\s*{list_token_pattern})+"
+            rf"\s*[.!?]?\s*$",
+            line,
+            re.IGNORECASE,
+        ):
+            return True
+
+        if re.search(
+            rf"^\s*(?:[-*+]\s+|\d+[.)]\s+)"
+            rf"(?:{client_label_pattern}\s*:\s*)?"
+            rf"{term_pattern}"
+            rf"(?:\s*(?:\([^)]+\)|[-–—:]\s*.*)?)?$",
+            line,
+            re.IGNORECASE,
+        ):
+            return True
+
+        if re.search(
+            rf"^\s*{term_pattern}(?:\s*(?:\([^)]+\)|[-–—:]\s*.*)?)?$",
+            line,
+            re.IGNORECASE,
+        ):
+            return True
+
+    return False
+
+
+def _used_tool_name_mention_present(stdout_text: str, expected: str) -> bool:
+    if _presented_tool_name_present(stdout_text, expected):
+        return True
+
+    normalized_text = stdout_text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    term_pattern = _presented_tool_name_token_pattern(expected)
+    use_patterns = (
+        rf"\b(?:i|we)\b[\s,:;.-]*.*?\bused\b(?:\s+(?:the\s+)?(?:public\s+editing\s+)?tool)?"
+        rf"[\s,:;.-]*{term_pattern}(?:\s+tool)?\b",
+        rf"\b(?:using|with|via)\b\s+(?:the\s+)?(?:public\s+editing\s+)?(?:tool\s+)?"
+        rf"{term_pattern}(?:\s+tool)?\b",
+    )
+
+    for raw_line in normalized_text.splitlines():
+        line = raw_line.strip()
+        if not line or not _displayed_presented_tool_name_token(line, expected):
+            continue
+        if any(re.search(pattern, line, re.IGNORECASE) for pattern in use_patterns):
+            return True
+
+    return False
+
+
+def _client_specific_term_present(
+    stdout_text: str,
+    expected: str,
+    *,
+    match_mode: str = "token",
+) -> bool:
+    if match_mode == "presented_tool_name":
+        return _presented_tool_name_present(stdout_text, expected)
+    if match_mode == "used_tool_name_mention":
+        return _used_tool_name_mention_present(stdout_text, expected)
+    pattern = re.compile(_client_specific_term_pattern(expected))
     return pattern.search(stdout_text) is not None
+
+
+def _codex_stdout_contract_visible_text(stdout_text: str) -> str | None:
+    events, _ = _parse_jsonl_events(stdout_text)
+    if events is None:
+        return None
+
+    messages: list[str] = []
+    for item in _completed_codex_items(events):
+        if item.get("type") != "agent_message":
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        stripped = text.strip()
+        if stripped:
+            messages.append(stripped)
+
+    if not messages:
+        return None
+    return "\n".join(messages)
+
+
+def _stdout_contract_match_text(
+    stdout_text: str,
+    context: VerifierContext | None,
+) -> str:
+    if context is not None and context.client_name == "codex":
+        codex_visible_text = _codex_stdout_contract_visible_text(stdout_text)
+        if codex_visible_text is not None:
+            return codex_visible_text
+    return stdout_text
+
+
+def _stdout_contract_reject_other_client_contains_any_by_client(
+    verifier: dict[str, object],
+    stdout_text: str,
+    context: VerifierContext | None,
+    *,
+    match_mode: str,
+) -> tuple[bool | None, str]:
+    raw_flag = verifier.get("reject_other_client_contains_any_by_client", False)
+    if not isinstance(raw_flag, bool):
+        return None, "reject_other_client_contains_any_by_client must be a boolean"
+    if not raw_flag:
+        return True, ""
+
+    other_client_contains_any, message = _other_client_specific_verifier_values(
+        verifier, "contains_any", context
+    )
+    if other_client_contains_any is None:
+        return None, message
+
+    forbidden_terms = sorted(
+        {
+            expected
+            for expected in other_client_contains_any
+            if _client_specific_term_present(
+                stdout_text,
+                expected,
+                match_mode=match_mode,
+            )
+        },
+        key=str.lower,
+    )
+    if forbidden_terms:
+        listed_terms = ", ".join(repr(term) for term in forbidden_terms)
+        return (
+            False,
+            "expected output not to list public tool names from other clients: "
+            f"{listed_terms}",
+        )
+    return True, ""
 
 
 def _codex_command_targets_path(command: str, path_suffix: str) -> bool:
@@ -2628,37 +3050,68 @@ def _verify_verifier_output(
         )
         if client_contains is None:
             return False, message
+        client_contains_match_mode, message = _client_specific_match_mode(
+            verifier, "contains"
+        )
+        if client_contains_match_mode is None:
+            return False, message
         client_contains_any, message = _client_specific_verifier_values(
             verifier, "contains_any", context
         )
         if client_contains_any is None:
+            return False, message
+        client_contains_any_match_mode, message = _client_specific_match_mode(
+            verifier, "contains_any"
+        )
+        if client_contains_any_match_mode is None:
             return False, message
         client_not_contains, message = _client_specific_verifier_values(
             verifier, "not_contains", context
         )
         if client_not_contains is None:
             return False, message
+        stdout_contract_text = _stdout_contract_match_text(stdout_text, context)
 
         contains = [str(needle) for needle in verifier.get("contains", [])]
         for expected in contains:
-            if expected not in stdout_text:
+            if expected not in stdout_contract_text:
                 return False, f"expected output to contain {expected!r}"
         for expected in client_contains:
-            if not _client_specific_term_present(stdout_text, expected):
+            if not _client_specific_term_present(
+                stdout_contract_text,
+                expected,
+                match_mode=client_contains_match_mode,
+            ):
                 return False, f"expected output to contain {expected!r}"
         contains_any = [str(needle) for needle in verifier.get("contains_any", [])]
-        if contains_any and not any(expected in stdout_text for expected in contains_any):
+        if contains_any and not any(
+            expected in stdout_contract_text for expected in contains_any
+        ):
             options = ", ".join(repr(expected) for expected in contains_any)
             return False, f"expected output to contain at least one of {options}"
         if client_contains_any and not any(
-            _client_specific_term_present(stdout_text, expected)
+            _client_specific_term_present(
+                stdout_contract_text,
+                expected,
+                match_mode=client_contains_any_match_mode,
+            )
             for expected in client_contains_any
         ):
             options = ", ".join(repr(expected) for expected in client_contains_any)
             return False, f"expected output to contain at least one of {options}"
+        ok, message = _stdout_contract_reject_other_client_contains_any_by_client(
+            verifier,
+            stdout_contract_text,
+            context,
+            match_mode=client_contains_any_match_mode,
+        )
+        if ok is None:
+            return False, message
+        if not ok:
+            return False, message
         not_contains = [str(needle) for needle in verifier.get("not_contains", [])] + client_not_contains
         for forbidden in not_contains:
-            if forbidden in stdout_text:
+            if forbidden in stdout_contract_text:
                 return False, f"expected output not to contain {forbidden!r}"
         return True, ""
     if verifier_type == "file_contains":
@@ -2722,6 +3175,15 @@ def _verify_verifier_output(
             ok, message = _verify_codex_phase_contract(events, phase_contract)
             if not ok:
                 return False, message
+        work_summary_contract = verifier.get("work_summary_contract")
+        if work_summary_contract is not None:
+            if not isinstance(work_summary_contract, dict):
+                return False, "work_summary_contract must be an object"
+            ok, message = _verify_codex_work_summary_contract(
+                events, work_summary_contract
+            )
+            if not ok:
+                return False, message
         return True, ""
     if verifier_type == "all_of":
         nested_verifiers = verifier.get("verifiers", [])
@@ -2756,10 +3218,72 @@ def verify_fixture_output(
     )
 
 
+def _path_is_within(candidate: pathlib.Path, root: pathlib.Path) -> bool:
+    resolved_candidate = candidate.resolve()
+    resolved_root = root.resolve()
+    return resolved_candidate == resolved_root or resolved_root in resolved_candidate.parents
+
+
+def _cleanup_client_runtime_roots() -> None:
+    for runtime_root in list(_CLIENT_RUNTIME_ROOTS_TO_CLEANUP):
+        shutil.rmtree(runtime_root, ignore_errors=True)
+
+
+def _register_client_runtime_root_cleanup(runtime_root: pathlib.Path) -> None:
+    global _CLIENT_RUNTIME_CLEANUP_REGISTERED
+    _CLIENT_RUNTIME_ROOTS_TO_CLEANUP.add(runtime_root)
+    if _CLIENT_RUNTIME_CLEANUP_REGISTERED:
+        return
+    atexit.register(_cleanup_client_runtime_roots)
+    _CLIENT_RUNTIME_CLEANUP_REGISTERED = True
+
+
+def _client_runtime_base_dir() -> pathlib.Path:
+    base_dir = pathlib.Path(tempfile.gettempdir()).resolve()
+    if _path_is_within(base_dir, REPO_ROOT):
+        fallback_dir = pathlib.Path("/tmp")
+        if fallback_dir.exists():
+            base_dir = fallback_dir.resolve()
+    if _path_is_within(base_dir, REPO_ROOT):
+        raise RuntimeError("client runtime root must live outside the repository")
+    return base_dir
+
+
+def prepare_client_runtime_root(report_dir: pathlib.Path) -> pathlib.Path:
+    report_dir_key = str(report_dir.resolve())
+    existing_root = _CLIENT_RUNTIME_ROOTS_BY_REPORT_DIR.get(report_dir_key)
+    if existing_root is not None and existing_root.exists():
+        return existing_root
+
+    runtime_root = pathlib.Path(
+        tempfile.mkdtemp(
+            prefix=CLIENT_RUNTIME_ROOT_PREFIX,
+            dir=str(_client_runtime_base_dir()),
+        )
+    ).resolve()
+    _CLIENT_RUNTIME_ROOTS_BY_REPORT_DIR[report_dir_key] = runtime_root
+    _register_client_runtime_root_cleanup(runtime_root)
+    return runtime_root
+
+
+def _client_runtime_case_token(case: MatrixCase, runtime_root: pathlib.Path) -> str:
+    runtime_root_key = str(runtime_root.resolve())
+    cache_key = (runtime_root_key, case.case_id)
+    existing_token = _CLIENT_RUNTIME_CASE_TOKENS.get(cache_key)
+    if existing_token is not None:
+        return existing_token
+
+    next_index = _CLIENT_RUNTIME_CASE_COUNTERS.get(runtime_root_key, 0) + 1
+    _CLIENT_RUNTIME_CASE_COUNTERS[runtime_root_key] = next_index
+    token = f"case-{next_index:04d}-{secrets.token_hex(4)}"
+    _CLIENT_RUNTIME_CASE_TOKENS[cache_key] = token
+    return token
+
+
 def prepare_workspace(
-    case: MatrixCase, workspaces_root: pathlib.Path
+    case: MatrixCase, runtime_root: pathlib.Path
 ) -> pathlib.Path | None:
-    workspace_dir = workspaces_root / case.case_id
+    workspace_dir = runtime_root / "workspaces" / _client_runtime_case_token(case, runtime_root)
     if workspace_dir.exists():
         shutil.rmtree(workspace_dir)
     if case.fixture.workspace_template is None:
@@ -2769,10 +3293,10 @@ def prepare_workspace(
     return workspace_dir
 
 
-def resolve_client_home_dir(case: MatrixCase, report_dir: pathlib.Path) -> pathlib.Path:
+def resolve_client_home_dir(case: MatrixCase, runtime_root: pathlib.Path) -> pathlib.Path:
     if case.client_name == "gemini":
-        return report_dir.parent / GEMINI_RUNNER_STATE_DIRNAME / GEMINI_SHARED_HOME_DIRNAME
-    return report_dir / "homes" / case.case_id
+        return runtime_root / GEMINI_RUNNER_STATE_DIRNAME / GEMINI_SHARED_HOME_DIRNAME
+    return runtime_root / "homes" / _client_runtime_case_token(case, runtime_root)
 
 
 def _gemini_bootstrap_bin_dir(home_dir: pathlib.Path) -> pathlib.Path:
@@ -2822,11 +3346,12 @@ def build_client_command(
     workspace_dir: pathlib.Path,
     client_home: pathlib.Path | None = None,
 ) -> list[str]:
+    prompt_text = render_fixture_prompt(fixture, client_name)
     if client_name == "codex":
         command = [
             "codex",
             "exec",
-            fixture.prompt,
+            prompt_text,
             "--model",
             lane.proxy_model,
             "--ephemeral",
@@ -2882,7 +3407,7 @@ def build_client_command(
         command = [
             "gemini",
             "--prompt",
-            fixture.prompt,
+            prompt_text,
             "--model",
             lane.proxy_model,
             "--sandbox=false",
@@ -2908,12 +3433,11 @@ def run_matrix_case(
 ) -> dict[str, object]:
     report_dir = report_dir.resolve()
     cases_dir = report_dir / "cases"
-    workspaces_root = report_dir / "workspaces"
     cases_dir.mkdir(parents=True, exist_ok=True)
-    workspaces_root.mkdir(parents=True, exist_ok=True)
 
-    workspace_dir = prepare_workspace(case, workspaces_root).resolve()
-    home_dir = resolve_client_home_dir(case, report_dir).resolve()
+    runtime_root = prepare_client_runtime_root(report_dir).resolve()
+    workspace_dir = prepare_workspace(case, runtime_root).resolve()
+    home_dir = resolve_client_home_dir(case, runtime_root).resolve()
     env = build_client_env(
         case.client_name,
         base_env,
