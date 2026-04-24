@@ -41,6 +41,63 @@ def make_context(module, client_name: str):
     return module.VerifierContext(client_name=client_name)
 
 
+def make_trace_context(module, client_name: str, trace_entries):
+    return module.VerifierContext(
+        client_name=client_name,
+        trace_entries=tuple(trace_entries),
+    )
+
+
+def trace_tool_identity_verifier():
+    return {
+        "type": "tool_identity_contract",
+        "contains_any_by_client": {
+            "codex": ["apply_patch"],
+            "claude": ["Edit"],
+            "gemini": ["replace"],
+        },
+        "contains_any_by_client_match_mode": "presented_tool_name",
+        "reject_other_client_contains_any_by_client": True,
+        "not_contains": ["__llmup_custom__"],
+    }
+
+
+def fake_request_trace_entry(
+    *,
+    request_id="req_tool_identity",
+    client_tool_names=None,
+    upstream_tool_names=None,
+    client_tool_choice=None,
+    upstream_tool_choice=None,
+):
+    client_summary = {
+        "tool_names": client_tool_names if client_tool_names is not None else ["Edit"],
+    }
+    if client_tool_choice is not None:
+        client_summary["tool_choice"] = client_tool_choice
+    upstream_summary = {
+        "tool_names": upstream_tool_names if upstream_tool_names is not None else ["Edit"],
+    }
+    if upstream_tool_choice is not None:
+        upstream_summary["tool_choice"] = upstream_tool_choice
+    return {
+        "timestamp_ms": 1,
+        "request_id": request_id,
+        "phase": "request",
+        "path": "/anthropic/v1/messages",
+        "stream": True,
+        "client_format": "anthropic",
+        "upstream_format": "openai-completion",
+        "client_model": "minimax-anth",
+        "upstream_name": "MINIMAX-ANTHROPIC",
+        "upstream_model": "MiniMax-M2.7-highspeed",
+        "request": {
+            "client_summary": client_summary,
+            "upstream_summary": upstream_summary,
+        },
+    }
+
+
 class CliMatrixContractTests(unittest.TestCase):
     def read_text(self, relative_path: str) -> str:
         return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
@@ -143,6 +200,58 @@ class CliMatrixContractTests(unittest.TestCase):
 
         self.assertTrue(ok, message)
         self.assertEqual(message, "")
+
+    def test_stdout_contract_rejects_codex_raw_json_internal_artifact_even_when_final_message_is_public(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            {
+                "type": "stdout_contract",
+                "contains_any_by_client": {
+                    "codex": ["apply_patch"],
+                },
+                "contains_any_by_client_match_mode": "presented_tool_name",
+                "not_contains": ["__llmup_custom__"],
+            },
+        )
+        stdout_text = "\n".join(
+            [
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_tool",
+                            "type": "custom_tool_call",
+                            "name": "__llmup_custom__apply_patch",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_final",
+                            "type": "agent_message",
+                            "text": "apply_patch",
+                        },
+                    }
+                ),
+                json.dumps({"type": "turn.completed"}),
+            ]
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            stdout_text,
+            workspace_dir=None,
+            context=make_context(module, "codex"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("__llmup_custom__", message)
 
     def test_stdout_contract_accepts_listed_tool_name_under_presented_tool_name_mode(self):
         module = load_module()
@@ -379,6 +488,61 @@ class CliMatrixContractTests(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertEqual(message, "")
 
+    def test_stdout_contract_accepts_used_tool_name_mention_current_client_surface_assignment(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            {
+                "type": "stdout_contract",
+                "contains_any_by_client": {
+                    "gemini": ["replace"],
+                },
+                "contains_any_by_client_match_mode": "used_tool_name_mention",
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            (
+                "Fixed `add` in `calc.py` and verified `main.py` runs correctly with "
+                "the expected outputs.\n\n"
+                "The exact public editing tool I actually used on the current client "
+                "surface is `replace`.\n"
+            ),
+            workspace_dir=None,
+            context=make_context(module, "gemini"),
+        )
+
+        self.assertTrue(ok, message)
+        self.assertEqual(message, "")
+
+    def test_stdout_contract_accepts_used_tool_name_mention_passive_tool_was_used(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            {
+                "type": "stdout_contract",
+                "contains_any_by_client": {
+                    "gemini": ["replace"],
+                },
+                "contains_any_by_client_match_mode": "used_tool_name_mention",
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "The `replace` tool was used to fix the regression.",
+            workspace_dir=None,
+            context=make_context(module, "gemini"),
+        )
+
+        self.assertTrue(ok, message)
+        self.assertEqual(message, "")
+
     def test_stdout_contract_rejects_other_client_public_tool_names_when_strict_client_scope_enabled(self):
         module = load_module()
         fixture = make_fixture(
@@ -450,6 +614,157 @@ class CliMatrixContractTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("other clients", message)
         self.assertIn("replace", message)
+
+    def test_tool_identity_contract_requires_stdout_public_contract_even_with_debug_trace(self):
+        module = load_module()
+        fixture = make_fixture(module, trace_tool_identity_verifier())
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Editing tools are available in this environment.",
+            workspace_dir=None,
+            context=make_trace_context(
+                module,
+                "claude",
+                [fake_request_trace_entry()],
+            ),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Edit", message)
+
+    def test_tool_identity_contract_rejects_internal_trace_tool_artifacts(self):
+        module = load_module()
+        fixture = make_fixture(module, trace_tool_identity_verifier())
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Public editing tool: `Edit`.",
+            workspace_dir=None,
+            context=make_trace_context(
+                module,
+                "claude",
+                [
+                    fake_request_trace_entry(
+                        upstream_tool_names=["Edit", "__llmup_custom__Edit"],
+                    )
+                ],
+            ),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("__llmup_custom__Edit", message)
+
+    def test_tool_identity_contract_rejects_internal_tool_choice_trace_artifacts(self):
+        module = load_module()
+        fixture = make_fixture(module, trace_tool_identity_verifier())
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Public editing tool: `Edit`.",
+            workspace_dir=None,
+            context=make_trace_context(
+                module,
+                "claude",
+                [
+                    fake_request_trace_entry(
+                        upstream_tool_choice={
+                            "type": "function",
+                            "function": {"name": "__llmup_custom__Edit"},
+                        },
+                    )
+                ],
+            ),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("tool_choice", message)
+        self.assertIn("__llmup_custom__Edit", message)
+
+    def test_tool_identity_contract_rejects_other_client_tool_names_in_trace(self):
+        module = load_module()
+        fixture = make_fixture(module, trace_tool_identity_verifier())
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Public editing tool: `Edit`.",
+            workspace_dir=None,
+            context=make_trace_context(
+                module,
+                "claude",
+                [fake_request_trace_entry(upstream_tool_names=["Edit", "apply_patch"])],
+            ),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("other clients", message)
+        self.assertIn("apply_patch", message)
+
+    def test_tool_identity_contract_rejects_other_client_allowed_tool_choice_names_in_trace(self):
+        module = load_module()
+        fixture = make_fixture(module, trace_tool_identity_verifier())
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Public editing tool: `Edit`.",
+            workspace_dir=None,
+            context=make_trace_context(
+                module,
+                "claude",
+                [
+                    fake_request_trace_entry(
+                        upstream_tool_choice={
+                            "type": "allowed_tools",
+                            "allowed_tools": {
+                                "mode": "required",
+                                "tools": [
+                                    {
+                                        "type": "function",
+                                        "function": {"name": "apply_patch"},
+                                    }
+                                ],
+                            },
+                        },
+                    )
+                ],
+            ),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("other clients", message)
+        self.assertIn("apply_patch", message)
+
+    def test_tool_identity_contract_requires_client_and_upstream_trace_tool_names(self):
+        module = load_module()
+        fixture = make_fixture(module, trace_tool_identity_verifier())
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Public editing tool: `Edit`.",
+            workspace_dir=None,
+            context=make_trace_context(
+                module,
+                "claude",
+                [fake_request_trace_entry(upstream_tool_names=[])],
+            ),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("upstream tool_names", message)
+
+    def test_tool_identity_contract_fails_closed_when_trace_window_is_empty(self):
+        module = load_module()
+        fixture = make_fixture(module, trace_tool_identity_verifier())
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "The public editing tool is `Edit`.",
+            workspace_dir=None,
+            context=make_context(module, "claude"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("debug trace", message)
 
     def test_stdout_contract_rejects_plain_verb_use_under_presented_tool_name_mode(self):
         module = load_module()
@@ -589,6 +904,111 @@ class CliMatrixContractTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("replace", message)
 
+    def test_stdout_contract_rejects_used_tool_name_mention_mode_for_available_tool_explanation(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            {
+                "type": "stdout_contract",
+                "contains_any_by_client": {
+                    "gemini": ["replace"],
+                },
+                "contains_any_by_client_match_mode": "used_tool_name_mention",
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "The public editing tool available on the current client surface is `replace`.",
+            workspace_dir=None,
+            context=make_context(module, "gemini"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("replace", message)
+
+    def test_stdout_contract_rejects_used_tool_name_mention_mode_for_tool_identity_only(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            {
+                "type": "stdout_contract",
+                "contains_any_by_client": {
+                    "gemini": ["replace"],
+                },
+                "contains_any_by_client_match_mode": "used_tool_name_mention",
+            },
+        )
+
+        for stdout_text in (
+            "Available tool is `replace`.",
+            "The tool is `replace`.",
+        ):
+            with self.subTest(stdout_text=stdout_text):
+                ok, message = module.verify_fixture_output(
+                    fixture,
+                    stdout_text,
+                    workspace_dir=None,
+                    context=make_context(module, "gemini"),
+                )
+
+                self.assertFalse(ok)
+                self.assertIn("replace", message)
+
+    def test_stdout_contract_rejects_used_tool_name_mention_mode_for_reserved_prefix_tool_name(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            {
+                "type": "stdout_contract",
+                "contains_any_by_client": {
+                    "codex": ["apply_patch"],
+                },
+                "contains_any_by_client_match_mode": "used_tool_name_mention",
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "The `__llmup_custom__apply_patch` tool was used to fix the regression.",
+            workspace_dir=None,
+            context=make_context(module, "codex"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("apply_patch", message)
+
+    def test_stdout_contract_rejects_used_tool_name_mention_mode_for_other_client_tool_name(
+        self,
+    ):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            {
+                "type": "stdout_contract",
+                "contains_any_by_client": {
+                    "gemini": ["replace"],
+                },
+                "contains_any_by_client_match_mode": "used_tool_name_mention",
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "The `Edit` tool was used to fix the regression.",
+            workspace_dir=None,
+            context=make_context(module, "gemini"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("replace", message)
+
     def test_stdout_contract_rejects_plain_tool_i_used_was_to_verb_phrase(self):
         module = load_module()
         fixture = make_fixture(
@@ -659,7 +1079,7 @@ class CliMatrixContractTests(unittest.TestCase):
         payload = json.loads(TOOL_IDENTITY_FIXTURE_PATH.read_text(encoding="utf-8"))
 
         self.assertEqual(payload["id"], "tool_identity_public_contract")
-        self.assertEqual(payload["verifier"]["type"], "stdout_contract")
+        self.assertEqual(payload["verifier"]["type"], "tool_identity_contract")
         self.assertEqual(
             payload["verifier"]["contains_any_by_client"],
             {

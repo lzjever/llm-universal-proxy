@@ -27,6 +27,7 @@
           ]
         },
         "contains_any_by_client_match_mode": "used_tool_name_mention",
+        "reject_other_client_contains_any_by_client": true,
         "not_contains": [
           "__llmup_custom__"
         ]

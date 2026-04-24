@@ -26,12 +26,30 @@ upstreams:
     format: openai-responses
     credential_env: OPENAI_API_KEY
     auth_policy: force_server
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
 
   MINIMAX_OPENAI:
     api_root: https://api.minimaxi.com/v1
     format: openai-completion
     credential_env: MINIMAX_API_KEY
     auth_policy: force_server
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
 
 model_aliases:
   gpt-5-4: OPENAI:gpt-5.4
@@ -169,7 +187,7 @@ Use `limits` when you want the proxy and client wrappers to know things such as:
 
 Use `surface_defaults` on an upstream, or `surface` on an alias, when you want to describe the client-visible behavior of a routed model.
 
-You do not need these fields for a first run. Add them when you want the client experience to be more accurate or more polished.
+Raw HTTP smoke tests can omit these fields, but wrapper/live-profile flows should provide at least the minimal text-only surface used by the quickstart. Add richer values only when the model surface really supports them.
 
 Example:
 
@@ -181,13 +199,13 @@ upstreams:
     credential_env: MINIMAX_API_KEY
     surface_defaults:
       modalities:
-        input: [text]
-        output: [text]
+        input: ["text"]
+        output: ["text"]
       tools:
         supports_search: false
         supports_view_image: false
         apply_patch_transport: freeform
-        supports_parallel_calls: true
+        supports_parallel_calls: false
 
 model_aliases:
   gpt-5-4-mini:

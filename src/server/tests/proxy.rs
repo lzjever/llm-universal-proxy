@@ -334,6 +334,102 @@ async fn live_responses_plain_text_custom_tool_bridge_to_openai_balanced_keeps_v
 }
 
 #[tokio::test]
+async fn live_responses_custom_tool_bridge_to_openai_restores_non_stream_response_custom_tool_call()
+{
+    let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
+    let response_body = serde_json::json!({
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_apply_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": serde_json::to_string(
+                            &serde_json::json!({ "input": patch_input })
+                        )
+                        .expect("bridge args")
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Create hello.txt" }]
+            }],
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": { "type": "text" }
+            }],
+            "tool_choice": {
+                "type": "custom",
+                "name": "apply_patch"
+            },
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(
+        body["output"][0],
+        serde_json::json!({
+            "type": "custom_tool_call",
+            "call_id": "call_apply_patch",
+            "name": "apply_patch",
+            "input": patch_input
+        })
+    );
+    let serialized = body.to_string();
+    assert!(
+        !serialized.contains("__llmup_custom__"),
+        "live response leaked reserved bridge prefix: {body:?}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    let upstream_body = &recorded[0];
+    assert_eq!(upstream_body["tools"][0]["function"]["name"], "apply_patch");
+    assert!(
+        upstream_body
+            .get(INTERNAL_TOOL_BRIDGE_CONTEXT_FIELD)
+            .is_none(),
+        "internal bridge context must not be sent upstream: {upstream_body:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn live_responses_rejects_external_tool_bridge_context_ingress() {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
@@ -363,8 +459,16 @@ async fn live_responses_rejects_external_tool_bridge_context_ingress() {
                 "content": [{ "type": "input_text", "text": "Create hello.txt" }]
             }],
             "_llmup_tool_bridge_context": {
-                "visible_tool_names": {
-                    "__llmup_custom__code_exec": "code_exec"
+                "version": 1,
+                "compatibility_mode": "max_compat",
+                "entries": {
+                    "code_exec": {
+                        "stable_name": "code_exec",
+                        "source_kind": "custom_text",
+                        "transport_kind": "function_object_wrapper",
+                        "wrapper_field": "input",
+                        "expected_canonical_shape": "single_required_string"
+                    }
                 }
             },
             "stream": false

@@ -1,6 +1,95 @@
 use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StreamToolBridgeContextEntry {
+    stable_name: String,
+    source_kind: String,
+    transport_kind: String,
+    wrapper_field: String,
+    expected_canonical_shape: String,
+}
+
+impl StreamToolBridgeContextEntry {
+    fn from_value(stable_name: &str, value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let declared_stable_name = object.get("stable_name").and_then(Value::as_str)?;
+        if declared_stable_name.is_empty() || declared_stable_name != stable_name {
+            return None;
+        }
+        let source_kind = object.get("source_kind")?.as_str()?;
+        let transport_kind = object.get("transport_kind")?.as_str()?;
+        let wrapper_field = object.get("wrapper_field")?.as_str()?;
+        let expected_canonical_shape = object.get("expected_canonical_shape")?.as_str()?;
+        if !matches!(source_kind, "custom_text" | "custom_grammar")
+            || transport_kind != "function_object_wrapper"
+            || wrapper_field != "input"
+            || expected_canonical_shape != "single_required_string"
+        {
+            return None;
+        }
+        Some(Self {
+            stable_name: stable_name.to_string(),
+            source_kind: source_kind.to_string(),
+            transport_kind: transport_kind.to_string(),
+            wrapper_field: wrapper_field.to_string(),
+            expected_canonical_shape: expected_canonical_shape.to_string(),
+        })
+    }
+
+    fn expects_canonical_input_wrapper(&self) -> bool {
+        !self.stable_name.is_empty()
+            && matches!(self.source_kind.as_str(), "custom_text" | "custom_grammar")
+            && self.transport_kind == "function_object_wrapper"
+            && self.wrapper_field == "input"
+            && self.expected_canonical_shape == "single_required_string"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StreamToolBridgeContext {
+    version: u64,
+    compatibility_mode: String,
+    entries: std::collections::BTreeMap<String, StreamToolBridgeContextEntry>,
+}
+
+impl StreamToolBridgeContext {
+    fn from_value(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let version = object.get("version").and_then(Value::as_u64)?;
+        if version != 1 {
+            return None;
+        }
+        let compatibility_mode = object.get("compatibility_mode").and_then(Value::as_str)?;
+        if !matches!(compatibility_mode, "strict" | "balanced" | "max_compat") {
+            return None;
+        }
+        let entries_object = object.get("entries")?.as_object()?;
+        let mut entries = std::collections::BTreeMap::new();
+        for (stable_name, entry_value) in entries_object {
+            let entry = StreamToolBridgeContextEntry::from_value(stable_name, entry_value)?;
+            entries.insert(stable_name.clone(), entry);
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        Some(Self {
+            version,
+            compatibility_mode: compatibility_mode.to_string(),
+            entries,
+        })
+    }
+
+    fn expects_canonical_input_wrapper(&self, name: &str) -> bool {
+        self.version == 1
+            && !self.compatibility_mode.is_empty()
+            && self
+                .entries
+                .get(name)
+                .is_some_and(StreamToolBridgeContextEntry::expects_canonical_input_wrapper)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamFatalRejection {
     pub message: String,
 }
@@ -259,21 +348,9 @@ pub(super) fn request_scoped_openai_custom_bridge_expects_canonical_input_wrappe
     bridge_context: Option<&Value>,
     name: &str,
 ) -> bool {
-    let Some(entry) = bridge_context
-        .and_then(|ctx| ctx.get("entries"))
-        .and_then(Value::as_object)
-        .and_then(|entries| entries.get(name))
-        .and_then(Value::as_object)
-    else {
-        return false;
-    };
-
-    entry.get("transport_kind").and_then(Value::as_str) == Some("function_object_wrapper")
-        && entry.get("wrapper_field").and_then(Value::as_str) == Some("input")
-        && entry
-            .get("expected_canonical_shape")
-            .and_then(Value::as_str)
-            == Some("single_required_string")
+    bridge_context
+        .and_then(StreamToolBridgeContext::from_value)
+        .is_some_and(|ctx| ctx.expects_canonical_input_wrapper(name))
 }
 
 pub(super) fn gemini_candidate_index(candidate: &Value) -> usize {

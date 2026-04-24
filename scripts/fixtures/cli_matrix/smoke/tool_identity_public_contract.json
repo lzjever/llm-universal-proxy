@@ -5,7 +5,7 @@
   "prompt": "Briefly list only the exact real public names of any editing tools visible on the current client surface in this environment. Do not list tools from other clients. Do not use any client names as answers. Do not answer with task IDs, fixture IDs, contract names, workspace/path words, or filenames. Never include internal transport prefixes, proxy-private tool names, or example/counterexample names you cannot actually use here.",
   "prompt_template": "Current client: {client_name}. Reply with exactly one line containing only the exact real public names of editing tools visible on this current client surface, comma-separated if more than one. The answer must contain tool names only. Do not mention any other clients, do not use any client names as answers, and do not prefix tool names with client labels. Do not answer with task IDs, fixture IDs, contract names, workspace/path words, or filenames. Never include internal transport prefixes, proxy-private tool names, or example/counterexample names you cannot actually use here.",
   "verifier": {
-    "type": "stdout_contract",
+    "type": "tool_identity_contract",
     "contains_any_by_client": {
       "codex": [
         "apply_patch"

@@ -14,7 +14,7 @@ LLM Universal Proxy (public short name: llmup)
 
 ### 1.2 Product Definition
 
-A single-binary HTTP proxy that acts as a universal protocol translation layer between LLM API clients and LLM backend endpoints. Clients using any of the four major LLM API protocols can transparently connect to any upstream endpoint using any of the same four protocols, with the proxy handling all format detection, request translation, response translation, and streaming adaptation in real time.
+A single-binary HTTP proxy that provides protocol-namespaced entrypoints and translation between supported LLM API surfaces. Clients using OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, or Google Gemini can route through one stable proxy to configured upstream endpoints; same-protocol paths stay native where possible, while translated paths preserve the portable core and warn or reject non-portable provider-native features.
 
 ### 1.3 Problem Statement
 
@@ -86,7 +86,7 @@ The proxy MUST expose the following namespaced endpoints:
 
 ### 2.3 Streaming Support
 
-- The proxy MUST support SSE (Server-Sent Events) streaming for all 16 protocol combinations.
+- The proxy MUST support SSE (Server-Sent Events) streaming for all 16 protocol combinations within the same portability, warning, and reject boundaries as non-streaming translation.
 - Streaming translation MUST operate chunk-by-chunk without buffering the entire response.
 - Each protocol's streaming lifecycle events MUST be correctly translated:
   - **OpenAI Chat Completions**: `data:` chunks + `[DONE]`
@@ -100,9 +100,9 @@ The proxy MUST translate the following request fields across protocols:
 
 | Field | Status | Notes |
 |-------|--------|-------|
-| Text messages | Must | Exact preservation across all formats |
+| Text messages | Must | Preserve portable text content across supported formats |
 | System instructions | Must | Map between `system` role (OpenAI), top-level `system` (Anthropic), `systemInstruction` (Gemini), `instructions` (Responses) |
-| Function tool definitions | Must | Map `function` tools across all formats |
+| Function tool definitions | Must | Map portable `function` tools across supported formats |
 | Visible tool identity | Must | The stable tool name supplied by the client is part of the semantic contract and must not be rewritten on model-visible or client-visible surfaces |
 | Tool choice (auto/none/required) | Must | Map between format-specific tool choice objects |
 | `max_output_tokens` / `max_tokens` | Must | Normalize field names |
@@ -117,7 +117,7 @@ The proxy MUST translate the following response fields:
 
 | Field | Status | Notes |
 |-------|--------|-------|
-| Text content | Must | Exact preservation |
+| Text content | Must | Preserve portable text content; warn or reject when a response field cannot be represented safely |
 | Tool calls / function calls | Must | Map between `tool_calls` (OpenAI), `tool_use` blocks (Anthropic), `functionCall` parts (Gemini) |
 | Tool results | Must | Map between `tool` role messages (OpenAI), `tool_result` blocks (Anthropic), `functionResponse` parts (Gemini) |
 | Usage / token metrics | Must | Map between `prompt_tokens/completion_tokens` (OpenAI), `input_tokens/output_tokens` (Anthropic), `promptTokenCount/candidatesTokenCount` (Gemini) |
@@ -141,6 +141,7 @@ Locked tool identity contract:
 - The proxy must not rewrite the visible tool name supplied by the client.
 - `__llmup_custom__*` is an internal transport artifact, not a public contract.
 - `apply_patch` remains a public freeform tool on client-visible surfaces.
+- Public editing tool identity is per client: Codex exposes `apply_patch`, Claude Code exposes `Edit`, and Gemini exposes `replace`; the proxy must not rewrite those public names.
 
 ### 2.7 Upstream Configuration
 
@@ -256,9 +257,9 @@ Admin namespace writes MUST use server-owned revisions with exact compare-and-sw
 
 ### 3.3 Compatibility
 
-- Compatible with any HTTP client that speaks one of the four supported protocols.
-- No client-side SDK changes required — the proxy is a drop-in replacement for the upstream URL.
-- Works with both official vendor APIs and third-party compatible endpoints.
+- Compatible with HTTP clients that speak one of the four supported protocol surfaces and can use a configured proxy base URL.
+- No SDK changes are required for portable request/response fields; provider-native extensions may require same-provider paths or a documented shim.
+- Works with official vendor APIs and third-party compatible endpoints within documented portability boundaries.
 
 ### 3.4 Deployment
 
@@ -380,7 +381,7 @@ For each upstream, test all applicable client entrypoints:
 | curl (OpenAI) | OpenAI Chat Completions | Direct HTTP request |
 | curl (Anthropic) | Anthropic Messages | Direct HTTP request |
 
-Current real-client regression coverage is intentionally narrow: smoke cases assert public tool identity by requiring `apply_patch` to appear and `__llmup_custom__*` to stay absent from public output, and long-horizon cases validate workspace-edit execution on supported lanes. This is not yet a full matrix of arbitrary structured tool behavior.
+Current real-client regression coverage is intentionally narrow: smoke cases assert public tool identity as a per-client public editing tool contract by requiring Codex `apply_patch`, Claude Code `Edit`, or Gemini `replace` on the matching client surface, rejecting other clients' public tool names, and keeping `__llmup_custom__*` absent from public output. Long-horizon cases validate workspace-edit execution on supported lanes. This is not yet a full matrix of arbitrary structured tool behavior.
 
 ---
 
@@ -433,9 +434,9 @@ These are NOT in scope for the current version but inform architectural decision
 
 | Metric | Target |
 |--------|--------|
-| All 16 protocol combinations working | 16/16 pass |
+| All 16 protocol combinations within documented portability boundaries | 16/16 assessed as pass, warn, or reject as specified |
 | Streaming works for all combinations | 16/16 pass |
-| Codex CLI can use any upstream through proxy | All test upstreams work |
-| Claude Code can use any upstream through proxy | All test upstreams work |
+| Codex CLI works through configured proxy lanes | Required test upstreams pass within the wrapper surface contract |
+| Claude Code works through configured proxy lanes | Required test upstreams pass within the wrapper surface contract |
 | Passthrough adds < 1ms latency | Measured |
 | No silent data loss during translation | All compat warnings are emitted correctly |

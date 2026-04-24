@@ -128,10 +128,7 @@ fn apply_request_translation_policy_bridge_context(
     policy: &RequestTranslationPolicy,
     body: &mut Value,
 ) {
-    let Some(bridge_context) = body.get_mut(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD) else {
-        return;
-    };
-    let Some(bridge_context_obj) = bridge_context.as_object_mut() else {
+    let Some(mut bridge_context) = request_scoped_tool_bridge_context_from_body(body) else {
         return;
     };
     let compatibility_mode = match policy.compatibility_mode {
@@ -139,10 +136,8 @@ fn apply_request_translation_policy_bridge_context(
         CompatibilityMode::Balanced => "balanced",
         CompatibilityMode::MaxCompat => "max_compat",
     };
-    bridge_context_obj.insert(
-        "compatibility_mode".to_string(),
-        Value::String(compatibility_mode.to_string()),
-    );
+    bridge_context.set_compatibility_mode(compatibility_mode);
+    insert_request_scoped_tool_bridge_context(body, &bridge_context);
 }
 
 fn apply_max_compat_structural_repair_pass(
@@ -153,24 +148,20 @@ fn apply_max_compat_structural_repair_pass(
     if compatibility_mode != CompatibilityMode::MaxCompat {
         return Ok(());
     }
-    let bridge_context = body
-        .get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD)
-        .cloned()
-        .filter(Value::is_object);
-    let Some(bridge_context) = bridge_context.as_ref() else {
+    let Some(bridge_context) = request_scoped_tool_bridge_context_from_body(body) else {
         return Ok(());
     };
 
-    repair_request_scoped_custom_bridge_tool_definitions(target_format, body, bridge_context)?;
-    repair_request_scoped_custom_bridge_tool_choice(body, bridge_context);
-    repair_request_scoped_custom_bridge_message_tool_calls(body, bridge_context)?;
+    repair_request_scoped_custom_bridge_tool_definitions(target_format, body, &bridge_context)?;
+    repair_request_scoped_custom_bridge_tool_choice(body, &bridge_context);
+    repair_request_scoped_custom_bridge_message_tool_calls(body, &bridge_context)?;
     Ok(())
 }
 
 fn repair_request_scoped_custom_bridge_tool_definitions(
     target_format: UpstreamFormat,
     body: &mut Value,
-    bridge_context: &Value,
+    bridge_context: &tools::ToolBridgeContext,
 ) -> Result<(), String> {
     let Some(original_tools) = body.get("tools").and_then(Value::as_array) else {
         return Ok(());
@@ -210,7 +201,10 @@ fn request_scoped_bridge_choice_name(choice: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn repair_request_scoped_custom_bridge_tool_choice(body: &mut Value, bridge_context: &Value) {
+fn repair_request_scoped_custom_bridge_tool_choice(
+    body: &mut Value,
+    bridge_context: &tools::ToolBridgeContext,
+) {
     let Some(choice) = body.get("tool_choice").cloned() else {
         return;
     };
@@ -283,7 +277,7 @@ fn repair_request_scoped_custom_bridge_tool_choice(body: &mut Value, bridge_cont
 
 fn repair_request_scoped_custom_bridge_message_tool_calls(
     body: &mut Value,
-    bridge_context: &Value,
+    bridge_context: &tools::ToolBridgeContext,
 ) -> Result<(), String> {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return Ok(());
@@ -726,17 +720,17 @@ use response_protocols::{
 };
 use tools::{
     anthropic_tool_use_type_for_openai_tool_call, copy_non_replayable_tool_call_marker,
-    normalized_openai_tool_call,
+    insert_request_scoped_tool_bridge_context, normalized_openai_tool_call,
     normalized_openai_tool_definitions_from_request_with_request_scoped_custom_bridge,
     normalized_tool_definition_to_openai_with_request_scoped_custom_bridge,
     openai_responses_custom_tool_bridge_arguments,
     openai_responses_custom_tool_input_from_bridge_value,
     openai_tool_arguments_to_structured_value, openai_tool_call_partial_replay_text,
     request_scoped_openai_custom_bridge_expects_canonical_input_wrapper,
-    semantic_text_part_from_claude_block, semantic_text_part_from_openai_part,
-    semantic_text_part_to_openai_value, semantic_tool_kind_from_value,
-    semantic_tool_result_content_from_value, semantic_tool_result_content_to_value,
-    tool_call_is_marked_non_replayable, REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD,
+    request_scoped_tool_bridge_context_from_body, semantic_text_part_from_claude_block,
+    semantic_text_part_from_openai_part, semantic_text_part_to_openai_value,
+    semantic_tool_kind_from_value, semantic_tool_result_content_from_value,
+    semantic_tool_result_content_to_value, tool_call_is_marked_non_replayable,
 };
 
 /// Translate response body from upstream format to client format.
@@ -749,7 +743,7 @@ pub fn translate_response(
     if upstream_format == client_format {
         return Ok(body.clone());
     }
-    let bridge_context = body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
+    let bridge_context = request_scoped_tool_bridge_context_from_body(body);
     let mut openai = if upstream_format == UpstreamFormat::Anthropic
         && client_format == UpstreamFormat::OpenAiResponses
     {
@@ -761,13 +755,8 @@ pub fn translate_response(
     } else {
         upstream_response_to_openai(upstream_format, body)?
     };
-    if let Some(bridge_context) = bridge_context {
-        if let Some(openai_obj) = openai.as_object_mut() {
-            openai_obj.insert(
-                REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD.to_string(),
-                bridge_context,
-            );
-        }
+    if let Some(bridge_context) = bridge_context.as_ref() {
+        insert_request_scoped_tool_bridge_context(&mut openai, bridge_context);
     }
     if client_format == UpstreamFormat::OpenAiCompletion {
         return Ok(openai);
@@ -1235,7 +1224,7 @@ fn claude_response_to_openai_internal(
     allow_reasoning_replay: bool,
 ) -> Result<Value, String> {
     let content = body.get("content").cloned().ok_or("missing content")?;
-    let bridge_context = body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
+    let bridge_context = request_scoped_tool_bridge_context_from_body(body);
     let mut converted = convert_claude_message_to_openai_impl(
         &serde_json::json!({
             "role": "assistant",
@@ -1346,8 +1335,8 @@ fn claude_response_to_openai_internal(
 
         result["usage"] = usage_json;
     }
-    if let Some(bridge_context) = bridge_context {
-        result[REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD] = bridge_context;
+    if let Some(bridge_context) = bridge_context.as_ref() {
+        insert_request_scoped_tool_bridge_context(&mut result, bridge_context);
     }
     Ok(result)
 }
@@ -1507,7 +1496,7 @@ fn openai_usage_to_gemini_usage(usage: Option<&Value>) -> Value {
 }
 
 fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result<(), String> {
-    let bridge_context = body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
+    let bridge_context = request_scoped_tool_bridge_context_from_body(body);
     let mut result = serde_json::json!({
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "messages": [],
@@ -1629,8 +1618,8 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
             result["tools"] = Value::Array(converted_tools);
         }
     }
-    if let Some(bridge_context) = bridge_context {
-        result[REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD] = bridge_context;
+    if let Some(bridge_context) = bridge_context.as_ref() {
+        insert_request_scoped_tool_bridge_context(&mut result, bridge_context);
     }
     *body = result;
     Ok(())
@@ -1639,7 +1628,7 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
 fn anthropic_tool_choice_to_openai(
     tool_choice: &Value,
     decode_custom_bridge: bool,
-    bridge_context: Option<&Value>,
+    bridge_context: Option<&tools::ToolBridgeContext>,
 ) -> Result<Option<(Value, bool)>, String> {
     let Some(tool_choice) = tool_choice.as_object() else {
         return Err(
@@ -1699,7 +1688,7 @@ fn anthropic_tool_choice_to_openai(
 fn convert_claude_message_to_openai_impl(
     msg: &Value,
     decode_custom_bridge: bool,
-    bridge_context: Option<&Value>,
+    bridge_context: Option<&tools::ToolBridgeContext>,
 ) -> Result<Option<Vec<Value>>, String> {
     let Some(role) = msg.get("role").and_then(Value::as_str) else {
         return Ok(None);
@@ -1868,8 +1857,7 @@ fn collapse_claude_text_parts_for_openai(parts: &[Value]) -> Value {
 
 fn openai_to_claude(body: &mut Value) -> Result<(), String> {
     let controls = openai_normalized_request_controls(body)?;
-    let request_scoped_tool_bridge_context =
-        body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
+    let request_scoped_tool_bridge_context = request_scoped_tool_bridge_context_from_body(body);
     let mut result = serde_json::json!({
         "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
         "max_tokens": body
@@ -2015,8 +2003,8 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
             result["tools"] = Value::Array(claude_tools);
         }
     }
-    if let Some(bridge_context) = request_scoped_tool_bridge_context {
-        result[REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD] = bridge_context;
+    if let Some(bridge_context) = request_scoped_tool_bridge_context.as_ref() {
+        insert_request_scoped_tool_bridge_context(&mut result, bridge_context);
     }
     *body = result;
     Ok(())

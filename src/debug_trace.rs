@@ -830,6 +830,8 @@ fn summarize_request_body(format: UpstreamFormat, body: &Value, max_text_chars: 
         UpstreamFormat::Google => json!({
             "model": body.get("model"),
             "contents_count": body.get("contents").and_then(Value::as_array).map(|a| a.len()),
+            "tool_names": body.get("tools").and_then(Value::as_array).map(|tools| tool_names_from_google_tools(tools)),
+            "toolConfig": google_request_field(body, "toolConfig", "tool_config"),
         }),
     }
 }
@@ -858,6 +860,28 @@ fn tool_names_from_claude_tools(tools: &[Value]) -> Vec<String> {
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
         .collect()
+}
+
+fn tool_names_from_google_tools(tools: &[Value]) -> Vec<String> {
+    tools
+        .iter()
+        .flat_map(|tool| {
+            google_request_field(tool, "functionDeclarations", "function_declarations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|declaration| {
+            declaration
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn google_request_field<'a>(value: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
+    value.get(camel).or_else(|| value.get(snake))
 }
 
 fn message_roles(messages: &[Value]) -> Vec<String> {
@@ -1305,6 +1329,71 @@ mod tests {
             project_trace_outcome(TransportOutcome::ClientDisconnected, &summary),
             TraceOutcome::Incomplete
         ));
+    }
+
+    #[test]
+    fn google_request_summary_includes_function_declaration_tool_names_and_selectors() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{ "role": "user", "parts": [{ "text": "edit file" }] }],
+            "tools": [{
+                "functionDeclarations": [
+                    { "name": "replace", "parameters": { "type": "object" } },
+                    { "name": "lookup_workspace", "parameters": { "type": "object" } }
+                ]
+            }],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "mode": "ANY",
+                    "allowedFunctionNames": ["replace"]
+                }
+            }
+        });
+
+        let summary = summarize_request_body(UpstreamFormat::Google, &body, 128);
+
+        assert_eq!(
+            summary["tool_names"],
+            json!(["replace", "lookup_workspace"])
+        );
+        assert_eq!(
+            summary["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            json!(["replace"])
+        );
+    }
+
+    #[test]
+    fn google_request_summary_omits_internal_bridge_context_artifacts() {
+        let body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{ "role": "user", "parts": [{ "text": "edit file" }] }],
+            "tools": [{
+                "functionDeclarations": [
+                    { "name": "replace", "parameters": { "type": "object" } }
+                ]
+            }],
+            "_llmup_tool_bridge_context": {
+                "version": 1,
+                "compatibility_mode": "max_compat",
+                "entries": {
+                    "__llmup_custom__replace": {
+                        "stable_name": "__llmup_custom__replace",
+                        "source_kind": "custom_text",
+                        "transport_kind": "function_object_wrapper",
+                        "wrapper_field": "input",
+                        "expected_canonical_shape": "single_required_string"
+                    }
+                }
+            }
+        });
+
+        let summary = summarize_request_body(UpstreamFormat::Google, &body, 128);
+
+        assert_eq!(summary["tool_names"], json!(["replace"]));
+        assert!(
+            !summary.to_string().contains("__llmup_custom__"),
+            "summary = {summary:?}"
+        );
     }
 
     #[test]

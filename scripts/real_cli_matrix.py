@@ -8,11 +8,13 @@ import argparse
 import ast
 import collections
 import dataclasses
+import hashlib
 import json
 import os
 import pathlib
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -51,6 +53,16 @@ VALID_PHASES = {
     "gemini_multi",
 }
 CLIENT_NAMES = ("codex", "claude", "gemini")
+TRACE_CLIENT_FORMAT_BY_CLIENT = {
+    "codex": "openai-responses",
+    "claude": "anthropic",
+    "gemini": "google",
+}
+TRACE_PATH_PREFIX_BY_CLIENT = {
+    "codex": "/openai/",
+    "claude": "/anthropic/",
+    "gemini": "/google/",
+}
 SAFE_ENV_KEYS = (
     "PATH",
     "LANG",
@@ -88,6 +100,8 @@ SUPPORTED_PROMPT_TEMPLATE_FIELDS = frozenset({"client_name"})
 REPLAY_MARKER_KEY_ENV = "LLMUP_INTERNAL_REPLAY_MARKER_KEY"
 REPLAY_MARKER_KEY_FILENAME = ".llmup-internal-replay-marker-key"
 CLIENT_RUNTIME_ROOT_PREFIX = "llmup-real-cli-runtime-"
+TRACE_CASE_START_SKEW_MS = 100
+TRACE_CASE_END_SKEW_MS = 5000
 
 _CLIENT_RUNTIME_ROOTS_BY_REPORT_DIR: dict[str, pathlib.Path] = {}
 _CLIENT_RUNTIME_CASE_TOKENS: dict[tuple[str, str], str] = {}
@@ -521,6 +535,9 @@ class VerifierContext:
     command: tuple[str, ...] | None = None
     home_dir: pathlib.Path | None = None
     workspace_dir: pathlib.Path | None = None
+    trace_entries: tuple[dict[str, object], ...] = ()
+    diagnostics: dict[str, object] | None = None
+    workspace_diff: dict[str, object] | None = None
 
 
 def parse_dotenv_exports(text: str) -> dict[str, str]:
@@ -2504,6 +2521,198 @@ def _codex_phase_item_indexes(
     return indexes
 
 
+def _codex_shell_payload(command: str) -> str:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+
+    shell_names = {"bash", "dash", "fish", "sh", "zsh"}
+    for index, part in enumerate(parts):
+        if pathlib.PurePath(part).name not in shell_names:
+            continue
+        for option_index in range(index + 1, len(parts) - 1):
+            option = parts[option_index]
+            if option.startswith("-") and "c" in option:
+                return parts[option_index + 1]
+    return command
+
+
+def _shell_command_tokens(command: str) -> list[str] | None:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _tokens_have_write_redirection(tokens: Sequence[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if token in {">", ">>", ">|", "<>"}:
+            next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if token in {">", ">>"} and next_token in {"/dev/null", "&1", "&2"}:
+                continue
+            if (
+                token in {">", ">>"}
+                and next_token == "&"
+                and index + 2 < len(tokens)
+                and tokens[index + 2] in {"1", "2"}
+            ):
+                continue
+            return True
+    return False
+
+
+def _shell_command_segments(tokens: Sequence[str]) -> list[list[str]] | None:
+    segments: list[list[str]] = []
+    current: list[str] = []
+    separators = {"&&", "||", ";", "|", "|&"}
+    unsupported_control_tokens = {"(", ")", "{", "}"}
+
+    for token in tokens:
+        if token in unsupported_control_tokens:
+            return None
+        if token in separators:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _drop_shell_prefix_tokens(tokens: Sequence[str]) -> list[str]:
+    stripped = list(tokens)
+    while stripped and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stripped[0]):
+        stripped = stripped[1:]
+    return stripped
+
+
+def _command_name(token: str) -> str:
+    return pathlib.PurePath(token).name
+
+
+def _sed_command_is_read_only(args: Sequence[str]) -> bool:
+    saw_print_only = False
+    for arg in args:
+        if arg == "--in-place" or arg.startswith("--in-place="):
+            return False
+        if arg == "-i" or arg.startswith("-i"):
+            return False
+        if arg == "-n" or (
+            arg.startswith("-") and "n" in arg[1:] and not arg.startswith("-e")
+        ):
+            saw_print_only = True
+    return saw_print_only
+
+
+def _find_command_is_read_only(args: Sequence[str]) -> bool:
+    mutating_primaries = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
+    return not any(arg in mutating_primaries for arg in args)
+
+
+def _python_inline_snippet_is_read_only(code: str) -> bool:
+    mutating_patterns = (
+        r"\bopen\s*\([^)]*,\s*['\"][^'\"]*[wax+]",
+        r"\b(?:write_text|write_bytes|unlink|remove|removedirs|rename|replace)\s*\(",
+        r"\b(?:mkdir|makedirs|rmdir|rmtree|move|copy|copyfile)\s*\(",
+        r"\b(?:exec|eval)\s*\(",
+        r"\b(?:system|popen|spawn\w*|run|call|check_call|check_output)\s*\(",
+        r"\bsubprocess\.",
+        r"\bshutil\.",
+    )
+    if any(re.search(pattern, code) for pattern in mutating_patterns):
+        return False
+
+    read_only_evidence = (
+        r"\bprint\s*\(",
+        r"\bread(?:_text|_bytes)?\s*\(",
+        r"\bopen\s*\(",
+        r"\blistdir\s*\(",
+        r"\bglob\s*\(",
+        r"\bexists\s*\(",
+        r"\bis_(?:file|dir)\s*\(",
+    )
+    return any(re.search(pattern, code) for pattern in read_only_evidence)
+
+
+def _python_command_is_read_only(args: Sequence[str]) -> bool:
+    for index, arg in enumerate(args):
+        if arg == "-c" and index + 1 < len(args):
+            return _python_inline_snippet_is_read_only(args[index + 1])
+        if arg.startswith("-c") and len(arg) > 2:
+            return _python_inline_snippet_is_read_only(arg[2:])
+    return False
+
+
+def _shell_segment_is_read_only_inspect(tokens: Sequence[str]) -> bool:
+    tokens = _drop_shell_prefix_tokens(tokens)
+    if not tokens:
+        return True
+
+    command = _command_name(tokens[0])
+    args = tokens[1:]
+    if command in {"cat", "head", "tail", "ls", "pwd", "stat", "wc"}:
+        return True
+    if command in {"grep", "egrep", "fgrep", "rg"}:
+        return True
+    if command == "sed":
+        return _sed_command_is_read_only(args)
+    if command == "find":
+        return _find_command_is_read_only(args)
+    if command in {"python", "python3"}:
+        return _python_command_is_read_only(args)
+    if command == "cd":
+        return True
+    return False
+
+
+def _codex_command_execution_is_read_only_inspect(item: dict[str, object]) -> bool:
+    command = item.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return False
+
+    payload = _codex_shell_payload(command)
+    tokens = _shell_command_tokens(payload)
+    if not tokens or _tokens_have_write_redirection(tokens):
+        return False
+
+    segments = _shell_command_segments(tokens)
+    if not segments:
+        return False
+    return all(_shell_segment_is_read_only_inspect(segment) for segment in segments)
+
+
+def _codex_phase_work_signal_indexes(
+    events: Iterable[dict[str, object]],
+    *,
+    event_types: tuple[str, ...],
+    item_types: set[str],
+    ignore_read_only_command_executions: bool,
+) -> list[int]:
+    indexes: list[int] = []
+    for index, event in enumerate(events):
+        item = _codex_event_item(event, event_types=event_types)
+        if item is None:
+            continue
+        item_type = item.get("type")
+        if not isinstance(item_type, str) or item_type not in item_types:
+            continue
+        if (
+            ignore_read_only_command_executions
+            and item_type == "command_execution"
+            and _codex_command_execution_is_read_only_inspect(item)
+        ):
+            continue
+        indexes.append(index)
+    return indexes
+
+
 def _describe_codex_pre_work_signal(item_types: Sequence[str]) -> str:
     labels = list(dict.fromkeys(str(item_type) for item_type in item_types))
     if not labels:
@@ -2539,6 +2748,15 @@ def _verify_codex_phase_contract(
     require_post_work_agent_message = bool(
         phase_contract.get("require_post_work_agent_message", False)
     )
+    raw_ignore_read_only_commands = phase_contract.get(
+        "ignore_read_only_command_executions", True
+    )
+    if not isinstance(raw_ignore_read_only_commands, bool):
+        return (
+            False,
+            "phase_contract.ignore_read_only_command_executions must be a boolean",
+        )
+    ignore_read_only_command_executions = raw_ignore_read_only_commands
 
     pre_work_item_types: list[str] = []
     if require_pre_work_signal:
@@ -2562,10 +2780,11 @@ def _verify_codex_phase_contract(
         event_types=("item.completed",),
         item_types=set(pre_work_item_types),
     )
-    work_signal_indexes = _codex_phase_item_indexes(
+    work_signal_indexes = _codex_phase_work_signal_indexes(
         events,
         event_types=("item.started", "item.completed"),
         item_types=work_item_types,
+        ignore_read_only_command_executions=ignore_read_only_command_executions,
     )
 
     if not work_signal_indexes:
@@ -2648,6 +2867,180 @@ def _verify_codex_work_summary_contract(
         )
 
     return True, ""
+
+
+def _ordered_unique_strings(values: Iterable[object]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def _trace_entries_for_phase(
+    trace_entries: Iterable[dict[str, object]], phase: str
+) -> list[dict[str, object]]:
+    return [entry for entry in trace_entries if entry.get("phase") == phase]
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _tool_names_from_tool_value(value: object) -> list[str]:
+    names: list[str] = []
+    if not isinstance(value, dict):
+        return names
+
+    name = value.get("name")
+    if isinstance(name, str):
+        names.append(name)
+
+    function = value.get("function")
+    if isinstance(function, dict):
+        function_name = function.get("name")
+        if isinstance(function_name, str):
+            names.append(function_name)
+
+    declarations = value.get("functionDeclarations")
+    if isinstance(declarations, list):
+        for declaration in declarations:
+            if not isinstance(declaration, dict):
+                continue
+            declaration_name = declaration.get("name")
+            if isinstance(declaration_name, str):
+                names.append(declaration_name)
+
+    return names
+
+
+def _tool_names_from_trace_value(value: object) -> list[str]:
+    names: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            names.extend(_tool_names_from_trace_value(item))
+        return names
+    if not isinstance(value, dict):
+        return names
+
+    names.extend(_string_list(value.get("tool_names")))
+
+    tools = value.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            names.extend(_tool_names_from_tool_value(tool))
+
+    declarations = value.get("functionDeclarations")
+    if isinstance(declarations, list):
+        for declaration in declarations:
+            names.extend(_tool_names_from_tool_value(declaration))
+
+    for child_value in value.values():
+        if child_value is tools or child_value is declarations:
+            continue
+        if isinstance(child_value, (dict, list)):
+            names.extend(_tool_names_from_trace_value(child_value))
+
+    return names
+
+
+def _tool_selector_names_from_trace_value(value: object) -> list[str]:
+    names: list[str] = []
+    if isinstance(value, list):
+        names.extend(_string_list(value))
+        for item in value:
+            names.extend(_tool_selector_names_from_trace_value(item))
+        return names
+    if not isinstance(value, dict):
+        return names
+
+    names.extend(_tool_names_from_tool_value(value))
+    for key in (
+        "allowed_tool_names",
+        "allowedFunctionNames",
+        "allowed_function_names",
+        "tool_names",
+    ):
+        names.extend(_string_list(value.get(key)))
+
+    for child_value in value.values():
+        if isinstance(child_value, (dict, list)):
+            names.extend(_tool_selector_names_from_trace_value(child_value))
+
+    return names
+
+
+def _trace_summary_tool_selector_names(summary: dict[str, object]) -> list[str]:
+    names: list[str] = []
+    for key in (
+        "tool_choice",
+        "allowed_tools",
+        "allowed_tool_names",
+        "allowedFunctionNames",
+        "allowed_function_names",
+        "functionCallingConfig",
+        "function_calling_config",
+        "toolConfig",
+        "tool_config",
+    ):
+        names.extend(_tool_selector_names_from_trace_value(summary.get(key)))
+    return names
+
+
+def _trace_request_tool_names(
+    trace_entries: Iterable[dict[str, object]], side: str
+) -> list[str]:
+    names: list[str] = []
+    summary_key = f"{side}_summary"
+    for entry in _trace_entries_for_phase(trace_entries, "request"):
+        request = entry.get("request")
+        if not isinstance(request, dict):
+            continue
+        summary = request.get(summary_key)
+        if isinstance(summary, dict):
+            names.extend(_string_list(summary.get("tool_names")))
+            if side == "client":
+                names.extend(_tool_names_from_trace_value(summary))
+        if side == "client":
+            names.extend(_tool_names_from_trace_value(request.get("new_items")))
+    return _ordered_unique_strings(names)
+
+
+def _trace_request_tool_selector_names(
+    trace_entries: Iterable[dict[str, object]], side: str
+) -> list[str]:
+    names: list[str] = []
+    summary_key = f"{side}_summary"
+    for entry in _trace_entries_for_phase(trace_entries, "request"):
+        request = entry.get("request")
+        if not isinstance(request, dict):
+            continue
+        summary = request.get(summary_key)
+        if isinstance(summary, dict):
+            names.extend(_trace_summary_tool_selector_names(summary))
+    return _ordered_unique_strings(names)
+
+
+def _contains_case_insensitive(values: Iterable[str], expected: str) -> bool:
+    expected_lower = expected.lower()
+    return any(value.lower() == expected_lower for value in values)
+
+
+def _matching_tool_terms(
+    values: Iterable[str], expected_terms: Iterable[str]
+) -> list[str]:
+    matches: list[str] = []
+    for expected in expected_terms:
+        if _contains_case_insensitive(values, expected):
+            matches.append(expected)
+    return matches
 
 
 def _client_specific_verifier_values(
@@ -2878,24 +3271,69 @@ def _presented_tool_name_present(stdout_text: str, expected: str) -> bool:
     return False
 
 
-def _used_tool_name_mention_present(stdout_text: str, expected: str) -> bool:
-    if _presented_tool_name_present(stdout_text, expected):
-        return True
-
-    normalized_text = stdout_text.replace("\\r\\n", "\n").replace("\\n", "\n")
-    term_pattern = _presented_tool_name_token_pattern(expected)
-    use_patterns = (
-        rf"\b(?:i|we)\b[\s,:;.-]*.*?\bused\b(?:\s+(?:the\s+)?(?:public\s+editing\s+)?tool)?"
-        rf"[\s,:;.-]*{term_pattern}(?:\s+tool)?\b",
-        rf"\b(?:using|with|via)\b\s+(?:the\s+)?(?:public\s+editing\s+)?(?:tool\s+)?"
-        rf"{term_pattern}(?:\s+tool)?\b",
+def _used_tool_name_bare_answer_present(line: str, expected: str) -> bool:
+    plain_line = _plain_presented_tool_name_line(line)
+    if not plain_line:
+        return False
+    term_pattern = _client_specific_term_pattern(expected)
+    return (
+        re.search(
+            rf"^\s*(?:[-*+]\s+|\d+[.)]\s+)?{term_pattern}"
+            rf"(?:\s*(?:\([^)]+\)|[-–—:]\s*.*))?[.!?]?\s*$",
+            plain_line,
+            re.IGNORECASE,
+        )
+        is not None
     )
+
+
+def _used_tool_name_context_patterns(expected: str) -> tuple[str, ...]:
+    term_pattern = _client_specific_term_pattern(expected)
+    used_tool_subject = (
+        r"(?:exact\s+)?(?:(?:public\s+editing|editing|public)\s+)?"
+        r"tool(?:\s+name)?"
+    )
+    current_surface_qualifier = (
+        r"(?:\s+(?:on|in|for)\s+(?:(?:the|this)\s+)?"
+        r"(?:current\s+)?client\s+surface)?"
+    )
+    trailing_description = r"(?:\s*(?:\([^)]+\)|[-–—:]\s*.*))?[.!?]?\s*$"
+    return (
+        rf"^\s*(?:the\s+)?{used_tool_subject}\s+i\s+(?:actually\s+)?used"
+        rf"{current_surface_qualifier}\s+(?:was|is)\s*:?\s*(?:the\s+)?{term_pattern}"
+        rf"(?:\s+tool)?{trailing_description}",
+        rf"^\s*(?:the\s+)?{used_tool_subject}\s+(?:actually\s+)?used"
+        rf"{current_surface_qualifier}\s*(?::|=|\s+(?:was|is)\s*:?)\s*"
+        rf"(?:the\s+)?{term_pattern}(?:\s+tool)?"
+        rf"{trailing_description}",
+        rf"\b(?:i|we)\b[\s,:;.-]*.*?\bused\b(?:\s+(?:the\s+)?"
+        rf"(?:public\s+editing\s+|editing\s+|public\s+)?tool)?[\s,:;.-]*"
+        rf"(?:the\s+)?{term_pattern}(?:\s+tool)?\b",
+        rf"\b(?:using|with|via)\b\s+(?:the\s+)?"
+        rf"(?:public\s+editing\s+|editing\s+|public\s+)?(?:tool\s+)?"
+        rf"{term_pattern}(?:\s+tool)?\b",
+        rf"^\s*(?:the\s+)?(?:{term_pattern}\s+(?:public\s+editing\s+|editing\s+|public\s+)?"
+        rf"tool|(?:public\s+editing\s+|editing\s+|public\s+)?tool\s+{term_pattern})"
+        rf"\s+(?:was|were|has\s+been|have\s+been|had\s+been)\s+"
+        rf"(?:actually\s+)?used\b",
+    )
+
+
+def _used_tool_name_mention_present(stdout_text: str, expected: str) -> bool:
+    normalized_text = stdout_text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    term_pattern = _client_specific_term_pattern(expected)
+    use_patterns = _used_tool_name_context_patterns(expected)
 
     for raw_line in normalized_text.splitlines():
         line = raw_line.strip()
-        if not line or not _displayed_presented_tool_name_token(line, expected):
+        if not line:
             continue
-        if any(re.search(pattern, line, re.IGNORECASE) for pattern in use_patterns):
+        plain_line = _plain_presented_tool_name_line(line)
+        if re.search(term_pattern, plain_line, re.IGNORECASE) is None:
+            continue
+        if _used_tool_name_bare_answer_present(line, expected):
+            return True
+        if any(re.search(pattern, plain_line, re.IGNORECASE) for pattern in use_patterns):
             return True
 
     return False
@@ -2970,10 +3408,23 @@ def _stdout_contract_reject_other_client_contains_any_by_client(
         {
             expected
             for expected in other_client_contains_any
-            if _client_specific_term_present(
-                stdout_text,
-                expected,
-                match_mode=match_mode,
+            if (
+                _client_specific_term_present(
+                    stdout_text,
+                    expected,
+                    match_mode=match_mode,
+                )
+                or _client_specific_term_present(
+                    stdout_text,
+                    expected,
+                    match_mode="presented_tool_name",
+                )
+                or re.search(
+                    rf"[`*]+\s*{_client_specific_term_pattern(expected)}\s*[`*]+",
+                    stdout_text,
+                    re.IGNORECASE,
+                )
+                is not None
             )
         },
         key=str.lower,
@@ -2985,6 +3436,97 @@ def _stdout_contract_reject_other_client_contains_any_by_client(
             "expected output not to list public tool names from other clients: "
             f"{listed_terms}",
         )
+    return True, ""
+
+
+def _verify_tool_identity_trace_contract(
+    verifier: dict[str, object],
+    context: VerifierContext | None,
+) -> tuple[bool, str]:
+    client_expected_terms, message = _client_specific_verifier_values(
+        verifier, "contains_any", context
+    )
+    if client_expected_terms is None:
+        return False, message
+    if not client_expected_terms:
+        return False, "tool_identity_contract requires contains_any_by_client terms"
+
+    other_client_terms, message = _other_client_specific_verifier_values(
+        verifier, "contains_any", context
+    )
+    if other_client_terms is None:
+        return False, message
+
+    trace_entries = tuple(context.trace_entries if context is not None else ())
+    if not trace_entries:
+        return (
+            False,
+            "expected debug trace request entries for tool identity contract; "
+            "no matching entries were captured after case filtering",
+        )
+    if not _trace_entries_for_phase(trace_entries, "request"):
+        return (
+            False,
+            "expected debug trace request entries for tool identity contract; "
+            "captured entries did not include a request phase",
+        )
+
+    client_tool_names = _trace_request_tool_names(trace_entries, "client")
+    upstream_tool_names = _trace_request_tool_names(trace_entries, "upstream")
+    client_selector_names = _trace_request_tool_selector_names(trace_entries, "client")
+    upstream_selector_names = _trace_request_tool_selector_names(trace_entries, "upstream")
+
+    if not client_tool_names:
+        return False, "expected debug trace client tool_names for tool identity contract"
+    if not upstream_tool_names:
+        return False, "expected debug trace upstream tool_names for tool identity contract"
+
+    all_trace_tool_names = client_tool_names + upstream_tool_names
+    all_trace_selector_names = client_selector_names + upstream_selector_names
+    all_trace_public_names = all_trace_tool_names + all_trace_selector_names
+    explicit_forbidden = [str(value) for value in verifier.get("not_contains", [])]
+    forbidden_terms = [
+        public_name
+        for public_name in all_trace_public_names
+        if any(forbidden in public_name for forbidden in explicit_forbidden)
+        or find_internal_tool_artifact(public_name) is not None
+    ]
+    if forbidden_terms:
+        listed_terms = ", ".join(repr(term) for term in _ordered_unique_strings(forbidden_terms))
+        return (
+            False,
+            "expected debug trace tool_names/tool_choice fields not to expose "
+            f"{listed_terms}",
+        )
+
+    missing_sides: list[str] = []
+    if not _matching_tool_terms(client_tool_names, client_expected_terms):
+        missing_sides.append("client")
+    if not _matching_tool_terms(upstream_tool_names, client_expected_terms):
+        missing_sides.append("upstream")
+    if missing_sides:
+        options = ", ".join(repr(expected) for expected in client_expected_terms)
+        return (
+            False,
+            "expected debug trace "
+            + " and ".join(f"{side} tool_names" for side in missing_sides)
+            + f" to include at least one of {options}",
+        )
+
+    raw_reject_flag = verifier.get("reject_other_client_contains_any_by_client", False)
+    if not isinstance(raw_reject_flag, bool):
+        return False, "reject_other_client_contains_any_by_client must be a boolean"
+    if raw_reject_flag:
+        forbidden_other_terms = _matching_tool_terms(all_trace_public_names, other_client_terms)
+        if forbidden_other_terms:
+            listed_terms = ", ".join(repr(term) for term in forbidden_other_terms)
+            return (
+                False,
+                "expected debug trace not to list public tool names from other clients "
+                "in tool_names/tool_choice fields: "
+                f"{listed_terms}",
+            )
+
     return True, ""
 
 
@@ -3044,6 +3586,18 @@ def _verify_verifier_output(
         needle = str(verifier["value"])
         ok = needle.lower() in stdout_text.lower()
         return ok, f"expected output to contain {needle!r}"
+    if verifier_type == "tool_identity_contract":
+        stdout_contract_verifier = dict(verifier)
+        stdout_contract_verifier["type"] = "stdout_contract"
+        ok, message = _verify_verifier_output(
+            stdout_contract_verifier,
+            stdout_text,
+            workspace_dir,
+            context,
+        )
+        if not ok:
+            return False, message
+        return _verify_tool_identity_trace_contract(verifier, context)
     if verifier_type == "stdout_contract":
         client_contains, message = _client_specific_verifier_values(
             verifier, "contains", context
@@ -3111,8 +3665,8 @@ def _verify_verifier_output(
             return False, message
         not_contains = [str(needle) for needle in verifier.get("not_contains", [])] + client_not_contains
         for forbidden in not_contains:
-            if forbidden in stdout_contract_text:
-                return False, f"expected output not to contain {forbidden!r}"
+            if forbidden in stdout_text:
+                return False, f"expected raw output not to contain {forbidden!r}"
         return True, ""
     if verifier_type == "file_contains":
         if workspace_dir is None:
@@ -3338,6 +3892,324 @@ def _report_path(report_dir: pathlib.Path, target: pathlib.Path) -> str:
     return os.path.relpath(target, report_dir)
 
 
+def trace_file_offset(trace_path: pathlib.Path) -> int:
+    try:
+        return pathlib.Path(trace_path).stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _parse_trace_window_lines(text: str) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    lines = text.splitlines()
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1:
+                continue
+            continue
+        if isinstance(payload, dict):
+            entries.append(payload)
+    return entries
+
+
+def read_trace_entries_since(
+    trace_path: pathlib.Path,
+    offset: int,
+    *,
+    timeout_secs: float = 0.75,
+) -> list[dict[str, object]]:
+    trace_path = pathlib.Path(trace_path)
+    deadline = time.time() + max(0.0, timeout_secs)
+    previous_size: int | None = None
+    stable_reads = 0
+    entries: list[dict[str, object]] = []
+
+    while True:
+        if trace_path.exists():
+            current_size = trace_path.stat().st_size
+            with trace_path.open("rb") as handle:
+                handle.seek(max(0, offset))
+                window_bytes = handle.read()
+            entries = _parse_trace_window_lines(
+                window_bytes.decode("utf-8", errors="replace")
+            )
+            if current_size == previous_size:
+                stable_reads += 1
+            else:
+                stable_reads = 0
+                previous_size = current_size
+            if stable_reads >= 2 or time.time() >= deadline:
+                return entries
+        elif time.time() >= deadline:
+            return []
+
+        if timeout_secs <= 0:
+            return entries
+        time.sleep(0.05)
+
+
+def _trace_entry_timestamp_ms(entry: dict[str, object]) -> int | None:
+    value = entry.get("timestamp_ms")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _trace_entry_within_case_window(
+    entry: dict[str, object],
+    started_ms: int,
+    finished_ms: int,
+) -> bool:
+    timestamp_ms = _trace_entry_timestamp_ms(entry)
+    if timestamp_ms is None:
+        return True
+    return (
+        started_ms - TRACE_CASE_START_SKEW_MS
+        <= timestamp_ms
+        <= finished_ms + TRACE_CASE_END_SKEW_MS
+    )
+
+
+def _trace_entry_route_matches_case(entry: dict[str, object], case: MatrixCase) -> bool:
+    expected_client_format = TRACE_CLIENT_FORMAT_BY_CLIENT.get(case.client_name)
+    client_format = entry.get("client_format")
+    if (
+        expected_client_format is not None
+        and isinstance(client_format, str)
+        and client_format != expected_client_format
+    ):
+        return False
+
+    expected_path_prefix = TRACE_PATH_PREFIX_BY_CLIENT.get(case.client_name)
+    path = entry.get("path")
+    if (
+        expected_path_prefix is not None
+        and isinstance(path, str)
+        and not path.startswith(expected_path_prefix)
+    ):
+        return False
+
+    client_model = entry.get("client_model")
+    if isinstance(client_model, str) and client_model != case.lane.proxy_model:
+        return False
+
+    upstream_name = entry.get("upstream_name")
+    if isinstance(upstream_name, str) and upstream_name != case.lane.upstream_name:
+        return False
+
+    upstream_model = entry.get("upstream_model")
+    if (
+        case.lane.upstream_model is not None
+        and isinstance(upstream_model, str)
+        and upstream_model != case.lane.upstream_model
+    ):
+        return False
+
+    return True
+
+
+def _trace_entry_matches_case_window_and_route(
+    entry: dict[str, object],
+    case: MatrixCase,
+    started_ms: int,
+    finished_ms: int,
+) -> bool:
+    return _trace_entry_within_case_window(
+        entry,
+        started_ms,
+        finished_ms,
+    ) and _trace_entry_route_matches_case(entry, case)
+
+
+def filter_trace_entries_for_case(
+    trace_entries: Iterable[dict[str, object]],
+    case: MatrixCase,
+    *,
+    started_ms: int,
+    finished_ms: int,
+) -> list[dict[str, object]]:
+    entries = list(trace_entries)
+    matching_request_ids = _ordered_unique_strings(
+        entry.get("request_id")
+        for entry in entries
+        if entry.get("phase") == "request"
+        and _trace_entry_matches_case_window_and_route(
+            entry,
+            case,
+            started_ms,
+            finished_ms,
+        )
+    )
+    if matching_request_ids:
+        matching_request_id_set = set(matching_request_ids)
+        return [
+            entry
+            for entry in entries
+            if isinstance(entry.get("request_id"), str)
+            and entry["request_id"] in matching_request_id_set
+        ]
+
+    return [
+        entry
+        for entry in entries
+        if _trace_entry_matches_case_window_and_route(
+            entry,
+            case,
+            started_ms,
+            finished_ms,
+        )
+    ]
+
+
+def _workspace_diff_empty_summary() -> dict[str, object]:
+    return {
+        "changed_files": [],
+        "added_files": [],
+        "modified_files": [],
+        "removed_files": [],
+    }
+
+
+def _workspace_file_should_be_ignored(path: pathlib.Path) -> bool:
+    ignored_parts = {"__pycache__", ".git", ".pytest_cache"}
+    return any(part in ignored_parts for part in path.parts)
+
+
+def snapshot_workspace(workspace_dir: pathlib.Path | None) -> dict[str, str]:
+    if workspace_dir is None:
+        return {}
+    workspace_dir = pathlib.Path(workspace_dir)
+    if not workspace_dir.exists():
+        return {}
+
+    snapshot: dict[str, str] = {}
+    for path in sorted(workspace_dir.rglob("*")):
+        if not path.is_file() or _workspace_file_should_be_ignored(path.relative_to(workspace_dir)):
+            continue
+        relative_path = path.relative_to(workspace_dir).as_posix()
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        snapshot[relative_path] = digest
+    return snapshot
+
+
+def summarize_workspace_diff(
+    before: dict[str, str],
+    after: dict[str, str],
+) -> dict[str, object]:
+    before_paths = set(before)
+    after_paths = set(after)
+    added_files = sorted(after_paths - before_paths)
+    removed_files = sorted(before_paths - after_paths)
+    modified_files = sorted(
+        path for path in before_paths & after_paths if before[path] != after[path]
+    )
+    changed_files = sorted(added_files + modified_files + removed_files)
+    return {
+        "changed_files": changed_files,
+        "added_files": added_files,
+        "modified_files": modified_files,
+        "removed_files": removed_files,
+    }
+
+
+def _codex_metadata_snapshot(
+    codex_metadata: CodexModelMetadata | None,
+) -> dict[str, object]:
+    if codex_metadata is None:
+        return {}
+    snapshot: dict[str, object] = {}
+    if codex_metadata.input_modalities is not None:
+        snapshot["input_modalities"] = list(codex_metadata.input_modalities)
+    if codex_metadata.supports_search_tool is not None:
+        snapshot["supports_search_tool"] = codex_metadata.supports_search_tool
+    if codex_metadata.supports_view_image is not None:
+        snapshot["supports_view_image"] = codex_metadata.supports_view_image
+    if codex_metadata.apply_patch_tool_type is not None:
+        snapshot["apply_patch_tool_type"] = codex_metadata.apply_patch_tool_type
+    if codex_metadata.supports_parallel_tool_calls is not None:
+        snapshot["supports_parallel_tool_calls"] = (
+            codex_metadata.supports_parallel_tool_calls
+        )
+    return snapshot
+
+
+def _trace_route_summary(
+    trace_entries: Iterable[dict[str, object]],
+) -> list[dict[str, object]]:
+    routes: list[dict[str, object]] = []
+    for entry in _trace_entries_for_phase(trace_entries, "request"):
+        route: dict[str, object] = {}
+        for key in (
+            "request_id",
+            "path",
+            "stream",
+            "client_format",
+            "upstream_format",
+            "client_model",
+            "upstream_name",
+            "upstream_model",
+        ):
+            value = entry.get(key)
+            if value is not None:
+                route[key] = value
+        routes.append(route)
+    return routes
+
+
+def build_case_diagnostics(
+    case: MatrixCase,
+    trace_entries: Iterable[dict[str, object]],
+    workspace_diff: dict[str, object] | None = None,
+) -> dict[str, object]:
+    trace_entries = tuple(trace_entries)
+    request_entries = _trace_entries_for_phase(trace_entries, "request")
+    response_entries = _trace_entries_for_phase(trace_entries, "response")
+    request_ids = _ordered_unique_strings(
+        entry.get("request_id") for entry in trace_entries
+    )
+    route_summary = _trace_route_summary(trace_entries)
+    surface_snapshot: dict[str, object] = {
+        "client_model": case.lane.proxy_model,
+        "lane": case.lane.name,
+        "upstream_name": case.lane.upstream_name,
+    }
+    if case.lane.upstream_model is not None:
+        surface_snapshot["upstream_model"] = case.lane.upstream_model
+    surface_snapshot.update(_codex_metadata_snapshot(case.lane.codex_metadata))
+
+    client_tool_names = _trace_request_tool_names(trace_entries, "client")
+    upstream_tool_names = _trace_request_tool_names(trace_entries, "upstream")
+    client_tool_selector_names = _trace_request_tool_selector_names(trace_entries, "client")
+    upstream_tool_selector_names = _trace_request_tool_selector_names(trace_entries, "upstream")
+
+    return {
+        "request_id": request_ids[0] if request_ids else None,
+        "request_ids": request_ids,
+        "trace_entry_count": len(trace_entries),
+        "trace_request_count": len(request_entries),
+        "trace_response_count": len(response_entries),
+        "route_summary": route_summary,
+        "surface_snapshot": surface_snapshot,
+        "tool_identity": {
+            "client_tool_names": client_tool_names,
+            "upstream_tool_names": upstream_tool_names,
+            "client_tool_selector_names": client_tool_selector_names,
+            "upstream_tool_selector_names": upstream_tool_selector_names,
+        },
+        "workspace_diff": workspace_diff or _workspace_diff_empty_summary(),
+    }
+
+
 def build_client_command(
     client_name: str,
     proxy_base: str,
@@ -3456,9 +4328,18 @@ def run_matrix_case(
     )
     stdin_text = client_stdin_text(case.client_name, case.fixture)
     timeout_secs = resolve_case_timeout_secs(case, home_dir, timeout_policy)
+    trace_path = report_dir / "debug-trace.jsonl"
+    trace_offset = trace_file_offset(trace_path)
+    workspace_before = snapshot_workspace(workspace_dir)
     started = time.time()
+    started_ms = int(started * 1000)
     status = "failed"
     message = ""
+    stdout_text = ""
+    stderr_text = ""
+    trace_entries: list[dict[str, object]] = []
+    workspace_diff_summary = _workspace_diff_empty_summary()
+    diagnostics: dict[str, object] | None = None
 
     try:
         run_kwargs: dict[str, object] = {
@@ -3481,6 +4362,22 @@ def run_matrix_case(
             mark_gemini_bootstrap_ready(home_dir)
         stdout_text = completed.stdout or ""
         stderr_text = completed.stderr or ""
+        workspace_diff_summary = summarize_workspace_diff(
+            workspace_before,
+            snapshot_workspace(workspace_dir),
+        )
+        finished_ms = int(time.time() * 1000)
+        trace_entries = filter_trace_entries_for_case(
+            read_trace_entries_since(trace_path, trace_offset),
+            case,
+            started_ms=started_ms,
+            finished_ms=finished_ms,
+        )
+        diagnostics = build_case_diagnostics(
+            case,
+            trace_entries,
+            workspace_diff_summary,
+        )
         if completed.returncode == 0:
             ok, verifier_message = verify_fixture_output(
                 case.fixture,
@@ -3492,6 +4389,9 @@ def run_matrix_case(
                     command=tuple(command),
                     home_dir=home_dir,
                     workspace_dir=workspace_dir,
+                    trace_entries=tuple(trace_entries),
+                    diagnostics=diagnostics,
+                    workspace_diff=workspace_diff_summary,
                 ),
             )
             if ok:
@@ -3505,6 +4405,22 @@ def run_matrix_case(
     except subprocess.TimeoutExpired as error:
         stdout_text = error.stdout or ""
         stderr_text = error.stderr or ""
+        workspace_diff_summary = summarize_workspace_diff(
+            workspace_before,
+            snapshot_workspace(workspace_dir),
+        )
+        finished_ms = int(time.time() * 1000)
+        trace_entries = filter_trace_entries_for_case(
+            read_trace_entries_since(trace_path, trace_offset),
+            case,
+            started_ms=started_ms,
+            finished_ms=finished_ms,
+        )
+        diagnostics = build_case_diagnostics(
+            case,
+            trace_entries,
+            workspace_diff_summary,
+        )
         message = f"timed out after {timeout_secs}s"
 
     duration_secs = round(time.time() - started, 3)
@@ -3526,6 +4442,8 @@ def run_matrix_case(
         "workspace_path": _report_path(report_dir, workspace_dir),
         "home_path": _report_path(report_dir, home_dir),
         "command": command,
+        "diagnostics": diagnostics
+        or build_case_diagnostics(case, trace_entries, workspace_diff_summary),
     }
 
 

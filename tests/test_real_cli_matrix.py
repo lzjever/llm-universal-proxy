@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 import unittest
 from unittest import mock
@@ -2441,7 +2442,7 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertEqual(payload["id"], "tool_identity_public_contract")
         self.assertEqual(payload["kind"], "smoke")
-        self.assertEqual(payload["verifier"]["type"], "stdout_contract")
+        self.assertEqual(payload["verifier"]["type"], "tool_identity_contract")
         self.assertEqual(
             payload["verifier"]["contains_any_by_client"],
             {
@@ -2561,6 +2562,264 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(captured["kwargs"]["input"], case.fixture.prompt)
         self.assertNotIn("stdin", captured["kwargs"])
 
+    def test_run_matrix_case_records_per_case_trace_window_diagnostics(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(module, name="minimax-anth", proxy_model="minimax-anth"),
+            fixture=make_fixture(module, prompt="Reply with exactly PONG"),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = pathlib.Path(temp_dir)
+            trace_path = report_dir / "debug-trace.jsonl"
+            trace_path.write_text(
+                json.dumps({"request_id": "req_before", "phase": "request"}) + "\n",
+                encoding="utf-8",
+            )
+
+            def fake_run(command, **kwargs):
+                with trace_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "request_id": "req_case",
+                                "phase": "request",
+                                "path": "/anthropic/v1/messages",
+                                "stream": True,
+                                "client_format": "anthropic",
+                                "upstream_format": "openai-completion",
+                                "client_model": "minimax-anth",
+                                "upstream_name": "MINIMAX-ANTHROPIC",
+                                "upstream_model": "MiniMax-M2.7-highspeed",
+                                "request": {
+                                    "client_summary": {"tool_names": ["Edit"]},
+                                    "upstream_summary": {"tool_names": ["Edit"]},
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                    handle.write(
+                        json.dumps(
+                            {
+                                "request_id": "req_case",
+                                "phase": "response",
+                                "path": "/anthropic/v1/messages",
+                                "http_status": 200,
+                                "outcome": "completed",
+                            }
+                        )
+                        + "\n"
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout="PONG\n", stderr="")
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        diagnostics = result["diagnostics"]
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(diagnostics["request_id"], "req_case")
+        self.assertEqual(diagnostics["trace_request_count"], 1)
+        self.assertEqual(diagnostics["trace_response_count"], 1)
+        self.assertEqual(
+            diagnostics["route_summary"][0]["upstream_name"],
+            "MINIMAX-ANTHROPIC",
+        )
+        self.assertEqual(diagnostics["tool_identity"]["client_tool_names"], ["Edit"])
+        self.assertNotIn("req_before", diagnostics["request_ids"])
+
+    def test_run_matrix_case_filters_async_lane_probe_trace_pollution_from_tool_identity(self):
+        module = load_module()
+        verifier = {
+            "type": "tool_identity_contract",
+            "contains_any_by_client": {
+                "codex": ["apply_patch"],
+                "claude": ["Edit"],
+                "gemini": ["replace"],
+            },
+            "contains_any_by_client_match_mode": "presented_tool_name",
+            "reject_other_client_contains_any_by_client": True,
+            "not_contains": ["__llmup_custom__"],
+        }
+        case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(module, name="minimax-anth", proxy_model="minimax-anth"),
+            fixture=make_fixture(
+                module,
+                fixture_id="tool_identity_public_contract",
+                prompt="List public editing tools",
+                verifier=verifier,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = pathlib.Path(temp_dir)
+            trace_path = report_dir / "debug-trace.jsonl"
+
+            def fake_run(command, **kwargs):
+                with trace_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "timestamp_ms": 1,
+                                "request_id": "req_probe",
+                                "phase": "request",
+                                "path": "/openai/v1/responses",
+                                "stream": False,
+                                "client_format": "openai-responses",
+                                "upstream_format": "openai-completion",
+                                "client_model": "minimax-anth",
+                                "upstream_name": "MINIMAX-ANTHROPIC",
+                                "upstream_model": "MiniMax-M2.7-highspeed",
+                                "request": {
+                                    "client_summary": {"tool_names": ["apply_patch"]},
+                                    "upstream_summary": {"tool_names": ["apply_patch"]},
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                    case_timestamp_ms = int(time.time() * 1000)
+                    handle.write(
+                        json.dumps(
+                            {
+                                "timestamp_ms": case_timestamp_ms,
+                                "request_id": "req_case",
+                                "phase": "request",
+                                "path": "/anthropic/v1/messages",
+                                "stream": True,
+                                "client_format": "anthropic",
+                                "upstream_format": "openai-completion",
+                                "client_model": "minimax-anth",
+                                "upstream_name": "MINIMAX-ANTHROPIC",
+                                "upstream_model": "MiniMax-M2.7-highspeed",
+                                "request": {
+                                    "client_summary": {"tool_names": ["Edit"]},
+                                    "upstream_summary": {"tool_names": ["Edit"]},
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                    handle.write(
+                        json.dumps(
+                            {
+                                "timestamp_ms": case_timestamp_ms,
+                                "request_id": "req_case",
+                                "phase": "response",
+                                "path": "/anthropic/v1/messages",
+                                "http_status": 200,
+                                "outcome": "completed",
+                            }
+                        )
+                        + "\n"
+                    )
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="The public editing tool is `Edit`.\n",
+                    stderr="",
+                )
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        diagnostics = result["diagnostics"]
+        self.assertEqual(result["status"], "passed", result["message"])
+        self.assertEqual(diagnostics["request_ids"], ["req_case"])
+        self.assertNotIn("req_probe", diagnostics["request_ids"])
+        self.assertEqual(diagnostics["tool_identity"]["client_tool_names"], ["Edit"])
+
+    def test_run_matrix_case_fails_tool_identity_when_trace_filtering_leaves_no_entries(self):
+        module = load_module()
+        verifier = {
+            "type": "tool_identity_contract",
+            "contains_any_by_client": {
+                "codex": ["apply_patch"],
+                "claude": ["Edit"],
+                "gemini": ["replace"],
+            },
+            "contains_any_by_client_match_mode": "presented_tool_name",
+            "reject_other_client_contains_any_by_client": True,
+            "not_contains": ["__llmup_custom__"],
+        }
+        case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(module, name="minimax-anth", proxy_model="minimax-anth"),
+            fixture=make_fixture(
+                module,
+                fixture_id="tool_identity_public_contract",
+                prompt="List public editing tools",
+                verifier=verifier,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = pathlib.Path(temp_dir)
+            trace_path = report_dir / "debug-trace.jsonl"
+
+            def fake_run(command, **kwargs):
+                with trace_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "timestamp_ms": int(time.time() * 1000),
+                                "request_id": "req_wrong_client",
+                                "phase": "request",
+                                "path": "/openai/v1/responses",
+                                "stream": False,
+                                "client_format": "openai-responses",
+                                "upstream_format": "openai-completion",
+                                "client_model": "minimax-anth",
+                                "upstream_name": "MINIMAX-ANTHROPIC",
+                                "upstream_model": "MiniMax-M2.7-highspeed",
+                                "request": {
+                                    "client_summary": {"tool_names": ["apply_patch"]},
+                                    "upstream_summary": {"tool_names": ["apply_patch"]},
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="The public editing tool is `Edit`.\n",
+                    stderr="",
+                )
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        diagnostics = result["diagnostics"]
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("debug trace", result["message"])
+        self.assertEqual(diagnostics["trace_entry_count"], 0)
+        self.assertEqual(diagnostics["route_summary"], [])
+        self.assertEqual(
+            diagnostics["tool_identity"]["client_tool_names"],
+            [],
+        )
+
     def test_run_matrix_case_feeds_claude_rendered_prompt_template_via_stdin(self):
         module = load_module()
         fixture = make_fixture(
@@ -2599,6 +2858,105 @@ class RealCliMatrixTests(unittest.TestCase):
             captured["kwargs"]["input"],
             "Current client: claude. Reply with exactly one line containing only that client's public editing tool names.",
         )
+
+    def test_run_matrix_case_records_workspace_diff_summary_changed_files(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="python_bugfix",
+            verifier={
+                "type": "python_source_and_output",
+                "source": {
+                    "path": "calc.py",
+                    "function": "add",
+                    "args": ["a", "b"],
+                    "returns": {
+                        "kind": "binary_op",
+                        "operator": "+",
+                        "left": "a",
+                        "right": "b",
+                    },
+                },
+                "entrypoint": {
+                    "path": "main.py",
+                    "expect_stdout_contains": [
+                        "2 + 3 = 5",
+                        "-1 + 5 = 4",
+                        "0 + 0 = 0",
+                        "4 * 5 = 20",
+                    ],
+                },
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = pathlib.Path(temp_dir)
+            workspace_template = temp_root / "template"
+            workspace_template.mkdir()
+            (workspace_template / "calc.py").write_text(
+                textwrap.dedent(
+                    """
+                    def add(a, b):
+                        return a - b
+
+                    def multiply(a, b):
+                        return a * b
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (workspace_template / "main.py").write_text(
+                textwrap.dedent(
+                    """
+                    from calc import add, multiply
+
+                    print(f"2 + 3 = {add(2, 3)}")
+                    print(f"-1 + 5 = {add(-1, 5)}")
+                    print(f"0 + 0 = {add(0, 0)}")
+                    print(f"4 * 5 = {multiply(4, 5)}")
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            fixture.workspace_template = workspace_template
+            case = make_case(
+                module,
+                client_name="claude",
+                lane=make_lane(module),
+                fixture=fixture,
+            )
+            report_dir = temp_root / "reports"
+            report_dir.mkdir()
+
+            original_run = module.subprocess.run
+
+            def fake_run(command, **kwargs):
+                if command and command[0] == sys.executable:
+                    return original_run(command, **kwargs)
+                workspace_dir = pathlib.Path(kwargs["cwd"])
+                (workspace_dir / "calc.py").write_text(
+                    "def add(a, b):\n"
+                    "    return a + b\n\n"
+                    "def multiply(a, b):\n"
+                    "    return a * b\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, stdout="fixed\n", stderr="")
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "passed", result["message"])
+        workspace_diff = result["diagnostics"]["workspace_diff"]
+        self.assertEqual(workspace_diff["changed_files"], ["calc.py"])
+        self.assertEqual(workspace_diff["modified_files"], ["calc.py"])
 
     def test_run_matrix_case_uses_external_runtime_paths_for_claude(self):
         module = load_module()

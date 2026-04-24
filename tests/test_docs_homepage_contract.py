@@ -1,8 +1,29 @@
+import importlib.util
 import pathlib
+import re
+import sys
 import unittest
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+REAL_CLI_MATRIX_PATH = REPO_ROOT / "scripts" / "real_cli_matrix.py"
+QUICKSTART_CONFIG_PATHS = (
+    "README.md",
+    "README_CN.md",
+    "examples/quickstart-openai-minimax.yaml",
+)
+QUICKSTART_ALIASES = ("gpt-5-4", "gpt-5-4-mini")
+
+
+def load_real_cli_matrix():
+    spec = importlib.util.spec_from_file_location(
+        "real_cli_matrix_docs_homepage_contract",
+        REAL_CLI_MATRIX_PATH,
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class DocsHomepageContractTests(unittest.TestCase):
@@ -20,6 +41,43 @@ class DocsHomepageContractTests(unittest.TestCase):
                 f"expected `{snippet}` after `{snippets[snippets.index(snippet) - 1]}`",
             )
             cursor = next_index
+
+    def extract_quickstart_config(self, relative_path: str) -> str:
+        text = self.read_text(relative_path)
+        if relative_path.endswith(".yaml"):
+            return text
+
+        match = re.search(
+            r"```yaml\n(?P<config>listen: 127\.0\.0\.1:8080\n.*?)\n```",
+            text,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match, f"missing quickstart YAML block in {relative_path}")
+        return match.group("config")
+
+    def assert_cli_ready_surface_contract(self, config_text: str) -> None:
+        module = load_real_cli_matrix()
+        parsed = module.parse_proxy_source(config_text)
+
+        for alias in QUICKSTART_ALIASES:
+            with self.subTest(alias=alias):
+                alias_config = parsed.model_alias_configs.get(alias)
+                self.assertIsNotNone(alias_config, f"missing alias: {alias}")
+                upstream_name = module._target_upstream_name(alias_config.target)
+                self.assertIsNotNone(upstream_name, f"missing target upstream for {alias}")
+                surface = module._effective_surface_metadata(
+                    parsed.upstream_surface_defaults.get(upstream_name),
+                    alias_config.surface,
+                )
+                module._validate_live_surface_codex_requirements(
+                    surface,
+                    require_tool_flags=True,
+                )
+                self.assertEqual(surface.input_modalities, ("text",))
+                self.assertFalse(surface.supports_search)
+                self.assertFalse(surface.supports_view_image)
+                self.assertEqual(surface.apply_patch_transport, "freeform")
+                self.assertFalse(surface.supports_parallel_calls)
 
     def test_readmes_follow_product_homepage_section_order(self):
         self.assert_in_order(
@@ -119,6 +177,13 @@ class DocsHomepageContractTests(unittest.TestCase):
         self.assertNotIn(".env.test", text)
         self.assertNotIn("proxy-test-minimax-and-local.yaml", text)
         self.assertNotIn("MINIMAX-ANTHROPIC", text)
+
+    def test_recommended_quickstart_config_has_cli_ready_surface_fields(self):
+        for relative_path in QUICKSTART_CONFIG_PATHS:
+            with self.subTest(path=relative_path):
+                self.assert_cli_ready_surface_contract(
+                    self.extract_quickstart_config(relative_path)
+                )
 
 
 if __name__ == "__main__":

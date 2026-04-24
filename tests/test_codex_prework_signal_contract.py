@@ -295,6 +295,122 @@ def codex_stdout_with_work_and_final_but_no_prework_signal() -> str:
     )
 
 
+def codex_stdout_with_read_only_inspect_before_prework_then_mutating_work(
+    read_only_command: str = "/usr/bin/zsh -lc 'cat calc.py main.py'",
+) -> str:
+    return _jsonl(
+        [
+            {"type": "thread.started", "thread_id": "thread_1"},
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_0",
+                    "type": "command_execution",
+                    "command": read_only_command,
+                    "aggregated_output": "",
+                    "exit_code": None,
+                    "status": "in_progress",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_0",
+                    "type": "command_execution",
+                    "command": read_only_command,
+                    "aggregated_output": "def add(a, b):\n    return a - b\n",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_1",
+                    "type": "reasoning",
+                    "text": "The add implementation subtracts and needs to be changed.",
+                },
+            },
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_2",
+                    "type": "command_execution",
+                    "command": "/usr/bin/zsh -lc \"sed -i 's/return a - b/return a + b/' calc.py\"",
+                    "status": "in_progress",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_2",
+                    "type": "command_execution",
+                    "command": "/usr/bin/zsh -lc \"sed -i 's/return a - b/return a + b/' calc.py\"",
+                    "aggregated_output": "",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_3",
+                    "type": "agent_message",
+                    "text": "I fixed calc.py and verified the output with main.py.",
+                },
+            },
+            {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+        ]
+    )
+
+
+def codex_stdout_with_mutating_work_before_prework_reasoning() -> str:
+    return _jsonl(
+        [
+            {"type": "thread.started", "thread_id": "thread_1"},
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "item_0",
+                    "type": "command_execution",
+                    "command": "/usr/bin/zsh -lc \"sed -i 's/return a - b/return a + b/' calc.py\"",
+                    "status": "in_progress",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_0",
+                    "type": "command_execution",
+                    "command": "/usr/bin/zsh -lc \"sed -i 's/return a - b/return a + b/' calc.py\"",
+                    "aggregated_output": "",
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_1",
+                    "type": "reasoning",
+                    "text": "The add implementation has been corrected.",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "item_2",
+                    "type": "agent_message",
+                    "text": "I fixed calc.py and verified the output with main.py.",
+                },
+            },
+            {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+        ]
+    )
+
+
 class CodexPreworkSignalContractTests(unittest.TestCase):
     def test_verify_fixture_output_rejects_single_final_agent_message_without_prework_signal_or_work(self):
         module = load_module()
@@ -341,6 +457,55 @@ class CodexPreworkSignalContractTests(unittest.TestCase):
             ok, message = module.verify_fixture_output(
                 fixture,
                 codex_stdout_with_work_and_final_but_no_prework_signal(),
+                workspace_dir,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("pre-work signal", message)
+
+    def test_verify_fixture_output_accepts_read_only_inspect_before_prework_then_mutating_work(self):
+        module = load_module()
+        fixture = make_fixture(module, codex_phase_verifier())
+
+        read_only_commands = [
+            "/usr/bin/zsh -lc 'cat calc.py main.py'",
+            "/usr/bin/zsh -lc \"sed -n '1,120p' calc.py\"",
+            "/usr/bin/zsh -lc 'head -n 20 calc.py'",
+            "/usr/bin/zsh -lc 'tail -n 20 calc.py'",
+            "/usr/bin/zsh -lc 'ls -la'",
+            "/usr/bin/zsh -lc 'find . -maxdepth 2 -type f'",
+            "/usr/bin/zsh -lc \"rg 'return a - b' .\"",
+            "/usr/bin/zsh -lc \"grep -R 'return a - b' .\"",
+            "/usr/bin/zsh -lc \"python -c \\\"from pathlib import Path; print(Path('calc.py').read_text())\\\"\"",
+        ]
+        for read_only_command in read_only_commands:
+            with self.subTest(read_only_command=read_only_command):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    workspace_dir = pathlib.Path(temp_dir)
+                    write_fixed_workspace(workspace_dir)
+
+                    ok, message = module.verify_fixture_output(
+                        fixture,
+                        codex_stdout_with_read_only_inspect_before_prework_then_mutating_work(
+                            read_only_command
+                        ),
+                        workspace_dir,
+                    )
+
+                self.assertTrue(ok, message)
+                self.assertEqual(message, "")
+
+    def test_verify_fixture_output_rejects_mutating_work_before_prework_reasoning(self):
+        module = load_module()
+        fixture = make_fixture(module, codex_phase_verifier())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = pathlib.Path(temp_dir)
+            write_fixed_workspace(workspace_dir)
+
+            ok, message = module.verify_fixture_output(
+                fixture,
+                codex_stdout_with_mutating_work_before_prework_reasoning(),
                 workspace_dir,
             )
 

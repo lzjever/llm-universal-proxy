@@ -386,17 +386,11 @@ async fn translate_sse_stream_gemini_to_responses_bridges_custom_tool_calls_with
         UpstreamFormat::Google,
         UpstreamFormat::OpenAiResponses,
     )
-    .with_request_scoped_tool_bridge_context(Some(serde_json::json!({
-        "compatibility_mode": "max_compat",
-        "entries": {
-            "apply_patch": {
-                "source_kind": "custom_grammar",
-                "transport_kind": "function_object_wrapper",
-                "wrapper_field": "input",
-                "expected_canonical_shape": "single_required_string"
-            }
-        }
-    })));
+    .with_request_scoped_tool_bridge_context(Some(typed_tool_bridge_context(
+        "apply_patch",
+        "custom_grammar",
+        "max_compat",
+    )));
 
     let mut frames = Vec::new();
     while let Some(frame) = stream.next().await {

@@ -36,12 +36,30 @@ upstreams:
     format: openai-responses
     credential_env: OPENAI_API_KEY
     auth_policy: force_server
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
 
   MINIMAX_OPENAI:
     api_root: https://api.minimaxi.com/v1
     format: openai-completion
     credential_env: MINIMAX_API_KEY
     auth_policy: force_server
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
 
 model_aliases:
   gpt-5-4: OPENAI:gpt-5.4
@@ -93,6 +111,15 @@ curl http://127.0.0.1:8080/openai/v1/responses \
 ```
 
 Reasoning effort such as `xhigh` is a client/request-side setting, not part of the model name. Keep the alias stable and set reasoning in the request or client config.
+
+## Compatibility Contract
+
+`llmup` gives clients a stable local protocol surface, not unlimited provider equivalence.
+
+- same-protocol paths stay native when possible
+- translated paths target a portable core and may warn or reject non-portable provider-native features
+- native extensions and provider-owned lifecycle state stay on same-provider paths unless a documented shim says otherwise
+- the quickstart includes conservative text-only `surface_defaults`; turn on search, image, or parallel-tool flags only when that model surface really supports them
 
 ## Codex / Claude Code / Gemini Basic Setup
 
@@ -152,6 +179,7 @@ The static YAML story is intentionally small:
 | `upstream_timeout_secs` | Upstream request timeout |
 | `upstreams` | Named upstream API roots, formats, and credential policy |
 | `model_aliases` | Stable local names mapped to `UPSTREAM:MODEL` |
+| `surface_defaults` / `surface` | Optional client-visible capability metadata for wrappers and model catalogs |
 | `proxy` | Optional default upstream egress proxy |
 | `hooks` | Optional usage / exchange export hooks |
 | `debug_trace` | Optional local debug trace |

@@ -14,12 +14,30 @@ upstreams:
     format: openai-responses
     credential_env: OPENAI_API_KEY
     auth_policy: force_server
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
 
   MINIMAX_OPENAI:
     api_root: https://api.minimaxi.com/v1
     format: openai-completion
     credential_env: MINIMAX_API_KEY
     auth_policy: force_server
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
 
 model_aliases:
   gpt-5-4: OPENAI:gpt-5.4

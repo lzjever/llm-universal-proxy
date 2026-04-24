@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use serde_json::Value;
@@ -324,6 +324,237 @@ pub(crate) fn openai_custom_tool_bridge_description_for_target(
 
 pub(crate) const OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX: &str = "__llmup_custom__";
 pub(crate) const REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD: &str = "_llmup_tool_bridge_context";
+const TOOL_BRIDGE_CONTEXT_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolBridgeSourceKind {
+    CustomText,
+    CustomGrammar,
+}
+
+impl ToolBridgeSourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CustomText => "custom_text",
+            Self::CustomGrammar => "custom_grammar",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "custom_text" => Some(Self::CustomText),
+            "custom_grammar" => Some(Self::CustomGrammar),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolBridgeTransportKind {
+    FunctionObjectWrapper,
+}
+
+impl ToolBridgeTransportKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FunctionObjectWrapper => "function_object_wrapper",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "function_object_wrapper" => Some(Self::FunctionObjectWrapper),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolBridgeWrapperField {
+    Input,
+}
+
+impl ToolBridgeWrapperField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "input" => Some(Self::Input),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolBridgeCanonicalShape {
+    SingleRequiredString,
+}
+
+impl ToolBridgeCanonicalShape {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleRequiredString => "single_required_string",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "single_required_string" => Some(Self::SingleRequiredString),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolBridgeContextEntry {
+    pub(crate) stable_name: String,
+    pub(crate) source_kind: ToolBridgeSourceKind,
+    pub(crate) transport_kind: ToolBridgeTransportKind,
+    pub(crate) wrapper_field: ToolBridgeWrapperField,
+    pub(crate) expected_canonical_shape: ToolBridgeCanonicalShape,
+}
+
+impl ToolBridgeContextEntry {
+    fn from_custom(custom: &NormalizedOpenAiFamilyCustomTool) -> Self {
+        Self {
+            stable_name: custom.name.clone(),
+            source_kind: request_scoped_custom_bridge_source_kind(custom),
+            transport_kind: ToolBridgeTransportKind::FunctionObjectWrapper,
+            wrapper_field: ToolBridgeWrapperField::Input,
+            expected_canonical_shape: ToolBridgeCanonicalShape::SingleRequiredString,
+        }
+    }
+
+    fn from_value(stable_name: &str, value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let declared_stable_name = object.get("stable_name").and_then(Value::as_str)?;
+        if declared_stable_name.is_empty() || declared_stable_name != stable_name {
+            return None;
+        }
+        Some(Self {
+            stable_name: stable_name.to_string(),
+            source_kind: ToolBridgeSourceKind::from_str(
+                object.get("source_kind").and_then(Value::as_str)?,
+            )?,
+            transport_kind: ToolBridgeTransportKind::from_str(
+                object.get("transport_kind").and_then(Value::as_str)?,
+            )?,
+            wrapper_field: ToolBridgeWrapperField::from_str(
+                object.get("wrapper_field").and_then(Value::as_str)?,
+            )?,
+            expected_canonical_shape: ToolBridgeCanonicalShape::from_str(
+                object
+                    .get("expected_canonical_shape")
+                    .and_then(Value::as_str)?,
+            )?,
+        })
+    }
+
+    fn to_value(&self) -> Value {
+        serde_json::json!({
+            "stable_name": self.stable_name,
+            "source_kind": self.source_kind.as_str(),
+            "transport_kind": self.transport_kind.as_str(),
+            "wrapper_field": self.wrapper_field.as_str(),
+            "expected_canonical_shape": self.expected_canonical_shape.as_str()
+        })
+    }
+
+    fn expects_canonical_input_wrapper(&self) -> bool {
+        self.transport_kind == ToolBridgeTransportKind::FunctionObjectWrapper
+            && self.wrapper_field == ToolBridgeWrapperField::Input
+            && self.expected_canonical_shape == ToolBridgeCanonicalShape::SingleRequiredString
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolBridgeContext {
+    pub(crate) version: u64,
+    pub(crate) compatibility_mode: String,
+    pub(crate) entries: BTreeMap<String, ToolBridgeContextEntry>,
+}
+
+impl ToolBridgeContext {
+    fn new(compatibility_mode: &str) -> Self {
+        Self {
+            version: TOOL_BRIDGE_CONTEXT_VERSION,
+            compatibility_mode: compatibility_mode.to_string(),
+            entries: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn from_value(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let version = object.get("version").and_then(Value::as_u64)?;
+        if version != TOOL_BRIDGE_CONTEXT_VERSION {
+            return None;
+        }
+        let compatibility_mode = object.get("compatibility_mode").and_then(Value::as_str)?;
+        if !matches!(compatibility_mode, "strict" | "balanced" | "max_compat") {
+            return None;
+        }
+        let entries_object = object.get("entries").and_then(Value::as_object)?;
+        let mut entries = BTreeMap::new();
+        for (stable_name, entry_value) in entries_object {
+            let entry = ToolBridgeContextEntry::from_value(stable_name, entry_value)?;
+            entries.insert(stable_name.clone(), entry);
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        Some(Self {
+            version,
+            compatibility_mode: compatibility_mode.to_string(),
+            entries,
+        })
+    }
+
+    pub(crate) fn to_value(&self) -> Value {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(stable_name, entry)| (stable_name.clone(), entry.to_value()))
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::json!({
+            "version": self.version,
+            "compatibility_mode": self.compatibility_mode,
+            "entries": entries
+        })
+    }
+
+    pub(crate) fn set_compatibility_mode(&mut self, compatibility_mode: &str) {
+        self.compatibility_mode = compatibility_mode.to_string();
+    }
+
+    pub(crate) fn expects_canonical_input_wrapper(&self, name: &str) -> bool {
+        self.entries
+            .get(name)
+            .is_some_and(ToolBridgeContextEntry::expects_canonical_input_wrapper)
+    }
+}
+
+pub(crate) fn request_scoped_tool_bridge_context_from_body(
+    body: &Value,
+) -> Option<ToolBridgeContext> {
+    body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD)
+        .and_then(ToolBridgeContext::from_value)
+}
+
+pub(crate) fn insert_request_scoped_tool_bridge_context(
+    body: &mut Value,
+    bridge_context: &ToolBridgeContext,
+) {
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD.to_string(),
+            bridge_context.to_value(),
+        );
+    }
+}
 
 pub(crate) fn openai_responses_custom_tool_bridge_arguments(input: &str) -> Result<String, String> {
     serde_json::to_string(&serde_json::json!({ "input": input }))
@@ -361,43 +592,31 @@ pub(crate) fn openai_responses_custom_tool_bridge_prefix_is_reserved(name: &str)
 
 fn request_scoped_custom_bridge_source_kind(
     custom: &NormalizedOpenAiFamilyCustomTool,
-) -> &'static str {
+) -> ToolBridgeSourceKind {
     if openai_custom_tool_format_is_plain_text(custom.format.as_ref()) {
-        "custom_text"
+        ToolBridgeSourceKind::CustomText
     } else {
-        "custom_grammar"
+        ToolBridgeSourceKind::CustomGrammar
     }
-}
-
-fn request_scoped_custom_bridge_entry(custom: &NormalizedOpenAiFamilyCustomTool) -> Value {
-    serde_json::json!({
-        "source_kind": request_scoped_custom_bridge_source_kind(custom),
-        "transport_kind": "function_object_wrapper",
-        "wrapper_field": "input",
-        "expected_canonical_shape": "single_required_string"
-    })
 }
 
 pub(crate) fn request_scoped_openai_custom_bridge_context(
     tools: &[NormalizedOpenAiFamilyToolDef],
-) -> Option<Value> {
-    let mut entries = serde_json::Map::new();
+) -> Option<ToolBridgeContext> {
+    let mut bridge_context = ToolBridgeContext::new("balanced");
     for tool in tools {
         let NormalizedOpenAiFamilyToolDef::Custom(custom) = tool else {
             continue;
         };
-        entries.insert(
+        bridge_context.entries.insert(
             custom.name.clone(),
-            request_scoped_custom_bridge_entry(custom),
+            ToolBridgeContextEntry::from_custom(custom),
         );
     }
-    if entries.is_empty() {
+    if bridge_context.entries.is_empty() {
         None
     } else {
-        Some(serde_json::json!({
-            "compatibility_mode": "balanced",
-            "entries": entries
-        }))
+        Some(bridge_context)
     }
 }
 
@@ -707,7 +926,7 @@ fn openai_function_uses_canonical_custom_bridge_wrapper(
 
 pub(crate) fn normalized_openai_tool_definitions_from_request_with_request_scoped_custom_bridge(
     body: &Value,
-    bridge_context: Option<&Value>,
+    bridge_context: Option<&ToolBridgeContext>,
 ) -> Result<Vec<NormalizedOpenAiFamilyToolDef>, String> {
     body.get("tools")
         .and_then(Value::as_array)
@@ -1168,37 +1387,16 @@ pub(crate) fn openai_tool_call_to_responses_item(tool_call: &Value) -> Value {
     item
 }
 
-fn request_scoped_custom_bridge_entry_for_name<'a>(
-    bridge_context: &'a Value,
-    name: &str,
-) -> Option<&'a serde_json::Map<String, Value>> {
-    bridge_context
-        .get("entries")
-        .and_then(Value::as_object)?
-        .get(name)?
-        .as_object()
-}
-
 pub(crate) fn request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
-    bridge_context: Option<&Value>,
+    bridge_context: Option<&ToolBridgeContext>,
     name: &str,
 ) -> bool {
-    let Some(entry) =
-        bridge_context.and_then(|ctx| request_scoped_custom_bridge_entry_for_name(ctx, name))
-    else {
-        return false;
-    };
-    entry.get("transport_kind").and_then(Value::as_str) == Some("function_object_wrapper")
-        && entry.get("wrapper_field").and_then(Value::as_str) == Some("input")
-        && entry
-            .get("expected_canonical_shape")
-            .and_then(Value::as_str)
-            == Some("single_required_string")
+    bridge_context.is_some_and(|ctx| ctx.expects_canonical_input_wrapper(name))
 }
 
 pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge_with_context(
     tool_call: &Value,
-    bridge_context: Option<&Value>,
+    bridge_context: Option<&ToolBridgeContext>,
 ) -> Result<Value, String> {
     let call = match normalized_openai_tool_call(tool_call) {
         Ok(Some(call)) => call,

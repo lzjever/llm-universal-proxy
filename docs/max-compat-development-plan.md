@@ -5,7 +5,7 @@ Last updated: 2026-04-23
 
 ## Goal
 
-Move translated agent-facing paths toward `max_compat` while enforcing two hard rules:
+Keep translated agent-facing paths on `max_compat` while enforcing two hard rules:
 
 - the proxy must not rewrite the visible tool name supplied by the client
 - the proxy must not reconstruct provider-owned lifecycle state
@@ -15,152 +15,108 @@ Locked contract:
 - The proxy must not rewrite the visible tool name supplied by the client.
 - `__llmup_custom__*` is an internal transport artifact, not a public contract.
 - `apply_patch` remains a public freeform tool on client-visible surfaces.
+- Real-client public editing contracts preserve each client's public tool name: Codex `apply_patch`, Claude Code `Edit`, and Gemini `replace`; the proxy does not rewrite them to a shared proxy name.
 
 Phase 0 and Phase 1 together define the intended translated-path bridge: preserve the stable visible tool name on live requests and carry bridge provenance in request-scoped translation context.
 
-## Phase 0: Reserved Prefix Enforcement
+## Current Baseline
 
-Goal:
+- `compatibility_mode` exists in config and defaults omitted configs to `max_compat`.
+- `surface_defaults`, alias `surface`, and `effective_model_surface()` exist as the shared model-surface truth chain.
+- model catalog endpoints expose effective `llmup.surface` metadata for wrappers and clients.
+- wrappers consume live/effective surface metadata and fail fast when critical agent-client fields are missing.
+- supported live custom/freeform bridge paths preserve visible tool names such as `apply_patch` and keep `__llmup_custom__*` internal.
+- Responses lifecycle resources remain native-only; the proxy does not invent provider-owned response/session state.
 
-- enforce that reserved names such as `__llmup_custom__apply_patch` are rejected or cleared before they reach any client-visible or model-visible surface
+## Delivered Phases
 
-Work items:
+### Phase 0: Reserved Prefix Enforcement
 
-- audit every live path where Responses custom tools can be renamed to `__llmup_custom__*`
-- split legacy stateless bridge helpers from live request translation helpers
-- make live `Responses -> OpenAI Completions` translation preserve the visible tool name
-- add regression tests that fail whenever translated Codex + `minimax-openai` surfaces the reserved prefix publicly
+Status: delivered for supported live request/response paths.
 
-Exit criteria:
+Current contract:
 
-- translated live upstream request no longer contains reserved-prefix tool names in public `tools` or `tool_choice`
-- asking the model what tools are available no longer surfaces the reserved prefix
+- reserved names such as `__llmup_custom__apply_patch` must not appear on public client-visible or model-visible surfaces
+- translated live requests preserve stable tool names in public `tools` and `tool_choice`
+- real-client smoke coverage asserts the per-client public editing tool names: Codex `apply_patch`, Claude Code `Edit`, and Gemini `replace`, while omitting reserved prefixes
 
-## Phase 1: Request-Scoped Tool Bridge Context
+### Phase 1: Request-Scoped Tool Bridge Context
 
-Goal:
+Status: delivered for the supported custom/freeform bridge paths.
 
-- preserve stable tool identity while still allowing reversible bridge decoding on function-only protocol hops
+Current contract:
 
-Work items:
-
-- extend request translation output to carry `ToolBridgeContext`
-- thread that context through non-stream response translation
-- thread that context through streaming translation
-- define conflict rules for same-name function and custom/freeform tools
-
-Exit criteria:
-
-- structured function tool calls on translated paths decode back to native `custom_tool_call` or equivalent without visible tool renaming
+- live translation carries bridge provenance in request-scoped context instead of recovering semantics from visible reserved prefixes
+- structured function-only protocol hops can still decode back to native custom/freeform semantics
 - ambiguous same-name function/custom definitions reject clearly
 
-## Phase 2: Compatibility Mode Plumbing
+### Phase 2: Compatibility Mode Plumbing
 
-Goal:
+Status: delivered.
 
-- make `strict`, `balanced`, and `max_compat` explicit runtime behavior rather than implied translator behavior
+Current contract:
 
-Work items:
+- `strict`, `balanced`, and `max_compat` are explicit policy modes
+- the same request can be evaluated differently by mode
+- visible tool identity is enforced in all modes
+- `max_compat` may warn and bridge portable semantics, but it still rejects provider-state reconstruction and unsafe non-portable shapes
 
-- add `compatibility_mode` to runtime config
-- extend `RequestTranslationPolicy`
-- make `assessment` mode-aware
-- document allow/warn/reject behavior per mode
+### Phase 3: Unified Capability Surface
 
-Exit criteria:
+Status: delivered.
 
-- the same request can be evaluated differently under `strict` and `max_compat`
-- visible tool identity rule is enforced in all modes
+Current contract:
 
-## Phase 3: Unified Capability Surface
+- upstream `surface_defaults` and alias `surface` merge into one effective model surface
+- `/openai/v1/models`, `/anthropic/v1/models`, and `/google/v1beta/models` expose `llmup.surface`
+- `apply_patch_transport` remains an internal transport description; the public Codex catalog still advertises `apply_patch` as `freeform`
 
-Goal:
+### Phase 4: Wrapper Alignment
 
-- replace wrapper-only client metadata with a shared runtime truth source
+Status: delivered for the current Codex, Claude Code, and Gemini wrappers.
 
-Work items:
+Current contract:
 
-- add `surface_defaults` to upstream config
-- add `surface` to alias config
-- implement `effective_model_surface()`
-- expose `llmup.surface` from model catalog endpoints
+- wrapper-generated metadata follows the effective surface truth chain
+- live model profile lookup fails fast if required `llmup.surface` fields are absent
+- wrapper launch mechanics may remain client-specific, but model capability truth should not fork into private brand-specific defaults
 
-Exit criteria:
+### Phase 5: Documentation Rollout
 
-- wrappers and `/models` consume the same effective surface data
-- Codex/Gemini metadata is no longer defined only in Python-side parsing logic
+Status: in progress.
 
-## Phase 4: Wrapper Alignment
+Current contract:
 
-Goal:
+- core docs must describe compatibility as portable core plus native-extension boundaries
+- README quickstart examples must include enough surface metadata for wrapper live-profile flows
+- docs must not reintroduce unbounded claims such as "drop-in replacement" or "any client to any backend" without same-paragraph portability, native-extension, warning, or reject boundaries
 
-- remove split-brain between live proxy behavior and wrapper-generated client metadata
+### Phase 6: Test Expansion
 
-Work items:
+Status: partially delivered.
 
-- update `interactive_cli.py` and `real_cli_matrix.py` to consume unified surface data
-- keep Codex catalog generation aligned with runtime surface
-- keep Gemini settings generation aligned with runtime surface
+Current real-client matrix coverage is intentionally narrow: the public tool enumeration contract proves each client's stable public editing tool name is surfaced without proxy rewriting, and workspace-edit execution proves the edit path still works on supported lanes. It is not yet a full behavioral matrix for arbitrary structured tool use.
 
-Exit criteria:
+Delivered coverage:
 
-- wrapper-generated metadata matches live proxy model metadata
-- wrapper no longer needs private brand-specific truth beyond client launch mechanics
+- translator and proxy tests for visible tool identity preservation
+- compatibility-mode policy tests
+- model-surface merge and catalog projection tests
+- wrapper parsing/runtime-config tests for `surface_defaults` and alias `surface`
+- live surface fail-fast tests for critical `llmup.surface.tools` fields
+- CLI smoke verifier coverage that fails if public output omits the current client's public editing tool name, mentions another client's public editing tool name, or surfaces `__llmup_custom__*`
 
-## Phase 5: Documentation Rollout
+## Remaining Roadmap
 
-Goal:
+1. Broaden structured-tool behavior coverage beyond the current public tool enumeration and supported workspace-edit lanes.
+2. Keep protocol baseline docs aligned with strict vs `max_compat` behavior for tools, state continuity, and streaming.
+3. Add more translated streaming regressions where bridge context, terminal events, and tool-call finalization interact.
+4. Continue tightening docs/example contract tests when wrapper live-profile requirements evolve.
+5. Preserve the fail-warn posture: translated paths should warn or reject non-portable native extensions rather than silently approximating them.
 
-- make the new compatibility contract explicit across project docs
+## Guardrails
 
-Work items:
-
-- update `README.md`
-- update `docs/DESIGN.md`
-- update `docs/PRD.md`
-- update `docs/CONSTITUTION.md`
-- update protocol baseline capability notes
-
-Exit criteria:
-
-- all core docs agree on portable core vs native extensions
-- all core docs agree that visible tool names are immutable
-
-## Phase 6: Test Expansion
-
-Goal:
-
-- prevent regressions in tool identity, compatibility mode behavior, and real-client compatibility
-
-Work items:
-
-- add translator tests for visible tool identity preservation
-- add streaming tests for bridge decoding with request-scoped context
-- add integration tests for translated live request shapes
-- add real-client matrix coverage for the public tool enumeration contract and workspace-edit execution on supported lanes
-- keep a runnable CLI smoke verifier that fails if public output omits `apply_patch` or surfaces `__llmup_custom__*`
-
-Exit criteria:
-
-- the prefixed bridge-name leak is covered by automated tests
-- the public tool enumeration contract asserts `apply_patch`, not just the absence of reserved prefixes
-- translated `apply_patch` remains usable on supported live paths
-
-Current real-client matrix coverage here is intentionally narrow: the public tool enumeration contract proves the stable public name is surfaced, and workspace-edit execution proves the edit path still works on supported lanes. It is not yet a full behavioral matrix for arbitrary structured tool use.
-
-## Suggested Delivery Order
-
-1. Phase 0
-2. Phase 1
-3. Phase 6 translator/integration coverage for the new bridge context
-4. Phase 2
-5. Phase 3
-6. Phase 4
-7. Phase 5 final doc sweep
-
-## Suggested Milestones
-
-- Milestone A: bug fixed, live tool names stable again
-- Milestone B: request-scoped bridge context landed for non-stream and stream
-- Milestone C: compatibility mode is explicit and testable
-- Milestone D: unified capability surface powers wrappers and model catalogs
+- Do not make client brand names a core data-plane policy axis.
+- Do not expose reserved bridge prefixes as public tool names.
+- Do not reconstruct provider-owned state for Responses lifecycle, Anthropic pause-turn state, Gemini caches, or provider-managed compaction.
+- Do not describe translated paths as full-fidelity provider equivalence; describe portable behavior and native-extension boundaries explicitly.

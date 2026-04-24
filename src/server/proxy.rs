@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -41,6 +42,117 @@ use super::responses_resources::{
 use super::state::{AppState, RuntimeNamespaceState, DEFAULT_NAMESPACE};
 
 const REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD: &str = "_llmup_tool_bridge_context";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedToolBridgeContextEntry {
+    stable_name: String,
+    source_kind: String,
+    transport_kind: String,
+    wrapper_field: String,
+    expected_canonical_shape: String,
+}
+
+impl TrustedToolBridgeContextEntry {
+    fn from_value(stable_name: &str, value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let declared_stable_name = object.get("stable_name").and_then(Value::as_str)?;
+        if declared_stable_name.is_empty() || declared_stable_name != stable_name {
+            return None;
+        }
+        let source_kind = object.get("source_kind")?.as_str()?;
+        let transport_kind = object.get("transport_kind")?.as_str()?;
+        let wrapper_field = object.get("wrapper_field")?.as_str()?;
+        let expected_canonical_shape = object.get("expected_canonical_shape")?.as_str()?;
+        if !matches!(source_kind, "custom_text" | "custom_grammar")
+            || transport_kind != "function_object_wrapper"
+            || wrapper_field != "input"
+            || expected_canonical_shape != "single_required_string"
+        {
+            return None;
+        }
+        Some(Self {
+            stable_name: stable_name.to_string(),
+            source_kind: source_kind.to_string(),
+            transport_kind: transport_kind.to_string(),
+            wrapper_field: wrapper_field.to_string(),
+            expected_canonical_shape: expected_canonical_shape.to_string(),
+        })
+    }
+
+    fn to_value(&self) -> Value {
+        serde_json::json!({
+            "stable_name": self.stable_name,
+            "source_kind": self.source_kind,
+            "transport_kind": self.transport_kind,
+            "wrapper_field": self.wrapper_field,
+            "expected_canonical_shape": self.expected_canonical_shape
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedToolBridgeContext {
+    version: u64,
+    compatibility_mode: String,
+    entries: BTreeMap<String, TrustedToolBridgeContextEntry>,
+}
+
+impl TrustedToolBridgeContext {
+    fn from_value(value: Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let version = object.get("version").and_then(Value::as_u64)?;
+        if version != 1 {
+            return None;
+        }
+        let compatibility_mode = object.get("compatibility_mode").and_then(Value::as_str)?;
+        if !matches!(compatibility_mode, "strict" | "balanced" | "max_compat") {
+            return None;
+        }
+        let entries_object = object.get("entries")?.as_object()?;
+        let mut entries = BTreeMap::new();
+        for (stable_name, entry_value) in entries_object {
+            let entry = TrustedToolBridgeContextEntry::from_value(stable_name, entry_value)?;
+            entries.insert(stable_name.clone(), entry);
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        Some(Self {
+            version,
+            compatibility_mode: compatibility_mode.to_string(),
+            entries,
+        })
+    }
+
+    fn take_from_body(body: &mut Value) -> Option<Self> {
+        let value = body
+            .as_object_mut()?
+            .remove(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD)?;
+        Self::from_value(value)
+    }
+
+    fn to_value(&self) -> Value {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(stable_name, entry)| (stable_name.clone(), entry.to_value()))
+            .collect::<serde_json::Map<String, Value>>();
+        serde_json::json!({
+            "version": self.version,
+            "compatibility_mode": self.compatibility_mode,
+            "entries": entries
+        })
+    }
+
+    fn insert_into(&self, body: &mut Value) {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD.to_string(),
+                self.to_value(),
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RequestBoundaryDecision {
@@ -462,12 +574,8 @@ pub(super) async fn handle_request_core(
         }
     }
 
-    let request_scoped_tool_bridge_context =
-        body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
-    let mut upstream_request_body = body.clone();
-    if let Some(obj) = upstream_request_body.as_object_mut() {
-        obj.remove(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD);
-    }
+    let request_scoped_tool_bridge_context = TrustedToolBridgeContext::take_from_body(&mut body);
+    let upstream_request_body = body.clone();
 
     debug!(
         "Translated body for upstream: {}",
@@ -589,7 +697,9 @@ pub(super) async fn handle_request_core(
             let translated =
                 TranslateSseStream::new(upstream_stream, upstream_format, client_format)
                     .with_request_scoped_tool_bridge_context(
-                        request_scoped_tool_bridge_context.clone(),
+                        request_scoped_tool_bridge_context
+                            .as_ref()
+                            .map(TrustedToolBridgeContext::to_value),
                     );
             Box::pin(translated.map(|r| r.map_err(std::io::Error::other)))
         } else {
@@ -676,14 +786,10 @@ pub(super) async fn handle_request_core(
         }
         return response;
     }
-    let translation_body = if let Some(bridge_context) = request_scoped_tool_bridge_context {
+    let translation_body = if let Some(bridge_context) = request_scoped_tool_bridge_context.as_ref()
+    {
         let mut translation_body = upstream_body.clone();
-        if let Some(obj) = translation_body.as_object_mut() {
-            obj.insert(
-                REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD.to_string(),
-                bridge_context,
-            );
-        }
+        bridge_context.insert_into(&mut translation_body);
         translation_body
     } else {
         upstream_body.clone()

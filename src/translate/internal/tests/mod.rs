@@ -1,6 +1,29 @@
 use super::*;
 use serde_json::json;
 
+fn typed_tool_bridge_context(
+    stable_name: &str,
+    source_kind: &str,
+    compatibility_mode: &str,
+) -> serde_json::Value {
+    let mut entries = serde_json::Map::new();
+    entries.insert(
+        stable_name.to_string(),
+        json!({
+            "stable_name": stable_name,
+            "source_kind": source_kind,
+            "transport_kind": "function_object_wrapper",
+            "wrapper_field": "input",
+            "expected_canonical_shape": "single_required_string"
+        }),
+    );
+    json!({
+        "version": 1,
+        "compatibility_mode": compatibility_mode,
+        "entries": entries
+    })
+}
+
 fn assess_request_translation(
     client_format: UpstreamFormat,
     upstream_format: UpstreamFormat,
@@ -874,9 +897,11 @@ fn translate_request_responses_to_openai_bridges_custom_tool_definition_choice_a
     assert_eq!(
         body["_llmup_tool_bridge_context"],
         json!({
+            "version": 1,
             "compatibility_mode": "max_compat",
             "entries": {
                 "code_exec": {
+                    "stable_name": "code_exec",
                     "source_kind": "custom_text",
                     "transport_kind": "function_object_wrapper",
                     "wrapper_field": "input",
@@ -6258,9 +6283,11 @@ fn translate_request_responses_custom_tool_to_claude_bridges_definition_choice_a
     assert_eq!(
         body["_llmup_tool_bridge_context"],
         json!({
+            "version": 1,
             "compatibility_mode": "max_compat",
             "entries": {
                 "code_exec": {
+                    "stable_name": "code_exec",
                     "source_kind": "custom_text",
                     "transport_kind": "function_object_wrapper",
                     "wrapper_field": "input",
@@ -6454,9 +6481,11 @@ eof_line: "*** End of File" LF
     assert_eq!(
         body["_llmup_tool_bridge_context"],
         json!({
+            "version": 1,
             "compatibility_mode": "max_compat",
             "entries": {
                 "apply_patch": {
+                    "stable_name": "apply_patch",
                     "source_kind": "custom_grammar",
                     "transport_kind": "function_object_wrapper",
                     "wrapper_field": "input",
@@ -6579,6 +6608,11 @@ fn translate_request_responses_string_grammar_custom_tool_to_claude_max_compat_w
         body["_llmup_tool_bridge_context"]["compatibility_mode"],
         "max_compat"
     );
+    assert_eq!(body["_llmup_tool_bridge_context"]["version"], 1);
+    assert_eq!(
+        body["_llmup_tool_bridge_context"]["entries"]["apply_patch"]["stable_name"],
+        "apply_patch"
+    );
     let tools = body["tools"].as_array().expect("anthropic tools");
     assert_eq!(tools[0]["name"], "apply_patch");
     assert_eq!(body["tool_choice"]["name"], "apply_patch");
@@ -6639,6 +6673,11 @@ fn translate_request_responses_string_grammar_custom_tool_to_openai_max_compat_w
     assert_eq!(
         body["_llmup_tool_bridge_context"]["compatibility_mode"],
         "max_compat"
+    );
+    assert_eq!(body["_llmup_tool_bridge_context"]["version"], 1);
+    assert_eq!(
+        body["_llmup_tool_bridge_context"]["entries"]["apply_patch"]["stable_name"],
+        "apply_patch"
     );
     assert_eq!(body["tools"][0]["function"]["name"], "apply_patch");
     assert_eq!(body["tool_choice"]["function"]["name"], "apply_patch");
@@ -6884,21 +6923,134 @@ fn translate_request_responses_string_grammar_custom_tool_to_gemini_max_compat_b
 }
 
 #[test]
+fn translate_request_openai_to_gemini_does_not_propagate_incomplete_tool_bridge_contexts() {
+    let entry = json!({
+        "stable_name": "apply_patch",
+        "source_kind": "custom_grammar",
+        "transport_kind": "function_object_wrapper",
+        "wrapper_field": "input",
+        "expected_canonical_shape": "single_required_string"
+    });
+    let cases = [
+        (
+            "legacy missing version",
+            json!({
+                "compatibility_mode": "max_compat",
+                "entries": { "apply_patch": entry.clone() }
+            }),
+        ),
+        (
+            "legacy missing stable_name",
+            json!({
+                "version": 1,
+                "compatibility_mode": "max_compat",
+                "entries": {
+                    "apply_patch": {
+                        "source_kind": "custom_grammar",
+                        "transport_kind": "function_object_wrapper",
+                        "wrapper_field": "input",
+                        "expected_canonical_shape": "single_required_string"
+                    }
+                }
+            }),
+        ),
+        (
+            "stable_name mismatch",
+            json!({
+                "version": 1,
+                "compatibility_mode": "max_compat",
+                "entries": {
+                    "apply_patch": {
+                        "stable_name": "__llmup_custom__apply_patch",
+                        "source_kind": "custom_grammar",
+                        "transport_kind": "function_object_wrapper",
+                        "wrapper_field": "input",
+                        "expected_canonical_shape": "single_required_string"
+                    }
+                }
+            }),
+        ),
+        (
+            "future version",
+            json!({
+                "version": 2,
+                "compatibility_mode": "max_compat",
+                "entries": { "apply_patch": entry }
+            }),
+        ),
+    ];
+
+    for (label, bridge_context) in cases {
+        let mut body = json!({
+            "model": "gpt-4o",
+            "_llmup_tool_bridge_context": bridge_context,
+            "messages": [{ "role": "user", "content": "Create hello.txt" }]
+        });
+
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            "gemini-2.5-flash",
+            &mut body,
+            false,
+        )
+        .unwrap_or_else(|err| panic!("{label}: translation should not fail: {err}"));
+
+        assert!(
+            body.get("_llmup_tool_bridge_context").is_none(),
+            "{label}: illegal bridge context should not propagate, body = {body:?}"
+        );
+    }
+}
+
+#[test]
+fn translate_request_openai_to_gemini_preserves_valid_typed_tool_bridge_context() {
+    let bridge_context = typed_tool_bridge_context("apply_patch", "custom_grammar", "max_compat");
+    let mut body = json!({
+        "model": "gpt-4o",
+        "_llmup_tool_bridge_context": bridge_context.clone(),
+        "messages": [
+            { "role": "user", "content": "Create hello.txt" },
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_apply_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": serde_json::to_string(&json!({ "input": "*** Begin Patch" })).unwrap()
+                    }
+                }]
+            }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Google,
+        "gemini-2.5-flash",
+        &mut body,
+        false,
+    )
+    .expect("valid typed bridge context should translate to Gemini");
+
+    assert_eq!(body["_llmup_tool_bridge_context"], bridge_context);
+    assert_eq!(
+        body["contents"][1]["parts"][0]["functionCall"]["name"],
+        "apply_patch"
+    );
+}
+
+#[test]
 fn max_compat_structural_repair_pass_canonicalizes_request_scoped_custom_bridge_for_gemini_transport(
 ) {
     let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
     let mut body = json!({
-        "_llmup_tool_bridge_context": {
-            "compatibility_mode": "max_compat",
-            "entries": {
-                "apply_patch": {
-                    "source_kind": "custom_grammar",
-                    "transport_kind": "function_object_wrapper",
-                    "wrapper_field": "input",
-                    "expected_canonical_shape": "single_required_string"
-                }
-            }
-        },
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "apply_patch",
+            "custom_grammar",
+            "max_compat"
+        ),
         "tools": [{
             "type": "custom",
             "custom": {
@@ -6959,17 +7111,11 @@ fn translate_request_claude_request_scoped_custom_tool_history_to_responses_rest
 {
     let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let mut body = json!({
-        "_llmup_tool_bridge_context": {
-            "compatibility_mode": "balanced",
-            "entries": {
-                "code_exec": {
-                    "source_kind": "custom_text",
-                    "transport_kind": "function_object_wrapper",
-                    "wrapper_field": "input",
-                    "expected_canonical_shape": "single_required_string"
-                }
-            }
-        },
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "code_exec",
+            "custom_text",
+            "balanced"
+        ),
         "model": "gpt-5",
         "tools": [{
             "name": "code_exec",
@@ -7057,17 +7203,11 @@ fn translate_request_claude_request_scoped_custom_tool_history_to_responses_rest
 #[test]
 fn translate_request_claude_request_scoped_noncanonical_custom_tool_history_falls_back_open() {
     let mut body = json!({
-        "_llmup_tool_bridge_context": {
-            "compatibility_mode": "balanced",
-            "entries": {
-                "code_exec": {
-                    "source_kind": "custom_text",
-                    "transport_kind": "function_object_wrapper",
-                    "wrapper_field": "input",
-                    "expected_canonical_shape": "single_required_string"
-                }
-            }
-        },
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "code_exec",
+            "custom_text",
+            "balanced"
+        ),
         "model": "gpt-5",
         "messages": [
             {
@@ -7168,20 +7308,24 @@ fn responses_custom_tool_bridge_round_trip_preserves_trusted_non_replayable_mark
         .expect("bridge should succeed")
         .expect("tool call");
 
+    let bridge_context = super::tools::ToolBridgeContext::from_value(&json!({
+        "version": 1,
+        "compatibility_mode": "balanced",
+        "entries": {
+            "apply_patch": {
+                "stable_name": "apply_patch",
+                "source_kind": "custom_grammar",
+                "transport_kind": "function_object_wrapper",
+                "wrapper_field": "input",
+                "expected_canonical_shape": "single_required_string"
+            }
+        }
+    }))
+    .expect("typed bridge context");
     let round_tripped =
         super::tools::openai_tool_call_to_responses_item_decoding_custom_bridge_with_context(
             &tool_call,
-            Some(&json!({
-                "compatibility_mode": "balanced",
-                "entries": {
-                    "apply_patch": {
-                        "source_kind": "custom_grammar",
-                        "transport_kind": "function_object_wrapper",
-                        "wrapper_field": "input",
-                        "expected_canonical_shape": "single_required_string"
-                    }
-                }
-            })),
+            Some(&bridge_context),
         )
         .expect("decode bridge back to custom tool");
 
@@ -10640,17 +10784,11 @@ fn translate_response_gemini_to_responses_decodes_request_scoped_custom_bridge_w
 {
     let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
     let body = json!({
-        "_llmup_tool_bridge_context": {
-            "compatibility_mode": "max_compat",
-            "entries": {
-                "apply_patch": {
-                    "source_kind": "custom_grammar",
-                    "transport_kind": "function_object_wrapper",
-                    "wrapper_field": "input",
-                    "expected_canonical_shape": "single_required_string"
-                }
-            }
-        },
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "apply_patch",
+            "custom_grammar",
+            "max_compat"
+        ),
         "responseId": "resp_gemini_custom",
         "modelVersion": "gemini-2.5-flash",
         "candidates": [{
@@ -10692,17 +10830,11 @@ fn translate_response_openai_to_responses_decodes_request_scoped_function_call_t
 ) {
     let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let body = json!({
-        "_llmup_tool_bridge_context": {
-            "compatibility_mode": "balanced",
-            "entries": {
-                "code_exec": {
-                    "source_kind": "custom_text",
-                    "transport_kind": "function_object_wrapper",
-                    "wrapper_field": "input",
-                    "expected_canonical_shape": "single_required_string"
-                }
-            }
-        },
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "code_exec",
+            "custom_text",
+            "balanced"
+        ),
         "id": "chatcmpl_tools",
         "object": "chat.completion",
         "choices": [{
@@ -10749,17 +10881,11 @@ fn translate_response_openai_to_responses_decodes_request_scoped_custom_bridge_w
 {
     let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
     let body = json!({
-        "_llmup_tool_bridge_context": {
-            "compatibility_mode": "balanced",
-            "entries": {
-                "apply_patch": {
-                    "source_kind": "custom_grammar",
-                    "transport_kind": "function_object_wrapper",
-                    "wrapper_field": "input",
-                    "expected_canonical_shape": "single_required_string"
-                }
-            }
-        },
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "apply_patch",
+            "custom_grammar",
+            "balanced"
+        ),
         "id": "chatcmpl_tools",
         "object": "chat.completion",
         "choices": [{
@@ -10806,17 +10932,11 @@ fn translate_response_openai_to_responses_request_scoped_custom_bridge_falls_bac
 ) {
     let raw_arguments = serde_json::to_string(&json!({ "input": 5, "extra": true })).expect("json");
     let body = json!({
-        "_llmup_tool_bridge_context": {
-            "compatibility_mode": "balanced",
-            "entries": {
-                "apply_patch": {
-                    "source_kind": "custom_grammar",
-                    "transport_kind": "function_object_wrapper",
-                    "wrapper_field": "input",
-                    "expected_canonical_shape": "single_required_string"
-                }
-            }
-        },
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "apply_patch",
+            "custom_grammar",
+            "balanced"
+        ),
         "id": "chatcmpl_tools",
         "object": "chat.completion",
         "choices": [{
@@ -10910,7 +11030,81 @@ fn translate_response_openai_to_responses_request_scoped_bridge_falls_back_when_
 
     for raw_arguments in bad_arguments {
         let body = json!({
-            "_llmup_tool_bridge_context": {
+            "_llmup_tool_bridge_context": typed_tool_bridge_context(
+                "code_exec",
+                "custom_text",
+                "balanced"
+            ),
+            "id": "chatcmpl_tools",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_custom",
+                        "type": "function",
+                        "function": {
+                            "name": "code_exec",
+                            "arguments": raw_arguments.clone()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let out = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .expect("noncanonical bridged args should fall back to function_call");
+
+        let output = out["output"].as_array().expect("responses output");
+        assert_eq!(
+            output[0],
+            json!({
+                "type": "function_call",
+                "call_id": "call_custom",
+                "name": "code_exec",
+                "arguments": raw_arguments
+            })
+        );
+    }
+}
+
+#[test]
+fn translate_response_openai_to_responses_fails_closed_for_incomplete_or_invalid_tool_bridge_contexts(
+) {
+    let exact_input = "print('hi')";
+    let raw_arguments = serde_json::to_string(&json!({ "input": exact_input })).expect("json");
+    let entry = json!({
+        "stable_name": "code_exec",
+        "source_kind": "custom_text",
+        "transport_kind": "function_object_wrapper",
+        "wrapper_field": "input",
+        "expected_canonical_shape": "single_required_string"
+    });
+    let cases = [
+        (
+            "missing version",
+            json!({
+                "compatibility_mode": "balanced",
+                "entries": { "code_exec": entry.clone() }
+            }),
+        ),
+        (
+            "missing compatibility_mode",
+            json!({
+                "version": 1,
+                "entries": { "code_exec": entry.clone() }
+            }),
+        ),
+        (
+            "missing stable_name",
+            json!({
+                "version": 1,
                 "compatibility_mode": "balanced",
                 "entries": {
                     "code_exec": {
@@ -10920,7 +11114,45 @@ fn translate_response_openai_to_responses_request_scoped_bridge_falls_back_when_
                         "expected_canonical_shape": "single_required_string"
                     }
                 }
-            },
+            }),
+        ),
+        (
+            "stable_name mismatch",
+            json!({
+                "version": 1,
+                "compatibility_mode": "balanced",
+                "entries": {
+                    "code_exec": {
+                        "stable_name": "other",
+                        "source_kind": "custom_text",
+                        "transport_kind": "function_object_wrapper",
+                        "wrapper_field": "input",
+                        "expected_canonical_shape": "single_required_string"
+                    }
+                }
+            }),
+        ),
+        (
+            "non-integer version",
+            json!({
+                "version": "1",
+                "compatibility_mode": "balanced",
+                "entries": { "code_exec": entry.clone() }
+            }),
+        ),
+        (
+            "future version",
+            json!({
+                "version": 2,
+                "compatibility_mode": "balanced",
+                "entries": { "code_exec": entry }
+            }),
+        ),
+    ];
+
+    for (label, bridge_context) in cases {
+        let body = json!({
+            "_llmup_tool_bridge_context": bridge_context,
             "id": "chatcmpl_tools",
             "object": "chat.completion",
             "choices": [{
@@ -10945,8 +11177,7 @@ fn translate_response_openai_to_responses_request_scoped_bridge_falls_back_when_
             UpstreamFormat::OpenAiResponses,
             &body,
         )
-        .expect("noncanonical bridged args should fall back to function_call");
-
+        .unwrap_or_else(|err| panic!("{label}: translation should fall back open: {err}"));
         let output = out["output"].as_array().expect("responses output");
         assert_eq!(
             output[0],
@@ -10954,8 +11185,9 @@ fn translate_response_openai_to_responses_request_scoped_bridge_falls_back_when_
                 "type": "function_call",
                 "call_id": "call_custom",
                 "name": "code_exec",
-                "arguments": raw_arguments
-            })
+                "arguments": raw_arguments.clone()
+            }),
+            "case = {label}"
         );
     }
 }
@@ -11991,17 +12223,11 @@ fn translate_response_claude_thinking_signature_provenance_maps_to_responses_car
 fn translate_response_claude_request_scoped_tool_use_restores_responses_custom_tool_call() {
     let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let body = json!({
-        "_llmup_tool_bridge_context": {
-            "compatibility_mode": "balanced",
-            "entries": {
-                "code_exec": {
-                    "source_kind": "custom_text",
-                    "transport_kind": "function_object_wrapper",
-                    "wrapper_field": "input",
-                    "expected_canonical_shape": "single_required_string"
-                }
-            }
-        },
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "code_exec",
+            "custom_text",
+            "balanced"
+        ),
         "id": "msg_custom_tool",
         "content": [{
             "type": "tool_use",

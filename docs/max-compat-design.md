@@ -1,17 +1,17 @@
 # Maximum Compatibility Design
 
 Status: active  
-Last updated: 2026-04-20
+Last updated: 2026-04-23
 
 ## Summary
 
-`llm-universal-proxy` should move toward a client-first maximum compatibility posture for translated paths, but it should stay protocol-first in the core architecture.
+`llm-universal-proxy` uses a client-first maximum compatibility posture for translated paths, while staying protocol-first in the core architecture.
 
 This means:
 
 - do not model `Codex`, `Claude`, and `Gemini` as first-class data-plane identities
 - do model a unified `capability surface` for each local model alias
-- do make `max_compat` a real runtime policy mode
+- do keep `max_compat` as an explicit runtime policy mode
 - do keep provider-owned state and provider-native lifecycle features native-only
 - do treat transport-only bridge artifacts as internal machinery, not as user-facing contract
 
@@ -20,9 +20,10 @@ Locked contract:
 - The proxy must not rewrite the visible tool name supplied by the client.
 - `__llmup_custom__*` is an internal transport artifact, not a public contract.
 - `apply_patch` remains a public freeform tool on client-visible surfaces.
+- Real-client public editing contracts preserve each client's public tool name: Codex `apply_patch`, Claude Code `Edit`, and Gemini `replace`.
 - The intended translated-path bridge preserves the stable visible tool name and carries bridge provenance in request-scoped translation context.
 
-The current system already has the right architectural seam for this work:
+The current system has the architectural seams for this work:
 
 - `src/server/proxy.rs` resolves routing and computes runtime policy
 - `src/translate/internal/assessment.rs` is the compatibility policy gate
@@ -64,9 +65,9 @@ Client brand names can still exist in wrappers, real-client test matrix labels, 
 
 ## Product Direction
 
-The product promise should be updated from "all 16 combinations work correctly" to a more precise contract:
+The product promise is bounded: protocol coverage means native passthrough for same-protocol paths and portable-core translation for mismatched paths, not full-fidelity provider equivalence.
 
-- same-protocol paths: native passthrough, as faithful as possible
+- same-protocol paths: native passthrough within proxy routing, auth, and observability boundaries
 - translated paths: `portable core` plus explicit compatibility behavior
 - provider-native state and native extensions: same-provider only unless a documented shim exists
 
@@ -88,22 +89,22 @@ Native extensions:
 
 ## Recommended Runtime Policy
 
-Add a namespace-level and alias-level setting:
+The runtime supports a namespace-level setting:
 
 ```yaml
 compatibility_mode: max_compat
 ```
 
-Recommended modes:
+Available modes:
 
-- `strict`: reject anything that is not native or lossless
+- `strict`: reject anything that is not native or safely portable
 - `balanced`: keep current warning-and-drop behavior for safe degradations
 - `max_compat`: prefer client usability for translated paths, while keeping hard semantic boundaries
 
-Recommended default direction:
+Current default direction:
 
 - passthrough paths remain native
-- translated paths should move toward `max_compat` by default for agent-facing deployments
+- omitted configs default to `max_compat` for translated agent-facing deployments
 - `strict` remains available for protocol verification, CI, and high-assurance integrations
 
 Hard boundaries that should stay unchanged even in `max_compat`:
@@ -115,11 +116,11 @@ Hard boundaries that should stay unchanged even in `max_compat`:
 
 ## Unified Capability Surface
 
-Today, capability metadata is split across Rust runtime config and Python wrapper logic. That split should be removed.
+Capability metadata now has a shared runtime source of truth instead of wrapper-only private defaults.
 
-The proxy should own a unified `ModelSurface` schema and expose one effective merged result per alias.
+The proxy owns a unified `ModelSurface` schema and exposes one effective merged result per alias.
 
-Recommended first-phase shape:
+Current shape:
 
 ```yaml
 model_aliases:
@@ -131,34 +132,31 @@ model_aliases:
     surface:
       modalities:
         input: [text]
+        output: [text]
       tools:
         supports_search: false
         supports_view_image: false
         apply_patch_transport: freeform
         supports_parallel_calls: false
-      reasoning:
-        supported_levels: [low, medium, high, xhigh]
-      session:
-        compaction_mode: local_summary
-      transport:
-        supports_websockets: false
 ```
 
-This should be resolved the same way `limits` are resolved today:
+Current `ModelSurface` support is limited to `limits`, `modalities`, and `tools`. Future surface fields for reasoning policy, session or compaction behavior, and transport capabilities are roadmap extensions, not current runtime contract.
+
+This is resolved the same way `limits` are resolved:
 
 - upstream defaults
 - alias overrides
 - effective merged surface at runtime
 
-Recommended implementation points:
+Implemented points:
 
-- add `surface_defaults` to `UpstreamConfig`
-- add `surface` to `ModelAlias`
-- add `effective_model_surface()` to config resolution
-- extend `RequestTranslationPolicy` to carry compatibility and surface data
-- expose `llmup.surface` from `/openai/v1/models`, `/anthropic/v1/models`, and `/google/v1beta/models`
+- `surface_defaults` on upstream config
+- `surface` on structured model aliases
+- `effective_model_surface()` in config resolution
+- compatibility mode and effective surface data carried into request policy
+- `llmup.surface` exposed from `/openai/v1/models`, `/anthropic/v1/models`, and `/google/v1beta/models`
 
-Wrappers should then consume the same effective surface instead of re-deriving private client metadata from source YAML.
+Wrappers consume the same effective surface and fail fast when live model profiles omit fields required for agent-client catalogs.
 
 ## Tool Identity Contract
 
@@ -206,18 +204,18 @@ with canonical bridged arguments:
 
 This works for reversible structured tool-call decoding, but it also changes the model-visible tool identity on the upstream request.
 
-For `Codex -> OpenAI Responses -> OpenAI Chat Completions`:
+Historically, for `Codex -> OpenAI Responses -> OpenAI Chat Completions`:
 
 - `run_codex_proxy.sh` launches Codex as a Responses client
 - `responses_to_messages(..., UpstreamFormat::OpenAiCompletion)` enables `bridge_custom_responses_semantics`
 - tool definitions are rewritten by `normalized_tool_definition_to_openai_with_custom_bridge(...)`
 - tool choice is also rewritten to the prefixed name
 
-That means the upstream model is told that the tool is named `__llmup_custom__apply_patch`.
+That meant the upstream model was told that the tool was named `__llmup_custom__apply_patch`.
 
-If the user asks the model "what tools do you have?", the model can truthfully answer with the synthetic prefixed name, even if later structured tool calls are decoded back to `apply_patch`.
+If the user asked the model "what tools do you have?", the model could truthfully answer with the synthetic prefixed name, even if later structured tool calls were decoded back to `apply_patch`.
 
-So this is a real bug:
+That was a real bug:
 
 - not because response decoding is absent
 - but because request-side tool identity leaks into model-visible prompt/tool context
@@ -235,28 +233,28 @@ This is implemented in `src/translate/internal/tools.rs` and covered by translat
 
 This transport shape is useful only as internal translator machinery for structured tool-call decoding. Visible prefix-based naming is never a valid live model-visible or client-visible contract for agent clients.
 
-The key correction is:
+The key correction was:
 
 - the problem is not only "decode before returning to the client"
 - the problem starts earlier, because the renamed tool definition is already visible to the upstream model
 
-So the live fix cannot be "rename and hide later".
+So the live fix could not be "rename and hide later".
 
-The intended translated-path bridge is:
+The translated-path bridge contract is:
 
 - keep the original stable tool name visible to the upstream model
 - move custom/freeform bridge provenance into request-scoped translation context
 - decode upstream function tool calls back to custom/freeform using that context
 
-Recommended redesign:
+Current live bridge behavior:
 
-- stop renaming `apply_patch` to `__llmup_custom__apply_patch` on live translated request paths
+- do not rename `apply_patch` to `__llmup_custom__apply_patch` on live translated request paths
 - keep the visible upstream tool name as `apply_patch`
 - continue using the canonical object wrapper `{ "input": string }` on function-only protocol hops
-- introduce request-scoped `ToolBridgeContext` so response and streaming translators know that `apply_patch` on this request is a bridged custom/freeform tool, not an ordinary function tool
+- use request-scoped `ToolBridgeContext` so response and streaming translators know that `apply_patch` on this request is a bridged custom/freeform tool, not an ordinary function tool
 - reserve prefix-based bridge names for internal-only transport bookkeeping; public request and response paths must reject or clear them
 
-Recommended behavior by policy:
+Current behavior by policy:
 
 - `strict`: if custom/freeform bridge would require changing the model-visible stable tool name, reject
 - `balanced`: allow bridged custom/freeform transport only when stable tool name remains unchanged and replay safety is preserved
@@ -268,9 +266,9 @@ Recommended behavior by policy:
 
 The intended translated-path bridge preserves the stable visible tool name and carries bridge provenance in request-scoped translation context.
 
-To preserve reversible decoding without exposing reserved prefixes, the live runtime should carry a per-request bridge context.
+To preserve reversible decoding without exposing reserved prefixes, the live runtime carries a per-request bridge context.
 
-Recommended first-phase shape:
+Current conceptual shape:
 
 ```text
 ToolBridgeContext
@@ -282,7 +280,7 @@ ToolBridgeContext
   }
 ```
 
-The context should be created during request translation and passed to:
+The context is created during request translation and passed to:
 
 - non-stream response translation
 - stream translation
@@ -298,62 +296,22 @@ Additional rule:
 
 - if one request contains both a function tool and a custom/freeform tool with the same stable name, reject the request as ambiguous
 
-## Documentation Changes
+## Current Rollout State
 
-The following docs should be updated after the schema and policy are introduced:
+Delivered:
 
-- `README.md`
-  - add `Compatibility Modes`
-  - add `Capability Surface`
-  - add `Custom Tool Bridge And apply_patch`
-  - explain wrapper metadata as part of compatibility, not as optional helper logic
-- `docs/DESIGN.md`
-  - add compatibility subsystem
-  - add capability surface truth model
-  - add internal bridge artifact rules
-- `docs/PRD.md`
-  - replace unconditional any-to-any wording with `portable core + native extensions`
-  - state that all translated combinations are supported within documented portability boundaries
-- `docs/CONSTITUTION.md`
-  - keep protocol-first design
-  - keep visible degradation
-  - explicitly forbid provider-state reconstruction
-- `docs/protocol-baselines/*`
-  - add `strict vs max_compat` notes for tools, state continuity, and streaming
+- `compatibility_mode` and `ModelSurface` are in config and runtime.
+- model catalog endpoints expose effective `llmup.surface` data.
+- wrappers consume live/effective surface metadata instead of relying only on legacy client-specific defaults.
+- live translated custom/freeform tool paths preserve stable names such as `apply_patch` and keep `__llmup_custom__*` internal.
+- strict safety tests, compatibility-mode policy tests, model-surface projection tests, and focused real-client matrix checks cover the public editing tool identity contract: Codex `apply_patch`, Claude Code `Edit`, and Gemini `replace`.
 
-## Test Plan
+Remaining work:
 
-Keep the current strict safety tests.
-
-Add these layers:
-
-- capability-surface unit tests
-  - merge rules
-  - `/models` projection
-  - wrapper consumption against the same truth source
-- compatibility-mode policy tests
-  - `strict`, `balanced`, `max_compat` decision tables
-- custom-tool bridge tests
-  - visible tool name stays `apply_patch` on translated live requests
-  - upstream request tools and `tool_choice` do not contain `__llmup_custom__apply_patch` on live agent paths
-  - structured tool calls still decode back to `custom_tool_call`
-  - replay safety markers are re-attested after bridge rewrites
-  - ambiguous same-name function/custom definitions reject
-- real-client matrix tests
-  - Codex catalog and proxy surface stay aligned
-  - asking "what tools are available?" must not surface `__llmup_custom__apply_patch`
-  - translated `apply_patch` remains usable without exposing internal bridge names
-  - wrapper-derived metadata matches live proxy metadata
-
-## Rollout Order
-
-1. Introduce `compatibility_mode` and `ModelSurface` in config and runtime.
-2. Extend `/models` to expose effective surface data.
-3. Add request-scoped `ToolBridgeContext` to live runtime request/response/stream translation.
-4. Stop visible custom-tool renaming on live agent-facing translated paths.
-5. Refactor wrappers to consume the unified surface instead of private parsing rules.
-6. Update README, DESIGN, PRD, CONSTITUTION, and protocol-baseline docs.
-7. Expand tests before enabling `max_compat` as the common translated-path default.
+- broaden real-client coverage beyond the current public tool enumeration and supported workspace-edit lanes.
+- extend `ModelSurface` only after the runtime supports additional reasoning, session, or transport fields.
+- keep protocol baseline docs aligned with strict vs `max_compat` behavior for tools, state continuity, and streaming.
+- expand arbitrary structured-tool behavior coverage without relaxing the visible tool identity contract.
 
 ## Non-Goals
 

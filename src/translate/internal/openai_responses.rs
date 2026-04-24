@@ -37,12 +37,14 @@ use super::tools::{
     openai_tool_result_content_to_responses_output,
     request_scoped_openai_custom_bridge_conflict_name, request_scoped_openai_custom_bridge_context,
     request_scoped_openai_custom_bridge_expects_canonical_input_wrapper,
-    responses_item_is_tool_output, responses_tool_call_item_to_openai_tool_call_strict,
+    request_scoped_tool_bridge_context_from_body, responses_item_is_tool_output,
+    responses_tool_call_item_to_openai_tool_call_strict,
     responses_tool_call_item_to_openai_tool_call_with_request_scoped_custom_bridge_strict,
     responses_tool_call_partial_replay_text, responses_tool_output_to_openai_tool_content,
     semantic_text_part_to_openai_value, semantic_text_part_to_responses_value,
     semantic_tool_kind_from_value, semantic_tool_output_item_type,
-    tool_call_is_marked_non_replayable, REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD,
+    tool_call_is_marked_non_replayable, ToolBridgeContext,
+    REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD,
 };
 
 const OPENAI_ANTHROPIC_REASONING_REPLAY_FIELD: &str = "_anthropic_reasoning_replay";
@@ -424,7 +426,7 @@ fn responses_response_to_openai_impl(
 }
 
 pub(super) fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
-    let bridge_context = body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD);
+    let bridge_context = request_scoped_tool_bridge_context_from_body(body);
     let choice = single_required_array_item(
         body.get("choices")
             .and_then(Value::as_array)
@@ -484,7 +486,7 @@ pub(super) fn openai_response_to_responses(body: &Value) -> Result<Value, String
             output.push(
                 openai_tool_call_to_responses_item_decoding_custom_bridge_with_context(
                     t,
-                    bridge_context,
+                    bridge_context.as_ref(),
                 )?,
             );
         }
@@ -1022,7 +1024,7 @@ pub(super) fn responses_to_messages(
             {
                 out.insert(
                     REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD.to_string(),
-                    bridge_context,
+                    bridge_context.to_value(),
                 );
             }
         }
@@ -1255,7 +1257,7 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
 
 pub(super) fn messages_to_responses(body: &mut Value) -> Result<(), String> {
     let controls = openai_normalized_request_controls(body)?;
-    let bridge_context = body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).cloned();
+    let bridge_context = request_scoped_tool_bridge_context_from_body(body);
     let bridge_context = bridge_context.as_ref();
     let messages = body
         .get("messages")
@@ -1539,14 +1541,14 @@ fn responses_tool_choice_to_openai_tool_choice(
 
 fn normalized_tool_definition_to_responses_with_request_scoped_custom_bridge(
     tool: &NormalizedOpenAiFamilyToolDef,
-    _bridge_context: Option<&Value>,
+    _bridge_context: Option<&ToolBridgeContext>,
 ) -> Value {
     normalized_tool_definition_to_responses(tool)
 }
 
 fn openai_tool_choice_to_responses_tool_choice(
     choice: &Value,
-    bridge_context: Option<&Value>,
+    bridge_context: Option<&ToolBridgeContext>,
 ) -> Option<Value> {
     if choice.is_string() {
         return Some(choice.clone());
@@ -1639,7 +1641,7 @@ fn openai_tool_choice_to_responses_tool_choice(
 fn normalized_tool_policy_to_responses_tool_choice(
     tool_policy: &NormalizedToolPolicy,
     restricted_tool_names: Option<&[String]>,
-    bridge_context: Option<&Value>,
+    bridge_context: Option<&ToolBridgeContext>,
 ) -> Value {
     let named_tool = |name: &str| {
         if request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(bridge_context, name)
