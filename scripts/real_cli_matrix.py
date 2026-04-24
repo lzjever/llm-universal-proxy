@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Iterable
+from typing import Iterable, Sequence
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -2399,6 +2399,143 @@ def _verify_codex_json_event_contract(
     return events, _completed_codex_items(events), ""
 
 
+def _codex_event_item(
+    event: dict[str, object],
+    *,
+    event_types: tuple[str, ...],
+) -> dict[str, object] | None:
+    if event.get("type") not in event_types:
+        return None
+    item = event.get("item")
+    if not isinstance(item, dict):
+        return None
+    return item
+
+
+def _codex_phase_item_indexes(
+    events: Iterable[dict[str, object]],
+    *,
+    event_types: tuple[str, ...],
+    item_types: set[str],
+) -> list[int]:
+    indexes: list[int] = []
+    for index, event in enumerate(events):
+        item = _codex_event_item(event, event_types=event_types)
+        if item is None:
+            continue
+        item_type = item.get("type")
+        if isinstance(item_type, str) and item_type in item_types:
+            indexes.append(index)
+    return indexes
+
+
+def _describe_codex_pre_work_signal(item_types: Sequence[str]) -> str:
+    labels = list(dict.fromkeys(str(item_type) for item_type in item_types))
+    if not labels:
+        return "pre-work signal"
+    if len(labels) == 1:
+        return f"pre-work signal ({labels[0]})"
+    if len(labels) == 2:
+        return f"pre-work signal ({labels[0]} or {labels[1]})"
+    return f"pre-work signal ({', '.join(labels[:-1])}, or {labels[-1]})"
+
+
+def _verify_codex_phase_contract(
+    events: list[dict[str, object]],
+    phase_contract: dict[str, object],
+) -> tuple[bool, str]:
+    raw_work_item_types = phase_contract.get(
+        "work_item_types", ["command_execution", "file_change"]
+    )
+    if not isinstance(raw_work_item_types, list) or not raw_work_item_types:
+        return False, "phase_contract.work_item_types must be a non-empty list"
+    work_item_types = {str(item_type) for item_type in raw_work_item_types}
+
+    raw_pre_work_item_types = phase_contract.get("pre_work_item_types")
+    if raw_pre_work_item_types is not None and (
+        not isinstance(raw_pre_work_item_types, list) or not raw_pre_work_item_types
+    ):
+        return False, "phase_contract.pre_work_item_types must be a non-empty list"
+
+    require_pre_work_signal = bool(phase_contract.get("require_pre_work_signal", False))
+    require_pre_work_agent_message = bool(
+        phase_contract.get("require_pre_work_agent_message", False)
+    )
+    require_post_work_agent_message = bool(
+        phase_contract.get("require_post_work_agent_message", False)
+    )
+
+    pre_work_item_types: list[str] = []
+    if require_pre_work_signal:
+        if raw_pre_work_item_types is None:
+            pre_work_item_types = ["reasoning", "agent_message"]
+        else:
+            pre_work_item_types = [
+                str(item_type) for item_type in raw_pre_work_item_types
+            ]
+    elif require_pre_work_agent_message:
+        pre_work_item_types = ["agent_message"]
+
+    pre_work_signal_label = _describe_codex_pre_work_signal(pre_work_item_types)
+    agent_message_indexes = _codex_phase_item_indexes(
+        events,
+        event_types=("item.completed",),
+        item_types={"agent_message"},
+    )
+    pre_work_signal_indexes = _codex_phase_item_indexes(
+        events,
+        event_types=("item.completed",),
+        item_types=set(pre_work_item_types),
+    )
+    work_signal_indexes = _codex_phase_item_indexes(
+        events,
+        event_types=("item.started", "item.completed"),
+        item_types=work_item_types,
+    )
+
+    if not work_signal_indexes:
+        final_agent_message_index = (
+            agent_message_indexes[-1] if agent_message_indexes else None
+        )
+        has_pre_work_signal_before_final = final_agent_message_index is not None and any(
+            index < final_agent_message_index for index in pre_work_signal_indexes
+        )
+        if pre_work_item_types and not has_pre_work_signal_before_final:
+            return (
+                False,
+                f"expected codex event stream to include {pre_work_signal_label} "
+                "before observable work",
+            )
+        return (
+            False,
+            "expected codex event stream to include observable work signal "
+            "between pre-work signal and final agent_message",
+        )
+
+    first_work_index = work_signal_indexes[0]
+    last_work_index = work_signal_indexes[-1]
+
+    if pre_work_item_types and not any(
+        index < first_work_index for index in pre_work_signal_indexes
+    ):
+        return (
+            False,
+            f"expected codex event stream to include {pre_work_signal_label} "
+            "before observable work",
+        )
+
+    if require_post_work_agent_message and not any(
+        index > last_work_index for index in agent_message_indexes
+    ):
+        return (
+            False,
+            "expected codex event stream to include post-work final agent_message "
+            "after observable work",
+        )
+
+    return True, ""
+
+
 def _client_specific_verifier_values(
     verifier: dict[str, object],
     key: str,
@@ -2577,6 +2714,14 @@ def _verify_verifier_output(
                     "expected codex event stream to include observable edit signal "
                     f"for {path_suffix!r}",
                 )
+
+        phase_contract = verifier.get("phase_contract")
+        if phase_contract is not None:
+            if not isinstance(phase_contract, dict):
+                return False, "phase_contract must be an object"
+            ok, message = _verify_codex_phase_contract(events, phase_contract)
+            if not ok:
+                return False, message
         return True, ""
     if verifier_type == "all_of":
         nested_verifiers = verifier.get("verifiers", [])
