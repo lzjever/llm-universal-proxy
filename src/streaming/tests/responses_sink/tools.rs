@@ -146,7 +146,7 @@ fn openai_chunk_to_responses_sse_decodes_request_scoped_custom_bridge_without_pr
 }
 
 #[test]
-fn openai_chunk_to_responses_sse_does_not_decode_legacy_prefixed_function_names() {
+fn openai_chunk_to_responses_sse_rejects_reserved_prefix_function_names_without_bridge_context() {
     let mut state = StreamState::default();
     let tool_chunk = serde_json::json!({
         "id": "chatcmpl-msg123",
@@ -181,11 +181,17 @@ fn openai_chunk_to_responses_sse_does_not_decode_legacy_prefixed_function_names(
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(joined.contains("response.function_call_arguments.delta"));
-    assert!(joined.contains("response.function_call_arguments.done"));
-    assert!(joined.contains("\"type\":\"function_call\""));
-    assert!(joined.contains("\"name\":\"__llmup_custom__code_exec\""));
+    assert!(joined.contains("\"type\":\"response.failed\""));
+    assert!(joined.contains("\"type\":\"invalid_request_error\""));
+    assert!(joined.contains("\"code\":\"reserved_openai_custom_bridge_prefix\""));
+    assert!(!joined.contains("\"name\":\"__llmup_custom__code_exec\""));
+    assert!(!joined.contains("__llmup_custom__"), "{joined}");
+    assert!(!joined.contains("response.function_call_arguments.delta"));
     assert!(!joined.contains("response.custom_tool_call_input.delta"));
+    assert!(
+        state.fatal_rejection.is_some(),
+        "reserved-prefix stream should be rejected"
+    );
 }
 
 #[test]

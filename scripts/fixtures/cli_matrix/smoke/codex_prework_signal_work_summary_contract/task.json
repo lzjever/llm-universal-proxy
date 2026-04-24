@@ -2,7 +2,7 @@
   "id": "codex_prework_signal_work_summary_contract",
   "kind": "smoke",
   "description": "Codex-only phase contract that requires a stable pre-work signal, an observable work step, and a post-work summary in the JSON event stream before workspace verification passes.",
-  "prompt": "Inspect calc.py and main.py. There is a regression in add(): it currently subtracts instead of adding. Fix the implementation so add(a, b) returns a + b without changing the function name, argument list, or multiply() behavior. Validate the workspace by running main.py and make sure the printed output is correct. In your final response, briefly summarize what changed and how you verified it.",
+  "prompt": "Before issuing any command or tool call, first emit a brief pre-work signal explaining that you will inspect the files, fix add(), and verify the result. Then inspect calc.py and main.py. There is a regression in add(): it currently subtracts instead of adding. Fix the implementation so add(a, b) returns a + b without changing the function name, argument list, or multiply() behavior. Validate the workspace by running main.py and make sure the printed output is correct. In your final response, briefly summarize what changed and how you verified it.",
   "timeout_secs": 180,
   "workspace_template": "../codex_observable_edit_contract/workspace",
   "supported_clients": [

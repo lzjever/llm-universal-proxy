@@ -5,6 +5,9 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 GOVERNANCE_SCRIPT = REPO_ROOT / "scripts" / "check-governance.sh"
+PYTHON_CONTRACT_TEST_COMMAND = (
+    "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
+)
 ACTIVE_DOC_PATHS = (
     REPO_ROOT / "README.md",
     REPO_ROOT / "README_CN.md",
@@ -94,6 +97,26 @@ def claim_units(text: str):
 
 
 class GovernanceTests(unittest.TestCase):
+    def test_default_test_entries_run_python_contract_tests_without_bytecode(self):
+        entrypoints = {
+            ".github/workflows/ci.yml": REPO_ROOT / ".github" / "workflows" / "ci.yml",
+            "Makefile": REPO_ROOT / "Makefile",
+            "scripts/test-and-report.sh": REPO_ROOT / "scripts" / "test-and-report.sh",
+            "scripts/check-governance.sh": GOVERNANCE_SCRIPT,
+        }
+
+        missing = []
+        for label, path in entrypoints.items():
+            text = path.read_text(encoding="utf-8")
+            if PYTHON_CONTRACT_TEST_COMMAND not in text:
+                missing.append(label)
+
+        self.assertFalse(
+            missing,
+            "Default test/governance entrypoints must run Python contract "
+            f"tests without writing __pycache__: {', '.join(missing)}",
+        )
+
     def test_governance_tracks_dynamic_proxy_binary_rule(self):
         script = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
 

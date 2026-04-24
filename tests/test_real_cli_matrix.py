@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -3383,6 +3384,277 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["message"], "exit code 7")
 
+    def test_wait_for_health_rejects_old_proxy_health_without_owned_listening_proof(self):
+        module = load_module()
+
+        class AliveProcess:
+            def poll(self):
+                return None
+
+        class OldProxyHealthResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            stdout_path = root / "proxy.stdout.log"
+            stderr_path = root / "proxy.stderr.log"
+            stdout_path.write_text("booting proxy but not bound yet\n", encoding="utf-8")
+            stderr_path.write_text("", encoding="utf-8")
+
+            with mock.patch.object(
+                module.urllib.request,
+                "urlopen",
+                return_value=OldProxyHealthResponse(),
+            ), mock.patch.object(
+                module.time,
+                "time",
+                side_effect=[100.0, 100.1, 101.2, 101.3],
+            ), mock.patch.object(
+                module.time,
+                "sleep",
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "owned listening proof|did not become healthy",
+                ):
+                    module.wait_for_health(
+                        "http://127.0.0.1:18888",
+                        timeout_secs=1,
+                        process=AliveProcess(),
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                    )
+
+    def test_wait_for_health_accepts_health_after_owned_listening_proof(self):
+        module = load_module()
+
+        class AliveProcess:
+            def poll(self):
+                return None
+
+        class OwnedProxyHealthResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            stdout_path = root / "proxy.stdout.log"
+            stderr_path = root / "proxy.stderr.log"
+            stdout_path.write_text(
+                "2026-04-24T00:00:00Z INFO listening on 127.0.0.1:18888\n",
+                encoding="utf-8",
+            )
+            stderr_path.write_text("", encoding="utf-8")
+
+            with mock.patch.object(
+                module.urllib.request,
+                "urlopen",
+                return_value=OwnedProxyHealthResponse(),
+            ) as urlopen:
+                module.wait_for_health(
+                    "http://127.0.0.1:18888",
+                    timeout_secs=1,
+                    process=AliveProcess(),
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                )
+
+        urlopen.assert_called_once_with("http://127.0.0.1:18888/health", timeout=2)
+
+    def test_run_fails_fast_when_old_proxy_is_healthy_but_owned_process_exited(self):
+        module = load_module()
+
+        class ExitedProcess:
+            def poll(self):
+                return 1
+
+            def wait(self, timeout=None):
+                return 1
+
+        class OldProxyHealthResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reports_root = pathlib.Path(temp_dir) / "reports"
+            binary_path = pathlib.Path(temp_dir) / "fake-proxy"
+            proxy_stderr_path = pathlib.Path(temp_dir) / "proxy.stderr.log"
+            proxy_stderr_path.write_text(
+                "error: failed to bind 127.0.0.1:18888: Address already in use\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                module, "ensure_required_binaries"
+            ), mock.patch.object(
+                module,
+                "start_proxy",
+                return_value=(
+                    ExitedProcess(),
+                    pathlib.Path(temp_dir) / "runtime-config.yaml",
+                    pathlib.Path(temp_dir) / "proxy.stdout.log",
+                    proxy_stderr_path,
+                ),
+            ), mock.patch.object(
+                module.urllib.request,
+                "urlopen",
+                return_value=OldProxyHealthResponse(),
+            ), mock.patch.object(
+                module, "refresh_lane_model_profiles"
+            ), mock.patch.object(
+                module, "probe_lane", return_value=None
+            ), mock.patch.object(
+                module,
+                "run_matrix_case",
+                return_value={
+                    "case_id": "unexpected",
+                    "client": "codex",
+                    "lane": "minimax-openai",
+                    "fixture": "smoke_pong",
+                    "status": "passed",
+                    "message": "",
+                },
+            ) as run_matrix_case:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "proxy process exited.*Address already in use",
+                ):
+                    module.run(
+                        [
+                            "--config-source",
+                            str(DEFAULT_CONFIG_PATH),
+                            "--env-file",
+                            str(pathlib.Path(temp_dir) / "missing.env"),
+                            "--fixtures-root",
+                            str(REPO_ROOT / "scripts" / "fixtures" / "cli_matrix"),
+                            "--reports-root",
+                            str(reports_root),
+                            "--binary",
+                            str(binary_path),
+                            "--proxy-port",
+                            "18888",
+                            "--proxy-health-timeout-secs",
+                            "1",
+                        ]
+                    )
+
+        run_matrix_case.assert_not_called()
+
+    def test_run_defaults_to_auto_proxy_port_and_writes_explicit_port_to_runtime_config(self):
+        module = load_module()
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        def available_port() -> int:
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                return int(sock.getsockname()[1])
+
+        observed_runtime_configs: list[str] = []
+        observed_health_urls: list[str] = []
+        observed_health_kwargs: list[dict[str, object]] = []
+
+        def fake_start_proxy(proxy_binary, runtime_config_text, report_dir, proxy_env):
+            observed_runtime_configs.append(runtime_config_text)
+            return (
+                FakeProcess(),
+                pathlib.Path(report_dir) / "runtime-config.yaml",
+                pathlib.Path(report_dir) / "proxy.stdout.log",
+                pathlib.Path(report_dir) / "proxy.stderr.log",
+            )
+
+        def fake_wait_for_health(base_url, **kwargs):
+            observed_health_urls.append(base_url)
+            observed_health_kwargs.append(kwargs)
+
+        explicit_port = available_port()
+        env_port = available_port()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = pathlib.Path(temp_dir)
+            reports_root = temp_root / "reports"
+            binary_path = temp_root / "fake-proxy"
+            common_args = [
+                "--proxy-only",
+                "--config-source",
+                str(DEFAULT_CONFIG_PATH),
+                "--env-file",
+                str(temp_root / "missing.env"),
+                "--fixtures-root",
+                str(REPO_ROOT / "scripts" / "fixtures" / "cli_matrix"),
+                "--reports-root",
+                str(reports_root),
+                "--binary",
+                str(binary_path),
+            ]
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": os.environ.get("PATH", "")},
+                clear=True,
+            ), mock.patch.object(
+                module, "ensure_required_binaries"
+            ), mock.patch.object(
+                module, "start_proxy", side_effect=fake_start_proxy
+            ), mock.patch.object(
+                module, "wait_for_health", side_effect=fake_wait_for_health
+            ), mock.patch.object(
+                module, "stop_proxy"
+            ), mock.patch.object(
+                module, "free_port", return_value=23456
+            ):
+                auto_exit_code = module.run(common_args)
+                explicit_exit_code = module.run(
+                    common_args + ["--proxy-port", str(explicit_port)]
+                )
+                os.environ["PROXY_PORT"] = str(env_port)
+                env_exit_code = module.run(common_args)
+
+        self.assertEqual(auto_exit_code, 0)
+        self.assertEqual(explicit_exit_code, 0)
+        self.assertEqual(env_exit_code, 0)
+        self.assertIn("listen: 127.0.0.1:23456", observed_runtime_configs[0])
+        self.assertNotIn("listen: 127.0.0.1:18888", observed_runtime_configs[0])
+        self.assertEqual(observed_health_urls[0], "http://127.0.0.1:23456")
+        self.assertIn(
+            f"listen: 127.0.0.1:{explicit_port}",
+            observed_runtime_configs[1],
+        )
+        self.assertEqual(
+            observed_health_urls[1],
+            f"http://127.0.0.1:{explicit_port}",
+        )
+        self.assertIn(
+            f"listen: 127.0.0.1:{env_port}",
+            observed_runtime_configs[2],
+        )
+        self.assertEqual(
+            observed_health_urls[2],
+            f"http://127.0.0.1:{env_port}",
+        )
+        for health_kwargs in observed_health_kwargs:
+            self.assertIsInstance(health_kwargs.get("process"), FakeProcess)
+            self.assertTrue(str(health_kwargs.get("stdout_path")).endswith("proxy.stdout.log"))
+            self.assertTrue(str(health_kwargs.get("stderr_path")).endswith("proxy.stderr.log"))
+
     def test_run_proxy_only_skips_client_binary_checks(self):
         module = load_module()
 
@@ -3425,6 +3697,8 @@ class RealCliMatrixTests(unittest.TestCase):
                 ),
             ), mock.patch.object(module, "wait_for_health"), mock.patch.object(
                 module, "stop_proxy"
+            ), mock.patch.object(
+                module, "free_port", return_value=23456
             ), mock.patch(
                 "sys.stdout", stdout
             ):
@@ -3447,7 +3721,7 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(observed["clients"], [])
         self.assertEqual(observed["proxy_binary"], binary_path)
-        self.assertIn("Proxy healthy at http://127.0.0.1:18888", stdout.getvalue())
+        self.assertIn("Proxy healthy at http://127.0.0.1:23456", stdout.getvalue())
 
     def test_resolve_cli_args_supports_list_matrix_and_case_filters(self):
         module = load_module()

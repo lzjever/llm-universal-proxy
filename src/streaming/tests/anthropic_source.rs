@@ -1,5 +1,13 @@
 use super::*;
 
+fn join_sse_chunks(chunks: Vec<Vec<u8>>) -> String {
+    chunks
+        .into_iter()
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn claude_message_start_produces_openai_chunk() {
     let event = serde_json::json!({
@@ -12,6 +20,35 @@ fn claude_message_start_produces_openai_chunk() {
     assert_eq!(state.message_id.as_deref(), Some("msg_1"));
     assert!(chunks[0].get("choices").is_some());
     assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+}
+
+#[test]
+fn translate_sse_event_anthropic_to_openai_rejects_reserved_tool_name() {
+    let mut state = StreamState::default();
+    let out = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_reserved",
+                "name": "__llmup_custom__apply_patch",
+                "input": { "input": "patch" }
+            }
+        }),
+        &mut state,
+    );
+    let joined = join_sse_chunks(out);
+
+    assert!(joined.contains("\"code\":\"reserved_openai_custom_bridge_prefix\""));
+    assert!(!joined.contains("\"name\":\"__llmup_custom__apply_patch\""));
+    assert!(!joined.contains("__llmup_custom__"), "{joined}");
+    assert!(
+        state.fatal_rejection.is_some(),
+        "reserved-prefix stream should be rejected"
+    );
 }
 
 #[test]
@@ -2107,6 +2144,67 @@ fn anthropic_error_event_maps_context_to_openai_context_finish() {
     assert!(joined.contains("\"finish_reason\":\"context_length_exceeded\""));
     assert!(joined.contains("\"code\":\"context_length_exceeded\""));
     assert!(joined.contains("[DONE]"));
+}
+
+#[test]
+fn anthropic_error_event_sanitizes_internal_artifacts_for_public_clients() {
+    for client_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+    ] {
+        let mut state = StreamState::default();
+        let out = translate_sse_event(
+            UpstreamFormat::Anthropic,
+            client_format,
+            &serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "provider leaked __llmup_custom__secret and _llmup_tool_bridge_context"
+                }
+            }),
+            &mut state,
+        );
+
+        let joined = out
+            .into_iter()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("__llmup_custom__"), "{joined}");
+        assert!(!joined.contains("_llmup_tool_bridge_context"), "{joined}");
+        assert!(!joined.contains("secret"), "{joined}");
+    }
+}
+
+#[test]
+fn anthropic_error_event_same_client_sanitizes_extra_internal_artifacts() {
+    let mut state = StreamState::default();
+    let out = translate_sse_event(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Anthropic,
+        &serde_json::json!({
+            "type": "error",
+            "debug": "__llmup_custom__top_level",
+            "error": {
+                "type": "api_error",
+                "message": "provider leaked __llmup_custom__secret and _llmup_tool_bridge_context",
+                "extra": "_llmup_tool_bridge_context"
+            }
+        }),
+        &mut state,
+    );
+
+    let joined = out
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("\"type\":\"error\""), "{joined}");
+    assert!(joined.contains("\"type\":\"api_error\""), "{joined}");
+    assert!(!joined.contains("__llmup_custom__"), "{joined}");
+    assert!(!joined.contains("_llmup_tool_bridge_context"), "{joined}");
+    assert!(!joined.contains("secret"), "{joined}");
 }
 
 #[test]

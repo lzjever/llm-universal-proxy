@@ -80,13 +80,248 @@ pub(super) fn ensure_single_openai_choice_for_non_openai_sink(
     }
 }
 
+fn validate_openai_stream_tool_call_name(tool_call: &Value) -> Result<(), String> {
+    validate_public_selector_visible_identity(tool_call)?;
+    for name in [
+        tool_call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str),
+        tool_call
+            .get("custom")
+            .and_then(|custom| custom.get("name"))
+            .and_then(Value::as_str),
+        tool_call.get("name").and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_public_tool_name_not_reserved(name)?;
+    }
+    Ok(())
+}
+
+fn validate_openai_stream_choice_tool_names(choice: &Value) -> Result<(), String> {
+    for container in [choice.get("delta"), choice.get("message")]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(tool_calls) = container.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in tool_calls {
+                validate_openai_stream_tool_call_name(tool_call)?;
+            }
+        }
+        if let Some(function_call) = container.get("function_call") {
+            validate_openai_stream_tool_call_name(function_call)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_stream_event_tool_names(event: &Value) -> Result<(), String> {
+    if let Some(choices) = event.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            validate_openai_stream_choice_tool_names(choice)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_anthropic_stream_content_tool_names(content: &Value) -> Result<(), String> {
+    let Some(blocks) = content.as_array() else {
+        return Ok(());
+    };
+    for block in blocks {
+        if matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("tool_use" | "server_tool_use")
+        ) {
+            if let Some(name) = block.get("name").and_then(Value::as_str) {
+                validate_public_tool_name_not_reserved(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_anthropic_stream_event_tool_names(event: &Value) -> Result<(), String> {
+    if matches!(
+        event
+            .get("content_block")
+            .and_then(|block| block.get("type"))
+            .and_then(Value::as_str),
+        Some("tool_use" | "server_tool_use")
+    ) {
+        if let Some(name) = event
+            .get("content_block")
+            .and_then(|block| block.get("name"))
+            .and_then(Value::as_str)
+        {
+            validate_public_tool_name_not_reserved(name)?;
+        }
+    }
+    if let Some(content) = event.get("content") {
+        validate_anthropic_stream_content_tool_names(content)?;
+    }
+    if let Some(message_content) = event
+        .get("message")
+        .and_then(|message| message.get("content"))
+    {
+        validate_anthropic_stream_content_tool_names(message_content)?;
+    }
+    Ok(())
+}
+
+fn validate_gemini_stream_content_tool_names(content: &Value) -> Result<(), String> {
+    let Some(parts) = content.get("parts").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for part in parts {
+        for tool_part in [
+            part.get("functionCall")
+                .or_else(|| part.get("function_call")),
+            part.get("functionResponse")
+                .or_else(|| part.get("function_response")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(name) = tool_part.get("name").and_then(Value::as_str) {
+                validate_public_tool_name_not_reserved(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_gemini_stream_response_tool_names(body: &Value) -> Result<(), String> {
+    if let Some(candidates) = body.get("candidates").and_then(Value::as_array) {
+        for candidate in candidates {
+            if let Some(content) = candidate.get("content") {
+                validate_gemini_stream_content_tool_names(content)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_gemini_stream_event_tool_names(event: &Value) -> Result<(), String> {
+    validate_gemini_stream_response_tool_names(event)?;
+    if let Some(response) = event.get("response") {
+        validate_gemini_stream_response_tool_names(response)?;
+    }
+    Ok(())
+}
+
+fn validate_responses_stream_item_tool_name(item: &Value) -> Result<(), String> {
+    validate_responses_public_tool_call_item_identity(item)
+}
+
+fn validate_responses_stream_output_tool_names(output: &Value) -> Result<(), String> {
+    validate_responses_public_output_tool_identity(output)
+}
+
+fn validate_responses_stream_event_tool_names(event: &Value) -> Result<(), String> {
+    validate_responses_public_stream_event_tool_identity(event)?;
+    if let Some(item) = event.get("item") {
+        validate_responses_stream_item_tool_name(item)?;
+    }
+    if let Some(output) = event.get("output") {
+        validate_responses_stream_output_tool_names(output)?;
+    }
+    if let Some(response) = event.get("response") {
+        validate_responses_public_response_object_tool_identity(response)?;
+    }
+    Ok(())
+}
+
+fn validate_public_stream_response_event_tool_names(
+    format: UpstreamFormat,
+    event: &Value,
+) -> Result<(), String> {
+    if contains_internal_context_field(event) {
+        return Err(INTERNAL_ARTIFACT_ERROR_MESSAGE.to_string());
+    }
+    match format {
+        UpstreamFormat::OpenAiCompletion => validate_openai_stream_event_tool_names(event),
+        UpstreamFormat::OpenAiResponses => validate_responses_stream_event_tool_names(event),
+        UpstreamFormat::Anthropic => validate_anthropic_stream_event_tool_names(event),
+        UpstreamFormat::Google => validate_gemini_stream_event_tool_names(event),
+    }
+}
+
+fn validate_openai_chunks_for_public_stream(
+    chunks: &[Value],
+    state: &mut StreamState,
+) -> Result<(), Vec<Value>> {
+    for chunk in chunks {
+        if let Err(message) = validate_openai_stream_event_tool_names(chunk) {
+            return Err(reject_openai_stream(
+                state,
+                "invalid_request_error",
+                "reserved_openai_custom_bridge_prefix",
+                message,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn openai_chunks_to_client_sse(
+    client_format: UpstreamFormat,
+    openai_chunks: Vec<Value>,
+    state: &mut StreamState,
+) -> Vec<Vec<u8>> {
+    match client_format {
+        UpstreamFormat::OpenAiCompletion => openai_chunks
+            .into_iter()
+            .map(|c| format_sse_data(&c))
+            .collect(),
+        UpstreamFormat::Anthropic => {
+            let mut out = Vec::new();
+            for c in &openai_chunks {
+                out.extend(openai_chunk_to_claude_sse(c, state));
+            }
+            out
+        }
+        UpstreamFormat::Google => {
+            let mut out = Vec::new();
+            for c in &openai_chunks {
+                out.extend(openai_chunk_to_gemini_sse(c, state));
+            }
+            out
+        }
+        UpstreamFormat::OpenAiResponses => {
+            let mut out = Vec::new();
+            for c in &openai_chunks {
+                out.extend(openai_chunk_to_responses_sse(c, state));
+            }
+            out
+        }
+    }
+}
+
+fn reject_public_stream_tool_name(
+    client_format: UpstreamFormat,
+    state: &mut StreamState,
+    message: String,
+) -> Vec<Vec<u8>> {
+    let chunks = reject_openai_stream(
+        state,
+        "invalid_request_error",
+        "reserved_openai_custom_bridge_prefix",
+        message,
+    );
+    openai_chunks_to_client_sse(client_format, chunks, state)
+}
+
 pub fn translate_sse_event(
     upstream_format: UpstreamFormat,
     client_format: UpstreamFormat,
     event: &Value,
     state: &mut StreamState,
 ) -> Vec<Vec<u8>> {
-    if upstream_format != client_format && state.fatal_rejection.is_some() {
+    if state.fatal_rejection.is_some() {
         return Vec::new();
     }
     if upstream_format == UpstreamFormat::OpenAiCompletion
@@ -105,16 +340,30 @@ pub fn translate_sse_event(
         }
         return Vec::new();
     }
-    if upstream_format == client_format {
-        if event.get("_done").and_then(Value::as_bool) == Some(true) {
-            return vec![b"data: [DONE]\n\n".to_vec()];
-        }
-        return vec![format_sse_data(event)];
-    }
     if upstream_format == UpstreamFormat::Anthropic
         && event.get("type").and_then(Value::as_str) == Some("error")
     {
         return anthropic_error_event_to_client_sse(event, client_format, state);
+    }
+    if upstream_format == client_format {
+        if event.get("_done").and_then(Value::as_bool) == Some(true) {
+            return vec![b"data: [DONE]\n\n".to_vec()];
+        }
+        let mut public_event = event.clone();
+        sanitize_public_stream_error_event(&mut public_event);
+        if let Err(message) =
+            validate_public_stream_response_event_tool_names(client_format, &public_event)
+        {
+            return reject_public_stream_tool_name(client_format, state, message);
+        }
+        return vec![format_sse_data(&public_event)];
+    }
+    if event.get("_done").and_then(Value::as_bool) != Some(true) {
+        if let Err(message) =
+            validate_public_stream_response_event_tool_names(upstream_format, event)
+        {
+            return reject_public_stream_tool_name(client_format, state, message);
+        }
     }
     let openai_chunks: Vec<Value> = match upstream_format {
         UpstreamFormat::OpenAiCompletion => openai_event_as_chunk(event).into_iter().collect(),
@@ -140,37 +389,11 @@ pub fn translate_sse_event(
     } else {
         openai_chunks
     };
-    if client_format == UpstreamFormat::OpenAiCompletion {
-        return openai_chunks
-            .into_iter()
-            .map(|c| format_sse_data(&c))
-            .collect();
-    }
-    if client_format == UpstreamFormat::Anthropic {
-        let mut out = Vec::new();
-        for c in &openai_chunks {
-            out.extend(openai_chunk_to_claude_sse(c, state));
-        }
-        return out;
-    }
-    if client_format == UpstreamFormat::Google {
-        let mut out = Vec::new();
-        for c in &openai_chunks {
-            out.extend(openai_chunk_to_gemini_sse(c, state));
-        }
-        return out;
-    }
-    if client_format == UpstreamFormat::OpenAiResponses {
-        let mut out = Vec::new();
-        for c in &openai_chunks {
-            out.extend(openai_chunk_to_responses_sse(c, state));
-        }
-        return out;
-    }
-    openai_chunks
-        .into_iter()
-        .map(|c| format_sse_data(&c))
-        .collect()
+    let openai_chunks = match validate_openai_chunks_for_public_stream(&openai_chunks, state) {
+        Ok(()) => openai_chunks,
+        Err(rejected) => rejected,
+    };
+    openai_chunks_to_client_sse(client_format, openai_chunks, state)
 }
 
 pub fn translate_response_chunk(
@@ -191,6 +414,194 @@ pub fn translate_response_chunk(
     ))
 }
 
+fn stream_event_is_public_error(event: &Value) -> bool {
+    event.get("error").is_some()
+        || matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("error" | "response.failed")
+        )
+}
+
+fn sanitize_internal_artifact_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            *text = sanitize_public_error_message(text);
+        }
+        Value::Array(items) => {
+            for item in items {
+                sanitize_internal_artifact_strings(item);
+            }
+        }
+        Value::Object(object) => {
+            let keys = object.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                if contains_internal_artifact_text(&key) {
+                    object.remove(&key);
+                    continue;
+                }
+                if let Some(value) = object.get_mut(&key) {
+                    sanitize_internal_artifact_strings(value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_public_stream_error_event(event: &mut Value) {
+    if stream_event_is_public_error(event) {
+        sanitize_internal_artifact_strings(event);
+    }
+}
+
+fn sse_frame_contains_internal_artifact(frame: &[u8]) -> bool {
+    contains_internal_artifact_text(String::from_utf8_lossy(frame).as_ref())
+}
+
+fn canonical_sse_frame(event_type: Option<&str>, event: &Value) -> Vec<u8> {
+    if event.get("_done").and_then(Value::as_bool) == Some(true) {
+        return b"data: [DONE]\n\n".to_vec();
+    }
+    match event_type {
+        Some(event_type) => format_sse_event(event_type, event),
+        None => format_sse_data(event),
+    }
+}
+
+/// Same-format SSE passthrough that validates public tool names before releasing each frame.
+pub struct GuardedSseStream<S, E> {
+    inner: S,
+    buffer: Vec<u8>,
+    client_format: UpstreamFormat,
+    state: StreamState,
+    output_queue: Vec<Vec<u8>>,
+    output_pos: usize,
+    close_after_output: bool,
+    _error: std::marker::PhantomData<E>,
+}
+
+impl<S, E> GuardedSseStream<S, E> {
+    pub fn new(inner: S, client_format: UpstreamFormat) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+            client_format,
+            state: StreamState::default(),
+            output_queue: Vec::new(),
+            output_pos: 0,
+            close_after_output: false,
+            _error: std::marker::PhantomData,
+        }
+    }
+
+    fn drain_validated_frames(&mut self) {
+        while let Some((frame, event)) = take_one_sse_frame(&mut self.buffer) {
+            let raw_has_internal_artifact = sse_frame_contains_internal_artifact(&frame);
+            let event_type = sse_frame_event_type(&frame);
+            if event_type
+                .as_deref()
+                .is_some_and(contains_internal_artifact_text)
+            {
+                self.output_queue.extend(reject_public_stream_tool_name(
+                    self.client_format,
+                    &mut self.state,
+                    INTERNAL_ARTIFACT_ERROR_MESSAGE.to_string(),
+                ));
+                self.close_after_output = true;
+                break;
+            }
+
+            let Some(mut event) = event else {
+                if raw_has_internal_artifact {
+                    self.output_queue.extend(reject_public_stream_tool_name(
+                        self.client_format,
+                        &mut self.state,
+                        INTERNAL_ARTIFACT_ERROR_MESSAGE.to_string(),
+                    ));
+                    self.close_after_output = true;
+                    break;
+                }
+                self.output_queue.push(frame);
+                continue;
+            };
+
+            if event.get("_done").and_then(Value::as_bool) == Some(true)
+                && !raw_has_internal_artifact
+            {
+                self.output_queue.push(frame);
+                continue;
+            }
+
+            sanitize_public_stream_error_event(&mut event);
+            if event.get("_done").and_then(Value::as_bool) != Some(true) {
+                if let Err(message) =
+                    validate_public_stream_response_event_tool_names(self.client_format, &event)
+                {
+                    self.output_queue.extend(reject_public_stream_tool_name(
+                        self.client_format,
+                        &mut self.state,
+                        message,
+                    ));
+                    self.close_after_output = true;
+                    break;
+                }
+            }
+            self.output_queue
+                .push(canonical_sse_frame(event_type.as_deref(), &event));
+        }
+    }
+}
+
+impl<S, E> Stream for GuardedSseStream<S, E>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + Unpin,
+{
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if this.output_pos < this.output_queue.len() {
+                let next = this.output_queue[this.output_pos].clone();
+                this.output_pos += 1;
+                if this.output_pos >= this.output_queue.len() {
+                    this.output_queue.clear();
+                    this.output_pos = 0;
+                }
+                return Poll::Ready(Some(Ok(bytes::Bytes::from(next))));
+            }
+            if this.close_after_output {
+                return Poll::Ready(None);
+            }
+
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.buffer.extend_from_slice(&chunk);
+                    this.drain_validated_frames();
+                    if !this.output_queue.is_empty() {
+                        continue;
+                    }
+                    if this.close_after_output {
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Some(Err(std::io::Error::other(e.into().to_string()))));
+                }
+                Poll::Ready(None) => {
+                    this.drain_validated_frames();
+                    if !this.output_queue.is_empty() {
+                        continue;
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 pub(super) fn anthropic_error_event_to_client_sse(
     event: &Value,
     client_format: UpstreamFormat,
@@ -201,13 +612,19 @@ pub(super) fn anthropic_error_event_to_client_sse(
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("api_error");
+    let error_type = if contains_internal_artifact_text(error_type) {
+        "api_error"
+    } else {
+        error_type
+    };
     let message = error
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or("Anthropic streaming error");
+    let message = sanitize_public_error_message(message);
 
     let (normalized_type, normalized_code, finish_reason) =
-        normalize_anthropic_stream_error(error_type, message);
+        normalize_anthropic_stream_error(error_type, &message);
 
     match client_format {
         UpstreamFormat::OpenAiResponses => {
@@ -246,7 +663,16 @@ pub(super) fn anthropic_error_event_to_client_sse(
             });
             vec![format_sse_data(&chunk), b"data: [DONE]\n\n".to_vec()]
         }
-        UpstreamFormat::Anthropic => vec![format_sse_data(event)],
+        UpstreamFormat::Anthropic => {
+            let sanitized = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "message": message
+                }
+            });
+            vec![format_sse_event("error", &sanitized)]
+        }
         UpstreamFormat::Google => vec![],
     }
 }
@@ -337,6 +763,48 @@ impl<S, E> TranslateSseStream<S, E> {
         self.state.request_scoped_tool_bridge_context = bridge_context;
         self
     }
+
+    fn reject_internal_artifact_frame(&mut self) {
+        self.output_queue.extend(reject_public_stream_tool_name(
+            self.client_format,
+            &mut self.state,
+            INTERNAL_ARTIFACT_ERROR_MESSAGE.to_string(),
+        ));
+        self.close_after_output = true;
+    }
+
+    fn drain_translated_frames(&mut self) {
+        while let Some((frame, event)) = take_one_sse_frame(&mut self.buffer) {
+            let event_type = sse_frame_event_type(&frame);
+            if event_type
+                .as_deref()
+                .is_some_and(contains_internal_artifact_text)
+            {
+                self.reject_internal_artifact_frame();
+                break;
+            }
+
+            let Some(event) = event else {
+                if sse_frame_contains_internal_artifact(&frame) {
+                    self.reject_internal_artifact_frame();
+                    break;
+                }
+                continue;
+            };
+
+            let translated = translate_sse_event(
+                self.upstream_format,
+                self.client_format,
+                &event,
+                &mut self.state,
+            );
+            self.output_queue.extend(translated);
+            if self.state.fatal_rejection.is_some() {
+                self.close_after_output = true;
+                break;
+            }
+        }
+    }
 }
 
 impl<S, E> Stream for TranslateSseStream<S, E>
@@ -365,21 +833,7 @@ where
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     this.buffer.extend_from_slice(&chunk);
-                    while let Some(event) = take_one_sse_event(&mut this.buffer) {
-                        let translated = translate_sse_event(
-                            this.upstream_format,
-                            this.client_format,
-                            &event,
-                            &mut this.state,
-                        );
-                        this.output_queue.extend(translated);
-                        if this.upstream_format != this.client_format
-                            && this.state.fatal_rejection.is_some()
-                        {
-                            this.close_after_output = true;
-                            break;
-                        }
-                    }
+                    this.drain_translated_frames();
                     if !this.output_queue.is_empty() {
                         continue;
                     }
@@ -391,22 +845,8 @@ where
                     return Poll::Ready(Some(Err(std::io::Error::other(e.into().to_string()))));
                 }
                 Poll::Ready(None) => {
-                    while let Some(event) = take_one_sse_event(&mut this.buffer) {
-                        let translated = translate_sse_event(
-                            this.upstream_format,
-                            this.client_format,
-                            &event,
-                            &mut this.state,
-                        );
-                        this.output_queue.extend(translated);
-                        if this.upstream_format != this.client_format
-                            && this.state.fatal_rejection.is_some()
-                        {
-                            this.close_after_output = true;
-                            break;
-                        }
-                    }
-                    if this.upstream_format == UpstreamFormat::Google {
+                    this.drain_translated_frames();
+                    if !this.close_after_output && this.upstream_format == UpstreamFormat::Google {
                         if let Some(chunk) = flush_pending_gemini_finish_chunk(&mut this.state) {
                             let translated = match this.client_format {
                                 UpstreamFormat::OpenAiCompletion => vec![format_sse_data(&chunk)],

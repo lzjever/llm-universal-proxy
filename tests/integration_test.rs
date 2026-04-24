@@ -27,6 +27,7 @@ use llm_universal_proxy::server::run_with_listener;
 use reqwest::Client;
 use serde_json::json;
 use serde_json::Value;
+use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -544,6 +545,88 @@ async fn spawn_headered_openai_responses_resource_mock() -> (String, tokio::task
     (base, handle)
 }
 
+#[derive(Clone, Copy)]
+enum ResponsesResourceLeakMode {
+    InternalContext,
+    PublicIdentity,
+}
+
+async fn spawn_leaky_openai_responses_resource_mock(
+    leak_mode: ResponsesResourceLeakMode,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(
+        State(leak_mode): State<ResponsesResourceLeakMode>,
+        method: Method,
+        uri: Uri,
+    ) -> Response {
+        let body = match (method.as_str(), uri.path()) {
+            ("GET", "/v1/responses/resp_123")
+            | ("DELETE", "/v1/responses/resp_123")
+            | ("POST", "/v1/responses/resp_123/cancel")
+            | ("POST", "/v1/responses/compact") => match leak_mode {
+                ResponsesResourceLeakMode::InternalContext => json!({
+                    "id": "resp_123",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "_llmup_tool_bridge_context": {
+                        "secret": "raw_upstream_bridge_secret"
+                    },
+                    "output": []
+                }),
+                ResponsesResourceLeakMode::PublicIdentity => json!({
+                    "id": "resp_123",
+                    "object": "response",
+                    "created_at": 1,
+                    "status": "completed",
+                    "metadata": {
+                        "secret": "raw_upstream_public_identity_secret"
+                    },
+                    "output": [{
+                        "type": "function_call",
+                        "call_id": "call_leak",
+                        "name": "__llmup_custom__apply_patch",
+                        "arguments": "{}"
+                    }]
+                }),
+            },
+            _ => json!({
+                "error": {
+                    "message": format!("unexpected {} {}", method, uri.path())
+                }
+            }),
+        };
+        let status = match (method.as_str(), uri.path()) {
+            ("GET", "/v1/responses/resp_123")
+            | ("DELETE", "/v1/responses/resp_123")
+            | ("POST", "/v1/responses/resp_123/cancel")
+            | ("POST", "/v1/responses/compact") => StatusCode::OK,
+            _ => StatusCode::NOT_FOUND,
+        };
+
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&body).expect("serialize leaky responses resource body"),
+            ))
+            .expect("build leaky responses resource response")
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/responses/compact", any(handler))
+        .route("/v1/responses/:response_id", any(handler))
+        .route("/v1/responses/:response_id/cancel", any(handler))
+        .with_state(leak_mode);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
 async fn spawn_discovery_empty_mock() -> (
     String,
     tokio::task::JoinHandle<()>,
@@ -865,6 +948,35 @@ async fn empty_startup_config_keeps_health_route_available() {
     let client = Client::new();
     let response = client.get(format!("{base}/health")).send().await.unwrap();
     assert!(response.status().is_success());
+}
+
+#[test]
+fn binary_does_not_log_listening_on_occupied_port() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let config_path = std::env::temp_dir().join(format!(
+        "llmup-occupied-listen-{}-{}.yaml",
+        std::process::id(),
+        addr.port()
+    ));
+    std::fs::write(&config_path, format!("listen: {addr}\n")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llm-universal-proxy"))
+        .arg("--config")
+        .arg(&config_path)
+        .env("RUST_LOG", "llm_universal_proxy=info")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&config_path);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !combined.contains(&format!("listening on {addr}")),
+        "bind failure must not be preceded by a misleading listening log: {combined}"
+    );
 }
 
 #[tokio::test]
@@ -1937,6 +2049,49 @@ async fn openai_namespace_response_compact_works() {
 }
 
 #[tokio::test]
+async fn openai_namespace_response_compact_rejects_public_boundary_artifacts() {
+    let (mock_base, _mock) = spawn_openai_responses_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let cases = [
+        json!({
+            "response_id": "resp_123",
+            "_llmup_tool_bridge_context": {
+                "secret": "client_bridge_secret"
+            }
+        }),
+        json!({
+            "response_id": "resp_123",
+            "tool_choice": "__llmup_custom__apply_patch"
+        }),
+        json!({
+            "response_id": "resp_123",
+            "tools": [{
+                "type": "function",
+                "name": "__llmup_custom__apply_patch"
+            }]
+        }),
+    ];
+
+    for body in cases {
+        let res = client
+            .post(format!("{proxy_base}/openai/v1/responses/compact"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = res.text().await.unwrap();
+        assert!(
+            !text.contains("client_bridge_secret"),
+            "error leaked full ingress body: {text}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn openai_namespace_response_resource_routes_preserve_upstream_protocol_headers() {
     let (mock_base, _mock) = spawn_headered_openai_responses_resource_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
@@ -1988,6 +2143,104 @@ async fn openai_namespace_response_resource_routes_preserve_upstream_protocol_he
                 .get("ratelimit-limit-requests")
                 .and_then(|value| value.to_str().ok()),
             Some("99")
+        );
+    }
+}
+
+#[tokio::test]
+async fn openai_namespace_response_resource_routes_reject_public_boundary_artifacts_from_upstream()
+{
+    let (mock_base, _mock) =
+        spawn_leaky_openai_responses_resource_mock(ResponsesResourceLeakMode::InternalContext)
+            .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let responses = vec![
+        client
+            .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
+            .send()
+            .await
+            .unwrap(),
+        client
+            .delete(format!("{proxy_base}/openai/v1/responses/resp_123"))
+            .send()
+            .await
+            .unwrap(),
+        client
+            .post(format!("{proxy_base}/openai/v1/responses/resp_123/cancel"))
+            .send()
+            .await
+            .unwrap(),
+        client
+            .post(format!("{proxy_base}/openai/v1/responses/compact"))
+            .json(&json!({ "response_id": "resp_123" }))
+            .send()
+            .await
+            .unwrap(),
+    ];
+
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let text = response.text().await.unwrap();
+        assert!(
+            !text.contains("raw_upstream_bridge_secret"),
+            "error leaked full upstream body: {text}"
+        );
+        assert!(
+            !text.contains("\"output\""),
+            "error leaked upstream response object: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn openai_namespace_response_resource_routes_reject_reserved_public_identity_from_upstream() {
+    let (mock_base, _mock) =
+        spawn_leaky_openai_responses_resource_mock(ResponsesResourceLeakMode::PublicIdentity).await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let client = Client::new();
+    let responses = vec![
+        client
+            .get(format!("{proxy_base}/openai/v1/responses/resp_123"))
+            .send()
+            .await
+            .unwrap(),
+        client
+            .delete(format!("{proxy_base}/openai/v1/responses/resp_123"))
+            .send()
+            .await
+            .unwrap(),
+        client
+            .post(format!("{proxy_base}/openai/v1/responses/resp_123/cancel"))
+            .send()
+            .await
+            .unwrap(),
+        client
+            .post(format!("{proxy_base}/openai/v1/responses/compact"))
+            .json(&json!({ "response_id": "resp_123" }))
+            .send()
+            .await
+            .unwrap(),
+    ];
+
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let text = response.text().await.unwrap();
+        assert!(
+            !text.contains("__llmup_custom__"),
+            "reserved-prefix artifact should not leak through resource error: {text}"
+        );
+        assert!(
+            !text.contains("raw_upstream_public_identity_secret"),
+            "error leaked full upstream body: {text}"
+        );
+        assert!(
+            !text.contains("\"output\""),
+            "error leaked upstream response object: {text}"
         );
     }
 }

@@ -16,8 +16,15 @@ pub(crate) use assessment::{assess_request_translation_with_surface, Translation
 pub(crate) use request::{translate_request_with_policy, RequestTranslationPolicy};
 pub(crate) use response::{
     classify_openai_finish_for_anthropic, classify_portable_non_success_terminal,
-    gemini_finish_reason_to_openai, responses_failed_code_to_openai_finish, AnthropicTerminal,
+    gemini_finish_reason_to_openai, responses_failed_code_to_openai_finish,
+    translate_response_with_context, AnthropicTerminal, ResponseTranslationContext,
 };
 pub(crate) use shared::{
     anthropic_tool_use_type_for_openai_tool_call, custom_tools_not_portable_message,
+    validate_public_selector_visible_identity, validate_public_tool_name_not_reserved,
+    validate_responses_public_output_tool_identity,
+    validate_responses_public_request_object_tool_identity,
+    validate_responses_public_response_object_tool_identity,
+    validate_responses_public_stream_event_tool_identity,
+    validate_responses_public_tool_call_item_identity,
 };

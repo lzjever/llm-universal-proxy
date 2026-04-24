@@ -11,6 +11,154 @@ fn parse_sse_events(body: &[u8]) -> Vec<Value> {
     events
 }
 
+async fn spawn_openai_completion_stream_mock_with_events(
+    response_events: Vec<Value>,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    #[derive(Clone)]
+    struct MockState {
+        requests: Arc<Mutex<Vec<Value>>>,
+        response_events: Vec<Value>,
+    }
+
+    async fn handle_chat_completions(
+        State(state): State<MockState>,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        state.requests.lock().await.push(body);
+
+        let pieces = state
+            .response_events
+            .iter()
+            .flat_map(|event| {
+                let event_bytes =
+                    serde_json::to_vec(event).expect("serialize OpenAI streaming payload");
+                vec![
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: ")),
+                    Ok(Bytes::from(event_bytes)),
+                    Ok(Bytes::from_static(b"\n\n")),
+                ]
+            })
+            .chain(std::iter::once(Ok(Bytes::from_static(b"data: [DONE]\n\n"))))
+            .collect::<Vec<_>>();
+        let body_stream = stream::iter(pieces);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from_stream(body_stream))
+            .expect("streaming response")
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/chat/completions", post(handle_chat_completions))
+        .with_state(MockState {
+            requests: requests.clone(),
+            response_events,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind OpenAI stream mock upstream");
+    let addr = listener
+        .local_addr()
+        .expect("OpenAI stream mock local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("OpenAI stream mock server");
+    });
+
+    (format!("http://{addr}"), requests, server)
+}
+
+async fn spawn_openai_responses_mock(
+    response_body: Value,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    #[derive(Clone)]
+    struct MockState {
+        requests: Arc<Mutex<Vec<Value>>>,
+        response_body: Value,
+    }
+
+    async fn handle_responses(
+        State(state): State<MockState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state.requests.lock().await.push(body);
+        Json(state.response_body)
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/responses", post(handle_responses))
+        .with_state(MockState {
+            requests: requests.clone(),
+            response_body,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind OpenAI Responses mock upstream");
+    let addr = listener
+        .local_addr()
+        .expect("OpenAI Responses mock local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("OpenAI Responses mock server");
+    });
+
+    (format!("http://{addr}"), requests, server)
+}
+
+async fn spawn_google_generate_content_mock(
+    response_body: Value,
+) -> (
+    String,
+    Arc<Mutex<Vec<(String, Value)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    #[derive(Clone)]
+    struct MockState {
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
+        response_body: Value,
+    }
+
+    async fn handle_generate_content(
+        uri: axum::http::Uri,
+        State(state): State<MockState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .requests
+            .lock()
+            .await
+            .push((uri.path().trim_start_matches('/').to_string(), body));
+        Json(state.response_body)
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/*path", post(handle_generate_content))
+        .with_state(MockState {
+            requests: requests.clone(),
+            response_body,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind Gemini mock upstream");
+    let addr = listener.local_addr().expect("Gemini mock local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("Gemini mock server");
+    });
+
+    (format!("http://{addr}"), requests, server)
+}
+
 async fn spawn_anthropic_messages_stream_mock(
     response_events: Vec<Value>,
 ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
@@ -198,6 +346,187 @@ fn classify_request_boundary_warns_for_gemini_top_k_drop_policy() {
         panic!("expected warning path, got {decision:?}");
     };
     assert!(warnings.iter().any(|warning| warning.contains("topK")));
+}
+
+#[tokio::test]
+async fn same_format_openai_streaming_passthrough_rejects_reserved_tool_name() {
+    let response_events = vec![serde_json::json!({
+        "id": "chatcmpl-reserved",
+        "object": "chat.completion.chunk",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_reserved",
+                    "type": "function",
+                    "function": {
+                        "name": "__llmup_custom__apply_patch",
+                        "arguments": "{}"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    })];
+    let (mock_base, requests, server) =
+        spawn_openai_completion_stream_mock_with_events(response_events).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/chat/completions".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("stream body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("stream body utf8");
+    assert!(
+        body_text.contains("\"code\":\"reserved_openai_custom_bridge_prefix\""),
+        "body = {body_text}"
+    );
+    assert!(
+        !body_text.contains("\"name\":\"__llmup_custom__apply_patch\""),
+        "same-format passthrough leaked reserved tool name: {body_text}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_openai_same_format_empty_policy_rejects_reserved_legacy_function_name() {
+    let response_body = serde_json::json!({
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hi" },
+            "finish_reason": "stop"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/chat/completions".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "functions": [{
+                "name": "__llmup_custom__legacy_exec",
+                "parameters": { "type": "object", "properties": {} }
+            }],
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body: Value = serde_json::from_slice(&body).expect("json body");
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("error message string");
+    assert_eq!(
+        message,
+        crate::internal_artifacts::GENERIC_UPSTREAM_ERROR_MESSAGE
+    );
+    assert!(!message.contains("__llmup_custom__"), "message = {message}");
+    assert!(!message.contains("legacy_exec"), "message = {message}");
+
+    let recorded = requests.lock().await;
+    assert!(recorded.is_empty(), "requests = {recorded:?}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_gemini_same_format_empty_policy_rejects_reserved_top_level_response_tool_name() {
+    let response_body = serde_json::json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{ "text": "Hi" }]
+            },
+            "finishReason": "STOP"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_google_generate_content_mock(response_body).await;
+    let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Google);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/google/v1beta/models/gemini-2.5-flash:generateContent".to_string(),
+        serde_json::json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }],
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{
+                            "functionCall": {
+                                "name": "__llmup_custom__apply_patch",
+                                "args": {}
+                            }
+                        }]
+                    }
+                }]
+            }
+        }),
+        "gemini-2.5-flash".to_string(),
+        crate::formats::UpstreamFormat::Google,
+        Some(false),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body: Value = serde_json::from_slice(&body).expect("json body");
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("error message string");
+    assert_eq!(
+        message,
+        crate::internal_artifacts::GENERIC_UPSTREAM_ERROR_MESSAGE
+    );
+    assert!(!message.contains("__llmup_custom__"), "message = {message}");
+    assert!(!message.contains("apply_patch"), "message = {message}");
+
+    let recorded = requests.lock().await;
+    assert!(recorded.is_empty(), "requests = {recorded:?}");
+    server.abort();
 }
 
 #[tokio::test]
@@ -430,6 +759,252 @@ async fn live_responses_custom_tool_bridge_to_openai_restores_non_stream_respons
 }
 
 #[tokio::test]
+async fn live_openai_responses_same_format_success_rejects_upstream_bridge_context_leak() {
+    let response_body = serde_json::json!({
+        "_llmup_tool_bridge_context": {
+            "version": 1,
+            "compatibility_mode": "balanced",
+            "entries": {
+                "code_exec": {
+                    "stable_name": "code_exec",
+                    "source_kind": "custom_text",
+                    "transport_kind": "function_object_wrapper",
+                    "wrapper_field": "input",
+                    "expected_canonical_shape": "single_required_string"
+                }
+            }
+        },
+        "id": "resp_leaky_context",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "output": []
+    });
+    let (mock_base, requests, server) = spawn_openai_responses_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": "Hi",
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("json body utf8");
+    assert!(
+        !body_text.contains("_llmup_tool_bridge_context"),
+        "public egress leaked internal bridge context: {body_text}"
+    );
+    assert!(
+        !body_text.contains("__llmup_custom__"),
+        "public egress leaked internal custom prefix: {body_text}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_openai_responses_same_format_success_rejects_reserved_tool_identity_without_leak() {
+    let response_body = serde_json::json!({
+        "id": "resp_reserved_identity",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "output": [{
+            "type": "custom_tool_call",
+            "call_id": "call_reserved",
+            "name": "__llmup_custom__apply_patch",
+            "input": "*** Begin Patch\n*** End Patch\n"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_responses_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": "Hi",
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("json body utf8");
+    assert!(
+        !body_text.contains("__llmup_custom__"),
+        "same-format non-stream rejection leaked reserved prefix: {body_text}"
+    );
+    assert!(
+        !body_text.contains("_llmup_tool_bridge_context"),
+        "same-format non-stream rejection leaked bridge context field: {body_text}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_openai_responses_same_format_success_preserves_regular_text_and_schema_descriptions()
+{
+    let public_text = "plain success text mentions __llmup_custom__apply_patch";
+    let schema_description =
+        "schema docs may mention __llmup_custom__apply_patch as literal user text";
+    let response_body = serde_json::json!({
+        "id": "resp_plain_reserved_text",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_plain_reserved_text",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": public_text,
+                "annotations": []
+            }]
+        }],
+        "tools": [{
+            "type": "function",
+            "name": "describe_patch_token",
+            "description": schema_description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "literal": {
+                        "type": "string",
+                        "description": schema_description
+                    }
+                }
+            }
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_responses_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": "Hi",
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("json body utf8");
+    let body: Value = serde_json::from_str(&body_text).expect("json body");
+    assert_eq!(body["output"][0]["content"][0]["text"], public_text);
+    assert_eq!(body["tools"][0]["description"], schema_description);
+    assert_eq!(
+        body["tools"][0]["parameters"]["properties"]["literal"]["description"],
+        schema_description
+    );
+    assert!(body_text.contains("__llmup_custom__apply_patch"));
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn same_format_openai_streaming_passthrough_preserves_regular_delta_content() {
+    let public_text = "delta content mentions __llmup_custom__apply_patch as text";
+    let response_events = vec![serde_json::json!({
+        "id": "chatcmpl-plain-reserved-text",
+        "object": "chat.completion.chunk",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": public_text
+            },
+            "finish_reason": null
+        }]
+    })];
+    let (mock_base, requests, server) =
+        spawn_openai_completion_stream_mock_with_events(response_events).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/chat/completions".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("stream body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("stream body utf8");
+    assert!(body_text.contains(public_text), "body = {body_text}");
+    assert!(
+        !body_text.contains("reserved_openai_custom_bridge_prefix"),
+        "plain delta content should not be treated as a reserved tool identity: {body_text}"
+    );
+    assert!(
+        !body_text.contains("response.failed"),
+        "plain delta content should not fail the stream: {body_text}"
+    );
+
+    let recorded = requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    server.abort();
+}
+
+#[tokio::test]
 async fn live_responses_rejects_external_tool_bridge_context_ingress() {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
@@ -487,11 +1062,14 @@ async fn live_responses_rejects_external_tool_bridge_context_ingress() {
     let message = body["error"]["message"]
         .as_str()
         .expect("error message string");
+    assert_eq!(
+        message,
+        crate::internal_artifacts::GENERIC_UPSTREAM_ERROR_MESSAGE
+    );
     assert!(
-        message.contains(INTERNAL_TOOL_BRIDGE_CONTEXT_FIELD),
+        !message.contains(INTERNAL_TOOL_BRIDGE_CONTEXT_FIELD),
         "message = {message}"
     );
-    assert!(message.contains("internal-only"), "message = {message}");
 
     let recorded = requests.lock().await;
     assert!(recorded.is_empty(), "requests = {recorded:?}");

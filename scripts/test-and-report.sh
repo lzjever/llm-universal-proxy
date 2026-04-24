@@ -4,6 +4,7 @@
 # Default report dir: ./test-reports (created if missing).
 
 set -e
+set -o pipefail
 
 REPORT_DIR="${PWD}/test-reports"
 while [[ $# -gt 0 ]]; do
@@ -38,12 +39,28 @@ if [[ -x "$HOME/.cargo/bin/cargo" ]]; then
 fi
 export CARGO
 CARGO_ENV="env -u RUSTC_WRAPPER -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY"
+PYTHON_CONTRACT_TEST_COMMAND="PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
 
 echo "Running tests (log: $LOG_FILE) ..."
-if $CARGO_ENV $CARGO test --locked --no-fail-fast 2>&1 | tee "$LOG_FILE"; then
-  TEST_EXIT=0
+TEST_EXIT=0
+echo "+ $CARGO test --locked --no-fail-fast" | tee "$LOG_FILE"
+if $CARGO_ENV $CARGO test --locked --no-fail-fast 2>&1 | tee -a "$LOG_FILE"; then
+  :
 else
   TEST_EXIT=$?
+fi
+
+{
+  echo ""
+  echo "+ $PYTHON_CONTRACT_TEST_COMMAND"
+} | tee -a "$LOG_FILE"
+if PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py' 2>&1 | tee -a "$LOG_FILE"; then
+  :
+else
+  python_exit=$?
+  if [[ $TEST_EXIT -eq 0 ]]; then
+    TEST_EXIT=$python_exit
+  fi
 fi
 
 # Parse log: "running N tests" per crate, "test result: ok. X passed; Y failed"
@@ -69,6 +86,23 @@ while IFS= read -r line; do
     n="${BASH_REMATCH[1]}"
     TOTAL_PASSED=$((TOTAL_PASSED + n))
     CRATE_RESULTS+=("passed $n")
+  fi
+  if [[ "$line" =~ ^Ran\ ([0-9]+)\ tests?\ in ]]; then
+    CURRENT_PYTHON_TESTS="${BASH_REMATCH[1]}"
+  elif [[ -n "${CURRENT_PYTHON_TESTS:-}" ]] && [[ "$line" == OK* ]]; then
+    TOTAL_PASSED=$((TOTAL_PASSED + CURRENT_PYTHON_TESTS))
+    CURRENT_PYTHON_TESTS=
+  elif [[ -n "${CURRENT_PYTHON_TESTS:-}" ]] && [[ "$line" =~ ^FAILED\ \( ]]; then
+    python_failed=0
+    if [[ "$line" =~ failures=([0-9]+) ]]; then
+      python_failed=$((python_failed + BASH_REMATCH[1]))
+    fi
+    if [[ "$line" =~ errors=([0-9]+) ]]; then
+      python_failed=$((python_failed + BASH_REMATCH[1]))
+    fi
+    TOTAL_FAILED=$((TOTAL_FAILED + python_failed))
+    TOTAL_PASSED=$((TOTAL_PASSED + CURRENT_PYTHON_TESTS - python_failed))
+    CURRENT_PYTHON_TESTS=
   fi
   if [[ "$line" == failures:* ]]; then
     in_failures=1

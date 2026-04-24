@@ -18,6 +18,7 @@ pub(crate) struct RequestTranslationPolicy {
 }
 
 impl RequestTranslationPolicy {
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         !self.has_native_request_policy_hooks()
             && self.compatibility_mode == CompatibilityMode::default()
@@ -38,6 +39,7 @@ impl RequestTranslationPolicy {
             == Some(false)
     }
 
+    #[cfg(test)]
     fn has_native_request_policy_hooks(&self) -> bool {
         self.max_output_tokens().is_some() || self.disables_parallel_tool_calls()
     }
@@ -82,6 +84,7 @@ pub fn translate_request_with_policy(
     {
         return Err(message);
     }
+    validate_public_request_tool_names(client_format, body)?;
 
     if client_format == upstream_format {
         if stream {
@@ -722,6 +725,7 @@ use tools::{
     anthropic_tool_use_type_for_openai_tool_call, copy_non_replayable_tool_call_marker,
     insert_request_scoped_tool_bridge_context, normalized_openai_tool_call,
     normalized_openai_tool_definitions_from_request_with_request_scoped_custom_bridge,
+    normalized_responses_tool_call, normalized_responses_tool_definitions_from_request,
     normalized_tool_definition_to_openai_with_request_scoped_custom_bridge,
     openai_responses_custom_tool_bridge_arguments,
     openai_responses_custom_tool_input_from_bridge_value,
@@ -731,7 +735,30 @@ use tools::{
     semantic_text_part_from_openai_part, semantic_text_part_to_openai_value,
     semantic_tool_kind_from_value, semantic_tool_result_content_from_value,
     semantic_tool_result_content_to_value, tool_call_is_marked_non_replayable,
+    validate_openai_public_tool_choice_identity, validate_openai_public_tool_identity,
+    validate_public_selector_visible_identities, validate_public_selector_visible_identity,
+    validate_public_tool_name_not_reserved,
+    validate_responses_public_response_object_tool_identity,
+    validate_responses_public_tool_metadata_identity,
 };
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResponseTranslationContext {
+    request_scoped_tool_bridge_context: Option<tools::ToolBridgeContext>,
+}
+
+impl ResponseTranslationContext {
+    pub fn with_request_scoped_tool_bridge_context_value(mut self, value: Option<Value>) -> Self {
+        self.request_scoped_tool_bridge_context = value
+            .as_ref()
+            .and_then(tools::ToolBridgeContext::from_value);
+        self
+    }
+
+    fn request_scoped_tool_bridge_context(&self) -> Option<&tools::ToolBridgeContext> {
+        self.request_scoped_tool_bridge_context.as_ref()
+    }
+}
 
 /// Translate response body from upstream format to client format.
 /// Converts via OpenAI pivot: upstream → openai → client when formats differ.
@@ -740,45 +767,69 @@ pub fn translate_response(
     client_format: UpstreamFormat,
     body: &Value,
 ) -> Result<Value, String> {
+    translate_response_with_context(
+        upstream_format,
+        client_format,
+        body,
+        ResponseTranslationContext::default(),
+    )
+}
+
+pub fn translate_response_with_context(
+    upstream_format: UpstreamFormat,
+    client_format: UpstreamFormat,
+    body: &Value,
+    context: ResponseTranslationContext,
+) -> Result<Value, String> {
+    if crate::internal_artifacts::contains_internal_context_field(body) {
+        return Err(format!(
+            "upstream response contained internal-only field `{}`",
+            crate::internal_artifacts::REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD
+        ));
+    }
+
     if upstream_format == client_format {
+        validate_public_response_tool_names(client_format, body)?;
         return Ok(body.clone());
     }
-    let bridge_context = request_scoped_tool_bridge_context_from_body(body);
-    let mut openai = if upstream_format == UpstreamFormat::Anthropic
+    let bridge_context = context.request_scoped_tool_bridge_context();
+    let openai = if upstream_format == UpstreamFormat::Anthropic
         && client_format == UpstreamFormat::OpenAiResponses
     {
-        claude_response_to_openai_with_reasoning_replay(body)?
+        claude_response_to_openai_with_reasoning_replay(body, bridge_context)?
     } else if upstream_format == UpstreamFormat::OpenAiResponses
         && client_format == UpstreamFormat::Anthropic
     {
         responses_response_to_openai_for_anthropic(body)?
     } else {
-        upstream_response_to_openai(upstream_format, body)?
+        upstream_response_to_openai(upstream_format, body, bridge_context)?
     };
-    if let Some(bridge_context) = bridge_context.as_ref() {
-        insert_request_scoped_tool_bridge_context(&mut openai, bridge_context);
-    }
     if client_format == UpstreamFormat::OpenAiCompletion {
         return Ok(openai);
     }
-    openai_response_to_client(client_format, &openai)
+    openai_response_to_client(client_format, &openai, bridge_context)
 }
 
 /// Convert upstream non-streaming response to OpenAI completion shape.
 fn upstream_response_to_openai(
     upstream_format: UpstreamFormat,
     body: &Value,
+    bridge_context: Option<&tools::ToolBridgeContext>,
 ) -> Result<Value, String> {
     match upstream_format {
         UpstreamFormat::OpenAiCompletion => Ok(normalize_openai_completion_response(body)),
-        UpstreamFormat::Anthropic => claude_response_to_openai(body),
+        UpstreamFormat::Anthropic => claude_response_to_openai(body, bridge_context),
         UpstreamFormat::Google => gemini_response_to_openai(body),
         UpstreamFormat::OpenAiResponses => responses_response_to_openai(body),
     }
 }
 
 /// Convert OpenAI completion response to client format (Responses, Claude, Gemini).
-fn openai_response_to_client(client_format: UpstreamFormat, body: &Value) -> Result<Value, String> {
+fn openai_response_to_client(
+    client_format: UpstreamFormat,
+    body: &Value,
+    bridge_context: Option<&tools::ToolBridgeContext>,
+) -> Result<Value, String> {
     if matches!(
         client_format,
         UpstreamFormat::Anthropic | UpstreamFormat::Google
@@ -790,10 +841,253 @@ fn openai_response_to_client(client_format: UpstreamFormat, body: &Value) -> Res
     }
     match client_format {
         UpstreamFormat::OpenAiCompletion => Ok(body.clone()),
-        UpstreamFormat::OpenAiResponses => openai_response_to_responses(body),
+        UpstreamFormat::OpenAiResponses => openai_response_to_responses(body, bridge_context),
         UpstreamFormat::Anthropic => openai_response_to_claude(body),
         UpstreamFormat::Google => openai_response_to_gemini(body),
     }
+}
+
+fn validate_public_request_tool_names(format: UpstreamFormat, body: &Value) -> Result<(), String> {
+    match format {
+        UpstreamFormat::OpenAiCompletion => validate_openai_request_tool_names(body),
+        UpstreamFormat::OpenAiResponses => validate_responses_request_tool_names(body),
+        UpstreamFormat::Anthropic => validate_anthropic_body_tool_names(body),
+        UpstreamFormat::Google => validate_gemini_request_tool_names(body),
+    }
+}
+
+fn validate_public_response_tool_names(format: UpstreamFormat, body: &Value) -> Result<(), String> {
+    match format {
+        UpstreamFormat::OpenAiCompletion => validate_openai_response_tool_names(body),
+        UpstreamFormat::OpenAiResponses => validate_responses_response_tool_names(body),
+        UpstreamFormat::Anthropic => validate_anthropic_body_tool_names(body),
+        UpstreamFormat::Google => validate_gemini_response_tool_names(body),
+    }
+}
+
+fn validate_openai_request_tool_names(body: &Value) -> Result<(), String> {
+    let bridge_context = request_scoped_tool_bridge_context_from_body(body);
+    normalized_openai_tool_definitions_from_request_with_request_scoped_custom_bridge(
+        body,
+        bridge_context.as_ref(),
+    )?;
+    validate_openai_legacy_function_definitions(body)?;
+    if let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) {
+        validate_openai_family_tool_choice_names(tool_choice)?;
+    }
+    if let Some(function_call) = body.get("function_call").filter(|value| !value.is_null()) {
+        validate_openai_legacy_function_call_name(function_call)?;
+    }
+    if let Some(names) = body.get("allowed_tool_names") {
+        validate_public_selector_visible_identities(names)?;
+    }
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            validate_openai_message_tool_call_names(message)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_response_tool_names(body: &Value) -> Result<(), String> {
+    let Some(choices) = body.get("choices").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for choice in choices {
+        if let Some(message) = choice.get("message") {
+            validate_openai_message_tool_call_names(message)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_message_tool_call_names(message: &Value) -> Result<(), String> {
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            validate_public_selector_visible_identity(tool_call)?;
+            normalized_openai_tool_call(tool_call)?;
+        }
+    }
+    if let Some(function_call) = message
+        .get("function_call")
+        .filter(|value| !value.is_null())
+    {
+        validate_openai_legacy_function_call_name(function_call)?;
+    }
+    Ok(())
+}
+
+fn validate_openai_legacy_function_definitions(body: &Value) -> Result<(), String> {
+    let Some(functions) = body.get("functions").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for function in functions {
+        validate_public_selector_visible_identity(function)?;
+        validate_openai_public_tool_identity(function)?;
+    }
+    Ok(())
+}
+
+fn validate_openai_legacy_function_call_name(function_call: &Value) -> Result<(), String> {
+    validate_public_selector_visible_identity(function_call)?;
+    validate_openai_public_tool_identity(function_call)
+}
+
+fn validate_responses_request_tool_names(body: &Value) -> Result<(), String> {
+    validate_responses_public_tool_metadata_identity(body)?;
+    normalized_responses_tool_definitions_from_request(body)?;
+    if let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) {
+        validate_openai_family_tool_choice_names(tool_choice)?;
+    }
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items {
+            normalized_responses_tool_call(item)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_responses_response_tool_names(body: &Value) -> Result<(), String> {
+    validate_responses_public_response_object_tool_identity(body)?;
+    if let Some(response) = body.get("response") {
+        validate_responses_public_response_object_tool_identity(response)?;
+    }
+    if let Some(output) = body.get("output").and_then(Value::as_array) {
+        for item in output {
+            normalized_responses_tool_call(item)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_family_tool_choice_names(choice: &Value) -> Result<(), String> {
+    validate_openai_public_tool_choice_identity(choice)
+}
+
+fn validate_anthropic_body_tool_names(body: &Value) -> Result<(), String> {
+    if let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) {
+        validate_public_selector_visible_identity(tool_choice)?;
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            validate_public_selector_visible_identity(tool)?;
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                validate_public_tool_name_not_reserved(name)?;
+            }
+        }
+    }
+    if let Some(content) = body.get("content") {
+        validate_anthropic_content_tool_names(content)?;
+    }
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if let Some(content) = message.get("content") {
+                validate_anthropic_content_tool_names(content)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_anthropic_content_tool_names(content: &Value) -> Result<(), String> {
+    let Some(blocks) = content.as_array() else {
+        return Ok(());
+    };
+    for block in blocks {
+        if matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("tool_use" | "server_tool_use")
+        ) {
+            if let Some(name) = block.get("name").and_then(Value::as_str) {
+                validate_public_tool_name_not_reserved(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_gemini_request_tool_names(body: &Value) -> Result<(), String> {
+    if let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) {
+        validate_public_selector_visible_identity(tool_choice)?;
+    }
+    if let Some(tools) = gemini_request_tools(body) {
+        for tool in tools {
+            validate_public_selector_visible_identity(tool)?;
+            if let Some(declarations) = gemini_tool_function_declarations(tool) {
+                for declaration in declarations {
+                    if let Some(name) = declaration.get("name").and_then(Value::as_str) {
+                        validate_public_tool_name_not_reserved(name)?;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tool_config) = gemini_request_tool_config(body) {
+        if let Some(function_calling_config) =
+            gemini_request_function_calling_config_from_object(tool_config)
+        {
+            for key in ["allowedFunctionNames", "allowed_function_names"] {
+                if let Some(allowed_names) = function_calling_config.get(key) {
+                    validate_public_selector_visible_identities(allowed_names)?;
+                }
+            }
+        }
+    }
+    if let Some(contents) = body.get("contents").and_then(Value::as_array) {
+        for content in contents {
+            validate_gemini_content_tool_names(content)?;
+        }
+    }
+    if let Some(candidates) = body.get("candidates").and_then(Value::as_array) {
+        for candidate in candidates {
+            if let Some(content) = candidate.get("content") {
+                validate_gemini_content_tool_names(content)?;
+            }
+        }
+    }
+    if let Some(response) = body.get("response") {
+        validate_gemini_response_candidate_tool_names(response)?;
+    }
+    Ok(())
+}
+
+fn validate_gemini_response_tool_names(body: &Value) -> Result<(), String> {
+    validate_gemini_response_candidate_tool_names(body)?;
+    if let Some(response) = body.get("response") {
+        validate_gemini_response_candidate_tool_names(response)?;
+    }
+    Ok(())
+}
+
+fn validate_gemini_response_candidate_tool_names(body: &Value) -> Result<(), String> {
+    if let Some(candidates) = body.get("candidates").and_then(Value::as_array) {
+        for candidate in candidates {
+            if let Some(content) = candidate.get("content") {
+                validate_gemini_content_tool_names(content)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_gemini_content_tool_names(content: &Value) -> Result<(), String> {
+    let Some(parts) = content.get("parts").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for part in parts {
+        for tool_part in [
+            gemini_part_field(part, "functionCall", "function_call"),
+            gemini_part_field(part, "functionResponse", "function_response"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(name) = tool_part.get("name").and_then(Value::as_str) {
+                validate_public_tool_name_not_reserved(name)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn anthropic_block_has_cache_control(block: &Value) -> bool {
@@ -1211,27 +1505,33 @@ fn claude_system_to_openai_content(system: &Value) -> Result<Option<Value>, Stri
     }
 }
 
-fn claude_response_to_openai(body: &Value) -> Result<Value, String> {
-    claude_response_to_openai_internal(body, false)
+fn claude_response_to_openai(
+    body: &Value,
+    bridge_context: Option<&tools::ToolBridgeContext>,
+) -> Result<Value, String> {
+    claude_response_to_openai_internal(body, false, bridge_context)
 }
 
-fn claude_response_to_openai_with_reasoning_replay(body: &Value) -> Result<Value, String> {
-    claude_response_to_openai_internal(body, true)
+fn claude_response_to_openai_with_reasoning_replay(
+    body: &Value,
+    bridge_context: Option<&tools::ToolBridgeContext>,
+) -> Result<Value, String> {
+    claude_response_to_openai_internal(body, true, bridge_context)
 }
 
 fn claude_response_to_openai_internal(
     body: &Value,
     allow_reasoning_replay: bool,
+    bridge_context: Option<&tools::ToolBridgeContext>,
 ) -> Result<Value, String> {
     let content = body.get("content").cloned().ok_or("missing content")?;
-    let bridge_context = request_scoped_tool_bridge_context_from_body(body);
     let mut converted = convert_claude_message_to_openai_impl(
         &serde_json::json!({
             "role": "assistant",
             "content": content
         }),
         allow_reasoning_replay,
-        bridge_context.as_ref(),
+        bridge_context,
     )?
     .ok_or("missing content")?;
     let mut message = converted
@@ -1334,9 +1634,6 @@ fn claude_response_to_openai_internal(
         );
 
         result["usage"] = usage_json;
-    }
-    if let Some(bridge_context) = bridge_context.as_ref() {
-        insert_request_scoped_tool_bridge_context(&mut result, bridge_context);
     }
     Ok(result)
 }
@@ -1585,35 +1882,36 @@ fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result
     }
     // Tools: strip cache_control
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let converted_tools: Vec<Value> = tools
-            .iter()
-            .filter_map(|t| {
-                // Skip if no name (invalid tool)
-                let name = t.get("name").and_then(Value::as_str)?;
-                if preserve_reasoning_replay
-                    && request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
-                        bridge_context.as_ref(),
-                        name,
-                    )
-                {
-                    return Some(serde_json::json!({
+        let mut converted_tools: Vec<Value> = Vec::new();
+        for t in tools {
+            let Some(name) = t.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            validate_public_tool_name_not_reserved(name)?;
+            if preserve_reasoning_replay
+                && request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
+                    bridge_context.as_ref(),
+                    name,
+                )
+            {
+                converted_tools.push(serde_json::json!({
                         "type": "custom",
                         "custom": {
                             "name": name,
                             "description": t.get("description")
                         }
-                    }));
-                }
-                Some(serde_json::json!({
+                }));
+            } else {
+                converted_tools.push(serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": name,
                         "description": t.get("description"),
                         "parameters": t.get("input_schema").or(t.get("parameters")).unwrap_or(&serde_json::json!({ "type": "object", "properties": {} }))
                     }
-                }))
-            })
-            .collect();
+                }));
+            }
+        }
         if !converted_tools.is_empty() {
             result["tools"] = Value::Array(converted_tools);
         }
@@ -1658,6 +1956,7 @@ fn anthropic_tool_choice_to_openai(
                     "Anthropic tool_choice.type = tool requires a non-empty `name` field."
                         .to_string(),
                 )?;
+            validate_public_tool_name_not_reserved(name)?;
             if decode_custom_bridge
                 && request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
                     bridge_context,
@@ -1746,6 +2045,7 @@ fn convert_claude_message_to_openai_impl(
             }
             "tool_use" => {
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                validate_public_tool_name_not_reserved(name)?;
                 let input = block
                     .get("input")
                     .cloned()
@@ -1780,18 +2080,23 @@ fn convert_claude_message_to_openai_impl(
                     }
                 }));
             }
-            "server_tool_use" => tool_calls.push(serde_json::json!({
-                "id": block.get("id"),
-                "type": "function",
-                "proxied_tool_kind": "anthropic_server_tool_use",
-                "function": {
-                    "name": block.get("name"),
-                    "arguments": block
-                        .get("input")
-                        .and_then(|input| serde_json::to_string(input).ok())
-                        .unwrap_or_else(|| "{}".to_string())
+            "server_tool_use" => {
+                if let Some(name) = block.get("name").and_then(Value::as_str) {
+                    validate_public_tool_name_not_reserved(name)?;
                 }
-            })),
+                tool_calls.push(serde_json::json!({
+                    "id": block.get("id"),
+                    "type": "function",
+                    "proxied_tool_kind": "anthropic_server_tool_use",
+                    "function": {
+                        "name": block.get("name"),
+                        "arguments": block
+                            .get("input")
+                            .and_then(|input| serde_json::to_string(input).ok())
+                            .unwrap_or_else(|| "{}".to_string())
+                    }
+                }));
+            }
             "tool_result" => {
                 let semantic_content =
                     semantic_tool_result_content_from_value(block.get("content"));

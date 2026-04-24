@@ -17,7 +17,7 @@ use super::openai_family::{
 use super::response_protocols::push_gemini_function_call_part;
 use super::tools::{
     insert_request_scoped_tool_bridge_context, request_scoped_tool_bridge_context_from_body,
-    semantic_tool_kind_from_value,
+    semantic_tool_kind_from_value, validate_public_tool_name_not_reserved,
 };
 
 pub(super) fn extract_gemini_text(content: &Value) -> String {
@@ -388,6 +388,10 @@ pub(super) fn gemini_openai_function_tool_from_declaration(
         ));
     }
 
+    if let Some(name) = declaration.get("name").and_then(Value::as_str) {
+        validate_public_tool_name_not_reserved(name)?;
+    }
+
     let mut function = serde_json::Map::new();
     function.insert(
         "name".to_string(),
@@ -490,6 +494,7 @@ pub(super) fn gemini_validated_allowed_function_names(
                     .to_string(),
             );
         }
+        validate_public_tool_name_not_reserved(name)?;
         validated_names.push(name.to_string());
     }
 
@@ -895,6 +900,9 @@ pub(super) fn convert_gemini_content_to_openai(content: &Value) -> Result<Vec<Va
         }
         if let Some(fc) = gemini_part_field(part, "functionCall", "function_call") {
             recognized = true;
+            if let Some(name) = fc.get("name").and_then(Value::as_str) {
+                validate_public_tool_name_not_reserved(name)?;
+            }
             let id = fc
                 .get("id")
                 .cloned()
@@ -1428,6 +1436,9 @@ pub(super) fn tool_message_to_gemini_function_response(
 ) -> Result<Value, String> {
     if semantic_tool_kind_from_value(msg) == SemanticToolKind::OpenAiCustom {
         return Err(custom_tools_not_portable_message(UpstreamFormat::Google));
+    }
+    if let Some(name) = function_name.as_str() {
+        validate_public_tool_name_not_reserved(name)?;
     }
     let call_id = msg.get("tool_call_id").cloned();
     let call_id_str = msg.get("tool_call_id").and_then(Value::as_str);

@@ -17,6 +17,11 @@ Locked contract:
 - `apply_patch` remains a public freeform tool on client-visible surfaces.
 - Real-client public editing contracts preserve each client's public tool name: Codex `apply_patch`, Claude Code `Edit`, and Gemini `replace`; the proxy does not rewrite them to a shared proxy name.
 
+Public-boundary text scanning boundary:
+
+- Successful payloads are not globally string-scanned for reserved prefixes in ordinary text, schema descriptions, metadata, or user-controlled content; a literal such as `__llmup_custom__apply_patch` may appear there without being rejected or scrubbed.
+- Structured internal carriers remain forbidden or cleaned at the public boundary: public tool names, namespaces, selectors, `_llmup_tool_bridge_context`, and upstream error text must not expose proxy-private transport artifacts.
+
 Phase 0 and Phase 1 together define the intended translated-path bridge: preserve the stable visible tool name on live requests and carry bridge provenance in request-scoped translation context.
 
 ## Current Baseline
@@ -96,6 +101,8 @@ Current contract:
 Status: partially delivered.
 
 Current real-client matrix coverage is intentionally narrow: the public tool enumeration contract proves each client's stable public editing tool name is surfaced without proxy rewriting, and workspace-edit execution proves the edit path still works on supported lanes. It is not yet a full behavioral matrix for arbitrary structured tool use.
+
+v0.2.13 Codex verifier note: the prework-signal checks are real-client matrix/prework validation constraints, not a data-plane protocol contract. Read-only evidence intentionally fails closed: the verifier trusts only direct system command paths from its allowlist, plus isolated `python3 -I -S -c` snippets that pass explicit parser allowlists. Shell wrappers, aliases, and bare `PATH` resolution are not treated as read-only evidence by default.
 
 Delivered coverage:
 

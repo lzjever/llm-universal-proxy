@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, Response, StatusCode},
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -16,32 +16,35 @@ use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
 use crate::debug_trace::DebugTraceContext;
+use crate::downstream::DownstreamCancellation;
 use crate::formats::UpstreamFormat;
 use crate::hooks::{
     capture_headers, json_response_headers, new_request_id, now_timestamp_ms, sse_response_headers,
     HookRequestContext,
 };
-use crate::streaming::{needs_stream_translation, TranslateSseStream};
+use crate::streaming::{needs_stream_translation, GuardedSseStream, TranslateSseStream};
 use crate::translate::{
-    assess_request_translation_with_surface, translate_request_with_policy, translate_response,
-    RequestTranslationPolicy, TranslationDecision,
+    assess_request_translation_with_surface, translate_request_with_policy,
+    translate_response_with_context, RequestTranslationPolicy, ResponseTranslationContext,
+    TranslationDecision,
 };
 use crate::upstream;
 
 use super::errors::{
     append_compatibility_warning_headers, classify_post_translation_non_stream_status,
-    error_response, format_upstream_unavailable_message, normalized_non_stream_upstream_error,
-    streaming_error_response,
+    client_closed_response, error_response, format_upstream_unavailable_message,
+    normalized_non_stream_upstream_error, streaming_error_response,
 };
 use super::headers::{
     append_upstream_protocol_response_headers, apply_upstream_headers, build_auth_headers,
+};
+use super::public_boundary::{
+    reject_internal_request_scoped_tool_bridge_context, REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD,
 };
 use super::responses_resources::{
     resolve_native_responses_stateful_route_or_error, responses_stateful_request_controls,
 };
 use super::state::{AppState, RuntimeNamespaceState, DEFAULT_NAMESPACE};
-
-const REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD: &str = "_llmup_tool_bridge_context";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrustedToolBridgeContextEntry {
@@ -143,15 +146,6 @@ impl TrustedToolBridgeContext {
             "entries": entries
         })
     }
-
-    fn insert_into(&self, body: &mut Value) {
-        if let Some(object) = body.as_object_mut() {
-            object.insert(
-                REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD.to_string(),
-                self.to_value(),
-            );
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,76 +222,159 @@ pub(super) async fn health() -> impl IntoResponse {
 
 pub(super) async fn handle_openai_chat_completions(
     State(state): State<Arc<AppState>>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_openai_chat_completions_inner(state, DEFAULT_NAMESPACE.to_string(), headers, body).await
+    handle_openai_chat_completions_inner(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub(super) async fn handle_openai_chat_completions_namespaced(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_openai_chat_completions_inner(state, namespace, headers, body).await
+    handle_openai_chat_completions_inner(
+        state,
+        namespace,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub(super) async fn handle_openai_responses(
     State(state): State<Arc<AppState>>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_openai_responses_inner(state, DEFAULT_NAMESPACE.to_string(), headers, body).await
+    handle_openai_responses_inner(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub(super) async fn handle_openai_responses_namespaced(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_openai_responses_inner(state, namespace, headers, body).await
+    handle_openai_responses_inner(
+        state,
+        namespace,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub(super) async fn handle_anthropic_messages(
     State(state): State<Arc<AppState>>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_anthropic_messages_inner(state, DEFAULT_NAMESPACE.to_string(), headers, body).await
+    handle_anthropic_messages_inner(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub(super) async fn handle_anthropic_messages_namespaced(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_anthropic_messages_inner(state, namespace, headers, body).await
+    handle_anthropic_messages_inner(
+        state,
+        namespace,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub(super) async fn handle_google_model_action(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_google_model_action_inner(state, DEFAULT_NAMESPACE.to_string(), id, headers, body).await
+    handle_google_model_action_inner(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        id,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub(super) async fn handle_google_model_action_namespaced(
     State(state): State<Arc<AppState>>,
     Path((namespace, id)): Path<(String, String)>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_google_model_action_inner(state, namespace, id, headers, body).await
+    handle_google_model_action_inner(
+        state,
+        namespace,
+        id,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 async fn handle_openai_chat_completions_inner(
     state: Arc<AppState>,
     namespace: String,
+    downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
 ) -> Response<Body> {
@@ -306,9 +383,10 @@ async fn handle_openai_chat_completions_inner(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    handle_request_core(
+    handle_request_core_with_downstream_cancellation(
         state,
         namespace,
+        downstream_cancellation,
         headers,
         "/openai/v1/chat/completions".to_string(),
         body,
@@ -322,6 +400,7 @@ async fn handle_openai_chat_completions_inner(
 async fn handle_openai_responses_inner(
     state: Arc<AppState>,
     namespace: String,
+    downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
 ) -> Response<Body> {
@@ -330,9 +409,10 @@ async fn handle_openai_responses_inner(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    handle_request_core(
+    handle_request_core_with_downstream_cancellation(
         state,
         namespace,
+        downstream_cancellation,
         headers,
         "/openai/v1/responses".to_string(),
         body,
@@ -346,6 +426,7 @@ async fn handle_openai_responses_inner(
 async fn handle_anthropic_messages_inner(
     state: Arc<AppState>,
     namespace: String,
+    downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
 ) -> Response<Body> {
@@ -354,9 +435,10 @@ async fn handle_anthropic_messages_inner(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    handle_request_core(
+    handle_request_core_with_downstream_cancellation(
         state,
         namespace,
+        downstream_cancellation,
         headers,
         "/anthropic/v1/messages".to_string(),
         body,
@@ -371,6 +453,7 @@ async fn handle_google_model_action_inner(
     state: Arc<AppState>,
     namespace: String,
     id: String,
+    downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
 ) -> Response<Body> {
@@ -392,9 +475,10 @@ async fn handle_google_model_action_inner(
             );
         }
     };
-    handle_request_core(
+    handle_request_core_with_downstream_cancellation(
         state,
         namespace,
+        downstream_cancellation,
         headers,
         format!("/google/v1beta/models/{id}"),
         body,
@@ -406,9 +490,36 @@ async fn handle_google_model_action_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) async fn handle_request_core(
     state: Arc<AppState>,
     namespace: String,
+    headers: HeaderMap,
+    path: String,
+    body: Value,
+    requested_model: String,
+    client_format: UpstreamFormat,
+    forced_stream: Option<bool>,
+) -> Response<Body> {
+    handle_request_core_with_downstream_cancellation(
+        state,
+        namespace,
+        DownstreamCancellation::disabled(),
+        headers,
+        path,
+        body,
+        requested_model,
+        client_format,
+        forced_stream,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_request_core_with_downstream_cancellation(
+    state: Arc<AppState>,
+    namespace: String,
+    downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     path: String,
     mut body: Value,
@@ -537,19 +648,17 @@ pub(super) async fn handle_request_core(
         );
     }
 
-    if client_format != upstream_format || !request_translation_policy.is_empty() {
-        if let Err(e) = translate_request_with_policy(
-            client_format,
-            upstream_format,
-            &resolved_model.upstream_model,
-            &mut body,
-            request_translation_policy,
-            stream,
-        ) {
-            error!("Translation failed: {}", e);
-            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-            return error_response(client_format, StatusCode::BAD_REQUEST, &e);
-        }
+    if let Err(e) = translate_request_with_policy(
+        client_format,
+        upstream_format,
+        &resolved_model.upstream_model,
+        &mut body,
+        request_translation_policy,
+        stream,
+    ) {
+        error!("Translation failed: {}", e);
+        tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+        return error_response(client_format, StatusCode::BAD_REQUEST, &e);
     }
 
     if let Some(obj) = body.as_object_mut() {
@@ -642,23 +751,28 @@ pub(super) async fn handle_request_core(
     } else {
         upstream_state.client.clone()
     };
-    let res = match upstream::call_upstream(
+    let res = match upstream::call_upstream_with_cancellation(
         &upstream_client,
         &url,
         &upstream_request_body,
         stream,
         &auth_headers,
+        &downstream_cancellation,
     )
     .await
     {
         Ok(r) => r,
-        Err(e) => {
+        Err(upstream::DownstreamAwareError::Inner(e)) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return if stream {
                 streaming_error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
             } else {
                 error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
             };
+        }
+        Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
+            tracker.finish_cancelled();
+            return client_closed_response(client_format);
         }
     };
     let preserve_native_upstream_protocol_headers = upstream_format == client_format;
@@ -668,19 +782,31 @@ pub(super) async fn handle_request_core(
         let upstream_response_headers = res.headers().clone();
         debug!("Upstream streaming response status: {}", status);
         if !status.is_success() {
-            let error_body = res
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
+            let error_body =
+                match upstream::read_response_text_with_cancellation(res, &downstream_cancellation)
+                    .await
+                {
+                    Ok(body) => body,
+                    Err(upstream::DownstreamAwareError::Inner(_)) => "Unknown error".to_string(),
+                    Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
+                        tracker.finish_cancelled();
+                        return client_closed_response(client_format);
+                    }
+                };
             error!(
                 "Upstream returned error for streaming request: {} - {}",
                 status, error_body
             );
             tracker.finish_error(status.as_u16());
+            let public_error_body = if serde_json::from_str::<Value>(&error_body).is_ok() {
+                error_body
+            } else {
+                format!("upstream streaming error body: {error_body}")
+            };
             let mut response = streaming_error_response(
                 client_format,
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                &error_body,
+                &public_error_body,
             );
             if preserve_native_upstream_protocol_headers {
                 append_upstream_protocol_response_headers(
@@ -703,7 +829,8 @@ pub(super) async fn handle_request_core(
                     );
             Box::pin(translated.map(|r| r.map_err(std::io::Error::other)))
         } else {
-            Box::pin(upstream_stream.map(|r| r.map_err(std::io::Error::other)))
+            let guarded = GuardedSseStream::new(upstream_stream, client_format);
+            Box::pin(guarded.map(|r| r.map_err(std::io::Error::other)))
         };
         if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.clone(), hook_ctx.clone()) {
             body_stream = Box::pin(dispatcher.wrap_stream(
@@ -737,11 +864,17 @@ pub(super) async fn handle_request_core(
 
     let status = res.status();
     let upstream_response_headers = res.headers().clone();
-    let bytes = match res.bytes().await {
+    let bytes = match upstream::read_response_bytes_with_cancellation(res, &downstream_cancellation)
+        .await
+    {
         Ok(b) => b,
-        Err(e) => {
+        Err(upstream::DownstreamAwareError::Inner(e)) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+        Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
+            tracker.finish_cancelled();
+            return client_closed_response(client_format);
         }
     };
     if !status.is_success() {
@@ -751,10 +884,16 @@ pub(super) async fn handle_request_core(
             String::from_utf8_lossy(&bytes)
         );
         tracker.finish_error(status.as_u16());
+        let upstream_error_body = String::from_utf8_lossy(&bytes);
+        let public_error_body = if serde_json::from_str::<Value>(&upstream_error_body).is_ok() {
+            upstream_error_body.to_string()
+        } else {
+            format!("upstream error body: {upstream_error_body}")
+        };
         let mut response = error_response(
             client_format,
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            &String::from_utf8_lossy(&bytes),
+            &public_error_body,
         );
         if preserve_native_upstream_protocol_headers {
             append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
@@ -786,19 +925,22 @@ pub(super) async fn handle_request_core(
         }
         return response;
     }
-    let translation_body = if let Some(bridge_context) = request_scoped_tool_bridge_context.as_ref()
-    {
-        let mut translation_body = upstream_body.clone();
-        bridge_context.insert_into(&mut translation_body);
-        translation_body
-    } else {
-        upstream_body.clone()
-    };
-    let out = match translate_response(upstream_format, client_format, &translation_body) {
+    let response_translation_context = ResponseTranslationContext::default()
+        .with_request_scoped_tool_bridge_context_value(
+            request_scoped_tool_bridge_context
+                .as_ref()
+                .map(TrustedToolBridgeContext::to_value),
+        );
+    let out = match translate_response_with_context(
+        upstream_format,
+        client_format,
+        &upstream_body,
+        response_translation_context,
+    ) {
         Ok(v) => v,
         Err(e) => {
-            tracker.finish_error(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
-            return error_response(client_format, StatusCode::INTERNAL_SERVER_ERROR, &e);
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+            return error_response(client_format, StatusCode::BAD_GATEWAY, &e);
         }
     };
     let response_status = classify_post_translation_non_stream_status(client_format, &out);
@@ -848,14 +990,6 @@ pub(super) fn classify_request_boundary(
             surface: crate::config::ModelSurface::default(),
         },
     )
-}
-
-fn reject_internal_request_scoped_tool_bridge_context(body: &Value) -> Option<String> {
-    body.get(REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD).map(|_| {
-        format!(
-            "request must not include internal-only field `{REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD}`"
-        )
-    })
 }
 
 fn classify_request_boundary_with_policy(

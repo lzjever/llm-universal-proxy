@@ -14,6 +14,11 @@
 # - A concrete proxy URL is also explicit. It cuts off env proxy inheritance for that upstream.
 # - Env proxy fallback only applies when both the namespace-level `proxy` and the upstream-level
 #   `proxy` are omitted for that upstream.
+# - This file focuses on raw HTTP/proxy egress behavior, so it omits client-visible
+#   `surface_defaults` and alias `surface` metadata.
+# - If adapting it for Codex, Claude Code, or Gemini wrapper/live-profile flows, add at least
+#   the minimal text-only `surface_defaults` from the quickstart, or accurate alias `surface`
+#   metadata for the routed models.
 
 listen: 127.0.0.1:8080
 upstream_timeout_secs: 120

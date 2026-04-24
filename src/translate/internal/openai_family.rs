@@ -8,6 +8,7 @@ use super::models::{
     NormalizedDecodingControls, NormalizedJsonSchemaOutputShape, NormalizedOutputShape,
     NormalizedRequestControls, NormalizedToolPolicy,
 };
+use super::tools::validate_public_tool_name_not_reserved;
 
 pub(super) fn openai_response_format_json_schema(
     container: &serde_json::Map<String, Value>,
@@ -215,6 +216,11 @@ pub(super) fn openai_normalized_tool_policy(
 ) -> Result<(Option<NormalizedToolPolicy>, Option<Vec<String>>), String> {
     let declared_tools = openai_declared_function_tools(body);
     let legacy_allowed_tool_names = openai_legacy_allowed_tool_names(body);
+    if let Some(names) = legacy_allowed_tool_names.as_ref() {
+        for name in names {
+            validate_public_tool_name_not_reserved(name)?;
+        }
+    }
     let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) else {
         return Ok((None, None));
     };
@@ -256,6 +262,7 @@ pub(super) fn openai_normalized_tool_policy(
                     "OpenAI tool_choice.type = function requires a non-empty function name."
                         .to_string(),
                 )?;
+            validate_public_tool_name_not_reserved(name)?;
             Ok((
                 Some(NormalizedToolPolicy::ForcedFunction(name.to_string())),
                 None,
@@ -299,6 +306,7 @@ pub(super) fn openai_normalized_tool_policy(
                             .to_string(),
                     );
                 };
+                validate_public_tool_name_not_reserved(name)?;
                 selected_names.push(name.to_string());
             }
 

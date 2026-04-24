@@ -1,5 +1,13 @@
 use super::*;
 
+fn join_sse_chunks(chunks: Vec<Vec<u8>>) -> String {
+    chunks
+        .into_iter()
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn gemini_event_with_text_produces_openai_chunks() {
     let event = serde_json::json!({
@@ -20,6 +28,42 @@ fn gemini_event_with_text_produces_openai_chunks() {
     assert_eq!(
         content_chunk.unwrap()["choices"][0]["delta"]["content"],
         "Hello"
+    );
+}
+
+#[test]
+fn translate_sse_event_gemini_to_openai_rejects_reserved_tool_name() {
+    let mut state = StreamState::default();
+    let out = translate_sse_event(
+        UpstreamFormat::Google,
+        UpstreamFormat::OpenAiCompletion,
+        &serde_json::json!({
+            "responseId": "resp_reserved",
+            "modelVersion": "gemini-2.5-flash",
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": "call_reserved",
+                            "name": "__llmup_custom__apply_patch",
+                            "args": { "input": "patch" }
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        }),
+        &mut state,
+    );
+    let joined = join_sse_chunks(out);
+
+    assert!(joined.contains("\"code\":\"reserved_openai_custom_bridge_prefix\""));
+    assert!(!joined.contains("\"name\":\"__llmup_custom__apply_patch\""));
+    assert!(!joined.contains("__llmup_custom__"), "{joined}");
+    assert!(
+        state.fatal_rejection.is_some(),
+        "reserved-prefix stream should be rejected"
     );
 }
 

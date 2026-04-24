@@ -1070,7 +1070,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "llm-universal-proxy"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "anyhow",
  "axum",
@@ -1079,6 +1079,8 @@ dependencies = [
  "crossterm",
  "futures-util",
  "hex",
+ "hyper",
+ "hyper-util",
  "ratatui",
  "reqwest",
  "serde",
@@ -1088,6 +1090,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
+ "tokio-util",
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",

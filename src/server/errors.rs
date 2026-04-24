@@ -9,6 +9,17 @@ use axum::{
 use serde_json::Value;
 
 use crate::formats::UpstreamFormat;
+use crate::internal_artifacts::{
+    contains_internal_artifact_text, sanitize_public_error_message, GENERIC_UPSTREAM_ERROR_MESSAGE,
+};
+
+pub(super) fn client_closed_response(format: UpstreamFormat) -> Response<Body> {
+    error_response(
+        format,
+        StatusCode::from_u16(499).expect("499 should be a valid HTTP status"),
+        "downstream client disconnected",
+    )
+}
 
 pub(super) fn format_upstream_unavailable_message(
     name: &str,
@@ -44,7 +55,7 @@ pub(super) fn error_response(
             Json(serde_json::json!({
                 "error": {
                     "code": status.as_u16(),
-                    "message": message,
+                    "message": normalized_error.message,
                     "status": google_status_text(status),
                 }
             })),
@@ -58,11 +69,16 @@ pub(super) fn streaming_error_response(
     status: StatusCode,
     message: &str,
 ) -> Response<Body> {
+    let public_message = if contains_internal_artifact_text(message) {
+        GENERIC_UPSTREAM_ERROR_MESSAGE.to_string()
+    } else {
+        message.to_string()
+    };
     if format != UpstreamFormat::OpenAiResponses {
-        return error_response(format, status, message);
+        return error_response(format, status, &public_message);
     }
 
-    let normalized_error = normalize_upstream_error(status, message);
+    let normalized_error = normalize_upstream_error(status, &public_message);
     let response_id = format!("resp_error_{}", uuid::Uuid::new_v4().simple());
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -114,13 +130,18 @@ pub(super) fn normalize_upstream_error(
         .as_ref()
         .and_then(extract_error_message)
         .filter(|message| !message.is_empty())
-        .unwrap_or_else(|| raw_message.to_string());
+        .map(|message| sanitize_public_error_message(&message))
+        .unwrap_or_else(|| sanitize_public_error_message(raw_message));
     let signal = parsed
         .as_ref()
         .map(extract_error_signal)
         .unwrap_or_default();
     let signal = signal.to_ascii_lowercase();
-    let message_lc = extracted_message.to_ascii_lowercase();
+    let message_for_classification = parsed
+        .as_ref()
+        .and_then(extract_error_message)
+        .unwrap_or_else(|| raw_message.to_string());
+    let message_lc = message_for_classification.to_ascii_lowercase();
     let combined = format!("{signal} {message_lc}");
 
     let (error_type, code) = if status == StatusCode::TOO_MANY_REQUESTS

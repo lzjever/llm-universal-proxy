@@ -5,19 +5,27 @@ mod errors;
 mod headers;
 mod models;
 mod proxy;
+mod public_boundary;
 mod responses_resources;
 mod state;
 #[cfg(test)]
 mod tests;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
+use std::{convert::Infallible, io, time::Duration};
 
 use axum::{
+    body::Body,
+    extract::Request,
     middleware,
+    response::Response,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
@@ -25,6 +33,10 @@ use tracing::info;
 use crate::config::Config;
 use crate::dashboard::run_dashboard;
 use crate::dashboard_logs;
+use crate::downstream::{
+    cancellation_channel, wrap_body_with_cancellation, DownstreamCancellation,
+    DownstreamCancellationHandle,
+};
 use crate::telemetry::RuntimeMetrics;
 
 use state::{build_runtime_state, AdminAccess, AppState};
@@ -73,8 +85,8 @@ async fn run_internal(
         .listen
         .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("listen addr: {e}"))?;
-    info!("listening on {}", listen);
     let listener = tokio::net::TcpListener::bind(listen).await?;
+    info!("listening on {}", listen);
     if dashboard_enabled {
         run_with_listener_and_dashboard(config, listener).await
     } else {
@@ -273,14 +285,106 @@ async fn run_server(
     let app = Router::new()
         .merge(admin_router)
         .merge(data_router)
+        .layer(middleware::from_fn(with_request_downstream_cancellation))
         .with_state(state);
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+    loop {
+        let (tcp_stream, remote_addr) = listener.accept().await?;
+        let (server_stream, watcher_stream) = duplicate_stream_for_disconnect_watch(tcp_stream)?;
+        let (downstream_cancel_handle, downstream_cancel) = cancellation_channel();
+        let tower_service = app
+            .clone()
+            .layer(Extension(remote_addr))
+            .layer(Extension(downstream_cancel.clone()));
+
+        tokio::spawn(async move {
+            let watcher_cancel_handle = downstream_cancel_handle.clone();
+            let disconnect_watcher = tokio::spawn(async move {
+                watch_downstream_disconnect(watcher_stream, watcher_cancel_handle).await;
+            });
+
+            let hyper_service = service_fn(move |request: hyper::Request<Incoming>| {
+                let mut tower_service = tower_service.clone();
+                async move {
+                    let response = tower::Service::call(&mut tower_service, request.map(Body::new))
+                        .await
+                        .unwrap_or_else(|err| match err {});
+                    Ok::<_, Infallible>(response)
+                }
+            });
+
+            let result = Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(TokioIo::new(server_stream), hyper_service)
+                .await;
+
+            downstream_cancel_handle.cancel();
+            disconnect_watcher.abort();
+            let _ = disconnect_watcher.await;
+
+            if let Err(_err) = result {
+                // Axum's default server ignores disconnect-related connection errors too.
+            }
+        });
+    }
+}
+
+fn duplicate_stream_for_disconnect_watch(
+    stream: tokio::net::TcpStream,
+) -> io::Result<(tokio::net::TcpStream, tokio::net::TcpStream)> {
+    let std_stream = stream.into_std()?;
+    std_stream.set_nonblocking(true)?;
+    let watcher_stream = std_stream.try_clone()?;
+    watcher_stream.set_nonblocking(true)?;
+    Ok((
+        tokio::net::TcpStream::from_std(std_stream)?,
+        tokio::net::TcpStream::from_std(watcher_stream)?,
+    ))
+}
+
+async fn watch_downstream_disconnect(
+    stream: tokio::net::TcpStream,
+    cancel_handle: DownstreamCancellationHandle,
+) {
+    let mut buf = [0u8; 1];
+
+    loop {
+        match stream.peek(&mut buf).await {
+            Ok(0) => {
+                cancel_handle.cancel();
+                return;
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                cancel_handle.cancel();
+                return;
+            }
+        }
+    }
+}
+
+async fn with_request_downstream_cancellation(
+    Extension(connection_cancellation): Extension<DownstreamCancellation>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let (request_cancel_handle, request_cancellation) = connection_cancellation.child_channel();
+    let (parts, body) = request.into_parts();
+    let mut request = Request::from_parts(
+        parts,
+        wrap_body_with_cancellation(body, request_cancel_handle.clone()),
+    );
+    request.extensions_mut().insert(request_cancellation);
+
+    let handler_guard = request_cancel_handle.drop_guard();
+    let response = next.run(request).await;
+    let _ = handler_guard.disarm();
+
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        wrap_body_with_cancellation(body, request_cancel_handle),
     )
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]

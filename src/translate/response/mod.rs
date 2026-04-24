@@ -9,3 +9,4 @@ pub(crate) use super::internal::response_protocols::{
     responses_failed_code_to_openai_finish, AnthropicTerminal,
 };
 pub use super::internal::translate_response;
+pub(crate) use super::internal::{translate_response_with_context, ResponseTranslationContext};

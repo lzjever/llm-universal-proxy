@@ -152,6 +152,14 @@ pub fn responses_event_to_openai_chunks(event: &Value, state: &mut StreamState) 
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            if let Err(message) = validate_public_tool_name_not_reserved(&raw_name) {
+                return reject_openai_stream(
+                    state,
+                    "invalid_request_error",
+                    "reserved_openai_custom_bridge_prefix",
+                    message,
+                );
+            }
             let output_index = event
                 .get("output_index")
                 .and_then(Value::as_u64)

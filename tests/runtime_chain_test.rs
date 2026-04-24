@@ -8,7 +8,7 @@ use axum::{
     extract::{Json, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use bytes::Bytes;
@@ -32,7 +32,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
 static ADMIN_TOKEN_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -325,6 +326,93 @@ fn unique_temp_path(label: &str, suffix: &str) -> PathBuf {
     ))
 }
 
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+async fn read_complete_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let mut expected_len = None;
+
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(buffer);
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+
+        if expected_len.is_none() {
+            if let Some(headers_end) = find_bytes(&buffer, b"\r\n\r\n") {
+                let body_start = headers_end + 4;
+                let header_bytes = &buffer[..body_start];
+                let header_text = String::from_utf8_lossy(header_bytes);
+                let content_length = header_text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                expected_len = Some(body_start + content_length);
+            }
+        }
+
+        if let Some(expected_len) = expected_len {
+            if buffer.len() >= expected_len {
+                return Ok(buffer);
+            }
+        }
+    }
+}
+
+async fn open_raw_http_request(
+    base: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> TcpStream {
+    let url = reqwest::Url::parse(base).expect("proxy base URL should parse");
+    let host = url
+        .host_str()
+        .expect("proxy base URL should include a host");
+    let port = url
+        .port_or_known_default()
+        .expect("proxy base URL should include a port");
+    let address = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(address)
+        .await
+        .expect("raw downstream client should connect");
+
+    let request_body = body.map(|value| serde_json::to_vec(value).unwrap());
+    let content_length = request_body.as_ref().map_or(0, Vec::len);
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\n");
+    if request_body.is_some() {
+        request.push_str("Content-Type: application/json\r\n");
+    }
+    request.push_str(&format!("Content-Length: {content_length}\r\n\r\n"));
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("raw downstream client should write request headers");
+    if let Some(request_body) = request_body {
+        stream
+            .write_all(&request_body)
+            .await
+            .expect("raw downstream client should write request body");
+    }
+    stream
+}
+
 async fn wait_for_payloads(captured: &CapturedHookPayloads, count: usize) -> Vec<Value> {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -518,6 +606,88 @@ async fn spawn_disconnect_observing_openai_mock(
         axum::serve(listener, app).await.ok();
     });
     (base, handle, drop_notify)
+}
+
+async fn spawn_pending_openai_send_mock() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<Notify>,
+    Arc<Notify>,
+) {
+    let request_started = Arc::new(Notify::new());
+    let abort_notify = Arc::new(Notify::new());
+    let request_started_task = request_started.clone();
+    let abort_notify_task = abort_notify.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_complete_http_request(&mut stream)
+            .await
+            .expect("pending upstream mock should receive a full request");
+        request_started_task.notify_waiters();
+
+        let mut buf = [0u8; 1];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    abort_notify_task.notify_waiters();
+                    break;
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+
+    (base, handle, request_started, abort_notify)
+}
+
+async fn spawn_pending_openai_response_resource_body_mock() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<Notify>,
+    Arc<Notify>,
+) {
+    let response_started = Arc::new(Notify::new());
+    let drop_notify = Arc::new(Notify::new());
+
+    async fn handler(
+        State((response_started, drop_notify)): State<(Arc<Notify>, Arc<Notify>)>,
+    ) -> Response {
+        response_started.notify_waiters();
+
+        let stream = ControlledSseStream::new(vec![
+            (
+                Duration::ZERO,
+                Bytes::from_static(
+                    br#"{"id":"resp_pending","object":"response","status":"completed","output":["#,
+                ),
+            ),
+            (Duration::from_secs(30), Bytes::from_static(b"]}")),
+        ])
+        .with_drop_notify(drop_notify);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/responses/:response_id", get(handler))
+        .route("/responses/:response_id", get(handler))
+        .with_state((response_started.clone(), drop_notify.clone()));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    (base, handle, response_started, drop_notify)
 }
 
 async fn spawn_namespaced_openai_echo_mock(
@@ -894,6 +1064,61 @@ async fn downstream_disconnect_stops_upstream_stream_promptly() {
     tokio::time::timeout(Duration::from_secs(1), drop_notify.notified())
         .await
         .expect("upstream body should be dropped soon after downstream disconnect");
+}
+
+#[tokio::test]
+async fn downstream_disconnect_aborts_upstream_before_response_headers() {
+    let (mock_base, _mock, request_started, abort_notify) = spawn_pending_openai_send_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+    let request_body = json!({
+        "model": "gpt-4",
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "stream": true
+    });
+    let stream = open_raw_http_request(
+        &proxy_base,
+        "POST",
+        "/openai/v1/chat/completions",
+        Some(&request_body),
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(1), request_started.notified())
+        .await
+        .expect("proxy should send the upstream request before client disconnects");
+
+    drop(stream);
+
+    tokio::time::timeout(Duration::from_secs(2), abort_notify.notified())
+        .await
+        .expect("upstream request should be aborted while still waiting for first response bytes");
+}
+
+#[tokio::test]
+async fn downstream_disconnect_aborts_pending_responses_resource_body_read() {
+    let (mock_base, _mock, response_started, drop_notify) =
+        spawn_pending_openai_response_resource_body_mock().await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+    let stream = open_raw_http_request(
+        &proxy_base,
+        "GET",
+        "/openai/v1/responses/resp_pending",
+        None,
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(1), response_started.notified())
+        .await
+        .expect("resource route should start the upstream response before disconnect");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    drop(stream);
+
+    tokio::time::timeout(Duration::from_secs(2), drop_notify.notified())
+        .await
+        .expect("resource route should abort upstream body reads after downstream disconnect");
 }
 
 #[tokio::test]

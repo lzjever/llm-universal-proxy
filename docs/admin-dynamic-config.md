@@ -17,13 +17,16 @@ The admin plane is separate from the client-facing data plane.
 
 Current access policy:
 
-- if `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is set, admin requests must send `Authorization: Bearer <token>`
+- if `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is set to a non-empty value, admin requests must send `Authorization: Bearer <token>`
+- the `Bearer` scheme is case-insensitive, but the token must be non-empty and must match exactly
+- if `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is set to an empty or whitespace-only value, admin auth is misconfigured and admin requests fail closed
 - if `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is not set, admin access is limited to loopback clients such as `127.0.0.1` and `::1`
+- in loopback-only mode, admin requests with proxy forwarding headers are rejected
 
 In other words:
 
-- local development can often use loopback admin access directly
-- shared or remote deployments should normally set an admin bearer token
+- local development can often use loopback admin access directly, without forwarding headers such as `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, or `X-Real-IP`
+- shared or remote deployments should normally set a non-empty admin bearer token
 
 ## Admin Endpoints
 
@@ -129,6 +132,8 @@ What you get instead is enough operational information to understand the runtime
 
 The write flow supports revision checks so a client does not accidentally overwrite a newer config.
 
+Runtime writes use the same client-visible surface contract as static YAML. Raw HTTP tests can omit `surface_defaults`, but Codex, Claude Code, and Gemini wrapper/live-profile flows should provide at least the conservative text-only surface shown below, or an accurate alias-level `surface`.
+
 ### Recommended write pattern
 
 1. read the current namespace state
@@ -158,7 +163,19 @@ curl -fsS \
         "api_root": "https://api.openai.com/v1",
         "fixed_upstream_format": "openai-responses",
         "fallback_credential_env": "OPENAI_API_KEY",
-        "auth_policy": "force_server"
+        "auth_policy": "force_server",
+        "surface_defaults": {
+          "modalities": {
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "tools": {
+            "supports_search": false,
+            "supports_view_image": false,
+            "apply_patch_transport": "freeform",
+            "supports_parallel_calls": false
+          }
+        }
       }
     ],
     "model_aliases": {

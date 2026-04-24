@@ -2024,18 +2024,155 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _log_tail(log_path: pathlib.Path | None, max_chars: int = 4000) -> str:
+    if log_path is None:
+        return ""
+    try:
+        text = pathlib.Path(log_path).read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return ""
+    return text[-max_chars:].strip()
+
+
+def _stderr_tail(stderr_path: pathlib.Path | None, max_chars: int = 4000) -> str:
+    return _log_tail(stderr_path, max_chars=max_chars)
+
+
+def _stderr_tail_message(stderr_path: pathlib.Path | None) -> str:
+    tail = _stderr_tail(stderr_path)
+    if not tail:
+        return ""
+    return "; stderr tail: " + " ".join(tail.split())
+
+
+def _proxy_log_tail_message(
+    stdout_path: pathlib.Path | None,
+    stderr_path: pathlib.Path | None,
+) -> str:
+    parts = []
+    for label, log_path in (("stdout", stdout_path), ("stderr", stderr_path)):
+        tail = _log_tail(log_path)
+        if tail:
+            parts.append(f"{label} tail: {' '.join(tail.split())}")
+    if not parts:
+        return ""
+    return "; " + "; ".join(parts)
+
+
+def _listen_addr_from_base_url(base_url: str) -> str:
+    parsed = urllib.parse.urlsplit(base_url)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    host = parsed.hostname
+    if host and port is not None:
+        if ":" in host and not host.startswith("["):
+            return f"[{host}]:{port}"
+        return f"{host}:{port}"
+    return parsed.netloc
+
+
+def _strip_ansi_codes(text: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+
+
+def _log_has_owned_listening_proof(log_text: str, listen_addr: str) -> bool:
+    if not log_text or not listen_addr:
+        return False
+    escaped_addr = re.escape(listen_addr)
+    proof_patterns = (
+        rf"\blistening\s+(?:on|at)\s+{escaped_addr}\b",
+        rf"\bbound\s+(?:on|to)\s+{escaped_addr}\b",
+    )
+    for line in _strip_ansi_codes(log_text).splitlines():
+        for pattern in proof_patterns:
+            if re.search(pattern, line, flags=re.IGNORECASE):
+                return True
+    return False
+
+
+def _owned_listening_proof_seen(
+    base_url: str,
+    stdout_path: pathlib.Path | None,
+    stderr_path: pathlib.Path | None,
+) -> bool:
+    listen_addr = _listen_addr_from_base_url(base_url)
+    for log_path in (stdout_path, stderr_path):
+        if _log_has_owned_listening_proof(
+            _log_tail(log_path, max_chars=65536),
+            listen_addr,
+        ):
+            return True
+    return False
+
+
+def _raise_if_proxy_process_exited(
+    process: subprocess.Popen[str] | None,
+    base_url: str,
+    stdout_path: pathlib.Path | None,
+    stderr_path: pathlib.Path | None,
+) -> None:
+    if process is None:
+        return
+    exit_code = process.poll()
+    if exit_code is None:
+        return
+    raise RuntimeError(
+        f"proxy process exited before becoming healthy at {base_url} "
+        f"(exit code {exit_code}){_proxy_log_tail_message(stdout_path, stderr_path)}"
+    )
+
+
 def wait_for_health(
-    base_url: str, timeout_secs: int = DEFAULT_TIMEOUT_POLICY.proxy_health_timeout_secs
+    base_url: str,
+    timeout_secs: int = DEFAULT_TIMEOUT_POLICY.proxy_health_timeout_secs,
+    *,
+    process: subprocess.Popen[str] | None = None,
+    stdout_path: pathlib.Path | None = None,
+    stderr_path: pathlib.Path | None = None,
 ) -> None:
     deadline = time.time() + timeout_secs
+    require_owned_ready = process is not None
+    owned_listening_seen = not require_owned_ready
     while time.time() < deadline:
+        _raise_if_proxy_process_exited(process, base_url, stdout_path, stderr_path)
+        if require_owned_ready and not owned_listening_seen:
+            owned_listening_seen = _owned_listening_proof_seen(
+                base_url,
+                stdout_path,
+                stderr_path,
+            )
+            if not owned_listening_seen:
+                time.sleep(0.2)
+                continue
         try:
             with urllib.request.urlopen(f"{base_url}/health", timeout=2) as response:
                 if response.status == 200:
+                    _raise_if_proxy_process_exited(
+                        process,
+                        base_url,
+                        stdout_path,
+                        stderr_path,
+                    )
                     return
         except Exception:
             time.sleep(0.2)
-    raise RuntimeError(f"proxy at {base_url} did not become healthy in time")
+    _raise_if_proxy_process_exited(process, base_url, stdout_path, stderr_path)
+    if require_owned_ready and not owned_listening_seen:
+        listen_addr = _listen_addr_from_base_url(base_url)
+        raise RuntimeError(
+            f"proxy at {base_url} did not become healthy in time; "
+            f"missing owned listening proof for {listen_addr}"
+            f"{_proxy_log_tail_message(stdout_path, stderr_path)}"
+        )
+    raise RuntimeError(
+        f"proxy at {base_url} did not become healthy in time"
+        f"{_proxy_log_tail_message(stdout_path, stderr_path)}"
+    )
 
 
 def http_get_json(url: str, timeout: int = 30) -> object:
@@ -5140,12 +5277,30 @@ def resolve_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reports-root", default=str(DEFAULT_REPORTS_ROOT))
     parser.add_argument("--binary", default=str(default_proxy_binary_path()))
     parser.add_argument("--proxy-host", default="127.0.0.1")
-    parser.add_argument("--proxy-port", type=int, default=int(os.environ.get("PROXY_PORT", "18888")))
+    parser.add_argument(
+        "--proxy-port",
+        type=int,
+        default=None,
+        help="proxy listen port; defaults to an automatically selected free port",
+    )
     add_timeout_policy_args(parser, include_case_thresholds=True)
     args = parser.parse_args(argv)
     args.list = args.list_matrix
     if args.test not in VALID_PHASES:
         parser.error(f"--test must be one of: {', '.join(sorted(VALID_PHASES))}")
+    env_proxy_port = os.environ.get("PROXY_PORT")
+    if args.proxy_port is not None:
+        args.proxy_port_source = "argument"
+    elif env_proxy_port:
+        try:
+            args.proxy_port = int(env_proxy_port)
+        except ValueError:
+            parser.error("PROXY_PORT must be an integer")
+        args.proxy_port_source = "environment"
+    else:
+        args.proxy_port_source = "auto"
+    if args.proxy_port is not None and not (1 <= int(args.proxy_port) <= 65535):
+        parser.error("--proxy-port must be between 1 and 65535")
     return args
 
 
@@ -5180,11 +5335,12 @@ def run(argv: list[str] | None = None) -> int:
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     report_dir = prepare_report_dir(pathlib.Path(args.reports_root))
     trace_path = report_dir / "debug-trace.jsonl"
+    proxy_port = int(args.proxy_port) if args.proxy_port is not None else free_port()
     runtime_config_text = build_runtime_config_text(
         parsed_source,
         dotenv_env,
         listen_host=args.proxy_host,
-        listen_port=args.proxy_port,
+        listen_port=proxy_port,
         trace_path=trace_path,
     )
     proxy_env = prepare_proxy_env(base_env, dotenv_env, report_dir)
@@ -5195,8 +5351,14 @@ def run(argv: list[str] | None = None) -> int:
         process, _runtime_config_path, _stdout_path, _stderr_path = start_proxy(
             proxy_binary, runtime_config_text, report_dir, proxy_env
         )
-        proxy_base = f"http://{args.proxy_host}:{args.proxy_port}"
-        wait_for_health(proxy_base, timeout_secs=timeout_policy.proxy_health_timeout_secs)
+        proxy_base = f"http://{args.proxy_host}:{proxy_port}"
+        wait_for_health(
+            proxy_base,
+            timeout_secs=timeout_policy.proxy_health_timeout_secs,
+            process=process,
+            stdout_path=_stdout_path,
+            stderr_path=_stderr_path,
+        )
         if args.proxy_only:
             print(f"Proxy healthy at {proxy_base}")
             print(f"OpenAI base: {proxy_base}/openai/v1")

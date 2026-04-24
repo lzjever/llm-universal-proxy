@@ -58,8 +58,12 @@ jobs:
         with:
           toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
 
-      - name: Run tests
+      - name: Run Rust tests
         run: cargo test --locked --verbose
+
+      - name: Run Python contract tests
+        if: ${{ always() }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'
 
   fmt:
     name: Format

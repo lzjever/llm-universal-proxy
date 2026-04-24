@@ -5,40 +5,89 @@ use axum::{
     extract::{OriginalUri, Path, State},
     http::{HeaderMap, Response, StatusCode},
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use serde_json::Value;
 
+use crate::downstream::DownstreamCancellation;
 use crate::formats::UpstreamFormat;
 use crate::upstream;
 
-use super::errors::{error_response, format_upstream_unavailable_message};
+use super::errors::{client_closed_response, error_response, format_upstream_unavailable_message};
 use super::headers::{
     append_upstream_protocol_response_headers, apply_upstream_headers, build_auth_headers,
 };
+use super::public_boundary::{
+    validate_openai_responses_resource_request_body,
+    validate_openai_responses_resource_response_body,
+};
 use super::state::{AppState, RuntimeNamespaceState, UpstreamState, DEFAULT_NAMESPACE};
+
+struct OpenAiResponsesResourceRequest {
+    method: reqwest::Method,
+    resource_path: String,
+    body: Option<Value>,
+    query: Option<String>,
+}
+
+impl OpenAiResponsesResourceRequest {
+    fn new(
+        method: reqwest::Method,
+        resource_path: String,
+        body: Option<Value>,
+        query: Option<String>,
+    ) -> Self {
+        Self {
+            method,
+            resource_path,
+            body,
+            query,
+        }
+    }
+}
 
 pub(super) async fn handle_openai_responses_compact(
     State(state): State<Arc<AppState>>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_openai_responses_compact_inner(state, DEFAULT_NAMESPACE.to_string(), headers, body).await
+    handle_openai_responses_compact_inner(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub(super) async fn handle_openai_responses_compact_namespaced(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    handle_openai_responses_compact_inner(state, namespace, headers, body).await
+    handle_openai_responses_compact_inner(
+        state,
+        namespace,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub(super) async fn handle_openai_response_get(
     State(state): State<Arc<AppState>>,
     OriginalUri(uri): OriginalUri,
     Path(response_id): Path<String>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     handle_openai_response_get_inner(
@@ -46,6 +95,9 @@ pub(super) async fn handle_openai_response_get(
         DEFAULT_NAMESPACE.to_string(),
         uri,
         response_id,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
     )
     .await
@@ -55,59 +107,112 @@ pub(super) async fn handle_openai_response_get_namespaced(
     State(state): State<Arc<AppState>>,
     OriginalUri(uri): OriginalUri,
     Path((namespace, response_id)): Path<(String, String)>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    handle_openai_response_get_inner(state, namespace, uri, response_id, headers).await
+    handle_openai_response_get_inner(
+        state,
+        namespace,
+        uri,
+        response_id,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+    )
+    .await
 }
 
 pub(super) async fn handle_openai_response_delete(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    handle_openai_response_delete_inner(state, DEFAULT_NAMESPACE.to_string(), response_id, headers)
-        .await
+    handle_openai_response_delete_inner(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        response_id,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+    )
+    .await
 }
 
 pub(super) async fn handle_openai_response_delete_namespaced(
     State(state): State<Arc<AppState>>,
     Path((namespace, response_id)): Path<(String, String)>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    handle_openai_response_delete_inner(state, namespace, response_id, headers).await
+    handle_openai_response_delete_inner(
+        state,
+        namespace,
+        response_id,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+    )
+    .await
 }
 
 pub(super) async fn handle_openai_response_cancel(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    handle_openai_response_cancel_inner(state, DEFAULT_NAMESPACE.to_string(), response_id, headers)
-        .await
+    handle_openai_response_cancel_inner(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        response_id,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+    )
+    .await
 }
 
 pub(super) async fn handle_openai_response_cancel_namespaced(
     State(state): State<Arc<AppState>>,
     Path((namespace, response_id)): Path<(String, String)>,
+    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    handle_openai_response_cancel_inner(state, namespace, response_id, headers).await
+    handle_openai_response_cancel_inner(
+        state,
+        namespace,
+        response_id,
+        downstream_cancellation
+            .map(|Extension(cancellation)| cancellation)
+            .unwrap_or_else(DownstreamCancellation::disabled),
+        headers,
+    )
+    .await
 }
 
 async fn handle_openai_responses_compact_inner(
     state: Arc<AppState>,
     namespace: String,
+    downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
 ) -> Response<Body> {
-    handle_openai_responses_resource(
+    handle_openai_responses_resource_with_downstream_cancellation(
         state,
         namespace,
+        downstream_cancellation,
         headers,
-        reqwest::Method::POST,
-        "responses/compact".to_string(),
-        Some(body),
-        None,
+        OpenAiResponsesResourceRequest::new(
+            reqwest::Method::POST,
+            "responses/compact".to_string(),
+            Some(body),
+            None,
+        ),
     )
     .await
 }
@@ -117,16 +222,20 @@ async fn handle_openai_response_get_inner(
     namespace: String,
     uri: axum::http::Uri,
     response_id: String,
+    downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
 ) -> Response<Body> {
-    handle_openai_responses_resource(
+    handle_openai_responses_resource_with_downstream_cancellation(
         state,
         namespace,
+        downstream_cancellation,
         headers,
-        reqwest::Method::GET,
-        format!("responses/{response_id}"),
-        None,
-        uri.query().map(ToString::to_string),
+        OpenAiResponsesResourceRequest::new(
+            reqwest::Method::GET,
+            format!("responses/{response_id}"),
+            None,
+            uri.query().map(ToString::to_string),
+        ),
     )
     .await
 }
@@ -135,16 +244,20 @@ async fn handle_openai_response_delete_inner(
     state: Arc<AppState>,
     namespace: String,
     response_id: String,
+    downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
 ) -> Response<Body> {
-    handle_openai_responses_resource(
+    handle_openai_responses_resource_with_downstream_cancellation(
         state,
         namespace,
+        downstream_cancellation,
         headers,
-        reqwest::Method::DELETE,
-        format!("responses/{response_id}"),
-        None,
-        None,
+        OpenAiResponsesResourceRequest::new(
+            reqwest::Method::DELETE,
+            format!("responses/{response_id}"),
+            None,
+            None,
+        ),
     )
     .await
 }
@@ -153,20 +266,25 @@ async fn handle_openai_response_cancel_inner(
     state: Arc<AppState>,
     namespace: String,
     response_id: String,
+    downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
 ) -> Response<Body> {
-    handle_openai_responses_resource(
+    handle_openai_responses_resource_with_downstream_cancellation(
         state,
         namespace,
+        downstream_cancellation,
         headers,
-        reqwest::Method::POST,
-        format!("responses/{response_id}/cancel"),
-        None,
-        None,
+        OpenAiResponsesResourceRequest::new(
+            reqwest::Method::POST,
+            format!("responses/{response_id}/cancel"),
+            None,
+            None,
+        ),
     )
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn handle_openai_responses_resource(
     state: Arc<AppState>,
     namespace: String,
@@ -176,10 +294,43 @@ pub(super) async fn handle_openai_responses_resource(
     body: Option<Value>,
     query: Option<String>,
 ) -> Response<Body> {
+    handle_openai_responses_resource_with_downstream_cancellation(
+        state,
+        namespace,
+        DownstreamCancellation::disabled(),
+        headers,
+        OpenAiResponsesResourceRequest::new(method, resource_path, body, query),
+    )
+    .await
+}
+
+async fn handle_openai_responses_resource_with_downstream_cancellation(
+    state: Arc<AppState>,
+    namespace: String,
+    downstream_cancellation: DownstreamCancellation,
+    headers: HeaderMap,
+    request: OpenAiResponsesResourceRequest,
+) -> Response<Body> {
+    let OpenAiResponsesResourceRequest {
+        method,
+        resource_path,
+        body,
+        query,
+    } = request;
     let request_path = format!("/openai/v1/{resource_path}");
     let mut tracker = state
         .metrics
         .start_request(&request_path, String::new(), false);
+    if let Some(body) = body.as_ref() {
+        if let Err(message) = validate_openai_responses_resource_request_body(body) {
+            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+            return error_response(
+                UpstreamFormat::OpenAiResponses,
+                StatusCode::BAD_REQUEST,
+                &message,
+            );
+        }
+    }
     let namespace_state = {
         let runtime = state.runtime.read().await;
         match runtime.namespaces.get(&namespace) {
@@ -253,50 +404,141 @@ pub(super) async fn handle_openai_responses_resource(
         url.push_str(&query);
     }
 
-    let response = match upstream::call_upstream_resource(
-        &upstream_state.client,
+    let response = match upstream::call_upstream_resource_with_cancellation(
+        &upstream_state.no_auto_decompression_client,
         method,
         &url,
         body.as_ref(),
         &auth_headers,
+        &downstream_cancellation,
     )
     .await
     {
         Ok(response) => response,
-        Err(error) => {
+        Err(upstream::DownstreamAwareError::Inner(error)) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
                 &error.to_string(),
             );
+        }
+        Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
+            tracker.finish_cancelled();
+            return client_closed_response(UpstreamFormat::OpenAiResponses);
         }
     };
 
     let status = response.status();
     let upstream_response_headers = response.headers().clone();
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) => {
+    if status_allows_empty_success_body(status)
+        && no_content_response_framing_is_invalid(&upstream_response_headers)
+    {
+        tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+        return error_response(
+            UpstreamFormat::OpenAiResponses,
+            StatusCode::BAD_GATEWAY,
+            "upstream returned invalid no-content response framing",
+        );
+    }
+    let bytes =
+        match upstream::read_response_bytes_with_cancellation(response, &downstream_cancellation)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(upstream::DownstreamAwareError::Inner(error)) => {
+                tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+                return error_response(
+                    UpstreamFormat::OpenAiResponses,
+                    StatusCode::BAD_GATEWAY,
+                    &error.to_string(),
+                );
+            }
+            Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
+                tracker.finish_cancelled();
+                return client_closed_response(UpstreamFormat::OpenAiResponses);
+            }
+        };
+
+    let response_body_bytes;
+    if status.is_success() {
+        if bytes.is_empty() {
+            if status_allows_empty_success_body(status) {
+                tracker.finish_success(status.as_u16());
+                let mut response = Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| {
+                        error_response(
+                            UpstreamFormat::OpenAiResponses,
+                            StatusCode::BAD_GATEWAY,
+                            "failed to build upstream resource response",
+                        )
+                    });
+                append_upstream_protocol_response_headers(
+                    &mut response,
+                    &upstream_response_headers,
+                );
+                return response;
+            }
+
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
-                &error.to_string(),
+                "upstream returned empty response body",
             );
         }
-    };
 
-    if status.is_success() {
+        if status_allows_empty_success_body(status) {
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+            return error_response(
+                UpstreamFormat::OpenAiResponses,
+                StatusCode::BAD_GATEWAY,
+                "upstream returned unexpected body for no-content response",
+            );
+        }
+
+        let upstream_body = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+                return error_response(
+                    UpstreamFormat::OpenAiResponses,
+                    StatusCode::BAD_GATEWAY,
+                    "upstream returned invalid JSON",
+                );
+            }
+        };
+        if let Err(message) = validate_openai_responses_resource_response_body(&upstream_body) {
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+            return error_response(
+                UpstreamFormat::OpenAiResponses,
+                StatusCode::BAD_GATEWAY,
+                &message,
+            );
+        }
+        response_body_bytes = serde_json::to_vec(&upstream_body).unwrap_or_else(|_| b"{}".to_vec());
         tracker.finish_success(status.as_u16());
     } else {
         tracker.finish_error(status.as_u16());
+        let upstream_error_body = String::from_utf8_lossy(&bytes);
+        let public_error_body = if serde_json::from_str::<Value>(&upstream_error_body).is_ok() {
+            upstream_error_body.to_string()
+        } else {
+            format!("upstream resource error body: {upstream_error_body}")
+        };
+        return error_response(
+            UpstreamFormat::OpenAiResponses,
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            &public_error_body,
+        );
     }
 
     let mut response = Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .body(Body::from(bytes))
+        .body(Body::from(response_body_bytes))
         .unwrap_or_else(|_| {
             error_response(
                 UpstreamFormat::OpenAiResponses,
@@ -306,6 +548,33 @@ pub(super) async fn handle_openai_responses_resource(
         });
     append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
     response
+}
+
+fn status_allows_empty_success_body(status: StatusCode) -> bool {
+    matches!(status, StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT)
+}
+
+fn no_content_response_framing_is_invalid(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.contains_key(reqwest::header::TRANSFER_ENCODING)
+        || !content_length_allows_no_content(headers)
+}
+
+fn content_length_allows_no_content(headers: &reqwest::header::HeaderMap) -> bool {
+    for value in headers.get_all(reqwest::header::CONTENT_LENGTH).iter() {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        for part in value.split(',') {
+            let part = part.trim_matches(|char| char == ' ' || char == '\t');
+            if part.is_empty()
+                || !part.as_bytes().iter().all(|byte| byte.is_ascii_digit())
+                || part.as_bytes().iter().any(|byte| *byte != b'0')
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub(super) fn resolve_native_responses_stateful_route_or_error(

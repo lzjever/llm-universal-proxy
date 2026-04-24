@@ -7,6 +7,7 @@ CARGO := $(if $(wildcard $(HOME)/.cargo/bin/cargo),$(HOME)/.cargo/bin/cargo,carg
 # Unset RUSTC_WRAPPER so rustup does not reject it (Cursor may set it to "cursor").
 # Unset proxy so cargo/git reach tuna mirror and crate hosts directly (avoids TLS/SSL errors).
 CARGO_ENV := env -u RUSTC_WRAPPER -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY
+PYTHON_CONTRACT_TEST := PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'
 
 .PHONY: build test check run run-release test-report test-binary-smoke governance
 
@@ -14,7 +15,12 @@ build:
 	$(CARGO_ENV) $(CARGO) build --locked --release
 
 test:
-	$(CARGO_ENV) $(CARGO) test --locked
+	@status=0; \
+	echo "$(CARGO_ENV) $(CARGO) test --locked"; \
+	$(CARGO_ENV) $(CARGO) test --locked || status=$$?; \
+	echo "$(PYTHON_CONTRACT_TEST)"; \
+	$(PYTHON_CONTRACT_TEST) || status=$$?; \
+	exit $$status
 
 # Build the release binary and run the local binary smoke script.
 test-binary-smoke: build

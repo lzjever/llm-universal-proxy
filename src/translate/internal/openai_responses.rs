@@ -5,7 +5,6 @@ use crate::formats::UpstreamFormat;
 use super::assessment::{openai_named_tool_choice_name, shared_control_profile_for_target};
 use super::messages::{
     custom_tools_not_portable_message, openai_assistant_audio_field_not_portable_message,
-    reserved_openai_custom_bridge_prefix_message,
     responses_multiple_output_audio_items_not_portable_message, single_required_array_item,
     translation_target_label,
 };
@@ -32,7 +31,6 @@ use super::tools::{
     normalized_tool_definition_to_openai,
     normalized_tool_definition_to_openai_with_request_scoped_custom_bridge,
     normalized_tool_definition_to_responses,
-    openai_responses_custom_tool_bridge_prefix_is_reserved,
     openai_tool_call_to_responses_item_decoding_custom_bridge_with_context,
     openai_tool_result_content_to_responses_output,
     request_scoped_openai_custom_bridge_conflict_name, request_scoped_openai_custom_bridge_context,
@@ -43,7 +41,8 @@ use super::tools::{
     responses_tool_call_partial_replay_text, responses_tool_output_to_openai_tool_content,
     semantic_text_part_to_openai_value, semantic_text_part_to_responses_value,
     semantic_tool_kind_from_value, semantic_tool_output_item_type,
-    tool_call_is_marked_non_replayable, ToolBridgeContext,
+    tool_call_is_marked_non_replayable, validate_public_tool_name_not_reserved,
+    validate_responses_public_tool_metadata_identity, ToolBridgeContext,
     REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD,
 };
 
@@ -425,8 +424,10 @@ fn responses_response_to_openai_impl(
     Ok(result)
 }
 
-pub(super) fn openai_response_to_responses(body: &Value) -> Result<Value, String> {
-    let bridge_context = request_scoped_tool_bridge_context_from_body(body);
+pub(super) fn openai_response_to_responses(
+    body: &Value,
+    bridge_context: Option<&ToolBridgeContext>,
+) -> Result<Value, String> {
     let choice = single_required_array_item(
         body.get("choices")
             .and_then(Value::as_array)
@@ -486,7 +487,7 @@ pub(super) fn openai_response_to_responses(body: &Value) -> Result<Value, String
             output.push(
                 openai_tool_call_to_responses_item_decoding_custom_bridge_with_context(
                     t,
-                    bridge_context.as_ref(),
+                    bridge_context,
                 )?,
             );
         }
@@ -564,54 +565,11 @@ pub(super) fn openai_response_to_responses(body: &Value) -> Result<Value, String
     Ok(result)
 }
 
-fn reject_reserved_custom_bridge_name(name: &str) -> Result<(), String> {
-    if openai_responses_custom_tool_bridge_prefix_is_reserved(name) {
-        return Err(reserved_openai_custom_bridge_prefix_message(name));
-    }
-    Ok(())
-}
-
-fn validate_responses_tool_choice_for_custom_bridge(choice: &Value) -> Result<(), String> {
-    let Some(choice_obj) = choice.as_object() else {
-        return Ok(());
-    };
-
-    match choice_obj.get("type").and_then(Value::as_str) {
-        Some("function") => {
-            if let Some(name) = openai_named_tool_choice_name(choice, "function") {
-                reject_reserved_custom_bridge_name(name)?;
-            }
-        }
-        Some("allowed_tools") => {
-            let Some(selected_tools) = choice_obj
-                .get("allowed_tools")
-                .and_then(Value::as_object)
-                .and_then(|allowed_tools| allowed_tools.get("tools"))
-                .or_else(|| choice_obj.get("tools"))
-                .and_then(Value::as_array)
-            else {
-                return Ok(());
-            };
-
-            for tool in selected_tools {
-                if tool.get("type").and_then(Value::as_str) != Some("function") {
-                    continue;
-                }
-                if let Some(name) = openai_named_tool_choice_name(tool, "function") {
-                    reject_reserved_custom_bridge_name(name)?;
-                }
-            }
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-
 fn validate_responses_request_for_custom_bridge(body: &Value) -> Result<(), String> {
+    validate_responses_public_tool_metadata_identity(body)?;
     for tool in normalized_responses_tool_definitions_from_request(body)? {
         if let NormalizedOpenAiFamilyToolDef::Function(function) = tool {
-            reject_reserved_custom_bridge_name(&function.name)?;
+            validate_public_tool_name_not_reserved(&function.name)?;
         }
     }
 
@@ -621,13 +579,9 @@ fn validate_responses_request_for_custom_bridge(body: &Value) -> Result<(), Stri
                 continue;
             };
             if let NormalizedOpenAiFamilyToolCall::Function { name, .. } = tool_call {
-                reject_reserved_custom_bridge_name(&name)?;
+                validate_public_tool_name_not_reserved(&name)?;
             }
         }
-    }
-
-    if let Some(tool_choice) = body.get("tool_choice") {
-        validate_responses_tool_choice_for_custom_bridge(tool_choice)?;
     }
 
     Ok(())
@@ -910,7 +864,7 @@ pub(super) fn responses_to_messages(
     }
     if let Some(tool_choice) = body.get("tool_choice").cloned() {
         if let Some(mapped_tool_choice) =
-            responses_tool_choice_to_openai_tool_choice(&tool_choice, target_format)
+            responses_tool_choice_to_openai_tool_choice(&tool_choice, target_format)?
         {
             out.insert("tool_choice".to_string(), mapped_tool_choice);
         }
@@ -1365,7 +1319,7 @@ pub(super) fn messages_to_responses(body: &mut Value) -> Result<(), String> {
         );
     } else if let Some(tool_choice) = body.get("tool_choice").cloned() {
         if let Some(mapped_tool_choice) =
-            openai_tool_choice_to_responses_tool_choice(&tool_choice, bridge_context)
+            openai_tool_choice_to_responses_tool_choice(&tool_choice, bridge_context)?
         {
             body["tool_choice"] = mapped_tool_choice;
         } else if let Some(obj) = body.as_object_mut() {
@@ -1465,78 +1419,107 @@ pub(super) fn messages_to_responses(body: &mut Value) -> Result<(), String> {
 fn responses_tool_choice_to_openai_tool_choice(
     choice: &Value,
     target_format: UpstreamFormat,
-) -> Option<Value> {
+) -> Result<Option<Value>, String> {
     let use_request_scoped_openai_custom_bridge = matches!(
         target_format,
         UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
     );
     let bridge_custom_responses_semantics = use_request_scoped_openai_custom_bridge;
     if choice.is_string() {
-        return Some(choice.clone());
+        return Ok(Some(choice.clone()));
     }
-    let obj = choice.as_object()?;
-    let ty = obj.get("type").and_then(Value::as_str)?;
-    match ty {
+    let Some(obj) = choice.as_object() else {
+        return Ok(None);
+    };
+    let Some(ty) = obj.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let mapped = match ty {
         "function" => {
-            let name = obj
+            let Some(name) = obj
                 .get("name")
-                .or_else(|| obj.get("function").and_then(|f| f.get("name")))?;
-            Some(serde_json::json!({
+                .or_else(|| obj.get("function").and_then(|f| f.get("name")))
+            else {
+                return Ok(None);
+            };
+            if let Some(name) = name.as_str() {
+                validate_public_tool_name_not_reserved(name)?;
+            }
+            serde_json::json!({
                 "type": "function",
                 "function": { "name": name }
-            }))
+            })
         }
         "custom" => {
-            let name = openai_named_tool_choice_name(choice, "custom")?;
+            let Some(name) = openai_named_tool_choice_name(choice, "custom") else {
+                return Ok(None);
+            };
+            validate_public_tool_name_not_reserved(name)?;
             if bridge_custom_responses_semantics {
-                Some(serde_json::json!({
+                serde_json::json!({
                     "type": "function",
                     "function": { "name": name }
-                }))
+                })
             } else {
-                Some(serde_json::json!({
+                serde_json::json!({
                     "type": "custom",
                     "custom": { "name": name }
-                }))
+                })
             }
         }
         "allowed_tools" => {
-            let mode = obj.get("mode")?;
-            let tools = obj.get("tools")?.as_array()?;
+            let Some(mode) = obj.get("mode") else {
+                return Ok(None);
+            };
+            let Some(tools) = obj.get("tools").and_then(Value::as_array) else {
+                return Ok(None);
+            };
             let converted_tools = tools
                 .iter()
                 .map(|tool| match tool.get("type").and_then(Value::as_str) {
-                    Some("function") if tool.get("name").is_some() => serde_json::json!({
-                        "type": "function",
-                        "function": { "name": tool.get("name").cloned().unwrap_or(Value::Null) }
-                    }),
-                    Some("custom") if bridge_custom_responses_semantics => tool
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(|name| {
-                            serde_json::json!({
+                    Some("function") if tool.get("name").is_some() => {
+                        if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                            validate_public_tool_name_not_reserved(name)?;
+                        }
+                        Ok(serde_json::json!({
+                            "type": "function",
+                            "function": { "name": tool.get("name").cloned().unwrap_or(Value::Null) }
+                        }))
+                    }
+                    Some("custom") if bridge_custom_responses_semantics => {
+                        if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                            validate_public_tool_name_not_reserved(name)?;
+                            Ok(serde_json::json!({
                                 "type": "function",
                                 "function": { "name": name }
-                            })
-                        })
-                        .unwrap_or_else(|| tool.clone()),
-                    Some("custom") if tool.get("name").is_some() => serde_json::json!({
-                        "type": "custom",
-                        "custom": { "name": tool.get("name").cloned().unwrap_or(Value::Null) }
-                    }),
-                    _ => tool.clone(),
+                            }))
+                        } else {
+                            Ok(tool.clone())
+                        }
+                    }
+                    Some("custom") if tool.get("name").is_some() => {
+                        if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                            validate_public_tool_name_not_reserved(name)?;
+                        }
+                        Ok(serde_json::json!({
+                            "type": "custom",
+                            "custom": { "name": tool.get("name").cloned().unwrap_or(Value::Null) }
+                        }))
+                    }
+                    _ => Ok(tool.clone()),
                 })
-                .collect::<Vec<_>>();
-            Some(serde_json::json!({
+                .collect::<Result<Vec<_>, String>>()?;
+            serde_json::json!({
                 "type": "allowed_tools",
                 "allowed_tools": {
                     "mode": mode,
                     "tools": converted_tools
                 }
-            }))
+            })
         }
-        _ => None,
-    }
+        _ => return Ok(None),
+    };
+    Ok(Some(mapped))
 }
 
 fn normalized_tool_definition_to_responses_with_request_scoped_custom_bridge(
@@ -1549,93 +1532,121 @@ fn normalized_tool_definition_to_responses_with_request_scoped_custom_bridge(
 fn openai_tool_choice_to_responses_tool_choice(
     choice: &Value,
     bridge_context: Option<&ToolBridgeContext>,
-) -> Option<Value> {
+) -> Result<Option<Value>, String> {
     if choice.is_string() {
-        return Some(choice.clone());
+        return Ok(Some(choice.clone()));
     }
-    let obj = choice.as_object()?;
-    let ty = obj.get("type").and_then(Value::as_str)?;
-    match ty {
+    let Some(obj) = choice.as_object() else {
+        return Ok(None);
+    };
+    let Some(ty) = obj.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let mapped = match ty {
         "function" => {
-            let name = obj
+            let Some(name) = obj
                 .get("name")
-                .or_else(|| obj.get("function").and_then(|f| f.get("name")))?;
+                .or_else(|| obj.get("function").and_then(|f| f.get("name")))
+            else {
+                return Ok(None);
+            };
             if let Some(name) = name.as_str().filter(|name| {
                 request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
                     bridge_context,
                     name,
                 )
             }) {
-                return Some(serde_json::json!({
+                validate_public_tool_name_not_reserved(name)?;
+                return Ok(Some(serde_json::json!({
                     "type": "custom",
                     "name": name
-                }));
+                })));
             }
-            Some(serde_json::json!({
+            if let Some(name) = name.as_str() {
+                validate_public_tool_name_not_reserved(name)?;
+            }
+            serde_json::json!({
                 "type": "function",
                 "name": name
-            }))
+            })
         }
         "custom" => {
-            let name = openai_named_tool_choice_name(choice, "custom")?;
-            Some(serde_json::json!({
+            let Some(name) = openai_named_tool_choice_name(choice, "custom") else {
+                return Ok(None);
+            };
+            validate_public_tool_name_not_reserved(name)?;
+            serde_json::json!({
                 "type": "custom",
                 "name": name
-            }))
+            })
         }
         "allowed_tools" => {
-            let allowed_tools = obj.get("allowed_tools")?.as_object()?;
-            let mode = allowed_tools.get("mode")?;
-            let tools = allowed_tools.get("tools")?.as_array()?;
+            let Some(allowed_tools) = obj.get("allowed_tools").and_then(Value::as_object) else {
+                return Ok(None);
+            };
+            let Some(mode) = allowed_tools.get("mode") else {
+                return Ok(None);
+            };
+            let Some(tools) = allowed_tools.get("tools").and_then(Value::as_array) else {
+                return Ok(None);
+            };
             let converted_tools = tools
                 .iter()
                 .map(|tool| {
                     match tool.get("type").and_then(Value::as_str) {
                         Some("function") => {
-                            if let Some(name) = tool.get("name").or_else(|| {
+                            if let Some(name_value) = tool.get("name").or_else(|| {
                                 tool.get("function")
                                     .and_then(|function| function.get("name"))
                             }) {
-                                if let Some(name) = name.as_str().filter(|name| {
+                                if let Some(name) = name_value.as_str().filter(|name| {
                                     request_scoped_openai_custom_bridge_expects_canonical_input_wrapper(
                                         bridge_context,
                                         name,
                                     )
                                 }) {
-                                    return serde_json::json!({
+                                    validate_public_tool_name_not_reserved(name)?;
+                                    return Ok(serde_json::json!({
                                         "type": "custom",
                                         "name": name
-                                    });
+                                    }));
                                 }
-                                return serde_json::json!({
+                                if let Some(name) = name_value.as_str() {
+                                    validate_public_tool_name_not_reserved(name)?;
+                                }
+                                return Ok(serde_json::json!({
                                     "type": "function",
-                                    "name": name
-                                });
+                                    "name": name_value
+                                }));
                             }
                         }
                         Some("custom") => {
                             if let Some(name) = tool.get("name").or_else(|| {
                                 tool.get("custom").and_then(|custom| custom.get("name"))
                             }) {
-                                return serde_json::json!({
+                                if let Some(name) = name.as_str() {
+                                    validate_public_tool_name_not_reserved(name)?;
+                                }
+                                return Ok(serde_json::json!({
                                     "type": "custom",
                                     "name": name
-                                });
+                                }));
                             }
                         }
                         _ => {}
                     }
-                    tool.clone()
+                    Ok(tool.clone())
                 })
-                .collect::<Vec<_>>();
-            Some(serde_json::json!({
+                .collect::<Result<Vec<_>, String>>()?;
+            serde_json::json!({
                 "type": "allowed_tools",
                 "mode": mode,
                 "tools": converted_tools
-            }))
+            })
         }
-        _ => None,
-    }
+        _ => return Ok(None),
+    };
+    Ok(Some(mapped))
 }
 
 fn normalized_tool_policy_to_responses_tool_choice(

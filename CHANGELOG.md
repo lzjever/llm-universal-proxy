@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.2.14 - 2026-04-24
+
+- Tightened the `max_compat` public boundary so client-visible tool identity stays stable, while proxy-private `__llmup_custom__*` transport names and `_llmup_tool_bridge_context` state no longer leak across or get trusted at external boundaries.
+- Made translated SSE handling frame-aware, failing closed on malformed raw artifact frames and artifact event types while preserving literal boundary text inside successful text, schema, and metadata payloads.
+- Hardened Responses resource and lifecycle success framing: non-204 / 205 empty success bodies now map to `502`, and 204 / 205 validation uses a no-auto-decompression client to reject illegal `Content-Length` / `Transfer-Encoding` no-content framing.
+- Added downstream-disconnect cancellation handling, expanded CLI matrix owned-health diagnostics, and stabilized real Codex `apply_patch` routing on the original public tool name.
+- Refined upstream egress proxy configuration docs, examples, CI Python unittest governance, and test-report generation so release validation and operational guidance stay reproducible.
+
 ## v0.2.13 - 2026-04-24
 
 - Hardened the Codex real-client prework / work-summary verifier so read-only classification now fails closed around shell startup hooks, PATH-based command resolution, wrapper aliases, shell redirection and control operators, shell expansions, and environment/config-driven helper execution.

@@ -6,6 +6,7 @@ use reqwest::{Client, Proxy};
 use serde_json::Value;
 
 use crate::config::{Config, ProxyConfig, UpstreamConfig};
+use crate::downstream::DownstreamCancellation;
 use crate::formats::UpstreamFormat;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +86,7 @@ fn build_client_with_proxy(
     timeout: Duration,
     resolved_proxy: &ResolvedProxyMetadata,
     streaming: bool,
+    auto_decompression: bool,
 ) -> Result<Client, String> {
     let mut builder = Client::builder();
     builder = if streaming {
@@ -92,6 +94,9 @@ fn build_client_with_proxy(
     } else {
         builder.timeout(timeout)
     };
+    if !auto_decompression {
+        builder = builder.no_gzip().no_brotli().no_zstd().no_deflate();
+    }
     match resolved_proxy.target {
         ResolvedProxyTarget::Inherited => {}
         ResolvedProxyTarget::Direct => {
@@ -115,9 +120,17 @@ pub(crate) fn build_upstream_clients(
     namespace_proxy: Option<&ProxyConfig>,
 ) -> Result<(Client, Client, ResolvedProxyMetadata), String> {
     let resolved_proxy = resolve_upstream_proxy(upstream_proxy, namespace_proxy);
-    let client = build_client_with_proxy(config.upstream_timeout, &resolved_proxy, false)?;
-    let streaming_client = build_client_with_proxy(config.upstream_timeout, &resolved_proxy, true)?;
+    let client = build_client_with_proxy(config.upstream_timeout, &resolved_proxy, false, true)?;
+    let streaming_client =
+        build_client_with_proxy(config.upstream_timeout, &resolved_proxy, true, true)?;
     Ok((client, streaming_client, resolved_proxy))
+}
+
+pub(crate) fn build_no_auto_decompression_client(
+    timeout: Duration,
+    resolved_proxy: &ResolvedProxyMetadata,
+) -> Result<Client, String> {
+    build_client_with_proxy(timeout, resolved_proxy, false, false)
 }
 
 /// Build a reqwest client with timeout from config.
@@ -157,6 +170,43 @@ pub async fn call_upstream(
     req.send().await
 }
 
+#[derive(Debug)]
+pub(crate) enum DownstreamAwareError<E> {
+    Inner(E),
+    DownstreamCancelled,
+}
+
+async fn await_with_downstream_cancellation<F, T, E>(
+    future: F,
+    downstream_cancellation: &DownstreamCancellation,
+) -> Result<T, DownstreamAwareError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    tokio::select! {
+        result = future => result.map_err(DownstreamAwareError::Inner),
+        _ = downstream_cancellation.cancelled() => Err(DownstreamAwareError::DownstreamCancelled),
+    }
+}
+
+pub(crate) async fn call_upstream_with_cancellation(
+    client: &Client,
+    url: &str,
+    body: &Value,
+    stream: bool,
+    headers: &[(String, String)],
+    downstream_cancellation: &DownstreamCancellation,
+) -> Result<reqwest::Response, DownstreamAwareError<reqwest::Error>> {
+    let mut req = client.post(url).json(body);
+    if stream {
+        req = req.header("Accept", "text/event-stream");
+    }
+    for (name, value) in headers {
+        req = req.header(name, value);
+    }
+    await_with_downstream_cancellation(req.send(), downstream_cancellation).await
+}
+
 /// Call an arbitrary upstream HTTP resource.
 pub async fn call_upstream_resource(
     client: &Client,
@@ -173,6 +223,38 @@ pub async fn call_upstream_resource(
         req = req.header(name, value);
     }
     req.send().await
+}
+
+pub(crate) async fn call_upstream_resource_with_cancellation(
+    client: &Client,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&Value>,
+    headers: &[(String, String)],
+    downstream_cancellation: &DownstreamCancellation,
+) -> Result<reqwest::Response, DownstreamAwareError<reqwest::Error>> {
+    let mut req = client.request(method, url);
+    if let Some(body) = body {
+        req = req.json(body);
+    }
+    for (name, value) in headers {
+        req = req.header(name, value);
+    }
+    await_with_downstream_cancellation(req.send(), downstream_cancellation).await
+}
+
+pub(crate) async fn read_response_text_with_cancellation(
+    response: reqwest::Response,
+    downstream_cancellation: &DownstreamCancellation,
+) -> Result<String, DownstreamAwareError<reqwest::Error>> {
+    await_with_downstream_cancellation(response.text(), downstream_cancellation).await
+}
+
+pub(crate) async fn read_response_bytes_with_cancellation(
+    response: reqwest::Response,
+    downstream_cancellation: &DownstreamCancellation,
+) -> Result<bytes::Bytes, DownstreamAwareError<reqwest::Error>> {
+    await_with_downstream_cancellation(response.bytes(), downstream_cancellation).await
 }
 
 /// Resolve upstream URL for the given format using config base URL.

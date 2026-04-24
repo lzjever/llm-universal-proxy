@@ -518,6 +518,20 @@ class CodexPreworkSignalContractTests(unittest.TestCase):
                     )
                 )
 
+    def test_read_only_inspect_classifier_accepts_direct_cat_but_rejects_shell_wrapper(self):
+        module = load_module()
+
+        self.assertTrue(
+            module._codex_command_execution_is_read_only_inspect(
+                {"command": "/usr/bin/cat calc.py main.py"}
+            )
+        )
+        self.assertFalse(
+            module._codex_command_execution_is_read_only_inspect(
+                {"command": "/usr/bin/zsh -lc 'cat calc.py main.py'"}
+            )
+        )
+
     def test_verify_fixture_output_rejects_dangerous_command_before_prework_reasoning(self):
         module = load_module()
         fixture = make_fixture(module, codex_phase_verifier())
@@ -705,6 +719,8 @@ class CodexPreworkSignalContractTests(unittest.TestCase):
         self.assertEqual(payload["id"], "codex_prework_signal_work_summary_contract")
         self.assertEqual(payload["supported_clients"], ["codex"])
         self.assertEqual(payload["workspace_template"], "../codex_observable_edit_contract/workspace")
+        self.assertIn("Before issuing any command or tool call", payload["prompt"])
+        self.assertIn("pre-work signal", payload["prompt"])
         self.assertEqual(
             payload["verifier"]["verifiers"][0]["phase_contract"],
             {

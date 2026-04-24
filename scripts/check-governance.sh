@@ -14,6 +14,7 @@ LOCK_VERSION="$(meta lock_version)"
 CHANGELOG_VERSION="$(meta changelog_version)"
 TOOLCHAIN="$(meta rust_toolchain)"
 TOOLCHAIN_ACTION_REF="$(meta rust_toolchain_action_ref)"
+PYTHON_CONTRACT_TEST_COMMAND="PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
 
 FAILURES=()
 
@@ -56,8 +57,10 @@ check_contains "Dockerfile" "cargo build --locked --release"
 check_contains "Makefile" "build --locked --release"
 check_contains "Makefile" "test --locked"
 check_contains "Makefile" "check --locked"
+check_contains "Makefile" "$PYTHON_CONTRACT_TEST_COMMAND"
 
 check_contains "scripts/test-and-report.sh" "test --locked --no-fail-fast"
+check_contains "scripts/test-and-report.sh" "$PYTHON_CONTRACT_TEST_COMMAND"
 check_contains "scripts/test_cli_clients.sh" "real_cli_matrix.py"
 check_contains "scripts/real_cli_matrix.py" "def default_proxy_binary_path("
 check_contains "scripts/real_cli_matrix.py" 'DEFAULT_RELEASE_PROXY_BINARY = REPO_ROOT / "target" / "release" / "llm-universal-proxy"'
@@ -75,6 +78,8 @@ check_absent ".github/workflows/ci.yml" '>> "$GITHUB_OUTPUT"'
 check_contains ".github/workflows/ci.yml" 'toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}'
 check_contains ".github/workflows/ci.yml" "dtolnay/rust-toolchain@${TOOLCHAIN_ACTION_REF}"
 check_absent ".github/workflows/ci.yml" "dtolnay/rust-toolchain@master"
+check_contains ".github/workflows/ci.yml" 'if: ${{ always() }}'
+check_contains ".github/workflows/ci.yml" "$PYTHON_CONTRACT_TEST_COMMAND"
 check_contains ".github/workflows/ci.yml" "bash scripts/test_binary_smoke.sh"
 
 check_contains ".github/workflows/release.yml" "bash scripts/check-governance.sh"

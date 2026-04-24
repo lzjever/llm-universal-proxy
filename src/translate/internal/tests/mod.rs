@@ -24,6 +24,16 @@ fn typed_tool_bridge_context(
     })
 }
 
+fn response_translation_context(
+    stable_name: &str,
+    source_kind: &str,
+    compatibility_mode: &str,
+) -> ResponseTranslationContext {
+    ResponseTranslationContext::default().with_request_scoped_tool_bridge_context_value(Some(
+        typed_tool_bridge_context(stable_name, source_kind, compatibility_mode),
+    ))
+}
+
 fn assess_request_translation(
     client_format: UpstreamFormat,
     upstream_format: UpstreamFormat,
@@ -945,6 +955,22 @@ fn translate_request_responses_to_openai_rejects_reserved_bridge_prefix_for_func
         json!({
             "model": "gpt-4o",
             "input": "run this",
+            "tools": [{
+                "type": "custom",
+                "name": "__llmup_custom__code_exec"
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "input": "run this",
+            "tool_choice": {
+                "type": "custom",
+                "name": "__llmup_custom__code_exec"
+            }
+        }),
+        json!({
+            "model": "gpt-4o",
+            "input": "run this",
             "tool_choice": {
                 "type": "function",
                 "name": "__llmup_custom__lookup_weather"
@@ -959,6 +985,15 @@ fn translate_request_responses_to_openai_rejects_reserved_bridge_prefix_for_func
                 "arguments": "{\"city\":\"SF\"}"
             }]
         }),
+        json!({
+            "model": "gpt-4o",
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "call_prefixed",
+                "name": "__llmup_custom__code_exec",
+                "input": "print('hi')"
+            }]
+        }),
     ];
 
     for mut body in cases {
@@ -970,6 +1005,85 @@ fn translate_request_responses_to_openai_rejects_reserved_bridge_prefix_for_func
             false,
         )
         .expect_err("reserved bridge namespace should be rejected");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_openai_to_responses_rejects_reserved_public_tool_names_without_bridge_context()
+{
+    let cases = [
+        json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "run this" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "__llmup_custom__lookup_weather",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "run this" }],
+            "functions": [{
+                "name": "__llmup_custom__legacy_exec",
+                "parameters": { "type": "object", "properties": {} }
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "run this" }],
+            "tool_choice": {
+                "type": "function",
+                "function": { "name": "__llmup_custom__lookup_weather" }
+            }
+        }),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "run this" }],
+            "function_call": { "name": "__llmup_custom__legacy_exec" }
+        }),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_prefixed",
+                    "type": "function",
+                    "function": {
+                        "name": "__llmup_custom__lookup_weather",
+                        "arguments": "{\"city\":\"SF\"}"
+                    }
+                }]
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "function_call": {
+                    "name": "__llmup_custom__legacy_exec",
+                    "arguments": "{}"
+                }
+            }]
+        }),
+    ];
+
+    for mut body in cases {
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            &mut body,
+            false,
+        )
+        .expect_err("reserved bridge namespace should be rejected on public ingress");
 
         assert!(err.contains("__llmup_custom__"), "err = {err}");
         assert!(err.contains("reserved bridge prefix"), "err = {err}");
@@ -1524,6 +1638,451 @@ fn translate_request_same_format_passthrough() {
     )
     .unwrap();
     assert_eq!(body, orig);
+}
+
+#[test]
+fn translate_request_same_format_rejects_reserved_public_tool_names() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Hi" }],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "__llmup_custom__lookup_weather",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        false,
+    )
+    .expect_err("same-format public ingress should reject reserved tool names");
+
+    assert!(err.contains("__llmup_custom__"), "err = {err}");
+    assert!(err.contains("reserved bridge prefix"), "err = {err}");
+}
+
+#[test]
+fn translate_request_same_format_rejects_malformed_visible_reserved_tool_definition_names() {
+    let cases = [
+        json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tools": [{
+                "function": {
+                    "name": "__llmup_custom__missing_type",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tools": [{
+                "type": "not_a_tool_type",
+                "custom": {
+                    "name": "__llmup_custom__unknown_type",
+                    "format": { "type": "text" }
+                }
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "tool_choice": {
+                "type": "not_a_tool_type",
+                "function": { "name": "__llmup_custom__tool_choice" }
+            }
+        }),
+    ];
+
+    for mut body in cases {
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            false,
+        )
+        .expect_err("same-format public ingress should reject visible reserved tool identity");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_same_format_rejects_reserved_selector_scalars() {
+    let cases = [
+        (
+            UpstreamFormat::OpenAiCompletion,
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "tool_choice": "__llmup_custom__lookup_weather"
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiCompletion,
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "function_call": "__llmup_custom__legacy_exec"
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiResponses,
+            json!({
+                "model": "gpt-4o",
+                "input": "Hi",
+                "tool_choice": "__llmup_custom__lookup_weather"
+            }),
+        ),
+        (
+            UpstreamFormat::Anthropic,
+            json!({
+                "model": "claude-3",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "tool_choice": "__llmup_custom__lookup_weather"
+            }),
+        ),
+        (
+            UpstreamFormat::Google,
+            json!({
+                "model": "gemini-2.5-flash",
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }],
+                "tool_choice": "__llmup_custom__lookup_weather"
+            }),
+        ),
+    ];
+
+    for (format, mut body) in cases {
+        let err = translate_request(format, format, "model", &mut body, false)
+            .expect_err("same-format selector scalar should reject reserved bridge prefix");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_same_format_allows_public_selector_scalars() {
+    let cases = [
+        (
+            UpstreamFormat::OpenAiCompletion,
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "tool_choice": "required",
+                "function_call": "auto"
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiResponses,
+            json!({
+                "model": "gpt-4o",
+                "input": "Hi",
+                "tool_choice": "none"
+            }),
+        ),
+        (
+            UpstreamFormat::Anthropic,
+            json!({
+                "model": "claude-3",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "tool_choice": "auto"
+            }),
+        ),
+        (
+            UpstreamFormat::Google,
+            json!({
+                "model": "gemini-2.5-flash",
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }],
+                "tool_choice": "auto"
+            }),
+        ),
+    ];
+
+    for (format, mut body) in cases {
+        translate_request(format, format, "model", &mut body, false)
+            .unwrap_or_else(|err| panic!("format = {format:?}, err = {err}"));
+    }
+}
+
+#[test]
+fn translate_request_responses_same_format_rejects_reserved_public_tool_identity() {
+    let cases = [
+        json!({
+            "model": "gpt-4o",
+            "input": "run this",
+            "tools": [{
+                "type": "function",
+                "name": "lookup_weather",
+                "namespace": "__llmup_custom__internal"
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "input": "run this",
+            "tool_choice": {
+                "type": "function",
+                "name": "lookup_weather",
+                "namespace": "__llmup_custom__internal"
+            }
+        }),
+        json!({
+            "model": "gpt-4o",
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_safe_name_reserved_namespace",
+                "name": "lookup_weather",
+                "namespace": "__llmup_custom__internal",
+                "arguments": "{}"
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "input": "run this",
+            "tool_choice": {
+                "type": "not_allowed_tools",
+                "tools": [{
+                    "type": "function",
+                    "name": "__llmup_custom__lookup_weather"
+                }]
+            }
+        }),
+        json!({
+            "model": "gpt-4o",
+            "input": "run this",
+            "tool_choice": {
+                "type": "not_allowed_tools",
+                "allowed_tools": {
+                    "tools": [{
+                        "type": "function",
+                        "namespace": "__llmup_custom__internal"
+                    }]
+                }
+            }
+        }),
+    ];
+
+    for mut body in cases {
+        let err = translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            &mut body,
+            false,
+        )
+        .expect_err("same-format Responses ingress should reject reserved public tool identity");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_same_format_rejects_malformed_selector_visible_identity() {
+    let cases = [
+        (
+            UpstreamFormat::Anthropic,
+            json!({
+                "model": "claude-3",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "tool_choice": { "name": "__llmup_custom__lookup_weather" }
+            }),
+        ),
+        (
+            UpstreamFormat::Google,
+            json!({
+                "model": "gemini-2.5-flash",
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }],
+                "toolConfig": {
+                    "functionCallingConfig": {
+                        "allowedFunctionNames": "__llmup_custom__lookup_weather"
+                    }
+                }
+            }),
+        ),
+    ];
+
+    for (format, mut body) in cases {
+        let err = translate_request(format, format, "model", &mut body, false)
+            .expect_err("malformed selector visible identity should reject reserved prefix");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_same_format_rejects_nested_malformed_selector_containers() {
+    let cases = [
+        (
+            UpstreamFormat::OpenAiCompletion,
+            json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "tool_choice": {
+                    "type": "allowed_tools",
+                    "allowed_tools": {
+                        "tools": [{
+                            "tool": {
+                                "name": "__llmup_custom__lookup_weather"
+                            }
+                        }]
+                    }
+                }
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiResponses,
+            json!({
+                "model": "gpt-4o",
+                "input": "Hi",
+                "tool_choice": {
+                    "type": "allowed_tools",
+                    "allowed_tools": {
+                        "tools": [{
+                            "tool": {
+                                "namespace": "__llmup_custom__internal"
+                            }
+                        }]
+                    }
+                }
+            }),
+        ),
+        (
+            UpstreamFormat::Anthropic,
+            json!({
+                "model": "claude-3",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "tool_choice": {
+                    "type": "tool",
+                    "tool": {
+                        "name": "__llmup_custom__lookup_weather"
+                    }
+                }
+            }),
+        ),
+        (
+            UpstreamFormat::Google,
+            json!({
+                "model": "gemini-2.5-flash",
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }],
+                "toolConfig": {
+                    "functionCallingConfig": {
+                        "allowedFunctionNames": [{
+                            "tool": {
+                                "name": "__llmup_custom__lookup_weather"
+                            }
+                        }]
+                    }
+                }
+            }),
+        ),
+    ];
+
+    for (format, mut body) in cases {
+        let err = translate_request(format, format, "model", &mut body, false)
+            .expect_err("nested selector containers should reject reserved bridge identities");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_same_format_does_not_scan_regular_text_or_schema_as_selector() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": "Please discuss __llmup_custom__lookup_weather as plain text."
+        }],
+        "tool_choice": "auto",
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup_weather",
+                "description": "Plain text mention of __llmup_custom__lookup_weather is not a selector.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "__llmup_custom__lookup_weather is only example text"
+                        }
+                    }
+                }
+            }
+        }]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        false,
+    )
+    .expect("ordinary text/schema mentions should not be treated as selectors");
+}
+
+#[test]
+fn translate_request_gemini_same_format_rejects_reserved_names_despite_response_field() {
+    let cases = [
+        json!({
+            "response": { "note": "unrelated client field must not redirect request validation" },
+            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "__llmup_custom__lookup_weather",
+                    "parameters": { "type": "object" }
+                }]
+            }]
+        }),
+        json!({
+            "response": { "note": "unrelated client field must not redirect request validation" },
+            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "allowedFunctionNames": ["__llmup_custom__lookup_weather"]
+                }
+            }
+        }),
+        json!({
+            "response": { "note": "unrelated client field must not redirect request validation" },
+            "contents": [{
+                "role": "model",
+                "parts": [{
+                    "functionCall": {
+                        "name": "__llmup_custom__lookup_weather",
+                        "args": {}
+                    }
+                }]
+            }]
+        }),
+    ];
+
+    for mut body in cases {
+        let err = translate_request(
+            UpstreamFormat::Google,
+            UpstreamFormat::Google,
+            "gemini-2.5-flash",
+            &mut body,
+            false,
+        )
+        .expect_err("Gemini public ingress must scan request fields even when response exists");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
 }
 
 #[test]
@@ -9362,6 +9921,231 @@ fn translate_response_same_format_passthrough() {
 }
 
 #[test]
+fn translate_response_same_format_rejects_reserved_public_tool_names() {
+    let cases = [
+        json!({
+            "id": "chatcmpl_tools",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_reserved",
+                        "type": "function",
+                        "function": {
+                            "name": "__llmup_custom__lookup_weather",
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "chatcmpl_legacy_function",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "function_call": {
+                        "name": "__llmup_custom__legacy_exec",
+                        "arguments": "{}"
+                    }
+                },
+                "finish_reason": "function_call"
+            }]
+        }),
+    ];
+
+    for body in cases {
+        let err = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .expect_err("same-format public egress should reject reserved tool names");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_response_same_format_rejects_malformed_visible_reserved_tool_call_names() {
+    let cases = [
+        json!({
+            "id": "chatcmpl_missing_type_function",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_reserved",
+                        "function": {
+                            "name": "__llmup_custom__missing_type",
+                            "arguments": "{}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "chatcmpl_unknown_type_custom",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_reserved_custom",
+                        "type": "not_a_tool_type",
+                        "custom": {
+                            "name": "__llmup_custom__unknown_type",
+                            "input": "print('hi')"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        json!({
+            "id": "chatcmpl_unknown_type_top_level",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_reserved_top_level",
+                        "type": "not_a_tool_type",
+                        "name": "__llmup_custom__top_level",
+                        "arguments": "{}"
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+    ];
+
+    for body in cases {
+        let err = translate_response(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiCompletion,
+            &body,
+        )
+        .expect_err("same-format public egress should reject visible reserved tool identity");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_response_responses_same_format_rejects_reserved_public_tool_identity() {
+    let cases = [
+        json!({
+            "id": "resp_output_namespace",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_safe_name_reserved_namespace",
+                "name": "lookup_weather",
+                "namespace": "__llmup_custom__internal",
+                "arguments": "{}"
+            }]
+        }),
+        json!({
+            "id": "resp_tools_name",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "output": [],
+            "tools": [{
+                "type": "function",
+                "name": "__llmup_custom__lookup_weather"
+            }]
+        }),
+        json!({
+            "id": "resp_tool_choice_namespace",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "output": [],
+            "tool_choice": {
+                "type": "function",
+                "name": "lookup_weather",
+                "namespace": "__llmup_custom__internal"
+            }
+        }),
+    ];
+
+    for body in cases {
+        let err = translate_response(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiResponses,
+            &body,
+        )
+        .expect_err("same-format Responses egress should reject reserved public tool identity");
+
+        assert!(err.contains("__llmup_custom__"), "err = {err}");
+        assert!(err.contains("reserved bridge prefix"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_response_same_format_rejects_internal_bridge_context_field() {
+    let body = json!({
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "apply_patch",
+            "custom_grammar",
+            "balanced"
+        ),
+        "id": "resp_internal_context",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "output": []
+    });
+
+    let err = translate_response(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect_err("same-format public egress must reject internal bridge context fields");
+
+    assert!(err.contains("_llmup_tool_bridge_context"), "err = {err}");
+}
+
+#[test]
+fn translate_response_same_format_rejects_nested_selector_containers() {
+    let body = json!({
+        "id": "resp_nested_selector",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "output": [],
+        "tool_choice": {
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "tools": [{
+                    "tool": {
+                        "name": "__llmup_custom__lookup_weather"
+                    }
+                }]
+            }
+        }
+    });
+
+    let err = translate_response(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect_err("same-format Responses egress should reject nested selector identities");
+
+    assert!(err.contains("__llmup_custom__"), "err = {err}");
+    assert!(err.contains("reserved bridge prefix"), "err = {err}");
+}
+
+#[test]
 fn translate_response_claude_to_openai_has_choices() {
     let body = json!({
         "id": "msg_1",
@@ -10784,11 +11568,6 @@ fn translate_response_gemini_to_responses_decodes_request_scoped_custom_bridge_w
 {
     let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
     let body = json!({
-        "_llmup_tool_bridge_context": typed_tool_bridge_context(
-            "apply_patch",
-            "custom_grammar",
-            "max_compat"
-        ),
         "responseId": "resp_gemini_custom",
         "modelVersion": "gemini-2.5-flash",
         "candidates": [{
@@ -10806,10 +11585,11 @@ fn translate_response_gemini_to_responses_decodes_request_scoped_custom_bridge_w
         }]
     });
 
-    let out = translate_response(
+    let out = translate_response_with_context(
         UpstreamFormat::Google,
         UpstreamFormat::OpenAiResponses,
         &body,
+        response_translation_context("apply_patch", "custom_grammar", "max_compat"),
     )
     .expect("Gemini response should decode bridged custom tool call");
 
@@ -10830,11 +11610,6 @@ fn translate_response_openai_to_responses_decodes_request_scoped_function_call_t
 ) {
     let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let body = json!({
-        "_llmup_tool_bridge_context": typed_tool_bridge_context(
-            "code_exec",
-            "custom_text",
-            "balanced"
-        ),
         "id": "chatcmpl_tools",
         "object": "chat.completion",
         "choices": [{
@@ -10857,10 +11632,11 @@ fn translate_response_openai_to_responses_decodes_request_scoped_function_call_t
         }]
     });
 
-    let out = translate_response(
+    let out = translate_response_with_context(
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::OpenAiResponses,
         &body,
+        response_translation_context("code_exec", "custom_text", "balanced"),
     )
     .unwrap();
 
@@ -10881,11 +11657,6 @@ fn translate_response_openai_to_responses_decodes_request_scoped_custom_bridge_w
 {
     let patch_input = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n";
     let body = json!({
-        "_llmup_tool_bridge_context": typed_tool_bridge_context(
-            "apply_patch",
-            "custom_grammar",
-            "balanced"
-        ),
         "id": "chatcmpl_tools",
         "object": "chat.completion",
         "choices": [{
@@ -10908,10 +11679,11 @@ fn translate_response_openai_to_responses_decodes_request_scoped_custom_bridge_w
         }]
     });
 
-    let out = translate_response(
+    let out = translate_response_with_context(
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::OpenAiResponses,
         &body,
+        response_translation_context("apply_patch", "custom_grammar", "balanced"),
     )
     .unwrap();
 
@@ -10928,15 +11700,98 @@ fn translate_response_openai_to_responses_decodes_request_scoped_custom_bridge_w
 }
 
 #[test]
+fn translate_response_ignores_upstream_body_supplied_bridge_context_without_sidecar() {
+    let exact_input = "print('hi')";
+    let raw_arguments = serde_json::to_string(&json!({ "input": exact_input })).expect("json");
+    let body = json!({
+        "_llmup_tool_bridge_context": typed_tool_bridge_context(
+            "code_exec",
+            "custom_text",
+            "balanced"
+        ),
+        "id": "chatcmpl_tools",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_custom",
+                    "type": "function",
+                    "function": {
+                        "name": "code_exec",
+                        "arguments": raw_arguments
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+
+    let err = translate_response(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect_err("response translation must not trust upstream body bridge context");
+
+    assert!(err.contains("_llmup_tool_bridge_context"), "err = {err}");
+}
+
+#[test]
+fn translate_response_uses_trusted_sidecar_bridge_context_for_custom_tool_restoration() {
+    let exact_input = "print('hi')";
+    let raw_arguments = serde_json::to_string(&json!({ "input": exact_input })).expect("json");
+    let body = json!({
+        "id": "chatcmpl_tools",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_custom",
+                    "type": "function",
+                    "function": {
+                        "name": "code_exec",
+                        "arguments": raw_arguments
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let context =
+        ResponseTranslationContext::default().with_request_scoped_tool_bridge_context_value(Some(
+            typed_tool_bridge_context("code_exec", "custom_text", "balanced"),
+        ));
+
+    let out = translate_response_with_context(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+        context,
+    )
+    .expect("trusted sidecar bridge context should restore custom tool calls");
+
+    assert_eq!(
+        out["output"][0],
+        json!({
+            "type": "custom_tool_call",
+            "call_id": "call_custom",
+            "name": "code_exec",
+            "input": exact_input
+        })
+    );
+    assert!(!out.to_string().contains("_llmup_tool_bridge_context"));
+    assert!(!out.to_string().contains("__llmup_custom__"));
+}
+
+#[test]
 fn translate_response_openai_to_responses_request_scoped_custom_bridge_falls_back_without_prefix_leak(
 ) {
     let raw_arguments = serde_json::to_string(&json!({ "input": 5, "extra": true })).expect("json");
     let body = json!({
-        "_llmup_tool_bridge_context": typed_tool_bridge_context(
-            "apply_patch",
-            "custom_grammar",
-            "balanced"
-        ),
         "id": "chatcmpl_tools",
         "object": "chat.completion",
         "choices": [{
@@ -10956,10 +11811,11 @@ fn translate_response_openai_to_responses_request_scoped_custom_bridge_falls_bac
         }]
     });
 
-    let out = translate_response(
+    let out = translate_response_with_context(
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::OpenAiResponses,
         &body,
+        response_translation_context("apply_patch", "custom_grammar", "balanced"),
     )
     .expect("noncanonical request-scoped bridge args should fall back to function_call");
 
@@ -10976,7 +11832,7 @@ fn translate_response_openai_to_responses_request_scoped_custom_bridge_falls_bac
 }
 
 #[test]
-fn translate_response_openai_to_responses_does_not_decode_reserved_prefix_function_call_without_request_context(
+fn translate_response_openai_to_responses_rejects_reserved_prefix_function_call_without_request_context(
 ) {
     let raw_arguments = serde_json::to_string(&json!({ "input": "print('hi')" })).expect("json");
     let body = json!({
@@ -10999,23 +11855,47 @@ fn translate_response_openai_to_responses_does_not_decode_reserved_prefix_functi
         }]
     });
 
-    let out = translate_response(
+    let err = translate_response(
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::OpenAiResponses,
         &body,
     )
-    .expect("reserved-prefix names should not decode without request context");
+    .expect_err("reserved-prefix names should fail closed without request context");
 
-    let output = out["output"].as_array().expect("responses output");
-    assert_eq!(
-        output[0],
-        json!({
-            "type": "function_call",
-            "call_id": "call_custom",
-            "name": "__llmup_custom__code_exec",
-            "arguments": raw_arguments
-        })
-    );
+    assert!(err.contains("__llmup_custom__"), "err = {err}");
+    assert!(err.contains("reserved bridge prefix"), "err = {err}");
+}
+
+#[test]
+fn translate_response_openai_to_responses_rejects_malformed_visible_reserved_tool_call_name() {
+    let body = json!({
+        "id": "chatcmpl_tools",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_custom",
+                    "function": {
+                        "name": "__llmup_custom__code_exec",
+                        "arguments": "{}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+
+    let err = translate_response(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect_err("cross-format OpenAI egress should reject visible reserved tool identity");
+
+    assert!(err.contains("__llmup_custom__"), "err = {err}");
+    assert!(err.contains("reserved bridge prefix"), "err = {err}");
 }
 
 #[test]
@@ -11030,11 +11910,6 @@ fn translate_response_openai_to_responses_request_scoped_bridge_falls_back_when_
 
     for raw_arguments in bad_arguments {
         let body = json!({
-            "_llmup_tool_bridge_context": typed_tool_bridge_context(
-                "code_exec",
-                "custom_text",
-                "balanced"
-            ),
             "id": "chatcmpl_tools",
             "object": "chat.completion",
             "choices": [{
@@ -11054,10 +11929,11 @@ fn translate_response_openai_to_responses_request_scoped_bridge_falls_back_when_
             }]
         });
 
-        let out = translate_response(
+        let out = translate_response_with_context(
             UpstreamFormat::OpenAiCompletion,
             UpstreamFormat::OpenAiResponses,
             &body,
+            response_translation_context("code_exec", "custom_text", "balanced"),
         )
         .expect("noncanonical bridged args should fall back to function_call");
 
@@ -11152,7 +12028,6 @@ fn translate_response_openai_to_responses_fails_closed_for_incomplete_or_invalid
 
     for (label, bridge_context) in cases {
         let body = json!({
-            "_llmup_tool_bridge_context": bridge_context,
             "id": "chatcmpl_tools",
             "object": "chat.completion",
             "choices": [{
@@ -11172,10 +12047,12 @@ fn translate_response_openai_to_responses_fails_closed_for_incomplete_or_invalid
             }]
         });
 
-        let out = translate_response(
+        let out = translate_response_with_context(
             UpstreamFormat::OpenAiCompletion,
             UpstreamFormat::OpenAiResponses,
             &body,
+            ResponseTranslationContext::default()
+                .with_request_scoped_tool_bridge_context_value(Some(bridge_context)),
         )
         .unwrap_or_else(|err| panic!("{label}: translation should fall back open: {err}"));
         let output = out["output"].as_array().expect("responses output");
@@ -12223,11 +13100,6 @@ fn translate_response_claude_thinking_signature_provenance_maps_to_responses_car
 fn translate_response_claude_request_scoped_tool_use_restores_responses_custom_tool_call() {
     let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let body = json!({
-        "_llmup_tool_bridge_context": typed_tool_bridge_context(
-            "code_exec",
-            "custom_text",
-            "balanced"
-        ),
         "id": "msg_custom_tool",
         "content": [{
             "type": "tool_use",
@@ -12239,10 +13111,11 @@ fn translate_response_claude_request_scoped_tool_use_restores_responses_custom_t
         "model": "claude-3"
     });
 
-    let out = translate_response(
+    let out = translate_response_with_context(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
         &body,
+        response_translation_context("code_exec", "custom_text", "balanced"),
     )
     .expect("Anthropic bridged tool_use should restore Responses custom tool calls");
 

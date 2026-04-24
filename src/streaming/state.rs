@@ -11,6 +11,9 @@ pub(super) struct StreamToolBridgeContextEntry {
 
 impl StreamToolBridgeContextEntry {
     fn from_value(stable_name: &str, value: &Value) -> Option<Self> {
+        if validate_public_tool_name_not_reserved(stable_name).is_err() {
+            return None;
+        }
         let object = value.as_object()?;
         let declared_stable_name = object.get("stable_name").and_then(Value::as_str)?;
         if declared_stable_name.is_empty() || declared_stable_name != stable_name {
@@ -573,7 +576,8 @@ pub(super) fn mark_stream_fatal_rejection(
     state: &mut StreamState,
     message: impl Into<String>,
 ) -> String {
-    let message = message.into();
+    let raw_message = message.into();
+    let message = sanitize_public_error_message(&raw_message);
     if state.fatal_rejection.is_none() {
         state.fatal_rejection = Some(StreamFatalRejection {
             message: message.clone(),

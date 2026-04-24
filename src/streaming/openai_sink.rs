@@ -805,6 +805,39 @@ pub(super) fn anthropic_error_event(error_type: &str, message: &str) -> Vec<u8> 
     )
 }
 
+fn reject_openai_responses_stream(
+    state: &mut StreamState,
+    response_id: &str,
+    created: u64,
+    code: &str,
+    message: impl Into<String>,
+) -> Vec<Vec<u8>> {
+    let message = mark_stream_fatal_rejection(state, message);
+    state.openai_tool_calls.clear();
+    state.finish_reason = Some("error".to_string());
+    state.responses_terminal_sent = true;
+    let failed = serde_json::json!({
+        "type": "response.failed",
+        "sequence_number": next_responses_seq(state),
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created,
+            "status": "failed",
+            "background": false,
+            "error": {
+                "type": "invalid_request_error",
+                "code": code,
+                "message": message
+            },
+            "incomplete_details": null,
+            "usage": null,
+            "output": []
+        }
+    });
+    vec![format_sse_event("response.failed", &failed)]
+}
+
 pub(super) fn reject_anthropic_stream(
     state: &mut StreamState,
     error_type: &str,
@@ -1073,6 +1106,16 @@ pub(super) fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState)
     if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
         for tc in tcs {
             let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if let Some(name) = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            {
+                if let Err(message) = validate_public_tool_name_not_reserved(name) {
+                    mark_stream_fatal_rejection(state, message);
+                    return out;
+                }
+            }
             let entry = state
                 .openai_tool_calls
                 .entry(idx)
@@ -1750,6 +1793,22 @@ pub(super) fn openai_chunk_to_responses_sse(
             let tc_idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             dedupe_tool_call_state_by_call_id(&mut state.openai_tool_calls, tc_idx, tc.get("id"));
             let output_index = responses_tool_output_index(state, tc_idx);
+            if let Some(name) = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            {
+                if let Err(message) = validate_public_tool_name_not_reserved(name) {
+                    out.extend(reject_openai_responses_stream(
+                        state,
+                        &response_id,
+                        chunk.get("created").and_then(Value::as_u64).unwrap_or(0),
+                        "reserved_openai_custom_bridge_prefix",
+                        message,
+                    ));
+                    return out;
+                }
+            }
             let mut args_delta: Option<(String, String, String, String, Option<String>)> = None;
             let should_flush_pending;
             {

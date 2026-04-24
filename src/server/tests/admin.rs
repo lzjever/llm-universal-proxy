@@ -190,6 +190,11 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
         config.proxy.as_ref(),
     )
     .expect("build admin upstream clients");
+    let no_auto_decompression_client = crate::upstream::build_no_auto_decompression_client(
+        config.upstream_timeout,
+        &resolved_proxy,
+    )
+    .expect("build admin no-auto-decompression upstream client");
     upstreams.insert(
         "default".to_string(),
         UpstreamState {
@@ -200,6 +205,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
             availability: crate::discovery::UpstreamAvailability::Available,
             client,
             streaming_client,
+            no_auto_decompression_client,
             resolved_proxy,
         },
     );
@@ -328,6 +334,11 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
         config.proxy.as_ref(),
     )
     .expect("build admin env upstream clients");
+    let no_auto_decompression_client = crate::upstream::build_no_auto_decompression_client(
+        config.upstream_timeout,
+        &resolved_proxy,
+    )
+    .expect("build admin env no-auto-decompression upstream client");
     upstreams.insert(
         "default".to_string(),
         UpstreamState {
@@ -338,6 +349,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
             availability: crate::discovery::UpstreamAvailability::Available,
             client,
             streaming_client,
+            no_auto_decompression_client,
             resolved_proxy,
         },
     );
@@ -414,6 +426,11 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
         config.proxy.as_ref(),
     )
     .expect("build admin namespace upstream clients");
+    let no_auto_decompression_client = crate::upstream::build_no_auto_decompression_client(
+        config.upstream_timeout,
+        &resolved_proxy,
+    )
+    .expect("build admin namespace no-auto-decompression upstream client");
     upstreams.insert(
         "default".to_string(),
         UpstreamState {
@@ -424,6 +441,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
             availability: crate::discovery::UpstreamAvailability::Available,
             client,
             streaming_client,
+            no_auto_decompression_client,
             resolved_proxy,
         },
     );

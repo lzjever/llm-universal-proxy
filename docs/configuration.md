@@ -268,6 +268,8 @@ Supported `proxy.url` schemes:
 
 For a fuller proxy example, see [examples/upstream-proxy.yaml](../examples/upstream-proxy.yaml).
 
+That example intentionally focuses on raw HTTP egress proxy behavior. If you adapt it for Codex, Claude Code, or Gemini wrapper/live-profile flows, keep the surface guidance above.
+
 ## Optional Hooks and Debug Trace
 
 These are optional and should usually come after the basic routing config is already working.

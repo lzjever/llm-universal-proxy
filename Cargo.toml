@@ -1,6 +1,6 @@
 [package]
 name = "llm-universal-proxy"
-version = "0.2.13"
+version = "0.2.14"
 edition = "2021"
 description = "Universal LLM endpoint proxy: single URL, 4 formats (Google, Anthropic, OpenAI completion, OpenAI responses), streaming, format conversion with passthrough when same."
 license = "MIT"
@@ -9,6 +9,7 @@ repository = "https://github.com/lzjever/llm-universal-proxy"
 [dependencies]
 axum = { version = "0.7", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -19,6 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "gzip", "brotli", "deflate", "zstd", "socks"], default-features = false }
 bytes = "1"
 futures-util = "0.3"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 thiserror = "2"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }

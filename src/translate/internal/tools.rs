@@ -7,7 +7,10 @@ use uuid::Uuid;
 
 use crate::formats::UpstreamFormat;
 
-use super::messages::{custom_tools_not_portable_message, translation_target_label};
+use super::messages::{
+    custom_tools_not_portable_message, reserved_openai_custom_bridge_prefix_message,
+    translation_target_label,
+};
 use super::models::{
     NormalizedOpenAiFamilyCustomTool, NormalizedOpenAiFamilyFunctionTool,
     NormalizedOpenAiFamilyNamespaceTool, NormalizedOpenAiFamilyToolCall,
@@ -17,12 +20,31 @@ use super::models::{
 pub(crate) fn anthropic_tool_use_type_for_openai_tool_call(
     tool_call: &Value,
 ) -> Result<&'static str, String> {
+    validate_openai_public_tool_identity(tool_call)?;
     match semantic_tool_kind_from_value(tool_call) {
         SemanticToolKind::OpenAiCustom => {
             Err(custom_tools_not_portable_message(UpstreamFormat::Anthropic))
         }
-        SemanticToolKind::AnthropicServerTool => Ok("server_tool_use"),
-        SemanticToolKind::Function => Ok("tool_use"),
+        SemanticToolKind::AnthropicServerTool => {
+            if let Some(name) = tool_call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+            {
+                validate_public_tool_name_not_reserved(name)?;
+            }
+            Ok("server_tool_use")
+        }
+        SemanticToolKind::Function => {
+            if let Some(name) = tool_call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+            {
+                validate_public_tool_name_not_reserved(name)?;
+            }
+            Ok("tool_use")
+        }
     }
 }
 
@@ -430,6 +452,9 @@ impl ToolBridgeContextEntry {
     }
 
     fn from_value(stable_name: &str, value: &Value) -> Option<Self> {
+        if openai_responses_custom_tool_bridge_prefix_is_reserved(stable_name) {
+            return None;
+        }
         let object = value.as_object()?;
         let declared_stable_name = object.get("stable_name").and_then(Value::as_str)?;
         if declared_stable_name.is_empty() || declared_stable_name != stable_name {
@@ -586,8 +611,241 @@ pub(crate) fn openai_responses_custom_tool_input_from_bridge_arguments(
 }
 
 pub(crate) fn openai_responses_custom_tool_bridge_prefix_is_reserved(name: &str) -> bool {
-    name.strip_prefix(OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX)
-        .is_some_and(|suffix| !suffix.is_empty())
+    name.starts_with(OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX)
+}
+
+pub(crate) fn validate_public_tool_name_not_reserved(name: &str) -> Result<(), String> {
+    if openai_responses_custom_tool_bridge_prefix_is_reserved(name) {
+        return Err(reserved_openai_custom_bridge_prefix_message(name));
+    }
+    Ok(())
+}
+
+fn validate_public_tool_identity_value_not_reserved(value: Option<&Value>) -> Result<(), String> {
+    if let Some(value) = value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        validate_public_tool_name_not_reserved(value)?;
+    }
+    Ok(())
+}
+
+fn selector_container_key_is_visible_identity_carrier(key: &str) -> bool {
+    matches!(
+        key,
+        "function"
+            | "custom"
+            | "tool"
+            | "tools"
+            | "allowed_tool"
+            | "allowed_tools"
+            | "allowedTools"
+            | "selected_tool"
+            | "selected_tools"
+            | "selectedTools"
+            | "allowedFunctionNames"
+            | "allowed_function_names"
+            | "functionCallingConfig"
+            | "function_calling_config"
+            | "toolConfig"
+            | "tool_config"
+    )
+}
+
+fn validate_public_selector_visible_identity_at(value: &Value, path: &str) -> Result<(), String> {
+    if let Some(name) = value.as_str().filter(|value| !value.is_empty()) {
+        return validate_public_tool_name_not_reserved(name)
+            .map_err(|err| format!("{path}: {err}"));
+    }
+
+    match value {
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                validate_public_selector_visible_identity_at(item, &format!("{path}[{index}]"))?;
+            }
+        }
+        Value::Object(object) => {
+            for key in ["name", "namespace"] {
+                if let Some(name) = object.get(key).and_then(Value::as_str) {
+                    validate_public_tool_name_not_reserved(name)
+                        .map_err(|err| format!("{path}.{key}: {err}"))?;
+                }
+            }
+            for (key, nested) in object {
+                if selector_container_key_is_visible_identity_carrier(key) {
+                    validate_public_selector_visible_identity_at(nested, &format!("{path}.{key}"))?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_public_selector_visible_identity(value: &Value) -> Result<(), String> {
+    validate_public_selector_visible_identity_at(value, "$")
+}
+
+pub(crate) fn validate_public_selector_visible_identities(value: &Value) -> Result<(), String> {
+    validate_public_selector_visible_identity(value)
+}
+
+pub(crate) fn validate_openai_public_tool_identity(value: &Value) -> Result<(), String> {
+    validate_public_tool_identity_value_not_reserved(Some(value))?;
+    validate_public_tool_identity_value_not_reserved(value.get("name"))?;
+    validate_public_tool_identity_value_not_reserved(
+        value
+            .get("function")
+            .and_then(|function| function.get("name")),
+    )?;
+    validate_public_tool_identity_value_not_reserved(
+        value.get("custom").and_then(|custom| custom.get("name")),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn validate_openai_public_tool_choice_identity(choice: &Value) -> Result<(), String> {
+    validate_public_selector_visible_identity(choice)?;
+    validate_openai_public_tool_identity(choice)?;
+    let Some(choice_obj) = choice.as_object() else {
+        return Ok(());
+    };
+
+    let Some(selected_tools) = choice_obj
+        .get("allowed_tools")
+        .and_then(Value::as_object)
+        .and_then(|allowed_tools| allowed_tools.get("tools"))
+        .or_else(|| choice_obj.get("tools"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for tool in selected_tools {
+        validate_openai_public_tool_identity(tool)?;
+    }
+    Ok(())
+}
+
+fn validate_responses_public_nested_tool_reference_identity(
+    value: Option<&Value>,
+) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    validate_public_tool_identity_value_not_reserved(Some(value))?;
+    validate_public_tool_identity_value_not_reserved(value.get("name"))?;
+    validate_public_tool_identity_value_not_reserved(value.get("namespace"))?;
+    Ok(())
+}
+
+fn validate_responses_public_tool_reference_identity(value: &Value) -> Result<(), String> {
+    validate_public_selector_visible_identity(value)?;
+    validate_public_tool_identity_value_not_reserved(Some(value))?;
+    validate_public_tool_identity_value_not_reserved(value.get("name"))?;
+    validate_public_tool_identity_value_not_reserved(value.get("namespace"))?;
+    validate_responses_public_nested_tool_reference_identity(value.get("function"))?;
+    validate_responses_public_nested_tool_reference_identity(value.get("custom"))?;
+    Ok(())
+}
+
+pub(crate) fn validate_responses_public_tool_choice_identity(choice: &Value) -> Result<(), String> {
+    validate_responses_public_tool_reference_identity(choice)?;
+    let Some(choice_obj) = choice.as_object() else {
+        return Ok(());
+    };
+
+    let Some(selected_tools) = choice_obj
+        .get("allowed_tools")
+        .and_then(Value::as_object)
+        .and_then(|allowed_tools| allowed_tools.get("tools"))
+        .or_else(|| choice_obj.get("tools"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for tool in selected_tools {
+        validate_responses_public_tool_reference_identity(tool)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_responses_public_tool_metadata_identity(
+    value: &Value,
+) -> Result<(), String> {
+    if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            validate_responses_public_tool_reference_identity(tool)?;
+        }
+    }
+    if let Some(tool_choice) = value.get("tool_choice").filter(|value| !value.is_null()) {
+        validate_responses_public_tool_choice_identity(tool_choice)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_responses_public_request_object_tool_identity(
+    value: &Value,
+) -> Result<(), String> {
+    validate_responses_public_tool_metadata_identity(value)?;
+    if let Some(items) = value.get("input").and_then(Value::as_array) {
+        for item in items {
+            validate_responses_public_tool_call_item_identity(item)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_responses_public_stream_event_tool_identity(
+    event: &Value,
+) -> Result<(), String> {
+    validate_responses_public_tool_metadata_identity(event)?;
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some(
+            "response.function_call_arguments.delta"
+                | "response.function_call_arguments.done"
+                | "response.custom_tool_call_input.delta"
+                | "response.custom_tool_call_input.done"
+        )
+    ) {
+        validate_public_tool_identity_value_not_reserved(event.get("name"))?;
+        validate_public_tool_identity_value_not_reserved(event.get("namespace"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_responses_public_tool_call_item_identity(
+    item: &Value,
+) -> Result<(), String> {
+    if matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    ) {
+        validate_public_tool_identity_value_not_reserved(item.get("name"))?;
+        validate_public_tool_identity_value_not_reserved(item.get("namespace"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_responses_public_output_tool_identity(output: &Value) -> Result<(), String> {
+    let Some(items) = output.as_array() else {
+        return Ok(());
+    };
+    for item in items {
+        validate_responses_public_tool_call_item_identity(item)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_responses_public_response_object_tool_identity(
+    response: &Value,
+) -> Result<(), String> {
+    validate_responses_public_tool_metadata_identity(response)?;
+    if let Some(output) = response.get("output") {
+        validate_responses_public_output_tool_identity(output)?;
+    }
+    Ok(())
 }
 
 fn request_scoped_custom_bridge_source_kind(
@@ -818,6 +1076,7 @@ pub(crate) fn raw_json_object_to_structured_value(
 pub(crate) fn normalized_openai_tool_definition(
     tool: &Value,
 ) -> Result<Option<NormalizedOpenAiFamilyToolDef>, String> {
+    validate_openai_public_tool_identity(tool)?;
     match tool.get("type").and_then(Value::as_str) {
         Some("function") => {
             let payload = openai_function_tool_payload(tool)
@@ -827,6 +1086,7 @@ pub(crate) fn normalized_openai_tool_definition(
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or("OpenAI function tools require a non-empty function name.".to_string())?;
+            validate_public_tool_name_not_reserved(name)?;
             Ok(Some(NormalizedOpenAiFamilyToolDef::Function(
                 NormalizedOpenAiFamilyFunctionTool {
                     name: name.to_string(),
@@ -844,6 +1104,7 @@ pub(crate) fn normalized_openai_tool_definition(
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or("OpenAI custom tools require a non-empty custom name.".to_string())?;
+            validate_public_tool_name_not_reserved(name)?;
             Ok(Some(NormalizedOpenAiFamilyToolDef::Custom(
                 NormalizedOpenAiFamilyCustomTool {
                     name: name.to_string(),
@@ -859,6 +1120,7 @@ pub(crate) fn normalized_openai_tool_definition(
 pub(crate) fn normalized_responses_tool_definition(
     tool: &Value,
 ) -> Result<Option<NormalizedOpenAiFamilyToolDef>, String> {
+    validate_responses_public_tool_reference_identity(tool)?;
     match tool.get("type").and_then(Value::as_str) {
         Some("function") => {
             let name = tool
@@ -870,6 +1132,7 @@ pub(crate) fn normalized_responses_tool_definition(
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or("OpenAI Responses function tools require a non-empty name.".to_string())?;
+            validate_public_tool_name_not_reserved(name)?;
             Ok(Some(NormalizedOpenAiFamilyToolDef::Function(
                 NormalizedOpenAiFamilyFunctionTool {
                     name: name.to_string(),
@@ -886,6 +1149,7 @@ pub(crate) fn normalized_responses_tool_definition(
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or("OpenAI Responses custom tools require a non-empty name.".to_string())?;
+            validate_public_tool_name_not_reserved(name)?;
             Ok(Some(NormalizedOpenAiFamilyToolDef::Custom(
                 NormalizedOpenAiFamilyCustomTool {
                     name: name.to_string(),
@@ -900,6 +1164,7 @@ pub(crate) fn normalized_responses_tool_definition(
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or("OpenAI Responses namespace tools require a non-empty name.".to_string())?;
+            validate_public_tool_name_not_reserved(name)?;
             Ok(Some(NormalizedOpenAiFamilyToolDef::Namespace(
                 NormalizedOpenAiFamilyNamespaceTool {
                     name: name.to_string(),
@@ -1112,6 +1377,7 @@ pub(crate) fn responses_tool_call_to_structured_value(
 pub(crate) fn normalized_openai_tool_call(
     tool_call: &Value,
 ) -> Result<Option<NormalizedOpenAiFamilyToolCall>, String> {
+    validate_openai_public_tool_identity(tool_call)?;
     let Some(tool_type) = tool_call.get("type").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -1127,6 +1393,7 @@ pub(crate) fn normalized_openai_tool_call(
                 .ok_or(
                     "OpenAI function tool calls require a non-empty function name.".to_string(),
                 )?;
+            validate_public_tool_name_not_reserved(name)?;
             Ok(Some(NormalizedOpenAiFamilyToolCall::Function {
                 id: tool_call.get("id").cloned(),
                 name: name.to_string(),
@@ -1140,6 +1407,7 @@ pub(crate) fn normalized_openai_tool_call(
         "custom" => {
             let name = openai_custom_tool_name(tool_call)
                 .ok_or("OpenAI custom tool calls require a `custom.name` field.".to_string())?;
+            validate_public_tool_name_not_reserved(name)?;
             Ok(Some(NormalizedOpenAiFamilyToolCall::Custom {
                 id: tool_call.get("id").cloned(),
                 name: name.to_string(),
@@ -1161,12 +1429,14 @@ pub(crate) fn normalized_responses_tool_call(
         Some("function_call") | Some("custom_tool_call") => {}
         _ => return Ok(None),
     }
+    validate_responses_public_tool_call_item_identity(item)?;
 
     let name = item
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or("OpenAI Responses tool calls require a non-empty name.".to_string())?;
+    validate_public_tool_name_not_reserved(name)?;
     let namespace = item
         .get("namespace")
         .and_then(Value::as_str)
@@ -1400,9 +1670,10 @@ pub(crate) fn openai_tool_call_to_responses_item_decoding_custom_bridge_with_con
 ) -> Result<Value, String> {
     let call = match normalized_openai_tool_call(tool_call) {
         Ok(Some(call)) => call,
-        Ok(None) | Err(_) => {
+        Ok(None) => {
             return Ok(openai_tool_call_to_responses_item(tool_call));
         }
+        Err(err) => return Err(err),
     };
 
     match call {
