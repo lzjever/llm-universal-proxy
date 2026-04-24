@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.2.13 - 2026-04-24
+
+- Hardened the Codex real-client prework / work-summary verifier so read-only classification now fails closed around shell startup hooks, PATH-based command resolution, wrapper aliases, shell redirection and control operators, shell expansions, and environment/config-driven helper execution.
+- Restricted Codex prework read-only evidence to trusted direct system commands or isolated `python3 -I -S -c` snippets with explicit parser allowlists, while rejecting shell wrappers, bare PATH commands, `egrep` / `fgrep` wrappers, unsafe `rg` helpers, mutating `sed` / `find` forms, and zsh expansion edge cases.
+- Expanded TDD coverage for direct dangerous command cases, including shell operator bypasses, tilde / equals / extended-glob expansion, Python startup and AST boundaries, `rg --no-config` enforcement, and direct parser regressions that are no longer hidden by shell-wrapper rejection.
+- Re-verified the Codex prework signal work-summary matrix case against `minimax-openai` after the verifier contract tightened, preserving the intended UI `Working` state recovery coverage while avoiding unsafe read-only false positives.
+
 ## v0.2.12 - 2026-04-21
 
 - Fixed translated Responses commentary message lifecycle and `phase` semantics used by Codex `Working` state recovery, so mid-turn preambles now close as `commentary` and terminal text after tool-boundary finishes is no longer mislabeled as `final_answer`.

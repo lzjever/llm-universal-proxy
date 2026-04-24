@@ -2522,19 +2522,8 @@ def _codex_phase_item_indexes(
 
 
 def _codex_shell_payload(command: str) -> str:
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return command
-
-    shell_names = {"bash", "dash", "fish", "sh", "zsh"}
-    for index, part in enumerate(parts):
-        if pathlib.PurePath(part).name not in shell_names:
-            continue
-        for option_index in range(index + 1, len(parts) - 1):
-            option = parts[option_index]
-            if option.startswith("-") and "c" in option:
-                return parts[option_index + 1]
+    # Shell startup can execute rc/env hooks. Without independent environment
+    # evidence, an explicit shell wrapper is not a transparent read-only layer.
     return command
 
 
@@ -2548,127 +2537,697 @@ def _shell_command_tokens(command: str) -> list[str] | None:
         return None
 
 
-def _tokens_have_write_redirection(tokens: Sequence[str]) -> bool:
-    for index, token in enumerate(tokens):
-        if token in {">", ">>", ">|", "<>"}:
-            next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
-            if token in {">", ">>"} and next_token in {"/dev/null", "&1", "&2"}:
+def _shell_payload_has_command_substitution(payload: str) -> bool:
+    return "`" in payload or "$(" in payload
+
+
+def _shell_payload_has_parameter_expansion(payload: str) -> bool:
+    index = 0
+    quote: str | None = None
+    while index < len(payload):
+        char = payload[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\":
+                index += 2
                 continue
-            if (
-                token in {">", ">>"}
-                and next_token == "&"
-                and index + 2 < len(tokens)
-                and tokens[index + 2] in {"1", "2"}
-            ):
+            if char == '"':
+                quote = None
+                index += 1
                 continue
+        else:
+            if char == "\\":
+                index += 2
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+
+        if char == "$":
             return True
+        index += 1
     return False
 
 
-def _shell_command_segments(tokens: Sequence[str]) -> list[list[str]] | None:
-    segments: list[list[str]] = []
-    current: list[str] = []
-    separators = {"&&", "||", ";", "|", "|&"}
-    unsupported_control_tokens = {"(", ")", "{", "}"}
-
-    for token in tokens:
-        if token in unsupported_control_tokens:
-            return None
-        if token in separators:
-            if current:
-                segments.append(current)
-                current = []
+def _shell_payload_has_unquoted_brace(payload: str) -> bool:
+    index = 0
+    quote: str | None = None
+    while index < len(payload):
+        char = payload[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
             continue
-        current.append(token)
+        if quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+                index += 1
+                continue
+            if char in {"{", "}"}:
+                return True
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char in {"{", "}"}:
+            return True
+        index += 1
+    return False
 
-    if current:
-        segments.append(current)
-    return segments
+
+def _shell_payload_has_unquoted_glob(payload: str) -> bool:
+    index = 0
+    quote: str | None = None
+    while index < len(payload):
+        char = payload[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char in {"*", "?", "["}:
+            return True
+        index += 1
+    return False
 
 
-def _drop_shell_prefix_tokens(tokens: Sequence[str]) -> list[str]:
-    stripped = list(tokens)
-    while stripped and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stripped[0]):
-        stripped = stripped[1:]
-    return stripped
+_SHELL_OPERATOR_CONTROL_CHARS = frozenset(";&|(){}<>")
+
+
+def _shell_payload_has_unquoted_chars(payload: str, chars: frozenset[str]) -> bool:
+    index = 0
+    quote: str | None = None
+    while index < len(payload):
+        char = payload[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char in chars:
+            return True
+        index += 1
+    return False
+
+
+def _shell_payload_has_unquoted_operator_or_control(payload: str) -> bool:
+    return _shell_payload_has_unquoted_chars(payload, _SHELL_OPERATOR_CONTROL_CHARS)
+
+
+def _shell_payload_has_unquoted_tilde(payload: str) -> bool:
+    return _shell_payload_has_unquoted_chars(payload, frozenset({"~"}))
+
+
+_ZSH_UNQUOTED_EXPANSION_CHARS = frozenset({"#", "^"})
+
+
+def _shell_payload_has_unquoted_zsh_expansion(payload: str) -> bool:
+    index = 0
+    quote: str | None = None
+    at_word_start = True
+    while index < len(payload):
+        char = payload[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            else:
+                at_word_start = False
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\":
+                index += 2
+                at_word_start = False
+                continue
+            if char == '"':
+                quote = None
+                index += 1
+                continue
+            at_word_start = False
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            at_word_start = False
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char.isspace():
+            at_word_start = True
+            index += 1
+            continue
+        if at_word_start and char == "=":
+            return True
+        if char in _ZSH_UNQUOTED_EXPANSION_CHARS:
+            return True
+        at_word_start = False
+        index += 1
+    return False
+
+
+def _tokens_have_shell_operator_or_control_token(tokens: Sequence[str]) -> bool:
+    return any(
+        bool(token) and all(char in _SHELL_OPERATOR_CONTROL_CHARS for char in token)
+        for token in tokens
+    )
+
+
+_SHELL_REDIRECTION_OPERATOR_CHARS = frozenset("<>&|")
+
+
+def _is_shell_redirection_operator(token: str) -> bool:
+    return (
+        any(char in token for char in "<>")
+        and all(char in _SHELL_REDIRECTION_OPERATOR_CHARS for char in token)
+    )
+
+
+def _tokens_have_unsafe_redirection(tokens: Sequence[str]) -> bool:
+    return any(_is_shell_redirection_operator(token) for token in tokens)
+
+
+def _shell_command_segments(tokens: Sequence[str]) -> list[list[str]] | None:
+    if _tokens_have_shell_operator_or_control_token(tokens):
+        return None
+
+    return [list(tokens)] if tokens else []
+
+
+def _tokens_start_with_shell_assignment(tokens: Sequence[str]) -> bool:
+    return (
+        bool(tokens)
+        and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]) is not None
+    )
+
+
+_TRUSTED_READ_ONLY_COMMAND_NAMES = frozenset(
+    {
+        "cat",
+        "find",
+        "grep",
+        "head",
+        "ls",
+        "pwd",
+        "rg",
+        "sed",
+        "stat",
+        "tail",
+        "wc",
+    }
+)
+_TRUSTED_PYTHON_COMMAND_NAMES = frozenset({"python3"})
+_TRUSTED_READ_ONLY_COMMAND_NAMES_BY_PATH = {
+    f"{prefix}/{name}": name
+    for prefix in ("/bin", "/usr/bin")
+    for name in _TRUSTED_READ_ONLY_COMMAND_NAMES | _TRUSTED_PYTHON_COMMAND_NAMES
+}
 
 
 def _command_name(token: str) -> str:
-    return pathlib.PurePath(token).name
+    return _TRUSTED_READ_ONLY_COMMAND_NAMES_BY_PATH.get(token, "")
+
+
+_SED_SAFE_PRINT_COMMAND_PATTERN = re.compile(
+    r"^\s*(?:(?:\d+|\$)\s*(?:,\s*(?:\d+|\$)\s*)?)?[pP]\s*$"
+)
+
+
+def _sed_inline_script_is_read_only(script: str) -> bool:
+    saw_command = False
+    for raw_command in re.split(r"[;\n]+", script):
+        command = raw_command.strip()
+        if not command or command.startswith("#"):
+            continue
+        if not _SED_SAFE_PRINT_COMMAND_PATTERN.match(command):
+            return False
+        saw_command = True
+    return saw_command
+
+
+def _parse_sed_short_options(
+    args: Sequence[str],
+    index: int,
+    scripts: list[str],
+) -> tuple[bool, bool, int]:
+    arg = args[index]
+    saw_print_only = False
+    option_chars = arg[1:]
+    position = 0
+    while position < len(option_chars):
+        option = option_chars[position]
+        if option == "i" or option == "f":
+            return False, saw_print_only, index + 1
+        if option == "n":
+            saw_print_only = True
+            position += 1
+            continue
+        if option in {"E", "r", "s", "u", "z", "b"}:
+            position += 1
+            continue
+        if option == "e":
+            attached_script = option_chars[position + 1 :]
+            if attached_script:
+                scripts.append(attached_script)
+                return True, saw_print_only, index + 1
+            if index + 1 >= len(args):
+                return False, saw_print_only, index + 1
+            scripts.append(args[index + 1])
+            return True, saw_print_only, index + 2
+        return False, saw_print_only, index + 1
+    return True, saw_print_only, index + 1
 
 
 def _sed_command_is_read_only(args: Sequence[str]) -> bool:
     saw_print_only = False
-    for arg in args:
-        if arg == "--in-place" or arg.startswith("--in-place="):
-            return False
-        if arg == "-i" or arg.startswith("-i"):
-            return False
-        if arg == "-n" or (
-            arg.startswith("-") and "n" in arg[1:] and not arg.startswith("-e")
+    scripts: list[str] = []
+    option_only_long_flags = {
+        "--binary",
+        "--debug",
+        "--follow-symlinks",
+        "--null-data",
+        "--posix",
+        "--regexp-extended",
+        "--sandbox",
+        "--separate",
+        "--unbuffered",
+    }
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            index += 1
+            if not scripts:
+                if index >= len(args):
+                    return False
+                scripts.append(args[index])
+            break
+        if arg in {"--in-place", "--file"} or arg.startswith(
+            ("--in-place=", "--file=")
         ):
+            return False
+        if arg in {"--quiet", "--silent"}:
             saw_print_only = True
-    return saw_print_only
+            index += 1
+            continue
+        if arg == "--expression":
+            if index + 1 >= len(args):
+                return False
+            scripts.append(args[index + 1])
+            index += 2
+            continue
+        if arg.startswith("--expression="):
+            scripts.append(arg.split("=", 1)[1])
+            index += 1
+            continue
+        if arg == "--line-length":
+            if index + 1 >= len(args):
+                return False
+            index += 2
+            continue
+        if arg.startswith("--line-length=") or arg in option_only_long_flags:
+            index += 1
+            continue
+        if arg.startswith("--"):
+            return False
+        if arg.startswith("-") and arg != "-":
+            ok, option_saw_print_only, next_index = _parse_sed_short_options(
+                args,
+                index,
+                scripts,
+            )
+            if not ok:
+                return False
+            saw_print_only = saw_print_only or option_saw_print_only
+            index = next_index
+            continue
+        if not scripts:
+            scripts.append(arg)
+        index += 1
+
+    return bool(scripts) and saw_print_only and all(
+        _sed_inline_script_is_read_only(script) for script in scripts
+    )
 
 
 def _find_command_is_read_only(args: Sequence[str]) -> bool:
-    mutating_primaries = {"-delete", "-exec", "-execdir", "-ok", "-okdir"}
-    return not any(arg in mutating_primaries for arg in args)
+    value_options = frozenset(
+        {
+            "-maxdepth",
+            "-mindepth",
+            "-name",
+            "-iname",
+            "-path",
+            "-ipath",
+            "-regex",
+            "-iregex",
+            "-size",
+            "-type",
+        }
+    )
+    no_arg_options = frozenset({"-print", "-print0"})
+
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return False
+        if not arg.startswith("-"):
+            index += 1
+            continue
+        if arg in value_options:
+            if index + 1 >= len(args):
+                return False
+            index += 2
+            continue
+        if arg in no_arg_options:
+            index += 1
+            continue
+        return False
+    return True
+
+
+_RG_ALLOWED_NO_ARG_LONG_OPTIONS = frozenset(
+    {
+        "--case-sensitive",
+        "--count",
+        "--count-matches",
+        "--files",
+        "--files-with-matches",
+        "--files-without-match",
+        "--fixed-strings",
+        "--heading",
+        "--hidden",
+        "--ignore-case",
+        "--json",
+        "--line-number",
+        "--no-config",
+        "--no-heading",
+        "--no-ignore",
+        "--no-line-number",
+        "--smart-case",
+        "--stats",
+        "--vimgrep",
+        "--word-regexp",
+    }
+)
+_RG_ALLOWED_VALUE_LONG_OPTIONS = frozenset(
+    {
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--glob",
+        "--max-count",
+        "--max-depth",
+        "--regexp",
+        "--type",
+        "--type-not",
+    }
+)
+_RG_ALLOWED_NO_ARG_SHORT_OPTIONS = frozenset(
+    {"F", "H", "S", "c", "h", "i", "l", "n", "v", "w"}
+)
+_RG_ALLOWED_VALUE_SHORT_OPTIONS = frozenset({"A", "B", "C", "e", "g", "m", "t", "T"})
+
+
+def _rg_short_options_are_read_only(
+    args: Sequence[str],
+    index: int,
+) -> tuple[bool, int]:
+    option_chars = args[index][1:]
+    position = 0
+    while position < len(option_chars):
+        option = option_chars[position]
+        rest = option_chars[position + 1 :]
+        if option in _RG_ALLOWED_NO_ARG_SHORT_OPTIONS:
+            position += 1
+            continue
+        if option in _RG_ALLOWED_VALUE_SHORT_OPTIONS:
+            if rest:
+                return True, index + 1
+            if index + 1 >= len(args):
+                return False, index + 1
+            return True, index + 2
+        return False, index + 1
+    return True, index + 1
+
+
+def _rg_command_is_read_only(args: Sequence[str]) -> bool:
+    saw_no_config = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if not arg.startswith("-") or arg == "-":
+            index += 1
+            continue
+        if arg in _RG_ALLOWED_NO_ARG_LONG_OPTIONS:
+            saw_no_config = saw_no_config or arg == "--no-config"
+            index += 1
+            continue
+        if any(
+            arg.startswith(f"{option}=")
+            for option in _RG_ALLOWED_VALUE_LONG_OPTIONS
+        ):
+            index += 1
+            continue
+        if arg in _RG_ALLOWED_VALUE_LONG_OPTIONS:
+            if index + 1 >= len(args):
+                return False
+            index += 2
+            continue
+        if arg.startswith("--"):
+            return False
+        ok, next_index = _rg_short_options_are_read_only(args, index)
+        if not ok:
+            return False
+        index = next_index
+    return saw_no_config
+
+
+_PYTHON_SAFE_OPEN_MODES = frozenset({"r", "rt", "tr", "rb", "br"})
+_PYTHON_DIRECT_READ_METHODS = frozenset({"read", "readline", "readlines"})
+_PYTHON_PRINT_KEYWORDS = frozenset({"sep", "end", "flush"})
+_PYTHON_OPEN_KEYWORDS = frozenset({"encoding", "errors", "mode", "newline"})
+
+
+def _python_string_literal(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _python_path_literal(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, (bytes, str))
+
+
+def _python_keyword_value_is_literal(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(
+        node.value,
+        (bool, bytes, int, str, type(None)),
+    )
+
+
+def _python_keywords_are_literals(
+    keywords: Sequence[ast.keyword],
+    allowed_names: frozenset[str],
+) -> bool:
+    for keyword in keywords:
+        if keyword.arg is None or keyword.arg not in allowed_names:
+            return False
+        if not _python_keyword_value_is_literal(keyword.value):
+            return False
+    return True
+
+
+def _python_open_call_is_allowed_read_source(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    if not isinstance(node.func, ast.Name) or node.func.id != "open":
+        return False
+    if not node.args or len(node.args) > 2:
+        return False
+    if not _python_path_literal(node.args[0]):
+        return False
+    if not _python_keywords_are_literals(node.keywords, _PYTHON_OPEN_KEYWORDS):
+        return False
+
+    mode = "r"
+    if len(node.args) == 2:
+        mode = _python_string_literal(node.args[1]) or ""
+    for keyword in node.keywords:
+        if keyword.arg == "mode":
+            if len(node.args) == 2:
+                return False
+            mode = _python_string_literal(keyword.value) or ""
+    return mode in _PYTHON_SAFE_OPEN_MODES
+
+
+def _python_read_call_arguments_are_allowed(node: ast.Call) -> bool:
+    if node.keywords:
+        return False
+    if not node.args:
+        return True
+    return (
+        len(node.args) == 1
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, int)
+    )
+
+
+def _python_direct_read_call_is_allowed(node: ast.Call) -> bool:
+    if not isinstance(node.func, ast.Attribute):
+        return False
+    return (
+        node.func.attr in _PYTHON_DIRECT_READ_METHODS
+        and _python_open_call_is_allowed_read_source(node.func.value)
+        and _python_read_call_arguments_are_allowed(node)
+    )
+
+
+def _python_expression_is_allowed(node: ast.AST) -> tuple[bool, bool]:
+    if isinstance(node, ast.Constant):
+        return True, False
+    if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+        results = [_python_expression_is_allowed(element) for element in node.elts]
+        return all(ok for ok, _ in results), any(evidence for _, evidence in results)
+    if isinstance(node, ast.Dict):
+        items = [item for pair in zip(node.keys, node.values) for item in pair if item]
+        results = [_python_expression_is_allowed(item) for item in items]
+        return all(ok for ok, _ in results), any(evidence for _, evidence in results)
+    if not isinstance(node, ast.Call):
+        return False, False
+    if isinstance(node.func, ast.Name) and node.func.id == "print":
+        if not _python_keywords_are_literals(node.keywords, _PYTHON_PRINT_KEYWORDS):
+            return False, False
+        results = [_python_expression_is_allowed(arg) for arg in node.args]
+        return all(ok for ok, _ in results), True
+    if _python_direct_read_call_is_allowed(node):
+        return True, True
+    return False, False
 
 
 def _python_inline_snippet_is_read_only(code: str) -> bool:
-    mutating_patterns = (
-        r"\bopen\s*\([^)]*,\s*['\"][^'\"]*[wax+]",
-        r"\b(?:write_text|write_bytes|unlink|remove|removedirs|rename|replace)\s*\(",
-        r"\b(?:mkdir|makedirs|rmdir|rmtree|move|copy|copyfile)\s*\(",
-        r"\b(?:exec|eval)\s*\(",
-        r"\b(?:system|popen|spawn\w*|run|call|check_call|check_output)\s*\(",
-        r"\bsubprocess\.",
-        r"\bshutil\.",
-    )
-    if any(re.search(pattern, code) for pattern in mutating_patterns):
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
         return False
 
-    read_only_evidence = (
-        r"\bprint\s*\(",
-        r"\bread(?:_text|_bytes)?\s*\(",
-        r"\bopen\s*\(",
-        r"\blistdir\s*\(",
-        r"\bglob\s*\(",
-        r"\bexists\s*\(",
-        r"\bis_(?:file|dir)\s*\(",
-    )
-    return any(re.search(pattern, code) for pattern in read_only_evidence)
+    saw_read_only_expression = False
+    for statement in tree.body:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            return False
+        if not isinstance(statement, ast.Expr):
+            return False
+        ok, has_read_only_expression = _python_expression_is_allowed(statement.value)
+        if not ok:
+            return False
+        saw_read_only_expression = saw_read_only_expression or has_read_only_expression
+
+    return saw_read_only_expression
 
 
 def _python_command_is_read_only(args: Sequence[str]) -> bool:
-    for index, arg in enumerate(args):
-        if arg == "-c" and index + 1 < len(args):
-            return _python_inline_snippet_is_read_only(args[index + 1])
-        if arg.startswith("-c") and len(arg) > 2:
-            return _python_inline_snippet_is_read_only(arg[2:])
+    saw_isolated = False
+    saw_no_site = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "-" or arg == "--" or not arg.startswith("-"):
+            return False
+        if arg.startswith("--"):
+            return False
+
+        option_chars = arg[1:]
+        char_index = 0
+        while char_index < len(option_chars):
+            option_char = option_chars[char_index]
+            rest = option_chars[char_index + 1 :]
+            if option_char == "I":
+                saw_isolated = True
+                char_index += 1
+                continue
+            if option_char == "S":
+                saw_no_site = True
+                char_index += 1
+                continue
+            if option_char == "c":
+                if not saw_isolated or not saw_no_site:
+                    return False
+                if rest:
+                    return _python_inline_snippet_is_read_only(rest)
+                if index + 1 >= len(args):
+                    return False
+                return _python_inline_snippet_is_read_only(args[index + 1])
+            return False
+        index += 1
     return False
 
 
 def _shell_segment_is_read_only_inspect(tokens: Sequence[str]) -> bool:
-    tokens = _drop_shell_prefix_tokens(tokens)
-    if not tokens:
-        return True
+    if _tokens_start_with_shell_assignment(tokens):
+        return False
 
     command = _command_name(tokens[0])
     args = tokens[1:]
     if command in {"cat", "head", "tail", "ls", "pwd", "stat", "wc"}:
         return True
-    if command in {"grep", "egrep", "fgrep", "rg"}:
+    if command == "grep":
         return True
+    if command == "rg":
+        return _rg_command_is_read_only(args)
     if command == "sed":
         return _sed_command_is_read_only(args)
     if command == "find":
         return _find_command_is_read_only(args)
-    if command in {"python", "python3"}:
+    if command == "python3":
         return _python_command_is_read_only(args)
-    if command == "cd":
-        return True
     return False
 
 
@@ -2678,8 +3237,25 @@ def _codex_command_execution_is_read_only_inspect(item: dict[str, object]) -> bo
         return False
 
     payload = _codex_shell_payload(command)
+    if "\n" in payload or "\r" in payload:
+        return False
+    if _shell_payload_has_command_substitution(payload):
+        return False
+    if _shell_payload_has_parameter_expansion(payload):
+        return False
+    if _shell_payload_has_unquoted_brace(payload):
+        return False
+    if _shell_payload_has_unquoted_glob(payload):
+        return False
+    if _shell_payload_has_unquoted_operator_or_control(payload):
+        return False
+    if _shell_payload_has_unquoted_tilde(payload):
+        return False
+    if _shell_payload_has_unquoted_zsh_expansion(payload):
+        return False
+
     tokens = _shell_command_tokens(payload)
-    if not tokens or _tokens_have_write_redirection(tokens):
+    if not tokens or _tokens_have_unsafe_redirection(tokens):
         return False
 
     segments = _shell_command_segments(tokens)

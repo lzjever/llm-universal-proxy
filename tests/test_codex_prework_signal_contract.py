@@ -296,7 +296,7 @@ def codex_stdout_with_work_and_final_but_no_prework_signal() -> str:
 
 
 def codex_stdout_with_read_only_inspect_before_prework_then_mutating_work(
-    read_only_command: str = "/usr/bin/zsh -lc 'cat calc.py main.py'",
+    read_only_command: str = "/usr/bin/cat calc.py main.py",
 ) -> str:
     return _jsonl(
         [
@@ -468,15 +468,23 @@ class CodexPreworkSignalContractTests(unittest.TestCase):
         fixture = make_fixture(module, codex_phase_verifier())
 
         read_only_commands = [
-            "/usr/bin/zsh -lc 'cat calc.py main.py'",
-            "/usr/bin/zsh -lc \"sed -n '1,120p' calc.py\"",
-            "/usr/bin/zsh -lc 'head -n 20 calc.py'",
-            "/usr/bin/zsh -lc 'tail -n 20 calc.py'",
-            "/usr/bin/zsh -lc 'ls -la'",
-            "/usr/bin/zsh -lc 'find . -maxdepth 2 -type f'",
-            "/usr/bin/zsh -lc \"rg 'return a - b' .\"",
-            "/usr/bin/zsh -lc \"grep -R 'return a - b' .\"",
-            "/usr/bin/zsh -lc \"python -c \\\"from pathlib import Path; print(Path('calc.py').read_text())\\\"\"",
+            "/usr/bin/cat calc.py main.py",
+            "/usr/bin/sed -n '1,120p' calc.py",
+            "/usr/bin/sed --quiet '1,120p' calc.py",
+            "/usr/bin/sed -n -e '1,80p' -e '81,160p' calc.py",
+            "/usr/bin/sed -n --line-length=80 1p calc.py",
+            "/usr/bin/head -n 20 calc.py",
+            "/usr/bin/tail -n 20 calc.py",
+            "/usr/bin/ls -la",
+            "/usr/bin/find . -maxdepth 2 -type f",
+            "/usr/bin/rg --no-config 'return a - b' .",
+            "/usr/bin/rg --no-config 'return.*b' .",
+            "/usr/bin/rg --no-config --max-count=5 'return' .",
+            "/usr/bin/grep -R 'return a - b' .",
+            "/usr/bin/grep -E 'return[[:space:]]+a' calc.py",
+            "/usr/bin/grep -F 'return a + b' calc.py",
+            "/usr/bin/python3 -I -S -c \"print(open('calc.py').read())\"",
+            "/usr/bin/python3 -IS -c \"print(open('calc.py', mode='r').read())\"",
         ]
         for read_only_command in read_only_commands:
             with self.subTest(read_only_command=read_only_command):
@@ -494,6 +502,151 @@ class CodexPreworkSignalContractTests(unittest.TestCase):
 
                 self.assertTrue(ok, message)
                 self.assertEqual(message, "")
+
+    def test_read_only_inspect_rejects_empty_quoted_zsh_equals_expansion(self):
+        module = load_module()
+
+        dangerous_commands = [
+            "/usr/bin/cat ''=sh",
+            '/usr/bin/cat ""=sh',
+        ]
+        for dangerous_command in dangerous_commands:
+            with self.subTest(dangerous_command=dangerous_command):
+                self.assertFalse(
+                    module._codex_command_execution_is_read_only_inspect(
+                        {"command": dangerous_command}
+                    )
+                )
+
+    def test_verify_fixture_output_rejects_dangerous_command_before_prework_reasoning(self):
+        module = load_module()
+        fixture = make_fixture(module, codex_phase_verifier())
+
+        dangerous_commands = [
+            "/usr/bin/zsh -lc 'rg --no-config -z needle .'",
+            "/usr/bin/zsh -lc 'rg --no-config --search-zip needle .'",
+            "/usr/bin/rg --no-config -z needle .",
+            "/usr/bin/rg --no-config -nz needle .",
+            "/usr/bin/rg --no-config --search-zip needle .",
+            "/usr/bin/rg --no-config --unknown-read-mode needle .",
+            "/usr/bin/rg --no-config needle =--pre=pre.sh .",
+            "/usr/bin/rg --no-config needle #safe .",
+            "/usr/bin/rg needle .",
+            "/usr/bin/egrep needle f",
+            "/usr/bin/fgrep needle f",
+            "/usr/bin/zsh -lc 'cat calc.py'",
+            "/bin/bash -c 'cat calc.py'",
+            "cat calc.py",
+            "python -c \"print(open('calc.py').read())\"",
+            "/usr/bin/python3 -c \"print(open('calc.py').read())\"",
+            "/usr/bin/python3 -I -c \"print(open('calc.py').read())\"",
+            "/usr/bin/python3 -S -c \"print(open('calc.py').read())\"",
+            "/usr/bin/python3 -I -S -c \"open('touched.txt', mode='w').write('x')\"",
+            "/usr/bin/python3 -I -S -c \"import os; print(open('calc.py').read())\"",
+            "/usr/bin/python3 -I -S -c \"getattr(open('calc.py'), 'read')()\"",
+            "/usr/bin/zsh -lc \"sed -n '1w touched.txt' calc.py\"",
+            "/usr/bin/sed -n '1w touched.txt' calc.py",
+            "/usr/bin/zsh -lc \"sed -n 's/foo/bar/w touched.txt' calc.py\"",
+            "/usr/bin/zsh -lc \"sed -n '1e touch touched.txt' calc.py\"",
+            "/usr/bin/zsh -lc \"sed -ni 's/a/b/' calc.py\"",
+            "/usr/bin/zsh -lc \"sed -nEi 's/a/b/' calc.py\"",
+            "/usr/bin/zsh -lc 'sed -n --file script.sed calc.py'",
+            "/usr/bin/sed -n 's/foo/bar/w touched.txt' calc.py",
+            "/usr/bin/sed -n '1e touch touched.txt' calc.py",
+            "/usr/bin/sed -ni 's/a/b/' calc.py",
+            "/usr/bin/zsh -lc 'cat calc.py &> touched.txt'",
+            "/usr/bin/cat calc.py > touched.txt",
+            "/usr/bin/cat calc.py &| /usr/bin/touch touched.txt",
+            "/usr/bin/zsh -lc 'cat calc.py >& touched.txt'",
+            "/usr/bin/zsh -lc 'cat calc.py >>| touched.txt'",
+            "/usr/bin/zsh -lc 'cat calc.py &>| touched.txt'",
+            "/usr/bin/zsh -lc 'cat calc.py &>>| touched.txt'",
+            "/usr/bin/zsh -lc 'cat calc.py >&| touched.txt'",
+            "/usr/bin/zsh -lc 'cat calc.py >>& touched.txt'",
+            "/usr/bin/zsh -lc \"cat calc.py > '&1'\"",
+            "/usr/bin/zsh -lc 'cat calc.py >\\&1'",
+            "/usr/bin/zsh -lc 'cat calc.py > &1'",
+            "/usr/bin/zsh -lc 'cat calc.py >>&1'",
+            "/usr/bin/zsh -lc 'cat calc.py >>&-'",
+            "/usr/bin/zsh -lc \"sed -n '1p' `touch touched.txt` calc.py\"",
+            "/usr/bin/zsh -lc 'cat $(touch touched.txt) calc.py'",
+            "/usr/bin/zsh -lc 'cat $HOME calc.py'",
+            "/usr/bin/zsh -lc 'X=-i; sed -n 1p $X calc.py'",
+            "/usr/bin/zsh -lc 'X=-delete; find . $X'",
+            "/usr/bin/zsh -lc 'X=-delete; find . $=X'",
+            "/usr/bin/zsh -lc 'X=--pre=./pre.sh; rg $X needle .'",
+            "/usr/bin/zsh -lc 'X=calc.py; cat ${X}'",
+            "/usr/bin/zsh -lc 'set -- -i; sed -n 1p $1 calc.py'",
+            "/usr/bin/zsh -lc 'set -- calc.py; cat $@'",
+            "/usr/bin/zsh -lc 'set -- calc.py; cat $*'",
+            "/usr/bin/zsh -lc 'cat $? calc.py'",
+            "/usr/bin/zsh -lc 'cat $# calc.py'",
+            "/usr/bin/zsh -lc 'cat $- calc.py'",
+            "/usr/bin/zsh -lc 'find . -fprint touched.txt'",
+            "/usr/bin/zsh -lc 'find . -fls touched.txt'",
+            "/usr/bin/find . -delete",
+            "/usr/bin/find . =-delete",
+            "/usr/bin/find . -fprint touched.txt",
+            "/usr/bin/find . -fls touched.txt",
+            "/usr/bin/find . ~",
+            "/usr/bin/zsh -lc 'rg --pre ./pre.sh pattern .'",
+            "/usr/bin/rg --no-config --pre ./pre.sh pattern .",
+            "/usr/bin/zsh -lc 'rg needle .'",
+            "/usr/bin/sed -n '1p' ~ calc.py",
+            "/usr/bin/sed -n 1p ^safe",
+            "/usr/bin/rg --no-config ~ needle .",
+            "/usr/bin/zsh -lc \"sed -n '1p' {-i,calc.py}\"",
+            "/usr/bin/zsh -lc 'find . -{delete,print}'",
+            "/usr/bin/zsh -lc 'rg --{pre=./pre.sh,files} needle .'",
+            "python -c \"from pathlib import Path; print(Path('calc.py').read_text())\"",
+            "python -X pycache_prefix=. -c \"print(open('calc.py', encoding='idna').read())\"",
+            "python -X perf -c \"print(open('calc.py').read())\"",
+            "/usr/bin/zsh -lc \"sed -n '1p' *\"",
+            "/usr/bin/zsh -lc 'rg needle *'",
+            "/usr/bin/zsh -lc \"python -c \\\"open('touched.txt', mode='w').write('x')\\\"\"",
+            "/usr/bin/zsh -lc \"python -c \\\"import os; getattr(os, 'system')('touch touched.txt'); print(open('calc.py').read())\\\"\"",
+            "/usr/bin/zsh -lc \"python -c \\\"from os import system as s; s('touch touched.txt'); print(open('calc.py').read())\\\"\"",
+            "/usr/bin/zsh -lc \"python -c \\\"from pathlib import Path; getattr(Path('touched.txt'), 'write_text')('x'); print(Path('calc.py').read_text())\\\"\"",
+            "/usr/bin/zsh -lc 'python mutate.py -c \"print(open(\\\"calc.py\\\").read())\"'",
+            "/usr/bin/zsh -lc 'python -m mutate -c \"print(open(\\\"calc.py\\\").read())\"'",
+            "/bin/bash --norc 'cat calc.py'",
+            "/usr/bin/zsh --no-rcs 'cat calc.py'",
+            "/usr/bin/zsh -oappendcreate pwd",
+            "/usr/bin/zsh -oclobber pwd",
+            "/usr/bin/zsh -lc 'cat calc.py\ntouch touched.txt'",
+            "/usr/bin/zsh -lc 'cat calc.py & touch touched.txt'",
+            "/usr/bin/zsh -lc 'RIPGREP_CONFIG_PATH=./rgrc rg needle .'",
+            "bash -lc 'cat calc.py'",
+            "zsh -lc 'cat calc.py'",
+            "./zsh -lc 'cat calc.py'",
+            "/tmp/bash -lc 'cat calc.py'",
+            "/bin/bash -lc 'cat </dev/tcp/127.0.0.1/1'",
+            "/bin/bash -lc \"python -c \\\"print(open('calc.py').read())\\\" </dev/tcp/127.0.0.1/1\"",
+            "/bin/bash -lc 'cat < calc.py'",
+            "/bin/bash -lc 'cat <<EOF'",
+            "/bin/bash -lc 'cat <<< hello'",
+            "/bin/bash -lc 'cat <&3'",
+            "/usr/bin/zsh -lc './cat calc.py'",
+            "/usr/bin/zsh -lc '/tmp/cat calc.py'",
+            "/usr/bin/zsh -lc 'cat calc.py' && touch touched.txt",
+            "touch touched.txt; /usr/bin/zsh -lc 'cat calc.py'",
+        ]
+        for dangerous_command in dangerous_commands:
+            with self.subTest(dangerous_command=dangerous_command):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    workspace_dir = pathlib.Path(temp_dir)
+                    write_fixed_workspace(workspace_dir)
+
+                    ok, message = module.verify_fixture_output(
+                        fixture,
+                        codex_stdout_with_read_only_inspect_before_prework_then_mutating_work(
+                            dangerous_command
+                        ),
+                        workspace_dir,
+                    )
+
+                self.assertFalse(ok)
+                self.assertIn("pre-work signal", message)
 
     def test_verify_fixture_output_rejects_mutating_work_before_prework_reasoning(self):
         module = load_module()
