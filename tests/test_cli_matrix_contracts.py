@@ -37,17 +37,25 @@ def make_fixture(module, verifier):
     )
 
 
+def make_context(module, client_name: str):
+    return module.VerifierContext(client_name=client_name)
+
+
 class CliMatrixContractTests(unittest.TestCase):
     def read_text(self, relative_path: str) -> str:
         return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
 
-    def test_stdout_contract_rejects_output_that_never_confirms_public_edit_tool(self):
+    def test_stdout_contract_rejects_output_that_never_confirms_client_public_edit_tool(self):
         module = load_module()
         fixture = make_fixture(
             module,
             {
                 "type": "stdout_contract",
-                "contains_any": ["apply_patch"],
+                "contains_any_by_client": {
+                    "codex": ["apply_patch"],
+                    "claude": ["Edit"],
+                    "gemini": ["replace"],
+                },
                 "not_contains": ["__llmup_custom__"],
             },
         )
@@ -56,19 +64,72 @@ class CliMatrixContractTests(unittest.TestCase):
             fixture,
             "Editing tools are available in this environment.",
             workspace_dir=None,
+            context=make_context(module, "claude"),
         )
 
         self.assertFalse(ok)
-        self.assertIn("apply_patch", message)
+        self.assertIn("Edit", message)
 
-    def test_stdout_contract_accepts_output_with_public_apply_patch_name(self):
+    def test_stdout_contract_accepts_output_with_client_specific_public_tool_name(self):
         module = load_module()
         fixture = make_fixture(
             module,
             {
                 "type": "stdout_contract",
-                "contains_any": ["apply_patch"],
+                "contains_any_by_client": {
+                    "codex": ["apply_patch"],
+                    "claude": ["Edit"],
+                    "gemini": ["replace"],
+                },
                 "not_contains": ["__llmup_custom__"],
+            },
+        )
+
+        for client_name, stdout_text in (
+            ("codex", "Public editing tool: apply_patch"),
+            ("claude", "Public editing tool: Edit"),
+            ("gemini", "Public editing tool: replace"),
+        ):
+            with self.subTest(client_name=client_name):
+                ok, message = module.verify_fixture_output(
+                    fixture,
+                    stdout_text,
+                    workspace_dir=None,
+                    context=make_context(module, client_name),
+                )
+
+                self.assertTrue(ok, message)
+                self.assertEqual(message, "")
+
+    def test_stdout_contract_uses_token_boundaries_for_client_specific_tool_names(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            {
+                "type": "stdout_contract",
+                "contains_any_by_client": {
+                    "claude": ["Edit"],
+                },
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Editing tools are available in this environment.",
+            workspace_dir=None,
+            context=make_context(module, "claude"),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Edit", message)
+
+    def test_stdout_contract_requires_client_context_for_client_specific_expectations(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            {
+                "type": "stdout_contract",
+                "contains_any_by_client": {"codex": ["apply_patch"]},
             },
         )
 
@@ -78,15 +139,22 @@ class CliMatrixContractTests(unittest.TestCase):
             workspace_dir=None,
         )
 
-        self.assertTrue(ok, message)
-        self.assertEqual(message, "")
+        self.assertFalse(ok)
+        self.assertIn("client_name", message)
 
-    def test_tool_identity_fixture_requires_public_apply_patch_name(self):
+    def test_tool_identity_fixture_requires_client_specific_public_tool_names(self):
         payload = json.loads(TOOL_IDENTITY_FIXTURE_PATH.read_text(encoding="utf-8"))
 
         self.assertEqual(payload["id"], "tool_identity_public_contract")
         self.assertEqual(payload["verifier"]["type"], "stdout_contract")
-        self.assertEqual(payload["verifier"]["contains_any"], ["apply_patch"])
+        self.assertEqual(
+            payload["verifier"]["contains_any_by_client"],
+            {
+                "codex": ["apply_patch"],
+                "claude": ["Edit"],
+                "gemini": ["replace"],
+            },
+        )
         self.assertIn("__llmup_custom__", payload["verifier"]["not_contains"])
 
     def test_clients_guide_uses_live_surface_truth_for_codex_wrapper(self):

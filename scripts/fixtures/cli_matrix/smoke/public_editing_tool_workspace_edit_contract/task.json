@@ -1,0 +1,59 @@
+{
+  "id": "public_editing_tool_workspace_edit_contract",
+  "kind": "smoke",
+  "description": "Cross-client workspace-edit smoke that requires each client's real public editing tool name in user-visible output and verifies the edit actually landed.",
+  "prompt": "Inspect calc.py and main.py. There is a regression in add(): it currently subtracts instead of adding. Fix the implementation so add(a, b) returns a + b without changing the function name, argument list, or multiply() behavior. Validate the workspace by running main.py and make sure the printed output is correct. In your final response, explicitly include the exact public editing tool name you used if this client exposes one, and never mention internal transport prefixes or proxy-private tool names.",
+  "timeout_secs": 180,
+  "workspace_template": "workspace",
+  "unsupported_lanes": [
+    "qwen-local"
+  ],
+  "verifier": {
+    "type": "all_of",
+    "verifiers": [
+      {
+        "type": "stdout_contract",
+        "contains_any_by_client": {
+          "codex": [
+            "apply_patch"
+          ],
+          "claude": [
+            "Edit"
+          ],
+          "gemini": [
+            "replace"
+          ]
+        },
+        "not_contains": [
+          "__llmup_custom__"
+        ]
+      },
+      {
+        "type": "python_source_and_output",
+        "source": {
+          "path": "calc.py",
+          "function": "add",
+          "args": [
+            "a",
+            "b"
+          ],
+          "returns": {
+            "kind": "binary_op",
+            "operator": "+",
+            "left": "a",
+            "right": "b"
+          }
+        },
+        "entrypoint": {
+          "path": "main.py",
+          "expect_stdout_contains": [
+            "2 + 3 = 5",
+            "-1 + 5 = 4",
+            "0 + 0 = 0",
+            "4 * 5 = 20"
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "codex_observable_edit_contract",
+  "kind": "smoke",
+  "description": "Codex-only observable edit contract that reads the JSON event stream and requires reasoning, user-facing messaging, and a provable edit signal before workspace verification passes.",
+  "prompt": "Inspect calc.py and main.py. There is a regression in add(): it currently subtracts instead of adding. Fix the implementation so add(a, b) returns a + b without changing the function name, argument list, or multiply() behavior. Validate the workspace by running main.py and make sure the printed output is correct. In your final response, briefly summarize what changed and how you verified it.",
+  "timeout_secs": 180,
+  "workspace_template": "workspace",
+  "supported_clients": [
+    "codex"
+  ],
+  "unsupported_lanes": [
+    "qwen-local"
+  ],
+  "verifier": {
+    "type": "all_of",
+    "verifiers": [
+      {
+        "type": "codex_json_event_contract",
+        "event_types": [
+          "turn.started",
+          "turn.completed"
+        ],
+        "completed_item_types": [
+          "reasoning",
+          "agent_message"
+        ],
+        "completed_edit_targets": [
+          {
+            "path_suffix": "calc.py",
+            "kind": "update"
+          }
+        ]
+      },
+      {
+        "type": "python_source_and_output",
+        "source": {
+          "path": "calc.py",
+          "function": "add",
+          "args": [
+            "a",
+            "b"
+          ],
+          "returns": {
+            "kind": "binary_op",
+            "operator": "+",
+            "left": "a",
+            "right": "b"
+          }
+        },
+        "entrypoint": {
+          "path": "main.py",
+          "expect_stdout_contains": [
+            "2 + 3 = 5",
+            "-1 + 5 = 4",
+            "0 + 0 = 0",
+            "4 * 5 = 20"
+          ]
+        }
+      }
+    ]
+  }
+}

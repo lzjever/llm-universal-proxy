@@ -482,6 +482,7 @@ class TaskFixture:
     timeout_secs: int
     workspace_template: pathlib.Path | None
     description: str = ""
+    supported_clients: tuple[str, ...] = ()
     unsupported_lanes: tuple[str, ...] = ()
 
 
@@ -491,6 +492,15 @@ class MatrixCase:
     lane: Lane
     fixture: TaskFixture
     case_id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class VerifierContext:
+    client_name: str | None = None
+    case_id: str | None = None
+    command: tuple[str, ...] | None = None
+    home_dir: pathlib.Path | None = None
+    workspace_dir: pathlib.Path | None = None
 
 
 def parse_dotenv_exports(text: str) -> dict[str, str]:
@@ -1389,6 +1399,10 @@ def load_fixtures(fixtures_root: pathlib.Path) -> list[TaskFixture]:
                     if workspace_template
                     else None
                 ),
+                supported_clients=tuple(
+                    str(client_name)
+                    for client_name in payload.get("supported_clients", [])
+                ),
                 unsupported_lanes=tuple(
                     str(lane_name) for lane_name in payload.get("unsupported_lanes", [])
                 ),
@@ -1421,6 +1435,12 @@ def lane_supports_fixture(lane: Lane, fixture: TaskFixture) -> bool:
     return True
 
 
+def client_supports_fixture(client_name: str, fixture: TaskFixture) -> bool:
+    if not fixture.supported_clients:
+        return True
+    return client_name in fixture.supported_clients
+
+
 def expand_matrix(
     clients: Iterable[str],
     lanes: Iterable[Lane],
@@ -1435,6 +1455,8 @@ def expand_matrix(
                 if skip_slow and fixture.kind != "smoke":
                     continue
                 if not phase_matches(client_name, fixture.kind, phase):
+                    continue
+                if not client_supports_fixture(client_name, fixture):
                     continue
                 if not lane_supports_fixture(lane, fixture):
                     continue
@@ -2310,10 +2332,153 @@ def _verify_python_entrypoint(
     return True, ""
 
 
+def _parse_jsonl_events(stdout_text: str) -> tuple[list[dict[str, object]] | None, str]:
+    events: list[dict[str, object]] = []
+    for line_number, raw_line in enumerate(stdout_text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as error:
+            return None, f"expected JSONL event on line {line_number}: {error.msg}"
+        if not isinstance(payload, dict):
+            return None, f"expected JSON object on line {line_number}"
+        events.append(payload)
+    if not events:
+        return None, "expected at least one JSONL event"
+    return events, ""
+
+
+def _completed_codex_items(
+    events: Iterable[dict[str, object]],
+) -> list[dict[str, object]]:
+    completed_items: list[dict[str, object]] = []
+    for event in events:
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if isinstance(item, dict):
+            completed_items.append(item)
+    return completed_items
+
+
+def _codex_file_change_matches(
+    item: dict[str, object], change_spec: dict[str, object]
+) -> bool:
+    if item.get("type") != "file_change":
+        return False
+    changes = item.get("changes")
+    if not isinstance(changes, list):
+        return False
+
+    required_kind = change_spec.get("kind")
+    path_suffix = change_spec.get("path_suffix")
+
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        if required_kind is not None and change.get("kind") != required_kind:
+            continue
+        change_path = change.get("path")
+        if path_suffix is not None:
+            if not isinstance(change_path, str) or not change_path.endswith(
+                str(path_suffix)
+            ):
+                continue
+        return True
+    return False
+
+
+def _verify_codex_json_event_contract(
+    stdout_text: str,
+) -> tuple[list[dict[str, object]] | None, list[dict[str, object]] | None, str]:
+    events, message = _parse_jsonl_events(stdout_text)
+    if events is None:
+        return None, None, message
+    return events, _completed_codex_items(events), ""
+
+
+def _client_specific_verifier_values(
+    verifier: dict[str, object],
+    key: str,
+    context: VerifierContext | None,
+) -> tuple[list[str] | None, str]:
+    by_client_key = f"{key}_by_client"
+    raw_values = verifier.get(by_client_key)
+    if raw_values is None:
+        return [], ""
+    if not isinstance(raw_values, dict):
+        return None, f"{by_client_key} must be an object"
+    client_name = context.client_name if context is not None else None
+    if not client_name:
+        return (
+            None,
+            "stdout_contract requires verifier context with client_name for client-specific expectations",
+        )
+    client_values = raw_values.get(client_name, [])
+    if not isinstance(client_values, list):
+        return None, f"{by_client_key}.{client_name} must be a list"
+    return [str(value) for value in client_values], ""
+
+
+def _client_specific_term_present(stdout_text: str, expected: str) -> bool:
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_:-]){re.escape(expected)}(?![A-Za-z0-9_:-])"
+    )
+    return pattern.search(stdout_text) is not None
+
+
+def _codex_command_targets_path(command: str, path_suffix: str) -> bool:
+    quoted_patterns = (
+        rf"(?<![A-Za-z0-9_./-]){re.escape(path_suffix)}(?![A-Za-z0-9_./-])",
+        rf"(?<![A-Za-z0-9_./-])\./{re.escape(path_suffix)}(?![A-Za-z0-9_./-])",
+    )
+    return any(re.search(pattern, command) for pattern in quoted_patterns)
+
+
+def _codex_command_execution_matches_edit_target(
+    item: dict[str, object], target_spec: dict[str, object]
+) -> bool:
+    if item.get("type") != "command_execution":
+        return False
+    if item.get("status") != "completed":
+        return False
+    if item.get("exit_code") != 0:
+        return False
+
+    command = item.get("command")
+    if not isinstance(command, str):
+        return False
+
+    path_suffix = str(target_spec.get("path_suffix", "")).strip()
+    if not path_suffix or not _codex_command_targets_path(command, path_suffix):
+        return False
+
+    write_patterns = (
+        r"\bsed\s+-i(?:[^\s\"']*)?\b",
+        rf"(?:^|[\s\"'])>\s*(?:\./)?{re.escape(path_suffix)}(?:[\s\"']|$)",
+        rf"(?:^|[\s\"'])>>\s*(?:\./)?{re.escape(path_suffix)}(?:[\s\"']|$)",
+        rf"\btee\b[^\n]*?(?:\./)?{re.escape(path_suffix)}(?:[\s\"']|$)",
+        r"\bwrite_text\s*\(",
+        r"\bopen\s*\([^)]*,\s*['\"](?:w|a)",
+    )
+    return any(re.search(pattern, command) for pattern in write_patterns)
+
+
+def _codex_item_matches_edit_target(
+    item: dict[str, object], target_spec: dict[str, object]
+) -> bool:
+    return _codex_file_change_matches(item, target_spec) or _codex_command_execution_matches_edit_target(
+        item, target_spec
+    )
+
+
 def _verify_verifier_output(
     verifier: dict[str, object],
     stdout_text: str,
     workspace_dir: pathlib.Path | None,
+    context: VerifierContext | None = None,
 ) -> tuple[bool, str]:
     verifier_type = verifier["type"]
     if verifier_type == "contains":
@@ -2321,16 +2486,41 @@ def _verify_verifier_output(
         ok = needle.lower() in stdout_text.lower()
         return ok, f"expected output to contain {needle!r}"
     if verifier_type == "stdout_contract":
-        for needle in verifier.get("contains", []):
-            expected = str(needle)
+        client_contains, message = _client_specific_verifier_values(
+            verifier, "contains", context
+        )
+        if client_contains is None:
+            return False, message
+        client_contains_any, message = _client_specific_verifier_values(
+            verifier, "contains_any", context
+        )
+        if client_contains_any is None:
+            return False, message
+        client_not_contains, message = _client_specific_verifier_values(
+            verifier, "not_contains", context
+        )
+        if client_not_contains is None:
+            return False, message
+
+        contains = [str(needle) for needle in verifier.get("contains", [])]
+        for expected in contains:
             if expected not in stdout_text:
+                return False, f"expected output to contain {expected!r}"
+        for expected in client_contains:
+            if not _client_specific_term_present(stdout_text, expected):
                 return False, f"expected output to contain {expected!r}"
         contains_any = [str(needle) for needle in verifier.get("contains_any", [])]
         if contains_any and not any(expected in stdout_text for expected in contains_any):
             options = ", ".join(repr(expected) for expected in contains_any)
             return False, f"expected output to contain at least one of {options}"
-        for needle in verifier.get("not_contains", []):
-            forbidden = str(needle)
+        if client_contains_any and not any(
+            _client_specific_term_present(stdout_text, expected)
+            for expected in client_contains_any
+        ):
+            options = ", ".join(repr(expected) for expected in client_contains_any)
+            return False, f"expected output to contain at least one of {options}"
+        not_contains = [str(needle) for needle in verifier.get("not_contains", [])] + client_not_contains
+        for forbidden in not_contains:
             if forbidden in stdout_text:
                 return False, f"expected output not to contain {forbidden!r}"
         return True, ""
@@ -2351,6 +2541,43 @@ def _verify_verifier_output(
         if not ok:
             return False, message
         return _verify_python_entrypoint(workspace_dir, dict(verifier["entrypoint"]))
+    if verifier_type == "codex_json_event_contract":
+        events, completed_items, message = _verify_codex_json_event_contract(stdout_text)
+        if events is None or completed_items is None:
+            return False, message
+
+        for expected_type in verifier.get("event_types", []):
+            event_type = str(expected_type)
+            if not any(event.get("type") == event_type for event in events):
+                return False, f"expected codex event stream to include {event_type!r}"
+
+        completed_item_types = {
+            str(item.get("type"))
+            for item in completed_items
+            if isinstance(item.get("type"), str)
+        }
+        for expected_type in verifier.get("completed_item_types", []):
+            item_type = str(expected_type)
+            if item_type not in completed_item_types:
+                return (
+                    False,
+                    f"expected codex event stream to include completed item type {item_type!r}",
+                )
+
+        for target_spec in verifier.get("completed_edit_targets", []):
+            if not isinstance(target_spec, dict):
+                return False, "completed_edit_targets entries must be objects"
+            if not any(
+                _codex_item_matches_edit_target(item, target_spec)
+                for item in completed_items
+            ):
+                path_suffix = target_spec.get("path_suffix", "the expected path")
+                return (
+                    False,
+                    "expected codex event stream to include observable edit signal "
+                    f"for {path_suffix!r}",
+                )
+        return True, ""
     if verifier_type == "all_of":
         nested_verifiers = verifier.get("verifiers", [])
         if not isinstance(nested_verifiers, list) or not nested_verifiers:
@@ -2358,7 +2585,12 @@ def _verify_verifier_output(
         for index, nested in enumerate(nested_verifiers):
             if not isinstance(nested, dict):
                 return False, f"all_of[{index}] must be a verifier object"
-            ok, message = _verify_verifier_output(nested, stdout_text, workspace_dir)
+            ok, message = _verify_verifier_output(
+                nested,
+                stdout_text,
+                workspace_dir,
+                context,
+            )
             if not ok:
                 return False, f"all_of[{index}]: {message}"
         return True, ""
@@ -2366,9 +2598,17 @@ def _verify_verifier_output(
 
 
 def verify_fixture_output(
-    fixture: TaskFixture, stdout_text: str, workspace_dir: pathlib.Path | None
+    fixture: TaskFixture,
+    stdout_text: str,
+    workspace_dir: pathlib.Path | None,
+    context: VerifierContext | None = None,
 ) -> tuple[bool, str]:
-    return _verify_verifier_output(fixture.verifier, stdout_text, workspace_dir)
+    return _verify_verifier_output(
+        fixture.verifier,
+        stdout_text,
+        workspace_dir,
+        context,
+    )
 
 
 def prepare_workspace(
@@ -2577,6 +2817,13 @@ def run_matrix_case(
                 case.fixture,
                 stdout_text,
                 workspace_dir if case.fixture.workspace_template is not None else None,
+                context=VerifierContext(
+                    client_name=case.client_name,
+                    case_id=case.case_id,
+                    command=tuple(command),
+                    home_dir=home_dir,
+                    workspace_dir=workspace_dir,
+                ),
             )
             if ok:
                 status = "passed"

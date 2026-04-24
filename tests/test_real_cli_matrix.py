@@ -177,6 +177,10 @@ def make_fixture(
     )
 
 
+def make_context(module, client_name: str):
+    return module.VerifierContext(client_name=client_name)
+
+
 def make_case(module, *, client_name, lane=None, fixture=None, case_id=None):
     lane = lane or make_lane(module)
     fixture = fixture or make_fixture(module)
@@ -2189,14 +2193,16 @@ class RealCliMatrixTests(unittest.TestCase):
             fixture_id="tool_identity_public_contract",
             verifier={
                 "type": "stdout_contract",
+                "contains_any_by_client": {"claude": ["Edit"]},
                 "not_contains": ["__llmup_custom__"],
             },
         )
 
         ok, message = module.verify_fixture_output(
             fixture,
-            "Public tools include apply_patch.",
+            "Public tools include Edit.",
             workspace_dir=None,
+            context=make_context(module, "claude"),
         )
 
         self.assertTrue(ok, message)
@@ -2222,14 +2228,78 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("__llmup_custom__", message)
 
+    def test_verify_fixture_output_rejects_stdout_contract_when_client_context_missing(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="tool_identity_public_contract",
+            verifier={
+                "type": "stdout_contract",
+                "contains_any_by_client": {"gemini": ["replace"]},
+            },
+        )
+
+        ok, message = module.verify_fixture_output(
+            fixture,
+            "Public tools include replace.",
+            workspace_dir=None,
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("client_name", message)
+
     def test_tool_identity_fixture_is_present_and_uses_stdout_contract(self):
         payload = json.loads(TOOL_IDENTITY_FIXTURE_PATH.read_text(encoding="utf-8"))
 
         self.assertEqual(payload["id"], "tool_identity_public_contract")
         self.assertEqual(payload["kind"], "smoke")
         self.assertEqual(payload["verifier"]["type"], "stdout_contract")
+        self.assertEqual(
+            payload["verifier"]["contains_any_by_client"],
+            {
+                "codex": ["apply_patch"],
+                "claude": ["Edit"],
+                "gemini": ["replace"],
+            },
+        )
         self.assertIn("__llmup_custom__", payload["verifier"]["not_contains"])
-        self.assertIn("apply_patch", payload["prompt"])
+        self.assertIn("exact public names", payload["prompt"])
+
+    def test_run_matrix_case_passes_verifier_context_with_client_name(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(module),
+            fixture=make_fixture(module, prompt="Reply with exactly PONG"),
+        )
+        observed = {}
+
+        def fake_verify(fixture, stdout_text, workspace_dir, context=None):
+            observed["fixture_id"] = fixture.fixture_id
+            observed["stdout_text"] = stdout_text
+            observed["workspace_dir"] = workspace_dir
+            observed["context"] = context
+            return True, ""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = pathlib.Path(temp_dir)
+            with mock.patch.object(
+                module.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["claude"], 0, stdout="PONG\n", stderr=""),
+            ), mock.patch.object(module, "verify_fixture_output", side_effect=fake_verify):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(observed["fixture_id"], case.fixture.fixture_id)
+        self.assertEqual(observed["stdout_text"], "PONG\n")
+        self.assertEqual(observed["context"].client_name, "claude")
 
     def test_run_matrix_case_feeds_claude_prompt_via_stdin(self):
         module = load_module()
