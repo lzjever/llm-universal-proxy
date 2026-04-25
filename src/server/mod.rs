@@ -11,6 +11,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 mod tracked_body;
+mod web_dashboard;
 
 use std::sync::Arc;
 use std::{convert::Infallible, io, time::Duration};
@@ -195,6 +196,18 @@ async fn run_server(
             admin::require_admin_access,
         ));
 
+    let dashboard_router = Router::new()
+        .route("/dashboard", get(web_dashboard::handle_dashboard_index))
+        .route("/dashboard/", get(web_dashboard::handle_dashboard_index))
+        .route(
+            "/dashboard/assets/app.css",
+            get(web_dashboard::handle_dashboard_css),
+        )
+        .route(
+            "/dashboard/assets/app.js",
+            get(web_dashboard::handle_dashboard_js),
+        );
+
     let data_router = Router::new()
         .route("/health", get(proxy::health))
         .route(
@@ -285,6 +298,7 @@ async fn run_server(
 
     let app = Router::new()
         .merge(admin_router)
+        .merge(dashboard_router)
         .merge(data_router)
         .layer(middleware::from_fn(with_request_downstream_cancellation))
         .with_state(state);

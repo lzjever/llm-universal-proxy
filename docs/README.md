@@ -8,6 +8,8 @@ Start here based on what you need:
   Static YAML configuration, full field reference, and upstream proxy support
 - [clients.md](./clients.md)
   Codex, Claude Code, and Gemini wrapper setup plus common client notes
+- [container.md](./container.md)
+  GHCR image usage, Docker Compose example, container smoke, and release policy
 - [admin-dynamic-config.md](./admin-dynamic-config.md)
   Admin API, live namespace config updates, CAS / revision behavior, and redacted state
 - [../examples/quickstart-openai-minimax.yaml](../examples/quickstart-openai-minimax.yaml)

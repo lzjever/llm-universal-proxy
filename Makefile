@@ -8,8 +8,13 @@ CARGO := $(if $(wildcard $(HOME)/.cargo/bin/cargo),$(HOME)/.cargo/bin/cargo,carg
 # Unset proxy so cargo/git reach tuna mirror and crate hosts directly (avoids TLS/SSL errors).
 CARGO_ENV := env -u RUSTC_WRAPPER -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY
 PYTHON_CONTRACT_TEST := PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'
+VERSION ?= $(shell python3 scripts/repo_metadata.py get version)
+VCS_REF ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null)
+DOCKER_VCS_REF := $(if $(VCS_REF),$(VCS_REF),unknown)
+DOCKER_IMAGE ?= llm-universal-proxy
+DOCKER_TAG ?= local
 
-.PHONY: build test check run run-release test-report test-binary-smoke governance
+.PHONY: build test check run run-release test-report test-binary-smoke governance docker-build docker-smoke
 
 build:
 	$(CARGO_ENV) $(CARGO) build --locked --release
@@ -41,3 +46,12 @@ run-release:
 
 governance:
 	@bash scripts/check-governance.sh
+
+docker-build:
+	docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg VCS_REF=$(DOCKER_VCS_REF) \
+		-t $(DOCKER_IMAGE):$(DOCKER_TAG) .
+
+docker-smoke: docker-build
+	IMAGE=$(DOCKER_IMAGE):$(DOCKER_TAG) bash scripts/test_container_smoke.sh

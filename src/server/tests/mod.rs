@@ -21,6 +21,7 @@ mod headers;
 mod proxy;
 mod responses_resources;
 mod state;
+mod web_dashboard;
 
 pub(super) static UPSTREAM_PROXY_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));

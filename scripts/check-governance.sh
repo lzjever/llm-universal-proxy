@@ -30,7 +30,7 @@ check_eq() {
 check_contains() {
     local file="$1"
     local pattern="$2"
-    if ! grep -Fq "$pattern" "$file"; then
+    if ! grep -Fq -- "$pattern" "$file"; then
         FAILURES+=("$file is missing: $pattern")
     fi
 }
@@ -38,7 +38,7 @@ check_contains() {
 check_absent() {
     local file="$1"
     local pattern="$2"
-    if grep -Fq "$pattern" "$file"; then
+    if grep -Fq -- "$pattern" "$file"; then
         FAILURES+=("$file still contains forbidden pattern: $pattern")
     fi
 }
@@ -53,14 +53,29 @@ fi
 check_contains "Dockerfile" "ARG RUST_TOOLCHAIN=${TOOLCHAIN}"
 check_contains "Dockerfile" "COPY rust-toolchain.toml"
 check_contains "Dockerfile" "cargo build --locked --release"
+check_contains "Dockerfile" 'org.opencontainers.image.source="https://github.com/lzjever/llm-universal-proxy"'
+check_contains "Dockerfile" "USER llmup:llmup"
+check_contains "Dockerfile" 'CMD ["--config", "/etc/llmup/config.yaml"]'
+check_contains "Dockerfile" "HEALTHCHECK"
+check_contains "Dockerfile" "http://127.0.0.1:8080/health"
 
 check_contains "Makefile" "build --locked --release"
 check_contains "Makefile" "test --locked"
 check_contains "Makefile" "check --locked"
 check_contains "Makefile" "$PYTHON_CONTRACT_TEST_COMMAND"
+check_contains "Makefile" "docker-build"
+check_contains "Makefile" "docker-smoke"
+check_contains "Makefile" "scripts/test_container_smoke.sh"
 
 check_contains "scripts/test-and-report.sh" "test --locked --no-fail-fast"
 check_contains "scripts/test-and-report.sh" "$PYTHON_CONTRACT_TEST_COMMAND"
+check_contains "scripts/test_container_smoke.sh" "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN=\${ADMIN_TOKEN}"
+check_contains "scripts/test_container_smoke.sh" "/etc/llmup/config.yaml"
+check_contains "scripts/test_container_smoke.sh" "host.docker.internal:host-gateway"
+check_contains "scripts/test_container_smoke.sh" 'CONTAINER_PORT="8080"'
+check_contains "scripts/test_container_smoke.sh" 'listen: 0.0.0.0:${CONTAINER_PORT}'
+check_contains "scripts/test_container_smoke.sh" '-p "${HOST}:${PROXY_PORT}:${CONTAINER_PORT}"'
+check_contains "scripts/test_container_smoke.sh" "wait_for_container_healthy"
 check_contains "scripts/test_cli_clients.sh" "real_cli_matrix.py"
 check_contains "scripts/real_cli_matrix.py" "def default_proxy_binary_path("
 check_contains "scripts/real_cli_matrix.py" 'DEFAULT_RELEASE_PROXY_BINARY = REPO_ROOT / "target" / "release" / "llm-universal-proxy"'
@@ -81,6 +96,9 @@ check_absent ".github/workflows/ci.yml" "dtolnay/rust-toolchain@master"
 check_contains ".github/workflows/ci.yml" 'if: ${{ always() }}'
 check_contains ".github/workflows/ci.yml" "$PYTHON_CONTRACT_TEST_COMMAND"
 check_contains ".github/workflows/ci.yml" "bash scripts/test_binary_smoke.sh"
+check_contains ".github/workflows/ci.yml" "Container Image Smoke"
+check_contains ".github/workflows/ci.yml" "push: false"
+check_contains ".github/workflows/ci.yml" "IMAGE=llm-universal-proxy:ci bash scripts/test_container_smoke.sh"
 
 check_contains ".github/workflows/release.yml" "bash scripts/check-governance.sh"
 check_contains ".github/workflows/release.yml" "id: repo_meta"
@@ -90,6 +108,24 @@ check_contains ".github/workflows/release.yml" 'toolchain: ${{ steps.repo_meta.o
 check_contains ".github/workflows/release.yml" "dtolnay/rust-toolchain@${TOOLCHAIN_ACTION_REF}"
 check_absent ".github/workflows/release.yml" "dtolnay/rust-toolchain@master"
 check_contains ".github/workflows/release.yml" "bash scripts/test_binary_smoke.sh"
+check_contains ".github/workflows/release.yml" "ghcr.io/lzjever/llm-universal-proxy"
+check_contains ".github/workflows/release.yml" "platforms: linux/amd64,linux/arm64"
+check_contains ".github/workflows/release.yml" "push: true"
+check_contains ".github/workflows/release.yml" '${{ env.GHCR_IMAGE }}:latest'
+check_contains ".github/workflows/release.yml" "IMAGE=llm-universal-proxy:release-smoke bash scripts/test_container_smoke.sh"
+
+check_contains "docs/README.md" "container.md"
+check_contains "README.md" "docs/container.md"
+check_contains "README_CN.md" "docs/container.md"
+check_contains "docs/container.md" "ghcr.io/lzjever/llm-universal-proxy"
+check_contains "docs/container.md" "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN"
+check_contains "docs/container.md" "Do not mount the local quickstart config unchanged for container service mode"
+check_contains "docs/admin-dynamic-config.md" "do not introduce a separate service key"
+check_contains "examples/container-config.yaml" "listen: 0.0.0.0:8080"
+check_contains "examples/container-config.yaml" "credential_env: OPENAI_API_KEY"
+check_contains "examples/docker-compose.yaml" 'OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}'
+check_contains "examples/docker-compose.yaml" 'LLM_UNIVERSAL_PROXY_ADMIN_TOKEN: ${LLM_UNIVERSAL_PROXY_ADMIN_TOKEN:?set LLM_UNIVERSAL_PROXY_ADMIN_TOKEN}'
+check_absent "examples/container-config.yaml" "credential_actual"
 
 if [[ ${#FAILURES[@]} -gt 0 ]]; then
     printf 'governance check failed:\n' >&2

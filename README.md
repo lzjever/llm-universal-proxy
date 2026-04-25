@@ -196,6 +196,10 @@ Practical rules:
 
 For the full YAML reference and more examples, see [docs/configuration.md](./docs/configuration.md).
 
+## Container Image
+
+Release images are published at `ghcr.io/lzjever/llm-universal-proxy`. Container usage, Docker Compose, container smoke, Admin Dashboard auth boundaries, and GHCR release policy are documented in [docs/container.md](./docs/container.md).
+
 ## Dynamic Configuration Overview
 
 Static YAML is the default. If you need live updates, the proxy also exposes admin endpoints for reading runtime state and replacing namespace config without restarting the whole process.
@@ -212,6 +216,7 @@ That flow is documented in [docs/admin-dynamic-config.md](./docs/admin-dynamic-c
 
 - [docs/configuration.md](./docs/configuration.md): static config, alias patterns, YAML reference
 - [docs/clients.md](./docs/clients.md): Codex / Claude Code / Gemini wrapper setup and base URL details
+- [docs/container.md](./docs/container.md): GHCR image usage, Docker Compose, container smoke, and release policy
 - [docs/admin-dynamic-config.md](./docs/admin-dynamic-config.md): admin API, live config, CAS updates
 - [docs/protocol-compatibility-matrix.md](./docs/protocol-compatibility-matrix.md): compatibility boundaries and portability summary
 - [docs/max-compat-design.md](./docs/max-compat-design.md): deeper translated-path compatibility notes

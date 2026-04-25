@@ -137,6 +137,107 @@ class GovernanceTests(unittest.TestCase):
             script,
         )
 
+    def test_container_image_contract_is_governed(self):
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        required = (
+            "ARG RUST_TOOLCHAIN=",
+            "FROM ${RUST_BASE_IMAGE} AS builder",
+            "FROM ${RUNTIME_BASE_IMAGE}",
+            "cargo build --locked --release",
+            'org.opencontainers.image.source="https://github.com/lzjever/llm-universal-proxy"',
+            "USER llmup:llmup",
+            "EXPOSE 8080",
+            "HEALTHCHECK",
+            "http://127.0.0.1:8080/health",
+            'CMD ["--config", "/etc/llmup/config.yaml"]',
+        )
+
+        for pattern in required:
+            with self.subTest(pattern=pattern):
+                self.assertIn(pattern, dockerfile)
+
+    def test_docker_smoke_target_has_script_and_governance_coverage(self):
+        makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+        script = (REPO_ROOT / "scripts" / "test_container_smoke.sh").read_text(
+            encoding="utf-8"
+        )
+        governance = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("docker-smoke", makefile)
+        self.assertIn("scripts/test_container_smoke.sh", makefile)
+        self.assertIn("/etc/llmup/config.yaml", script)
+        self.assertIn("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN=${ADMIN_TOKEN}", script)
+        self.assertIn("host.docker.internal:host-gateway", script)
+        self.assertIn('CONTAINER_PORT="8080"', script)
+        self.assertIn("listen: 0.0.0.0:${CONTAINER_PORT}", script)
+        self.assertIn('-p "${HOST}:${PROXY_PORT}:${CONTAINER_PORT}"', script)
+        self.assertIn("wait_for_container_healthy", script)
+        self.assertNotIn("listen: 0.0.0.0:${PROXY_PORT}", script)
+        self.assertIn("scripts/test_container_smoke.sh", governance)
+
+    def test_ci_and_release_workflows_keep_container_publish_scope_tight(self):
+        ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        release = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Container Image Smoke", ci)
+        self.assertIn("push: false", ci)
+        self.assertIn(
+            "IMAGE=llm-universal-proxy:ci bash scripts/test_container_smoke.sh",
+            ci,
+        )
+        self.assertIn("GHCR_IMAGE: ghcr.io/lzjever/llm-universal-proxy", release)
+        self.assertIn("platforms: linux/amd64,linux/arm64", release)
+        self.assertIn("push: true", release)
+        self.assertIn("${{ env.GHCR_IMAGE }}:latest", release)
+        self.assertIn(
+            "IMAGE=llm-universal-proxy:release-smoke bash scripts/test_container_smoke.sh",
+            release,
+        )
+        self.assertNotIn(":edge", release)
+
+    def test_container_examples_and_docs_do_not_bake_secrets(self):
+        container_config = (REPO_ROOT / "examples" / "container-config.yaml").read_text(
+            encoding="utf-8"
+        )
+        compose = (REPO_ROOT / "examples" / "docker-compose.yaml").read_text(
+            encoding="utf-8"
+        )
+        container_doc = (REPO_ROOT / "docs" / "container.md").read_text(
+            encoding="utf-8"
+        )
+        admin_doc = (REPO_ROOT / "docs" / "admin-dynamic-config.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("listen: 0.0.0.0:8080", container_config)
+        self.assertIn("credential_env: OPENAI_API_KEY", container_config)
+        self.assertNotIn("credential_actual", container_config)
+        self.assertIn("${OPENAI_API_KEY:?set OPENAI_API_KEY}", compose)
+        self.assertIn(
+            "${LLM_UNIVERSAL_PROXY_ADMIN_TOKEN:?set LLM_UNIVERSAL_PROXY_ADMIN_TOKEN}",
+            compose,
+        )
+        self.assertNotRegex(container_config + compose, r"sk-[A-Za-z0-9]")
+        self.assertIn("ghcr.io/lzjever/llm-universal-proxy", container_doc)
+        self.assertIn(
+            "Do not mount the local quickstart config unchanged for container service mode",
+            container_doc,
+        )
+        self.assertIn("do not introduce a separate service key", admin_doc)
+
+    def test_readme_and_docs_expose_container_entrypoint_only(self):
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        readme_cn = (REPO_ROOT / "README_CN.md").read_text(encoding="utf-8")
+        docs_index = (REPO_ROOT / "docs" / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("docs/container.md", readme)
+        self.assertIn("docs/container.md", readme_cn)
+        self.assertIn("container.md", docs_index)
+
     def test_active_docs_bound_overbroad_compatibility_promises(self):
         violations = []
 

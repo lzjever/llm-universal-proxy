@@ -28,6 +28,19 @@ In other words:
 - local development can often use loopback admin access directly, without forwarding headers such as `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, or `X-Real-IP`
 - shared or remote deployments should normally set a non-empty admin bearer token
 
+## Admin Dashboard Boundary
+
+The Web Admin Dashboard uses the same admin plane and the same `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` boundary as the endpoints below.
+
+Current product boundary:
+
+- keep `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`
+- do not introduce a separate service key
+- dashboard login is admin-token based
+- do not add multi-user accounts, readonly roles, or complex session behavior in this plan
+
+For container-specific runtime notes, see [Container Image and GHCR Release](./container.md).
+
 ## Admin Endpoints
 
 The current admin endpoints are:

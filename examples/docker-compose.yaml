@@ -1,0 +1,12 @@
+services:
+  llmup:
+    image: ghcr.io/lzjever/llm-universal-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./container-config.yaml:/etc/llmup/config.yaml:ro
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:?set MINIMAX_API_KEY}
+      LLM_UNIVERSAL_PROXY_ADMIN_TOKEN: ${LLM_UNIVERSAL_PROXY_ADMIN_TOKEN:?set LLM_UNIVERSAL_PROXY_ADMIN_TOKEN}

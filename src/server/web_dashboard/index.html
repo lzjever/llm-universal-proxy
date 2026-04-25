@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>LLM Universal Proxy Admin</title>
+    <link rel="stylesheet" href="/dashboard/assets/app.css">
+    <script defer src="/dashboard/assets/app.js"></script>
+  </head>
+  <body>
+    <main class="dashboard" data-dashboard-root>
+      <section class="hero">
+        <p class="eyebrow">Runtime control plane</p>
+        <h1>LLM Universal Proxy Admin</h1>
+        <p class="lede">
+          View namespaces, inspect redacted runtime state, and apply a complete runtime config payload through the existing admin API.
+        </p>
+      </section>
+
+      <section class="panel auth-panel" aria-labelledby="auth-title">
+        <div>
+          <h2 id="auth-title">Admin Access</h2>
+          <p>
+            Loopback-only deployments can load data directly. If an admin token is configured, enter it here so browser API calls send a Bearer token.
+          </p>
+        </div>
+        <form class="auth-form" data-token-form>
+          <label for="admin-token">Admin token</label>
+          <div class="auth-row">
+            <input id="admin-token" name="token" type="password" autocomplete="off" placeholder="Paste admin token">
+            <button type="submit">Use Token</button>
+            <button type="button" class="ghost" data-clear-token>Clear</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <div class="section-head">
+            <h2>Namespaces</h2>
+            <button type="button" class="ghost" data-refresh>Refresh</button>
+          </div>
+          <p class="hint">Choose a namespace to load its redacted admin state.</p>
+          <div class="namespace-list" data-namespace-list></div>
+        </div>
+
+        <div class="panel state-panel">
+          <div class="section-head">
+            <h2>Redacted State</h2>
+            <span class="pill" data-selected-namespace>No namespace selected</span>
+          </div>
+          <pre class="state-view" data-state-view>Select a namespace to inspect runtime state.</pre>
+        </div>
+      </section>
+
+      <section class="panel config-panel" aria-labelledby="config-title">
+        <div class="section-head">
+          <div>
+            <h2 id="config-title">Apply Runtime Config</h2>
+            <p class="warning">
+              Paste a complete runtime config payload. Do not submit redacted state from above; redacted secrets are intentionally not editable payloads.
+            </p>
+          </div>
+        </div>
+
+        <form data-config-form>
+          <div class="form-grid">
+            <label>
+              Namespace
+              <input name="namespace" data-config-namespace placeholder="default">
+            </label>
+            <label>
+              Optional if_revision
+              <input name="if_revision" data-config-revision placeholder="Leave blank for new namespaces">
+            </label>
+          </div>
+          <label>
+            Complete runtime config payload
+            <textarea name="config" data-config-payload spellcheck="false" placeholder='{"listen":"127.0.0.1:0","upstream_timeout_secs":30,"compatibility_mode":"balanced","proxy":"direct","upstreams":[],"model_aliases":{},"hooks":{"max_pending_bytes":1048576,"timeout_secs":10,"failure_threshold":5,"cooldown_secs":30,"exchange":null,"usage":null},"debug_trace":{"path":null,"max_text_chars":20000}}'></textarea>
+          </label>
+          <div class="actions">
+            <button type="submit">Apply Config</button>
+          </div>
+        </form>
+      </section>
+
+      <output class="status" data-status role="status" aria-live="polite">Ready.</output>
+    </main>
+  </body>
+</html>
