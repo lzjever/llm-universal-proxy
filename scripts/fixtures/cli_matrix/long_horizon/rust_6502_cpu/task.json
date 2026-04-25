@@ -1,0 +1,30 @@
+{
+  "id": "rust_6502_cpu",
+  "kind": "long_horizon",
+  "description": "Codex long-horizon Rust implementation task for a 6502 CPU emulator, verified by locked contract tests and cargo test.",
+  "prompt": "Implement a complete MOS 6502 CPU emulator in Rust in this workspace. The public API expected by the existing tests is already sketched in src/lib.rs; keep that API stable, do not edit Cargo.toml, Cargo.lock, or tests/cpu6502_contract.rs, and implement the CPU and memory bus behavior in src/lib.rs. Support reset vector loading, status flags, stack behavior, step(), run_until_brk(), and the representative official opcodes and addressing modes needed by the contract tests, while keeping the design extensible enough for a fuller 6502. Run cargo test --locked and only finish after all tests pass. In your final response, briefly summarize the implementation and the verification you ran.",
+  "timeout_secs": 1800,
+  "workspace_template": "workspace",
+  "supported_clients": ["codex"],
+  "unsupported_lanes": ["qwen-local"],
+  "verifier": {
+    "type": "all_of",
+    "verifiers": [
+      {
+        "type": "file_sha256",
+        "path": "tests/cpu6502_contract.rs",
+        "sha256": "64ad185cabdc0614fa8b721526570e1db9924e2b20647611f5c9e5019365df61"
+      },
+      {
+        "type": "command_success",
+        "command": ["cargo", "test", "--locked"],
+        "timeout_secs": 120
+      },
+      {
+        "type": "file_contains",
+        "path": "src/lib.rs",
+        "needle": "Cpu6502"
+      }
+    ]
+  }
+}

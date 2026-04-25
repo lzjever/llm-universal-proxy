@@ -2278,6 +2278,93 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertTrue(ok, message)
 
+    def test_verify_fixture_output_accepts_successful_workspace_command(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="command_success",
+            verifier={
+                "type": "command_success",
+                "command": [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; print(Path('answer.txt').read_text().strip())",
+                ],
+                "expect_stdout_contains": ["forty-two"],
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = pathlib.Path(temp_dir)
+            (workspace_dir / "answer.txt").write_text("forty-two\n", encoding="utf-8")
+
+            ok, message = module.verify_fixture_output(fixture, "", workspace_dir)
+
+        self.assertTrue(ok, message)
+
+    def test_verify_fixture_output_rejects_failed_workspace_command(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="command_success",
+            verifier={
+                "type": "command_success",
+                "command": [sys.executable, "-c", "import sys; print('bad'); sys.exit(7)"],
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ok, message = module.verify_fixture_output(
+                fixture,
+                "",
+                pathlib.Path(temp_dir),
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("exit 0", message)
+        self.assertIn("7", message)
+
+    def test_verify_fixture_output_accepts_locked_file_digest(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="file_sha256",
+            verifier={
+                "type": "file_sha256",
+                "path": "contract.txt",
+                "sha256": "3dd7131bf1c92dd2a9c9eb03891f3fbaf0321ef9ef019be728d8cc29225d6928",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = pathlib.Path(temp_dir)
+            (workspace_dir / "contract.txt").write_text("contract\n", encoding="utf-8")
+
+            ok, message = module.verify_fixture_output(fixture, "", workspace_dir)
+
+        self.assertTrue(ok, message)
+
+    def test_verify_fixture_output_rejects_changed_file_digest(self):
+        module = load_module()
+        fixture = make_fixture(
+            module,
+            fixture_id="file_sha256",
+            verifier={
+                "type": "file_sha256",
+                "path": "contract.txt",
+                "sha256": "3dd7131bf1c92dd2a9c9eb03891f3fbaf0321ef9ef019be728d8cc29225d6928",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = pathlib.Path(temp_dir)
+            (workspace_dir / "contract.txt").write_text("changed\n", encoding="utf-8")
+
+            ok, message = module.verify_fixture_output(fixture, "", workspace_dir)
+
+        self.assertFalse(ok)
+        self.assertIn("sha256", message)
+
     def test_verify_fixture_output_supports_stdout_contract_without_internal_tool_artifacts(self):
         module = load_module()
         fixture = make_fixture(

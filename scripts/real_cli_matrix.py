@@ -2561,6 +2561,68 @@ def _verify_python_entrypoint(
     return True, ""
 
 
+def _verify_command_success(
+    workspace_dir: pathlib.Path, command_spec: dict[str, object]
+) -> tuple[bool, str]:
+    raw_command = command_spec.get("command")
+    if not isinstance(raw_command, list) or not raw_command:
+        return False, "command_success requires a non-empty command list"
+
+    command = [str(part) for part in raw_command]
+    timeout_secs = int(command_spec.get("timeout_secs", 120))
+    cwd = workspace_dir
+
+    if "cwd" in command_spec:
+        relative_cwd = pathlib.Path(str(command_spec["cwd"]))
+        if relative_cwd.is_absolute():
+            return False, "command_success cwd must be relative to the workspace"
+        cwd = workspace_dir / relative_cwd
+        if not _path_is_within(cwd, workspace_dir):
+            return False, "command_success cwd must stay inside the workspace"
+        if not cwd.is_dir():
+            return False, f"expected command_success cwd {relative_cwd} to exist"
+
+    env = os.environ.copy()
+    for key, value in dict(command_spec.get("env", {})).items():
+        env[str(key)] = str(value)
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_secs,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False, f"command_success executable not found: {command[0]!r}"
+    except subprocess.TimeoutExpired:
+        command_text = " ".join(command)
+        return False, f"expected command {command_text!r} to finish within {timeout_secs}s"
+
+    stdout_text = completed.stdout or ""
+    stderr_text = completed.stderr or ""
+    if completed.returncode != 0:
+        diagnostic = (stderr_text or stdout_text).strip()
+        if diagnostic:
+            return (
+                False,
+                f"expected command to exit 0, got {completed.returncode}: {diagnostic[:240]}",
+            )
+        return False, f"expected command to exit 0, got {completed.returncode}"
+
+    for expected_text in command_spec.get("expect_stdout_contains", []):
+        if str(expected_text) not in stdout_text:
+            return False, f"expected command stdout to contain {expected_text!r}"
+    for expected_text in command_spec.get("expect_stderr_contains", []):
+        if str(expected_text) not in stderr_text:
+            return False, f"expected command stderr to contain {expected_text!r}"
+    return True, ""
+
+
 def _parse_jsonl_events(stdout_text: str) -> tuple[list[dict[str, object]] | None, str]:
     events: list[dict[str, object]] = []
     for line_number, raw_line in enumerate(stdout_text.splitlines(), start=1):
@@ -4391,6 +4453,20 @@ def _verify_verifier_output(
         needle = str(verifier["needle"])
         ok = needle in target.read_text(encoding="utf-8")
         return ok, f"expected {relative_path} to contain {needle!r}"
+    if verifier_type == "file_sha256":
+        if workspace_dir is None:
+            return False, "workspace verifier required a workspace directory"
+        relative_path = pathlib.Path(str(verifier["path"]))
+        target = workspace_dir / relative_path
+        if not target.exists():
+            return False, f"expected file {relative_path} to exist"
+        expected_digest = str(verifier["sha256"]).lower()
+        actual_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        ok = actual_digest == expected_digest
+        return (
+            ok,
+            f"expected {relative_path} sha256 {expected_digest}, got {actual_digest}",
+        )
     if verifier_type == "python_source_and_output":
         if workspace_dir is None:
             return False, "workspace verifier required a workspace directory"
@@ -4398,6 +4474,10 @@ def _verify_verifier_output(
         if not ok:
             return False, message
         return _verify_python_entrypoint(workspace_dir, dict(verifier["entrypoint"]))
+    if verifier_type == "command_success":
+        if workspace_dir is None:
+            return False, "workspace verifier required a workspace directory"
+        return _verify_command_success(workspace_dir, verifier)
     if verifier_type == "codex_json_event_contract":
         events, completed_items, message = _verify_codex_json_event_contract(stdout_text)
         if events is None or completed_items is None:
