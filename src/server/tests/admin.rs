@@ -182,6 +182,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
             ..crate::config::HookConfig::default()
         },
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
     let mut upstreams = BTreeMap::new();
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
@@ -226,6 +227,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
         runtime: Arc::new(RwLock::new(runtime)),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
+        data_auth_policy: loopback_data_auth_policy_for_tests(),
     });
 
     let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))
@@ -326,6 +328,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
     let mut upstreams = BTreeMap::new();
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
@@ -370,6 +373,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
         runtime: Arc::new(RwLock::new(runtime)),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
+        data_auth_policy: loopback_data_auth_policy_for_tests(),
     });
 
     let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))
@@ -418,6 +422,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
     let mut upstreams = BTreeMap::new();
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
@@ -462,6 +467,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
         runtime: Arc::new(RwLock::new(runtime)),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
+        data_auth_policy: loopback_data_auth_policy_for_tests(),
     });
 
     let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))

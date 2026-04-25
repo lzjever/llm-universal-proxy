@@ -29,5 +29,6 @@ pub fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     }
 }

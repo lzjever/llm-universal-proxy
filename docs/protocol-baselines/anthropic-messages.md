@@ -141,6 +141,7 @@ Anthropic Messages is fundamentally a typed-content protocol. Correct implementa
 - Preserve block order exactly.
 - Preserve block-local metadata such as citation spans, signatures, tool IDs, source URLs, titles, and cache controls.
 - Never coerce Anthropic block arrays into OpenAI's `content: string | parts[]` abstraction on the Anthropic-native path.
+- On cross-protocol request paths, fail closed for top-level `thinking` / `context_management`, `redacted_thinking`, and `thinking` blocks that require provider signatures or omitted/non-string thinking payloads. These are Anthropic-native protocol semantics, not portable reasoning text.
 
 ## Response contract
 

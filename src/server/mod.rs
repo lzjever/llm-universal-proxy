@@ -1,6 +1,8 @@
 //! HTTP server: single POST endpoint, format detection, proxy to upstream with optional translation.
 
 mod admin;
+mod body_limits;
+mod data_auth;
 mod errors;
 mod headers;
 mod models;
@@ -19,6 +21,7 @@ use std::{convert::Infallible, io, time::Duration};
 use axum::{
     body::Body,
     extract::Request,
+    http::{header, HeaderName},
     middleware,
     response::Response,
     routing::{get, post},
@@ -29,7 +32,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 use tracing::info;
 
 use crate::config::Config;
@@ -121,19 +124,49 @@ pub async fn run_with_listener(
     config: Config,
     listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_with_listener_internal(config, listener, data_auth::DataAccess::from_env()).await
+}
+
+#[doc(hidden)]
+pub async fn run_with_listener_with_data_token(
+    config: Config,
+    listener: tokio::net::TcpListener,
+    data_token: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if data_token.trim().is_empty() {
+        return Err(io::Error::other("data auth token must not be empty").into());
+    }
+    run_with_listener_internal(
+        config,
+        listener,
+        data_auth::DataAccess::BearerToken(data_token),
+    )
+    .await
+}
+
+async fn run_with_listener_internal(
+    config: Config,
+    listener: tokio::net::TcpListener,
+    data_access: data_auth::DataAccess,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !config.upstreams.is_empty() {
         config
             .validate()
             .map_err(|e| format!("invalid config: {e}"))?;
     }
+    let listener_addr = listener.local_addr()?;
+    data_auth::validate_startup(&config, listener_addr, &data_access).map_err(io::Error::other)?;
+    let data_auth_policy =
+        data_auth::RuntimeConfigValidationPolicy::new(listener_addr, data_access.clone());
     let metrics = RuntimeMetrics::new(&config);
     let runtime = build_runtime_state(config).await?;
     let state = Arc::new(AppState {
         runtime: Arc::new(RwLock::new(runtime)),
         metrics,
         admin_access: AdminAccess::from_env(),
+        data_auth_policy,
     });
-    run_server(state, listener).await
+    run_server(state, listener, data_access).await
 }
 
 pub async fn run_with_listener_and_dashboard(
@@ -145,6 +178,11 @@ pub async fn run_with_listener_and_dashboard(
             .validate()
             .map_err(|e| format!("invalid config: {e}"))?;
     }
+    let data_access = data_auth::DataAccess::from_env();
+    let listener_addr = listener.local_addr()?;
+    data_auth::validate_startup(&config, listener_addr, &data_access).map_err(io::Error::other)?;
+    let data_auth_policy =
+        data_auth::RuntimeConfigValidationPolicy::new(listener_addr, data_access.clone());
     let metrics = RuntimeMetrics::new(&config);
     let runtime = Arc::new(RwLock::new(build_runtime_state(config.clone()).await?));
     let dashboard_runtime = DashboardRuntimeHandle::new(runtime.clone());
@@ -152,9 +190,11 @@ pub async fn run_with_listener_and_dashboard(
         runtime,
         metrics: metrics.clone(),
         admin_access: AdminAccess::from_env(),
+        data_auth_policy,
     });
     let server_state = state.clone();
-    let mut server = tokio::spawn(async move { run_server(server_state, listener).await });
+    let mut server =
+        tokio::spawn(async move { run_server(server_state, listener, data_access).await });
     tokio::select! {
         server_result = &mut server => {
             server_result.map_err(|e| std::io::Error::other(e.to_string()))?
@@ -170,16 +210,9 @@ pub async fn run_with_listener_and_dashboard(
 async fn run_server(
     state: Arc<AppState>,
     listener: tokio::net::TcpListener,
+    data_access: data_auth::DataAccess,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::DELETE,
-            axum::http::Method::OPTIONS,
-        ])
-        .allow_headers(Any);
+    let cors = data_cors_layer_from_env().map_err(io::Error::other)?;
 
     let admin_router = Router::new()
         .route("/admin/state", get(admin::handle_admin_state))
@@ -208,8 +241,7 @@ async fn run_server(
             get(web_dashboard::handle_dashboard_js),
         );
 
-    let data_router = Router::new()
-        .route("/health", get(proxy::health))
+    let protected_data_router = Router::new()
         .route(
             "/openai/v1/chat/completions",
             post(proxy::handle_openai_chat_completions),
@@ -220,6 +252,14 @@ async fn run_server(
             post(responses_resources::handle_openai_responses_compact),
         )
         .route(
+            "/openai/v1/responses/input_tokens",
+            post(responses_resources::handle_openai_responses_input_tokens),
+        )
+        .route(
+            "/openai/v1/responses/:response_id/input_items",
+            get(responses_resources::handle_openai_response_input_items),
+        )
+        .route(
             "/openai/v1/responses/:response_id",
             get(responses_resources::handle_openai_response_get)
                 .delete(responses_resources::handle_openai_response_delete),
@@ -227,6 +267,26 @@ async fn run_server(
         .route(
             "/openai/v1/responses/:response_id/cancel",
             post(responses_resources::handle_openai_response_cancel),
+        )
+        .route(
+            "/openai/v1/conversations",
+            post(responses_resources::handle_openai_conversations_create),
+        )
+        .route(
+            "/openai/v1/conversations/:conversation_id",
+            get(responses_resources::handle_openai_conversation_get)
+                .post(responses_resources::handle_openai_conversation_update)
+                .delete(responses_resources::handle_openai_conversation_delete),
+        )
+        .route(
+            "/openai/v1/conversations/:conversation_id/items",
+            get(responses_resources::handle_openai_conversation_items)
+                .post(responses_resources::handle_openai_conversation_item_create),
+        )
+        .route(
+            "/openai/v1/conversations/:conversation_id/items/:item_id",
+            get(responses_resources::handle_openai_conversation_item_get)
+                .delete(responses_resources::handle_openai_conversation_item_delete),
         )
         .route("/openai/v1/models", get(models::handle_openai_models))
         .route("/openai/v1/models/:id", get(models::handle_openai_model))
@@ -253,6 +313,14 @@ async fn run_server(
             post(responses_resources::handle_openai_responses_compact_namespaced),
         )
         .route(
+            "/namespaces/:namespace/openai/v1/responses/input_tokens",
+            post(responses_resources::handle_openai_responses_input_tokens_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/responses/:response_id/input_items",
+            get(responses_resources::handle_openai_response_input_items_namespaced),
+        )
+        .route(
             "/namespaces/:namespace/openai/v1/responses/:response_id",
             get(responses_resources::handle_openai_response_get_namespaced)
                 .delete(responses_resources::handle_openai_response_delete_namespaced),
@@ -260,6 +328,26 @@ async fn run_server(
         .route(
             "/namespaces/:namespace/openai/v1/responses/:response_id/cancel",
             post(responses_resources::handle_openai_response_cancel_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/conversations",
+            post(responses_resources::handle_openai_conversations_create_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/conversations/:conversation_id",
+            get(responses_resources::handle_openai_conversation_get_namespaced)
+                .post(responses_resources::handle_openai_conversation_update_namespaced)
+                .delete(responses_resources::handle_openai_conversation_delete_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/conversations/:conversation_id/items",
+            get(responses_resources::handle_openai_conversation_items_namespaced)
+                .post(responses_resources::handle_openai_conversation_item_create_namespaced),
+        )
+        .route(
+            "/namespaces/:namespace/openai/v1/conversations/:conversation_id/items/:item_id",
+            get(responses_resources::handle_openai_conversation_item_get_namespaced)
+                .delete(responses_resources::handle_openai_conversation_item_delete_namespaced),
         )
         .route(
             "/namespaces/:namespace/openai/v1/models",
@@ -294,7 +382,19 @@ async fn run_server(
             get(models::handle_google_model_namespaced)
                 .post(proxy::handle_google_model_action_namespaced),
         )
-        .layer(cors);
+        .route_layer(middleware::from_fn_with_state(
+            data_auth::DataAuthState::new(data_access),
+            data_auth::require_data_access,
+        ));
+
+    let data_router = Router::new()
+        .route("/health", get(proxy::health))
+        .merge(protected_data_router);
+    let data_router = if let Some(cors) = cors {
+        data_router.layer(cors)
+    } else {
+        data_router
+    };
 
     let app = Router::new()
         .merge(admin_router)
@@ -341,6 +441,41 @@ async fn run_server(
             }
         });
     }
+}
+
+fn data_cors_layer_from_env() -> Result<Option<CorsLayer>, String> {
+    let origins = data_auth::cors_allowed_origins_from_env()?;
+    if origins.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers(AllowHeaders::list([
+                header::ACCEPT,
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                HeaderName::from_static(data_auth::DATA_TOKEN_HEADER),
+                HeaderName::from_static("x-api-key"),
+                HeaderName::from_static("api-key"),
+                HeaderName::from_static("openai-api-key"),
+                HeaderName::from_static("x-goog-api-key"),
+                HeaderName::from_static("anthropic-api-key"),
+                HeaderName::from_static("anthropic-version"),
+                HeaderName::from_static("anthropic-beta"),
+                HeaderName::from_static("openai-organization"),
+                HeaderName::from_static("openai-project"),
+                HeaderName::from_static("idempotency-key"),
+                HeaderName::from_static("x-stainless-helper-method"),
+            ])),
+    ))
 }
 
 fn duplicate_stream_for_disconnect_watch(

@@ -53,6 +53,12 @@ README_FORBIDDEN_RESERVED_PREFIX_PUBLIC_CONTRACT_PATTERNS = (
     r"`__llmup_custom__[^`]*`\s+is\s+(?:an?\s+)?public contract",
     r"`__llmup_custom__[^`]*`\s+is\s+(?:an?\s+)?public tool(?: name)?",
 )
+FORBIDDEN_DANGEROUS_ARGS = (
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-skip-permissions",
+    "--sandbox=false",
+    "--yolo",
+)
 FORBIDDEN_LEGACY_TOOL_IDENTITY_LANGUAGE = {
     REPO_ROOT / "README.md": (
         "Important current limitation:",
@@ -598,6 +604,39 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(qwen_surface.apply_patch_transport, "freeform")
         self.assertEqual(qwen_metadata.input_modalities, ("text",))
         self.assertFalse(qwen_metadata.supports_search_tool)
+
+    def test_build_runtime_config_does_not_render_local_qwen_env_secret(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            textwrap.dedent(
+                """
+                listen: 127.0.0.1:18888
+                upstreams:
+                  MINIMAX-OPENAI:
+                    api_root: "https://api.minimaxi.com/v1"
+                    format: openai-completion
+                    credential_env: MINIMAX_API_KEY
+                    auth_policy: force_server
+                model_aliases:
+                  minimax-openai: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+                """
+            )
+        )
+
+        rendered = module.build_runtime_config_text(
+            parsed,
+            {
+                "LOCAL_QWEN_BASE_URL": "http://127.0.0.1:9997/v1",
+                "LOCAL_QWEN_MODEL": "qwen3.5-9b-awq",
+                "LOCAL_QWEN_API_KEY": "sk-local-secret-that-must-not-be-rendered",
+            },
+            listen_host="127.0.0.1",
+            listen_port=19999,
+            trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
+        )
+
+        self.assertIn("credential_env: LOCAL_QWEN_API_KEY", rendered)
+        self.assertNotIn("sk-local-secret-that-must-not-be-rendered", rendered)
 
     def test_build_runtime_config_preserves_structured_model_alias_limits(self):
         module = load_module()
@@ -1645,54 +1684,80 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(alias_metadata.input_modalities, ("text", "image"))
         self.assertFalse(alias_metadata.supports_search_tool)
 
-    def test_build_client_command_uses_known_good_gemini_sandbox_flag_form(self):
+    def test_build_client_command_uses_safe_permission_defaults(self):
         module = load_module()
-        lane = make_lane(module, name="minimax-openai", proxy_model="minimax-openai")
         fixture = make_fixture(module)
 
-        command = module.build_client_command(
-            "gemini",
-            "http://127.0.0.1:18888",
-            lane,
-            fixture,
-            pathlib.Path("/tmp/workspace"),
+        cases = (
+            (
+                "codex",
+                make_lane(module, name="minimax-openai", proxy_model="minimax-openai"),
+                {"client_home": pathlib.Path("/tmp/codex-home").resolve()},
+            ),
+            (
+                "claude",
+                make_lane(module, name="claude-haiku-4-5", proxy_model="claude-haiku-4-5"),
+                {},
+            ),
+            (
+                "gemini",
+                make_lane(module, name="minimax-openai", proxy_model="minimax-openai"),
+                {},
+            ),
         )
 
-        self.assertIn("--sandbox=false", command)
-        self.assertNotIn("--sandbox", command)
-        self.assertIn("--yolo", command)
+        for client_name, lane, kwargs in cases:
+            with self.subTest(client=client_name):
+                command = module.build_client_command(
+                    client_name,
+                    "http://127.0.0.1:18888",
+                    lane,
+                    fixture,
+                    pathlib.Path("/tmp/workspace").resolve(),
+                    **kwargs,
+                )
+                for forbidden_arg in FORBIDDEN_DANGEROUS_ARGS:
+                    self.assertNotIn(forbidden_arg, command)
+                if client_name == "codex":
+                    self.assertIn("--sandbox", command)
+                    sandbox_index = command.index("--sandbox")
+                    self.assertEqual(command[sandbox_index + 1], "workspace-write")
 
-    def test_build_client_command_uses_codex_dangerous_bypass_mode(self):
+    def test_build_client_command_allows_explicit_dangerous_harness(self):
         module = load_module()
-        lane = make_lane(module, name="minimax-openai", proxy_model="minimax-openai")
         fixture = make_fixture(module)
 
-        command = module.build_client_command(
+        codex = module.build_client_command(
             "codex",
             "http://127.0.0.1:18888",
-            lane,
+            make_lane(module, name="minimax-openai", proxy_model="minimax-openai"),
             fixture,
             pathlib.Path("/tmp/workspace").resolve(),
             client_home=pathlib.Path("/tmp/codex-home").resolve(),
+            dangerous_harness=True,
         )
-
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
-        self.assertNotIn("--sandbox", command)
-
-    def test_build_client_command_uses_claude_dangerous_skip_permissions(self):
-        module = load_module()
-        lane = make_lane(module, name="claude-haiku-4-5", proxy_model="claude-haiku-4-5")
-        fixture = make_fixture(module)
-
-        command = module.build_client_command(
+        claude = module.build_client_command(
             "claude",
             "http://127.0.0.1:18888",
-            lane,
+            make_lane(module, name="claude-haiku-4-5", proxy_model="claude-haiku-4-5"),
             fixture,
             pathlib.Path("/tmp/workspace").resolve(),
+            dangerous_harness=True,
+        )
+        gemini = module.build_client_command(
+            "gemini",
+            "http://127.0.0.1:18888",
+            make_lane(module, name="minimax-openai", proxy_model="minimax-openai"),
+            fixture,
+            pathlib.Path("/tmp/workspace").resolve(),
+            dangerous_harness=True,
         )
 
-        self.assertIn("--dangerously-skip-permissions", command)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", codex)
+        self.assertNotIn("--sandbox", codex)
+        self.assertIn("--dangerously-skip-permissions", claude)
+        self.assertIn("--sandbox=false", gemini)
+        self.assertIn("--yolo", gemini)
 
     def test_build_client_command_injects_codex_model_catalog_for_capacity_aware_alias(self):
         module = load_module()
@@ -1719,8 +1784,8 @@ class RealCliMatrixTests(unittest.TestCase):
         )
 
         joined = " ".join(command)
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
-        self.assertNotIn("--sandbox", command)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertIn("--sandbox", command)
         self.assertIn("model_catalog_json", joined)
         self.assertIn(str(home_dir / ".codex" / "catalog.json"), joined)
         self.assertIn('web_search="disabled"', joined)
@@ -3831,6 +3896,15 @@ class RealCliMatrixTests(unittest.TestCase):
                 "gemini__minimax-openai__smoke_pong",
             ],
         )
+
+    def test_resolve_cli_args_requires_explicit_dangerous_harness_opt_in(self):
+        module = load_module()
+
+        safe_args = module.resolve_cli_args(["--list-matrix"])
+        dangerous_args = module.resolve_cli_args(["--list-matrix", "--dangerous-harness"])
+
+        self.assertFalse(safe_args.dangerous_harness)
+        self.assertTrue(dangerous_args.dangerous_harness)
 
     def test_write_reports_creates_json_markdown_and_latest_symlink(self):
         module = load_module()

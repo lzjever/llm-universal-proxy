@@ -1,5 +1,6 @@
 import importlib.util
 import pathlib
+import re
 import subprocess
 import sys
 import unittest
@@ -16,6 +17,9 @@ TRACKED_CONFIG_PATH = (
 )
 LEGACY_IGNORED_CONFIG_PATH = REPO_ROOT / "proxy-test-minimax-and-local.yaml"
 COMPAT_SCRIPT_PATH = REPO_ROOT / "scripts" / "test_compatibility.sh"
+PROVIDER_KEY_RE = re.compile(
+    r"sk-(?:cp|ant|proj|live|test)-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{32,}"
+)
 
 
 def load_module():
@@ -71,6 +75,13 @@ class DefaultMatrixConfigSourceContractTests(unittest.TestCase):
             script_text,
         )
         self.assertNotIn("CONFIG=\"${CONFIG:-proxy-test-minimax-and-local.yaml}\"", script_text)
+
+    def test_tracked_default_config_uses_env_credentials_without_provider_keys(self):
+        config_text = TRACKED_CONFIG_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("credential_env: MINIMAX_API_KEY", config_text)
+        self.assertNotIn("credential_actual", config_text)
+        self.assertIsNone(PROVIDER_KEY_RE.search(config_text))
 
 
 if __name__ == "__main__":

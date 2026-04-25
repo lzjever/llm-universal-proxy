@@ -78,6 +78,88 @@ impl Default for DebugTraceConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    #[serde(default = "default_max_non_stream_response_bytes")]
+    pub max_non_stream_response_bytes: usize,
+    #[serde(default = "default_max_upstream_error_body_bytes")]
+    pub max_upstream_error_body_bytes: usize,
+    #[serde(default = "default_max_sse_frame_bytes")]
+    pub max_sse_frame_bytes: usize,
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+    #[serde(default = "default_stream_max_duration_secs")]
+    pub stream_max_duration_secs: u64,
+    #[serde(default = "default_stream_max_events")]
+    pub stream_max_events: usize,
+    #[serde(default = "default_max_accumulated_stream_state_bytes")]
+    pub max_accumulated_stream_state_bytes: usize,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_request_body_bytes: default_max_request_body_bytes(),
+            max_non_stream_response_bytes: default_max_non_stream_response_bytes(),
+            max_upstream_error_body_bytes: default_max_upstream_error_body_bytes(),
+            max_sse_frame_bytes: default_max_sse_frame_bytes(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            stream_max_duration_secs: default_stream_max_duration_secs(),
+            stream_max_events: default_stream_max_events(),
+            max_accumulated_stream_state_bytes: default_max_accumulated_stream_state_bytes(),
+        }
+    }
+}
+
+impl ResourceLimits {
+    fn validate(&self) -> Result<(), String> {
+        if self.max_request_body_bytes == 0 {
+            return Err(
+                "resource_limits.max_request_body_bytes must be greater than zero".to_string(),
+            );
+        }
+        if self.max_non_stream_response_bytes == 0 {
+            return Err(
+                "resource_limits.max_non_stream_response_bytes must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if self.max_upstream_error_body_bytes == 0 {
+            return Err(
+                "resource_limits.max_upstream_error_body_bytes must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if self.max_sse_frame_bytes == 0 {
+            return Err(
+                "resource_limits.max_sse_frame_bytes must be greater than zero".to_string(),
+            );
+        }
+        if self.stream_idle_timeout_secs == 0 {
+            return Err(
+                "resource_limits.stream_idle_timeout_secs must be greater than zero".to_string(),
+            );
+        }
+        if self.stream_max_duration_secs == 0 {
+            return Err(
+                "resource_limits.stream_max_duration_secs must be greater than zero".to_string(),
+            );
+        }
+        if self.stream_max_events == 0 {
+            return Err("resource_limits.stream_max_events must be greater than zero".to_string());
+        }
+        if self.max_accumulated_stream_state_bytes == 0 {
+            return Err(
+                "resource_limits.max_accumulated_stream_state_bytes must be greater than zero"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookEndpointConfig {
     pub url: String,
     pub authorization: Option<String>,
@@ -271,6 +353,8 @@ pub struct Config {
     pub hooks: HookConfig,
     /// Optional local debug trace sink.
     pub debug_trace: DebugTraceConfig,
+    /// Resource boundaries for request bodies, upstream bodies, and streaming state.
+    pub resource_limits: ResourceLimits,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -353,6 +437,8 @@ pub struct RuntimeConfigPayload {
     pub hooks: RuntimeHookConfig,
     #[serde(default)]
     pub debug_trace: DebugTraceConfig,
+    #[serde(default)]
+    pub resource_limits: ResourceLimits,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -423,6 +509,7 @@ pub struct AdminConfigView {
     pub model_aliases: BTreeMap<String, AdminModelAliasView>,
     pub hooks: AdminHookConfigView,
     pub debug_trace: AdminDebugTraceConfigView,
+    pub resource_limits: ResourceLimits,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -443,6 +530,8 @@ struct FileConfig {
     hooks: HooksFileConfig,
     #[serde(default)]
     debug_trace: DebugTraceConfig,
+    #[serde(default)]
+    resource_limits: ResourceLimits,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -528,6 +617,7 @@ impl Default for Config {
             model_aliases: BTreeMap::new(),
             hooks: HookConfig::default(),
             debug_trace: DebugTraceConfig::default(),
+            resource_limits: ResourceLimits::default(),
         }
     }
 }
@@ -615,6 +705,7 @@ impl Config {
                 }),
             },
             debug_trace: parsed.debug_trace,
+            resource_limits: parsed.resource_limits,
         })
     }
 
@@ -623,6 +714,7 @@ impl Config {
         if self.upstreams.is_empty() {
             return Err("at least one upstream must be configured".to_string());
         }
+        self.resource_limits.validate()?;
         if let Some(proxy) = &self.proxy {
             proxy.validate("proxy")?;
         }
@@ -680,6 +772,14 @@ impl Config {
                     "upstream `{}` auth_policy=force-server requires a server credential",
                     upstream.name
                 ));
+            }
+            for (header_name, _) in &upstream.upstream_headers {
+                if is_forbidden_upstream_header_name(header_name) {
+                    return Err(format!(
+                        "upstream `{}` upstream_headers must not override forbidden auth/secret header `{}`",
+                        upstream.name, header_name
+                    ));
+                }
             }
             if !seen.insert(upstream.name.clone()) {
                 return Err(format!("duplicate upstream name `{}`", upstream.name));
@@ -887,6 +987,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
                 }),
             },
             debug_trace: value.debug_trace,
+            resource_limits: value.resource_limits,
         };
         config.validate()?;
         Ok(config)
@@ -940,6 +1041,7 @@ impl From<&Config> for RuntimeConfigPayload {
                     }),
             },
             debug_trace: value.debug_trace.clone(),
+            resource_limits: value.resource_limits.clone(),
         }
     }
 }
@@ -1013,6 +1115,7 @@ impl From<&Config> for AdminConfigView {
                 path: value.debug_trace.path.clone(),
                 max_text_chars: value.debug_trace.max_text_chars,
             },
+            resource_limits: value.resource_limits.clone(),
         }
     }
 }
@@ -1057,7 +1160,7 @@ fn strip_url_query_and_fragment(value: &str) -> &str {
 }
 
 fn admin_header_view(name: &str, value: &str) -> AdminHeaderValueView {
-    if is_sensitive_admin_header_name(name) {
+    if is_sensitive_header_name(name) {
         AdminHeaderValueView {
             name: name.to_string(),
             value: None,
@@ -1072,7 +1175,7 @@ fn admin_header_view(name: &str, value: &str) -> AdminHeaderValueView {
     }
 }
 
-fn is_sensitive_admin_header_name(name: &str) -> bool {
+pub(crate) fn is_sensitive_header_name(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
     normalized == "authorization"
         || normalized == "proxy-authorization"
@@ -1086,6 +1189,19 @@ fn is_sensitive_admin_header_name(name: &str) -> bool {
         || normalized.contains("token")
         || normalized.contains("secret")
         || normalized.contains("credential")
+}
+
+pub(crate) fn is_forbidden_upstream_header_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "x-api-key"
+            | "api-key"
+            | "openai-api-key"
+            | "x-goog-api-key"
+            | "anthropic-api-key"
+    )
 }
 
 fn default_listen() -> String {
@@ -1114,6 +1230,38 @@ fn default_hook_cooldown_secs() -> u64 {
 
 fn default_debug_trace_max_text_chars() -> usize {
     16384
+}
+
+fn default_max_request_body_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_max_non_stream_response_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_max_upstream_error_body_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_max_sse_frame_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_stream_idle_timeout_secs() -> u64 {
+    300
+}
+
+fn default_stream_max_duration_secs() -> u64 {
+    3600
+}
+
+fn default_stream_max_events() -> usize {
+    100_000
+}
+
+fn default_max_accumulated_stream_state_bytes() -> usize {
+    8 * 1024 * 1024
 }
 
 /// Build full upstream POST URL for a format.
@@ -1381,6 +1529,16 @@ upstreams:
             model_aliases: BTreeMap::new(),
             hooks: RuntimeHookConfig::default(),
             debug_trace: DebugTraceConfig::default(),
+            resource_limits: ResourceLimits {
+                max_request_body_bytes: 4096,
+                max_non_stream_response_bytes: 8192,
+                max_upstream_error_body_bytes: 1024,
+                max_sse_frame_bytes: 2048,
+                stream_idle_timeout_secs: 7,
+                stream_max_duration_secs: 11,
+                stream_max_events: 13,
+                max_accumulated_stream_state_bytes: 16384,
+            },
         };
 
         let config = Config::try_from(payload).unwrap();
@@ -1393,6 +1551,9 @@ upstreams:
                 url: "http://regional-proxy.example:8080".to_string(),
             })
         );
+        assert_eq!(round_trip.resource_limits.max_request_body_bytes, 4096);
+        assert_eq!(round_trip.resource_limits.max_sse_frame_bytes, 2048);
+        assert_eq!(round_trip.resource_limits.stream_max_events, 13);
     }
 
     #[test]
@@ -1664,6 +1825,132 @@ upstreams:
     }
 
     #[test]
+    fn validate_rejects_forbidden_upstream_auth_header_overrides() {
+        for forbidden in [
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "api-key",
+            "openai-api-key",
+            "x-goog-api-key",
+            "anthropic-api-key",
+        ] {
+            let c = Config::from_yaml_str(&format!(
+                r#"
+listen: 127.0.0.1:8080
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+    upstream_headers:
+      {forbidden}: secret
+"#
+            ))
+            .unwrap();
+            let error = c
+                .validate()
+                .expect_err("forbidden upstream auth header must be rejected");
+            assert!(
+                error.contains(forbidden),
+                "error should name forbidden header `{forbidden}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_config_rejects_forbidden_upstream_auth_header_overrides() {
+        let mut payload = RuntimeConfigPayload {
+            listen: "127.0.0.1:0".to_string(),
+            upstream_timeout_secs: 30,
+            compatibility_mode: CompatibilityMode::Balanced,
+            proxy: Some(ProxyConfig::Direct),
+            upstreams: vec![RuntimeUpstreamConfig {
+                name: "default".to_string(),
+                api_root: "https://api.openai.com/v1".to_string(),
+                fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+                fallback_credential_env: None,
+                fallback_credential_actual: None,
+                auth_policy: AuthPolicy::ClientOrFallback,
+                upstream_headers: vec![("openai-api-key".to_string(), "secret".to_string())],
+                proxy: None,
+                limits: None,
+                surface_defaults: None,
+            }],
+            model_aliases: BTreeMap::new(),
+            hooks: RuntimeHookConfig::default(),
+            debug_trace: DebugTraceConfig::default(),
+            resource_limits: ResourceLimits::default(),
+        };
+
+        let error = Config::try_from(payload.clone())
+            .expect_err("runtime config must reject forbidden auth header override");
+        assert!(error.contains("openai-api-key"));
+
+        payload.upstreams[0].upstream_headers = vec![("x-tenant".to_string(), "demo".to_string())];
+        Config::try_from(payload).expect("non-secret upstream header should remain allowed");
+    }
+
+    #[test]
+    fn config_from_yaml_str_parses_resource_limits() {
+        let c = Config::from_yaml_str(
+            r#"
+listen: 127.0.0.1:8080
+resource_limits:
+  max_request_body_bytes: 4096
+  max_non_stream_response_bytes: 8192
+  max_upstream_error_body_bytes: 1024
+  max_sse_frame_bytes: 2048
+  stream_idle_timeout_secs: 7
+  stream_max_duration_secs: 11
+  stream_max_events: 13
+  max_accumulated_stream_state_bytes: 16384
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(c.resource_limits.max_request_body_bytes, 4096);
+        assert_eq!(c.resource_limits.max_non_stream_response_bytes, 8192);
+        assert_eq!(c.resource_limits.max_upstream_error_body_bytes, 1024);
+        assert_eq!(c.resource_limits.max_sse_frame_bytes, 2048);
+        assert_eq!(c.resource_limits.stream_idle_timeout_secs, 7);
+        assert_eq!(c.resource_limits.stream_max_duration_secs, 11);
+        assert_eq!(c.resource_limits.stream_max_events, 13);
+        assert_eq!(c.resource_limits.max_accumulated_stream_state_bytes, 16384);
+        c.validate().expect("positive resource limits are valid");
+    }
+
+    #[test]
+    fn validate_rejects_zero_resource_limits() {
+        let mut c = Config {
+            upstreams: vec![UpstreamConfig {
+                name: "demo".to_string(),
+                api_root: "https://api.openai.com/v1".to_string(),
+                fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+                fallback_credential_env: None,
+                fallback_credential_actual: None,
+                fallback_api_key: None,
+                auth_policy: AuthPolicy::ClientOrFallback,
+                upstream_headers: Vec::new(),
+                proxy: None,
+                limits: None,
+                surface_defaults: None,
+            }],
+            ..Config::default()
+        };
+
+        c.resource_limits.max_request_body_bytes = 0;
+        let error = c.validate().expect_err("zero resource limit must fail");
+        assert!(
+            error.contains("resource_limits.max_request_body_bytes"),
+            "error = {error}"
+        );
+    }
+
+    #[test]
     fn validate_rejects_invalid_hook_url() {
         let c = Config::from_yaml_str(
             r#"
@@ -1801,6 +2088,10 @@ upstreams:
                 ..HookConfig::default()
             },
             debug_trace: DebugTraceConfig::default(),
+            resource_limits: ResourceLimits {
+                max_request_body_bytes: 12_345,
+                ..ResourceLimits::default()
+            },
         };
 
         let view = AdminConfigView::from(&config);
@@ -1888,6 +2179,11 @@ upstreams:
         assert_eq!(
             json["upstreams"][0]["proxy"]["url"],
             "socks5h://regional-proxy.example:1080/egress"
+        );
+        assert_eq!(view.resource_limits.max_request_body_bytes, 12_345);
+        assert_eq!(
+            json["resource_limits"]["max_request_body_bytes"],
+            serde_json::json!(12_345)
         );
         assert!(json["hooks"]["exchange"].get("authorization").is_none());
         assert!(json["upstreams"][0]["upstream_headers"][1]["value"].is_null());

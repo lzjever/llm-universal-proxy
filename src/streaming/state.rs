@@ -170,7 +170,6 @@ pub struct StreamState {
     pub tool_block_indices: std::collections::HashMap<usize, usize>,
     // Gemini state
     pub function_index: usize,
-    pub gemini_dummy_signature_emitted: bool,
     pub(super) gemini_candidate_index: Option<usize>,
     pub(super) openai_choice_index: Option<usize>,
     pub openai_role_sent: bool,
@@ -586,6 +585,98 @@ pub(super) fn mark_stream_fatal_rejection(
     message
 }
 
+impl StreamState {
+    pub(crate) fn accumulated_bytes(&self) -> usize {
+        let mut total = 0usize;
+        total = total.saturating_add(optional_string_len(&self.message_id));
+        total = total.saturating_add(optional_string_len(&self.model));
+        total = total.saturating_add(value_len(&self.request_scoped_tool_bridge_context));
+        total = total.saturating_add(value_len(&self.usage));
+        total = total.saturating_add(optional_string_len(&self.finish_reason));
+        total = total.saturating_add(optional_string_len(&self.output_item_id));
+        total = total.saturating_add(self.responses_output_text.len());
+        total = total.saturating_add(optional_string_len(&self.responses_reasoning_id));
+        total = total.saturating_add(self.responses_reasoning_text.len());
+        total = total.saturating_add(self.openai_seen_content.len());
+        total = total.saturating_add(self.openai_seen_refusal.len());
+        total = total.saturating_add(self.openai_seen_reasoning.len());
+        total = total.saturating_add(value_len(&self.openai_terminal_error));
+        for item in self.openai_tool_calls.values() {
+            total = total.saturating_add(item.accumulated_bytes());
+        }
+        for item in self.claude_tool_uses.values() {
+            total = total.saturating_add(item.accumulated_bytes());
+        }
+        for item in self.claude_blocks.values() {
+            total = total.saturating_add(item.accumulated_bytes());
+        }
+        for item in &self.claude_thinking_provenance {
+            total = total.saturating_add(optional_string_len(&item.signature));
+        }
+        for item in &self.responses_message_parts {
+            total = total.saturating_add(item.accumulated_bytes());
+        }
+        for item in &self.responses_completed_message_items {
+            total = total.saturating_add(value_bytes(&item.item));
+        }
+        total
+    }
+}
+
+impl ToolCallState {
+    fn accumulated_bytes(&self) -> usize {
+        value_len(&self.id)
+            .saturating_add(self.name.len())
+            .saturating_add(self.arguments.len())
+            .saturating_add(value_len(&self.non_replayable_marker))
+            .saturating_add(optional_string_len(&self.custom_input_text))
+            .saturating_add(optional_string_len(&self.tool_type))
+            .saturating_add(optional_string_len(&self.proxied_tool_kind))
+            .saturating_add(optional_string_len(&self.gemini_emitted_arguments))
+            .saturating_add(optional_string_len(&self.responses_item_id))
+    }
+}
+
+impl ClaudeToolUseState {
+    fn accumulated_bytes(&self) -> usize {
+        value_len(&self.id)
+            .saturating_add(self.name.len())
+            .saturating_add(self.arguments.len())
+            .saturating_add(optional_string_len(&self.proxied_tool_kind))
+    }
+}
+
+impl ClaudeBlockState {
+    fn accumulated_bytes(&self) -> usize {
+        self.thinking
+            .len()
+            .saturating_add(optional_string_len(&self.signature))
+            .saturating_add(self.annotations.iter().map(value_bytes).sum::<usize>())
+    }
+}
+
+impl ResponsesMessagePartState {
+    fn accumulated_bytes(&self) -> usize {
+        self.text
+            .len()
+            .saturating_add(self.annotations.iter().map(value_bytes).sum::<usize>())
+    }
+}
+
+fn optional_string_len(value: &Option<String>) -> usize {
+    value.as_ref().map(|value| value.len()).unwrap_or(0)
+}
+
+fn value_len(value: &Option<Value>) -> usize {
+    value.as_ref().map(value_bytes).unwrap_or(0)
+}
+
+fn value_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
 pub(super) fn reject_openai_stream(
     state: &mut StreamState,
     error_type: &str,
@@ -606,8 +697,6 @@ pub(super) fn reject_openai_stream(
     });
     vec![chunk]
 }
-
-pub(super) const GEMINI_DUMMY_THOUGHT_SIGNATURE_STREAM: &str = "skip_thought_signature_validator";
 
 pub(super) fn responses_usage_to_openai_usage_stream(usage: &Value) -> Value {
     let input_tokens = usage

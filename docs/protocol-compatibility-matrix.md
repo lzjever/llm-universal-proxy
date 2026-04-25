@@ -1,7 +1,7 @@
 # Protocol Compatibility Matrix
 
 - Status: active summary
-- Last refreshed: 2026-04-19
+- Last refreshed: 2026-04-25
 - Scope: short entrypoint into the detailed compatibility docs
 
 This file is now the short compatibility front door. Detailed provider comparisons live under [`protocol-baselines/matrices/`](protocol-baselines/matrices/) and the dated refresh audit lives under [`protocol-baselines/audits/`](protocol-baselines/audits/).
@@ -42,5 +42,9 @@ The proxy should treat function calling and explicit transcript replay as the co
 - Gemini `inlineData` image, audio, and PDF content to OpenAI Chat/Responses remains supported. All Gemini `fileData.fileUri` sources, including HTTP(S), currently fail closed for OpenAI targets until an explicit fetch/upload adapter exists. OpenAI-supplied file URI or HTTP(S) file references can still map to Gemini `fileData` when MIME provenance is available.
 - OpenAI `file` and Responses `input_file` MIME provenance must be self-consistent. Conflicting explicit MIME metadata, MIME-bearing data URIs, or filename hints fail closed instead of allowing the request-policy gate and downstream translator to disagree.
 - Reasoning text and continuity should be preserved where possible, but request-side reasoning knobs remain vendor-specific. Translation should keep the model-visible reasoning trail when portable without implying that all providers expose equivalent control surfaces.
+- Cross-provider request translation fails closed for high-risk provider-state, safety, and reasoning fields that the proxy cannot faithfully replay: OpenAI Responses `store: true`, stateful controls such as `previous_response_id` / `conversation` / `context_management`, and opaque reasoning-continuity fields such as `include: ["reasoning.encrypted_content"]` or reasoning item `encrypted_content`, including proxy-local Anthropic thinking carriers; Gemini `cachedContent` / `cached_content`, Gemini `safetySettings` / `safety_settings`, Gemini `thoughtSignature` / `thought_signature` anywhere in request content or history; Anthropic top-level `thinking` / `context_management`; and Anthropic signed, omitted, or redacted thinking blocks. Same-provider passthrough preserves native provider fields.
+- OpenAI Responses lifecycle and state resource endpoints, including response input items, input token counting, conversations, and conversation items, are same-provider native pass-through only. They require one available native OpenAI Responses upstream in the selected namespace and fail closed for no upstream, multiple candidate upstreams, unavailable upstreams, or cross-provider state reconstruction.
+- OpenAI-to-Gemini tool-call translation does not synthesize Gemini thought signatures. Real provider `thoughtSignature` values are only preserved on Gemini passthrough, not fabricated during cross-protocol conversion.
+- Anthropic `redacted_thinking` and thinking blocks that rely on provider signatures or omitted/non-string `thinking` payloads are not represented by a cross-provider standard in this compatibility layer; cross-protocol request support remains fail-closed unless a future explicit mapping is designed and documented.
 - Replayable tool history requires a complete and trusted structured call. Non-replayable or truncated tool calls should intentionally degrade to text/context preservation rather than masquerade as valid structured replay across providers.
 - Unsupported media, unsupported source transports, unknown typed parts, and Gemini video routed to non-Gemini targets should fail closed before contacting the upstream rather than being silently dropped.

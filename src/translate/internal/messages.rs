@@ -82,21 +82,12 @@ pub(crate) fn reserved_openai_custom_bridge_prefix_message(name: &str) -> String
     )
 }
 
-pub(crate) fn anthropic_thinking_provenance_dropped_message(target_label: &str) -> String {
+pub(crate) fn responses_reasoning_continuity_not_portable_message(
+    field: &str,
+    target_label: &str,
+) -> String {
     format!(
-        "Anthropic thinking provenance (`signature` or omitted thinking) is not portable to {target_label}; provenance-only reasoning details will be dropped while preserving any portable assistant, tool, and visible text semantics"
-    )
-}
-
-pub(crate) fn responses_reasoning_carrier_dropped_message(target_label: &str) -> String {
-    format!(
-        "OpenAI Responses reasoning encrypted_content is not portable to {target_label}; the carrier will be dropped and the reasoning summary will be preserved when possible"
-    )
-}
-
-pub(crate) fn responses_reasoning_carrier_malformed_message(target_label: &str) -> String {
-    format!(
-        "OpenAI Responses reasoning encrypted_content is malformed for {target_label}; the carrier will be dropped and the reasoning summary will be preserved when possible"
+        "OpenAI Responses reasoning-continuity field `{field}` carries provider-owned opaque state and cannot be faithfully translated to {target_label}; use a native OpenAI Responses upstream to preserve it"
     )
 }
 

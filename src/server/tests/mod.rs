@@ -55,6 +55,13 @@ impl Drop for ScopedEnvVar {
     }
 }
 
+pub(super) fn loopback_data_auth_policy_for_tests() -> data_auth::RuntimeConfigValidationPolicy {
+    data_auth::RuntimeConfigValidationPolicy::new(
+        "127.0.0.1:0".parse().expect("loopback socket addr"),
+        data_auth::DataAccess::LoopbackOnly,
+    )
+}
+
 pub(super) fn test_upstream_config(
     name: &str,
     format: crate::formats::UpstreamFormat,
@@ -96,6 +103,7 @@ pub(super) fn runtime_namespace_state_for_tests(
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
     let upstream_states = upstreams
         .iter()
@@ -323,6 +331,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
         &config,
@@ -365,6 +374,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         runtime: Arc::new(RwLock::new(runtime)),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
+        data_auth_policy: loopback_data_auth_policy_for_tests(),
     })
 }
 

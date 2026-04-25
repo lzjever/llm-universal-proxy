@@ -10,19 +10,16 @@ use super::media::{
     openai_file_part_resolved_mime_type,
 };
 use super::messages::{
-    anthropic_thinking_provenance_dropped_message, custom_tool_format_downgraded_message,
-    custom_tools_not_portable_message, openai_assistant_audio_history_not_portable_message,
-    openai_request_audio_not_portable_message, responses_reasoning_carrier_dropped_message,
-    responses_reasoning_carrier_malformed_message, single_candidate_choice_contract_message,
+    custom_tool_format_downgraded_message, custom_tools_not_portable_message,
+    openai_assistant_audio_history_not_portable_message, openai_request_audio_not_portable_message,
+    responses_reasoning_continuity_not_portable_message, single_candidate_choice_contract_message,
     translation_target_label,
 };
 use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
     SemanticToolKind, SharedControlProfile, TranslationAssessment,
 };
-use super::openai_responses::{
-    decode_anthropic_reasoning_carrier, responses_input_item_is_message, responses_input_item_type,
-};
+use super::openai_responses::{responses_input_item_is_message, responses_input_item_type};
 use super::request_gemini::{gemini_generation_config_field, gemini_part_field};
 use super::tools::{
     normalized_responses_tool_definition, openai_custom_tool_format_is_plain_text,
@@ -44,10 +41,14 @@ pub(super) fn responses_stateful_request_controls_for_translate(body: &Value) ->
         "conversation",
         "background",
         "prompt",
+        "context_management",
     ] {
         if body.get(field).is_some() {
             controls.push(field);
         }
+    }
+    if body.get("store").and_then(Value::as_bool) == Some(true) {
+        controls.push("store");
     }
     controls
 }
@@ -279,6 +280,9 @@ pub(super) fn responses_include_has_nonportable_items(
     }
 
     include_items.iter().any(|item| {
+        if *item == "reasoning.encrypted_content" {
+            return false;
+        }
         !matches!(
             (target_format, *item),
             (
@@ -508,9 +512,6 @@ pub(super) fn responses_warning_only_request_controls_for_translate(
         && !profile.parallel_tool_calls
     {
         controls.push("parallel_tool_calls".to_string());
-    }
-    if body.get("context_management").is_some() {
-        controls.push("context_management".to_string());
     }
     controls
 }
@@ -803,17 +804,10 @@ pub(super) fn responses_nonportable_input_item_message(
     items.iter().find_map(|item| {
         let item_type = responses_input_item_type(item)?;
         if item_type == "reasoning" && item.get("encrypted_content").is_some() {
-            match target_format {
-                UpstreamFormat::Anthropic => {
-                    return None;
-                }
-                UpstreamFormat::OpenAiCompletion => {}
-                _ => {
-                    return Some(format!(
-                        "OpenAI Responses reasoning item field `encrypted_content` cannot be faithfully translated to {target_label}"
-                    ))
-                }
-            }
+            return Some(responses_reasoning_continuity_not_portable_message(
+                "input[].reasoning.encrypted_content",
+                target_label,
+            ));
         }
         if matches!(item_type, "function_call" | "custom_tool_call")
             && item.get("namespace").is_some()
@@ -839,37 +833,19 @@ pub(super) fn responses_nonportable_input_item_message(
     })
 }
 
-pub(super) fn responses_warning_only_input_item_message(
+pub(super) fn responses_reasoning_continuity_request_message(
     body: &Value,
     target_format: UpstreamFormat,
 ) -> Option<String> {
-    let items = body.get("input").and_then(Value::as_array)?;
-    items.iter().find_map(|item| {
-        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-            return None;
-        }
-        let encrypted_content = item.get("encrypted_content")?;
-        match target_format {
-            UpstreamFormat::OpenAiCompletion => Some(
-                "OpenAI Responses reasoning item field `encrypted_content` is not portable to OpenAI Chat Completions and will be dropped while preserving reasoning summary text"
-                    .to_string(),
-            ),
-            UpstreamFormat::Anthropic => {
-                if let Some(carrier) = encrypted_content.as_str() {
-                    decode_anthropic_reasoning_carrier(carrier)
-                        .err()
-                        .map(|_| responses_reasoning_carrier_dropped_message(
-                            translation_target_label(target_format),
-                        ))
-                } else {
-                    Some(responses_reasoning_carrier_malformed_message(
-                        translation_target_label(target_format),
-                    ))
-                }
-            }
-            _ => None,
-        }
-    })
+    let target_label = translation_target_label(target_format);
+    if responses_include_items(body).contains(&"reasoning.encrypted_content") {
+        return Some(responses_reasoning_continuity_not_portable_message(
+            "reasoning.encrypted_content",
+            target_label,
+        ));
+    }
+    responses_nonportable_input_item_message(body, target_format)
+        .filter(|message| message.contains("encrypted_content"))
 }
 
 pub(super) fn cross_protocol_requested_choice_count(
@@ -1533,7 +1509,7 @@ pub(super) fn anthropic_warning_only_request_controls_for_translate(
     body: &Value,
 ) -> Vec<&'static str> {
     let mut controls = Vec::new();
-    for field in ["thinking", "top_k", "service_tier", "context_management"] {
+    for field in ["top_k", "service_tier"] {
         if body.get(field).is_some() {
             controls.push(field);
         }
@@ -1548,7 +1524,7 @@ pub(super) fn anthropic_nonportable_request_controls_for_translate(
     body: &Value,
 ) -> Vec<&'static str> {
     let mut controls = Vec::new();
-    for field in ["container"] {
+    for field in ["container", "thinking", "context_management"] {
         if body.get(field).is_some() {
             controls.push(field);
         }
@@ -1592,6 +1568,10 @@ pub(crate) fn assess_request_translation(
                 "Responses request controls {quoted} require a native OpenAI Responses upstream and cannot be translated to {upstream_format}; the proxy does not reconstruct provider state"
             ));
         }
+        if let Some(message) = responses_reasoning_continuity_request_message(body, upstream_format)
+        {
+            assessment.reject(message);
+        }
         let dropped_controls =
             responses_warning_only_request_controls_for_translate(body, upstream_format);
         if !dropped_controls.is_empty() {
@@ -1604,9 +1584,6 @@ pub(crate) fn assess_request_translation(
                 "OpenAI Responses controls {quoted} are not portable on this translation path to {} and will be dropped",
                 translation_target_label(upstream_format)
             ));
-        }
-        if let Some(message) = responses_warning_only_input_item_message(body, upstream_format) {
-            assessment.warning(message);
         }
         if let Some(message) = responses_nonportable_tool_choice_message(body, upstream_format) {
             assessment.reject(message);
@@ -1651,7 +1628,10 @@ pub(crate) fn assess_request_translation(
         ));
     }
 
-    if body.get("store").is_some() {
+    if body.get("store").is_some()
+        && !(client_format == UpstreamFormat::OpenAiResponses
+            && body.get("store").and_then(Value::as_bool) == Some(true))
+    {
         assessment.warning(cross_protocol_store_warning_message(
             client_format,
             upstream_format,
@@ -1772,11 +1752,10 @@ pub(crate) fn assess_request_translation(
                 translation_target_label(upstream_format)
             ));
         }
-        if anthropic_request_has_nonportable_thinking_provenance(body)
-            && upstream_format != UpstreamFormat::OpenAiResponses
-        {
-            assessment.warning(anthropic_thinking_provenance_dropped_message(
-                translation_target_label(upstream_format),
+        if anthropic_request_has_nonportable_thinking_provenance(body) {
+            assessment.reject(format!(
+                "Anthropic thinking content blocks with `signature` or omitted/non-string `thinking` require native Anthropic semantics and cannot be faithfully translated to {}",
+                translation_target_label(upstream_format)
             ));
         }
         if let Some(message) = anthropic_request_nonportable_tool_definition_message(

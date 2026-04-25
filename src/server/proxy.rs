@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, Response, StatusCode},
     response::IntoResponse,
     Extension, Json,
@@ -29,6 +29,7 @@ use crate::translate::{
 };
 use crate::upstream;
 
+use super::body_limits::read_limited_json_request;
 use super::errors::{
     append_compatibility_warning_headers, classify_post_translation_non_stream_status,
     client_closed_response, error_response, format_upstream_unavailable_message,
@@ -162,9 +163,19 @@ pub(super) async fn health() -> impl IntoResponse {
 pub(super) async fn handle_openai_chat_completions(
     State(state): State<Arc<AppState>>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+    request: Request,
+) -> Response<Body> {
+    let (headers, body) = match read_limited_json_request(
+        &state,
+        DEFAULT_NAMESPACE,
+        UpstreamFormat::OpenAiCompletion,
+        request,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     handle_openai_chat_completions_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -181,9 +192,19 @@ pub(super) async fn handle_openai_chat_completions_namespaced(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+    request: Request,
+) -> Response<Body> {
+    let (headers, body) = match read_limited_json_request(
+        &state,
+        &namespace,
+        UpstreamFormat::OpenAiCompletion,
+        request,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     handle_openai_chat_completions_inner(
         state,
         namespace,
@@ -199,9 +220,19 @@ pub(super) async fn handle_openai_chat_completions_namespaced(
 pub(super) async fn handle_openai_responses(
     State(state): State<Arc<AppState>>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+    request: Request,
+) -> Response<Body> {
+    let (headers, body) = match read_limited_json_request(
+        &state,
+        DEFAULT_NAMESPACE,
+        UpstreamFormat::OpenAiResponses,
+        request,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     handle_openai_responses_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -218,9 +249,19 @@ pub(super) async fn handle_openai_responses_namespaced(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+    request: Request,
+) -> Response<Body> {
+    let (headers, body) = match read_limited_json_request(
+        &state,
+        &namespace,
+        UpstreamFormat::OpenAiResponses,
+        request,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     handle_openai_responses_inner(
         state,
         namespace,
@@ -236,9 +277,19 @@ pub(super) async fn handle_openai_responses_namespaced(
 pub(super) async fn handle_anthropic_messages(
     State(state): State<Arc<AppState>>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+    request: Request,
+) -> Response<Body> {
+    let (headers, body) = match read_limited_json_request(
+        &state,
+        DEFAULT_NAMESPACE,
+        UpstreamFormat::Anthropic,
+        request,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     handle_anthropic_messages_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -255,9 +306,15 @@ pub(super) async fn handle_anthropic_messages_namespaced(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+    request: Request,
+) -> Response<Body> {
+    let (headers, body) =
+        match read_limited_json_request(&state, &namespace, UpstreamFormat::Anthropic, request)
+            .await
+        {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
     handle_anthropic_messages_inner(
         state,
         namespace,
@@ -274,9 +331,15 @@ pub(super) async fn handle_google_model_action(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+    request: Request,
+) -> Response<Body> {
+    let (headers, body) =
+        match read_limited_json_request(&state, DEFAULT_NAMESPACE, UpstreamFormat::Google, request)
+            .await
+        {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
     handle_google_model_action_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -294,9 +357,19 @@ pub(super) async fn handle_google_model_action_namespaced(
     State(state): State<Arc<AppState>>,
     Path((namespace, id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+    request: Request,
+) -> Response<Body> {
+    let (headers, body) = match read_limited_json_request(
+        &state,
+        &namespace,
+        UpstreamFormat::Google,
+        request,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     handle_google_model_action_inner(
         state,
         namespace,
@@ -721,17 +794,35 @@ async fn handle_request_core_with_downstream_cancellation(
         let upstream_response_headers = res.headers().clone();
         debug!("Upstream streaming response status: {}", status);
         if !status.is_success() {
-            let error_body =
-                match upstream::read_response_text_with_cancellation(res, &downstream_cancellation)
-                    .await
-                {
-                    Ok(body) => body,
-                    Err(upstream::DownstreamAwareError::Inner(_)) => "Unknown error".to_string(),
-                    Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
-                        tracker.finish_cancelled();
-                        return client_closed_response(client_format);
-                    }
-                };
+            let error_body = match upstream::read_response_text_limited_with_cancellation(
+                res,
+                namespace_state
+                    .config
+                    .resource_limits
+                    .max_upstream_error_body_bytes,
+                &downstream_cancellation,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(upstream::DownstreamAwareError::Inner(
+                    upstream::ResponseBodyLimitError::LimitExceeded { limit },
+                )) => {
+                    tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+                    return streaming_error_response(
+                        client_format,
+                        StatusCode::BAD_GATEWAY,
+                        &format!("upstream error body exceeded resource limit of {limit} bytes"),
+                    );
+                }
+                Err(upstream::DownstreamAwareError::Inner(
+                    upstream::ResponseBodyLimitError::Inner(_),
+                )) => "Unknown error".to_string(),
+                Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
+                    tracker.finish_cancelled();
+                    return client_closed_response(client_format);
+                }
+            };
             error!(
                 "Upstream returned error for streaming request: {} - {}",
                 status, error_body
@@ -761,6 +852,7 @@ async fn handle_request_core_with_downstream_cancellation(
         > = if needs_stream_translation(upstream_format, client_format) {
             let translated =
                 TranslateSseStream::new(upstream_stream, upstream_format, client_format)
+                    .with_resource_limits(namespace_state.config.resource_limits.clone())
                     .with_request_scoped_tool_bridge_context(
                         request_scoped_tool_bridge_context
                             .as_ref()
@@ -768,7 +860,8 @@ async fn handle_request_core_with_downstream_cancellation(
                     );
             Box::pin(translated.map(|r| r.map_err(std::io::Error::other)))
         } else {
-            let guarded = GuardedSseStream::new(upstream_stream, client_format);
+            let guarded = GuardedSseStream::new(upstream_stream, client_format)
+                .with_resource_limits(namespace_state.config.resource_limits.clone());
             Box::pin(guarded.map(|r| r.map_err(std::io::Error::other)))
         };
         if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.clone(), hook_ctx.clone()) {
@@ -803,11 +896,37 @@ async fn handle_request_core_with_downstream_cancellation(
 
     let status = res.status();
     let upstream_response_headers = res.headers().clone();
-    let bytes = match upstream::read_response_bytes_with_cancellation(res, &downstream_cancellation)
-        .await
+    let response_body_limit = if status.is_success() {
+        namespace_state
+            .config
+            .resource_limits
+            .max_non_stream_response_bytes
+    } else {
+        namespace_state
+            .config
+            .resource_limits
+            .max_upstream_error_body_bytes
+    };
+    let bytes = match upstream::read_response_bytes_limited_with_cancellation(
+        res,
+        response_body_limit,
+        &downstream_cancellation,
+    )
+    .await
     {
         Ok(b) => b,
-        Err(upstream::DownstreamAwareError::Inner(e)) => {
+        Err(upstream::DownstreamAwareError::Inner(
+            upstream::ResponseBodyLimitError::LimitExceeded { limit },
+        )) => {
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+            let message = if status.is_success() {
+                format!("upstream response body exceeded resource limit of {limit} bytes")
+            } else {
+                format!("upstream error body exceeded resource limit of {limit} bytes")
+            };
+            return error_response(client_format, StatusCode::BAD_GATEWAY, &message);
+        }
+        Err(upstream::DownstreamAwareError::Inner(upstream::ResponseBodyLimitError::Inner(e))) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
             return error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string());
         }

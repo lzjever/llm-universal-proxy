@@ -3,30 +3,45 @@ use crate::server::responses_resources::handle_openai_responses_resource;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type RecordedStreamRequests = Arc<Mutex<Vec<(String, Option<String>)>>>;
+type RecordedResourceRequests = Arc<Mutex<Vec<RecordedResourceRequest>>>;
+
+#[derive(Debug, Clone)]
+struct RecordedResourceRequest {
+    method: String,
+    uri: String,
+    body: Option<Value>,
+    authorization: Option<String>,
+    helper_method: Option<String>,
+    openai_organization: Option<String>,
+    openai_project: Option<String>,
+    idempotency_key: Option<String>,
+    data_token: Option<String>,
+    content_type: Option<String>,
+}
 
 #[derive(Clone)]
 struct RecordedResponsesResourceStreamState {
     status: StatusCode,
-    content_type: &'static str,
-    body: &'static str,
+    content_type: String,
+    body: String,
     seen_requests: RecordedStreamRequests,
 }
 
 async fn spawn_raw_responses_resource_mock(
     status: StatusCode,
-    body: &'static str,
+    body: impl Into<String>,
 ) -> (String, tokio::task::JoinHandle<()>) {
     #[derive(Clone)]
     struct RawState {
         status: StatusCode,
-        body: &'static str,
+        body: String,
     }
 
     async fn handle_resource(State(state): State<RawState>) -> Response<Body> {
         Response::builder()
             .status(state.status)
             .header("Content-Type", "application/json")
-            .body(Body::from(state.body))
+            .body(Body::from(state.body.clone()))
             .expect("raw resource response")
     }
 
@@ -37,7 +52,10 @@ async fn spawn_raw_responses_resource_mock(
         )
         .route("/responses/:id/cancel", post(handle_resource))
         .route("/responses/compact", post(handle_resource))
-        .with_state(RawState { status, body });
+        .with_state(RawState {
+            status,
+            body: body.into(),
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind raw responses resource mock");
@@ -53,8 +71,8 @@ async fn spawn_raw_responses_resource_mock(
 
 async fn spawn_recorded_responses_resource_stream_mock(
     status: StatusCode,
-    content_type: &'static str,
-    body: &'static str,
+    content_type: impl Into<String>,
+    body: impl Into<String>,
 ) -> (String, RecordedStreamRequests, tokio::task::JoinHandle<()>) {
     async fn handle_resource(
         axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
@@ -72,8 +90,8 @@ async fn spawn_recorded_responses_resource_stream_mock(
             .push((uri.to_string(), accept));
         Response::builder()
             .status(state.status)
-            .header("Content-Type", state.content_type)
-            .body(Body::from(state.body))
+            .header("Content-Type", state.content_type.as_str())
+            .body(Body::from(state.body.clone()))
             .expect("streaming resource response")
     }
 
@@ -82,8 +100,8 @@ async fn spawn_recorded_responses_resource_stream_mock(
         .route("/responses/:id", axum::routing::get(handle_resource))
         .with_state(RecordedResponsesResourceStreamState {
             status,
-            content_type,
-            body,
+            content_type: content_type.into(),
+            body: body.into(),
             seen_requests: seen_requests.clone(),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -97,6 +115,88 @@ async fn spawn_recorded_responses_resource_stream_mock(
     });
 
     (format!("http://{addr}"), seen_requests, server)
+}
+
+async fn spawn_recording_responses_resource_mock() -> (
+    String,
+    RecordedResourceRequests,
+    tokio::task::JoinHandle<()>,
+) {
+    #[derive(Clone)]
+    struct RecordingState {
+        requests: RecordedResourceRequests,
+    }
+
+    async fn handle_resource(
+        State(state): State<RecordingState>,
+        request: axum::extract::Request,
+    ) -> Response<Body> {
+        let (parts, body) = request.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("record upstream request body");
+        let body = if body_bytes.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_slice(&body_bytes).expect("json upstream request body"))
+        };
+        let header_value = |name: &str| {
+            parts
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string)
+        };
+        state.requests.lock().await.push(RecordedResourceRequest {
+            method: parts.method.to_string(),
+            uri: parts
+                .uri
+                .path_and_query()
+                .map(|path| path.as_str().to_string())
+                .unwrap_or_else(|| parts.uri.path().to_string()),
+            body,
+            authorization: header_value("authorization"),
+            helper_method: header_value("x-stainless-helper-method"),
+            openai_organization: header_value("openai-organization"),
+            openai_project: header_value("openai-project"),
+            idempotency_key: header_value("idempotency-key"),
+            data_token: header_value(data_auth::DATA_TOKEN_HEADER),
+            content_type: header_value("content-type"),
+        });
+
+        if parts.method == axum::http::Method::DELETE {
+            return Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .expect("delete resource response");
+        }
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"id":"resource_ok","object":"list","data":[],"has_more":false}"#,
+            ))
+            .expect("recording resource response")
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/*path", axum::routing::any(handle_resource))
+        .with_state(RecordingState {
+            requests: requests.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind recording responses resource mock");
+    let addr = listener.local_addr().expect("recording resource mock addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("recording responses resource mock server");
+    });
+
+    (format!("http://{addr}"), requests, server)
 }
 
 async fn call_raw_responses_resource(
@@ -201,6 +301,75 @@ async fn response_body_text(response: Response<Body>) -> String {
     String::from_utf8(body.to_vec()).expect("response body utf8")
 }
 
+async fn send_raw_proxy_resource_request(
+    proxy_addr: std::net::SocketAddr,
+    method: &reqwest::Method,
+    path: &str,
+    label: &str,
+    body: Option<&Value>,
+) -> (StatusCode, String) {
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let body_bytes = body
+        .map(|body| serde_json::to_vec(body).expect("serialize raw proxy body"))
+        .unwrap_or_default();
+    let mut request = format!(
+        "{} {path} HTTP/1.1\r\nHost: {proxy_addr}\r\nopenai-api-key: client-secret\r\nx-stainless-helper-method: {label}\r\nOpenAI-Organization: org-route-preserve\r\nOpenAI-Project: proj-route-preserve\r\nIdempotency-Key: idem-{label}\r\n{}: data-token-must-not-forward\r\nConnection: close\r\n",
+        method.as_str(),
+        data_auth::DATA_TOKEN_HEADER
+    );
+    if body.is_some() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+    }
+    request.push_str("\r\n");
+
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write raw proxy request head");
+    if !body_bytes.is_empty() {
+        stream
+            .write_all(&body_bytes)
+            .await
+            .expect("write raw proxy request body");
+    }
+
+    let mut raw_response = Vec::new();
+    stream
+        .read_to_end(&mut raw_response)
+        .await
+        .expect("read raw proxy response");
+    let response_text = String::from_utf8_lossy(&raw_response).to_string();
+    let status = response_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .expect("raw proxy response status");
+    let body_text = response_text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body_text)
+}
+
+async fn set_resource_limits(state: &Arc<AppState>, limits: crate::config::ResourceLimits) {
+    let mut runtime = state.runtime.write().await;
+    runtime
+        .namespaces
+        .get_mut(DEFAULT_NAMESPACE)
+        .expect("default namespace")
+        .config
+        .resource_limits = limits;
+}
+
+fn format_sse_event(event_type: &str, data: &Value) -> String {
+    format!("event: {event_type}\ndata: {data}\n\n")
+}
+
 async fn assert_raw_no_content_framing_fails_closed(raw_response: Vec<u8>) -> String {
     let (response, server) = call_raw_tcp_responses_resource(raw_response).await;
 
@@ -243,6 +412,649 @@ async fn assert_empty_success_body_fails_closed(
     );
 
     server.abort();
+}
+
+#[tokio::test]
+async fn openai_responses_resource_post_body_limit_rejects_all_json_body_handlers_before_upstream()
+{
+    let (mock_base, recorded, upstream_server) = spawn_recording_responses_resource_mock().await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+    set_resource_limits(
+        &state,
+        crate::config::ResourceLimits {
+            max_request_body_bytes: 96,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+    let proxy_server =
+        tokio::spawn(
+            async move { run_server(state, listener, data_auth::DataAccess::Disabled).await },
+        );
+    let proxy_base = format!("http://{proxy_addr}");
+    let client = reqwest::Client::new();
+
+    let oversized_secret = "RESOURCE_REQUEST_SENTINEL_SHOULD_NOT_LEAK";
+    let oversized_text = format!("{oversized_secret}{}", "x".repeat(512));
+    let cases = [
+        (
+            "compact",
+            "/openai/v1/responses/compact",
+            serde_json::json!({ "input": oversized_text }),
+        ),
+        (
+            "input_tokens",
+            "/openai/v1/responses/input_tokens",
+            serde_json::json!({ "input": oversized_text }),
+        ),
+        (
+            "conversation create",
+            "/openai/v1/conversations",
+            serde_json::json!({ "metadata": { "note": oversized_text } }),
+        ),
+        (
+            "conversation update",
+            "/openai/v1/conversations/conv_body_limit",
+            serde_json::json!({ "metadata": { "note": oversized_text } }),
+        ),
+        (
+            "conversation item create",
+            "/openai/v1/conversations/conv_body_limit/items",
+            serde_json::json!({
+                "items": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": oversized_text
+                }]
+            }),
+        ),
+    ];
+
+    for (label, path, body) in cases {
+        let response = client
+            .post(format!("{proxy_base}{path}"))
+            .header("openai-api-key", "client-secret")
+            .json(&body)
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{label}");
+        let body_text = response.text().await.expect("error body");
+        assert!(
+            body_text.contains("request body exceeded"),
+            "{label}: {body_text}"
+        );
+        assert!(
+            !body_text.contains(oversized_secret),
+            "{label}: {body_text}"
+        );
+    }
+
+    assert!(recorded.lock().await.is_empty());
+    proxy_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_non_stream_success_body_limit_fails_closed_without_payload_leak(
+) {
+    let upstream_sentinel = "RESOURCE_NON_STREAM_SENTINEL_SHOULD_NOT_LEAK";
+    let raw_body = serde_json::json!({
+        "id": "resp_large",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_large",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": format!("{upstream_sentinel}{}", "x".repeat(1024)),
+                "annotations": []
+            }]
+        }]
+    })
+    .to_string();
+    let (mock_base, server) = spawn_raw_responses_resource_mock(StatusCode::OK, raw_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+    set_resource_limits(
+        &state,
+        crate::config::ResourceLimits {
+            max_non_stream_response_bytes: 256,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_large".to_string(),
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body_text = response_body_text(response).await;
+    assert!(
+        body_text.contains("upstream response body exceeded"),
+        "{body_text}"
+    );
+    assert!(!body_text.contains(upstream_sentinel), "{body_text}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_upstream_error_body_limit_fails_closed_without_payload_leak(
+) {
+    let upstream_sentinel = "RESOURCE_ERROR_SENTINEL_SHOULD_NOT_LEAK";
+    let raw_body = format!("{upstream_sentinel}{}", "x".repeat(1024));
+    let (mock_base, server) =
+        spawn_raw_responses_resource_mock(StatusCode::BAD_REQUEST, raw_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+    set_resource_limits(
+        &state,
+        crate::config::ResourceLimits {
+            max_upstream_error_body_bytes: 64,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_error".to_string(),
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body_text = response_body_text(response).await;
+    assert!(
+        body_text.contains("upstream error body exceeded"),
+        "{body_text}"
+    );
+    assert!(!body_text.contains(upstream_sentinel), "{body_text}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_stream_true_uses_configured_sse_frame_limit() {
+    let upstream_sentinel = "RESOURCE_STREAM_FRAME_SENTINEL_SHOULD_NOT_LEAK";
+    let oversized_event = serde_json::json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 0,
+        "response_id": "resp_stream_frame_limit",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": format!("{upstream_sentinel}{}", "x".repeat(128))
+    });
+    let upstream_body = format_sse_event("response.output_text.delta", &oversized_event);
+    let (mock_base, _seen_requests, server) = spawn_recorded_responses_resource_stream_mock(
+        StatusCode::OK,
+        "text/event-stream",
+        upstream_body,
+    )
+    .await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+    set_resource_limits(
+        &state,
+        crate::config::ResourceLimits {
+            max_sse_frame_bytes: 64,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_stream_frame_limit".to_string(),
+        None,
+        Some("stream=true".to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response_body_text(response).await;
+    assert!(
+        body_text.contains("\"code\":\"upstream_sse_frame_too_large\""),
+        "{body_text}"
+    );
+    assert!(!body_text.contains(upstream_sentinel), "{body_text}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_stream_true_uses_configured_event_limit() {
+    let first_sentinel = "RESOURCE_STREAM_FIRST_EVENT_ALLOWED";
+    let second_sentinel = "RESOURCE_STREAM_SECOND_EVENT_SHOULD_NOT_LEAK";
+    let first = serde_json::json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 0,
+        "response_id": "resp_stream_event_limit",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": first_sentinel
+    });
+    let second = serde_json::json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 1,
+        "response_id": "resp_stream_event_limit",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": second_sentinel
+    });
+    let upstream_body = [
+        format_sse_event("response.output_text.delta", &first),
+        format_sse_event("response.output_text.delta", &second),
+    ]
+    .concat();
+    let (mock_base, _seen_requests, server) = spawn_recorded_responses_resource_stream_mock(
+        StatusCode::OK,
+        "text/event-stream",
+        upstream_body,
+    )
+    .await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+    set_resource_limits(
+        &state,
+        crate::config::ResourceLimits {
+            stream_max_events: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_stream_event_limit".to_string(),
+        None,
+        Some("stream=true".to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response_body_text(response).await;
+    assert!(body_text.contains(first_sentinel), "{body_text}");
+    assert!(
+        body_text.contains("\"code\":\"upstream_stream_event_limit_exceeded\""),
+        "{body_text}"
+    );
+    assert!(!body_text.contains(second_sentinel), "{body_text}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn openai_responses_state_resource_routes_preserve_method_path_query_body_and_headers() {
+    let (mock_base, recorded, upstream_server) = spawn_recording_responses_resource_mock().await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+    {
+        let mut runtime = state.runtime.write().await;
+        let default_namespace = runtime
+            .namespaces
+            .get(DEFAULT_NAMESPACE)
+            .expect("default namespace")
+            .clone();
+        runtime
+            .namespaces
+            .insert("tenant".to_string(), default_namespace);
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy listener");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+    let proxy_server =
+        tokio::spawn(
+            async move { run_server(state, listener, data_auth::DataAccess::Disabled).await },
+        );
+    let proxy_base = format!("http://{proxy_addr}");
+    let client = reqwest::Client::new();
+
+    let post_body = serde_json::json!({
+        "input": [{ "role": "user", "content": "hello" }],
+        "metadata": { "source": "route-test" }
+    });
+    let cases = vec![
+        (
+            "default response input items",
+            reqwest::Method::GET,
+            "/openai/v1/responses/resp%2Fstate%3Fowned/input_items?after=item%2F1&limit=2",
+            "/responses/resp%2Fstate%3Fowned/input_items?after=item%2F1&limit=2",
+            None,
+        ),
+        (
+            "default response input items dot segment",
+            reqwest::Method::GET,
+            "/openai/v1/responses/%2E%2E/input_items?after=%2E",
+            "/responses/%2E%2E/input_items?after=%2E",
+            None,
+        ),
+        (
+            "default input tokens",
+            reqwest::Method::POST,
+            "/openai/v1/responses/input_tokens?trace=keep",
+            "/responses/input_tokens?trace=keep",
+            Some(post_body.clone()),
+        ),
+        (
+            "default create conversation",
+            reqwest::Method::POST,
+            "/openai/v1/conversations?trace=keep",
+            "/conversations?trace=keep",
+            Some(serde_json::json!({ "metadata": { "tenant": "default" } })),
+        ),
+        (
+            "default get conversation",
+            reqwest::Method::GET,
+            "/openai/v1/conversations/conv%2Fstate%3Fowned?include=items",
+            "/conversations/conv%2Fstate%3Fowned?include=items",
+            None,
+        ),
+        (
+            "default update conversation",
+            reqwest::Method::POST,
+            "/openai/v1/conversations/conv%2Fstate%3Fowned?trace=keep",
+            "/conversations/conv%2Fstate%3Fowned?trace=keep",
+            Some(serde_json::json!({ "metadata": { "phase": "update" } })),
+        ),
+        (
+            "default delete conversation",
+            reqwest::Method::DELETE,
+            "/openai/v1/conversations/conv%2Fstate%3Fowned?trace=keep",
+            "/conversations/conv%2Fstate%3Fowned?trace=keep",
+            None,
+        ),
+        (
+            "default list conversation items",
+            reqwest::Method::GET,
+            "/openai/v1/conversations/conv%2Fstate%3Fowned/items?after=item%2F0",
+            "/conversations/conv%2Fstate%3Fowned/items?after=item%2F0",
+            None,
+        ),
+        (
+            "default create conversation item",
+            reqwest::Method::POST,
+            "/openai/v1/conversations/conv%2Fstate%3Fowned/items?trace=keep",
+            "/conversations/conv%2Fstate%3Fowned/items?trace=keep",
+            Some(serde_json::json!({
+                "items": [{ "type": "message", "role": "user", "content": "item" }]
+            })),
+        ),
+        (
+            "default get conversation item",
+            reqwest::Method::GET,
+            "/openai/v1/conversations/conv%2Fstate%3Fowned/items/item%2Fstate%3Fowned?include=content",
+            "/conversations/conv%2Fstate%3Fowned/items/item%2Fstate%3Fowned?include=content",
+            None,
+        ),
+        (
+            "default get conversation item dot segments",
+            reqwest::Method::GET,
+            "/openai/v1/conversations/%2E/items/%2E%2E",
+            "/conversations/%2E/items/%2E%2E",
+            None,
+        ),
+        (
+            "default delete conversation item",
+            reqwest::Method::DELETE,
+            "/openai/v1/conversations/conv%2Fstate%3Fowned/items/item%2Fstate%3Fowned?trace=keep",
+            "/conversations/conv%2Fstate%3Fowned/items/item%2Fstate%3Fowned?trace=keep",
+            None,
+        ),
+        (
+            "namespaced response input items",
+            reqwest::Method::GET,
+            "/namespaces/tenant/openai/v1/responses/resp%2Ftenant%3Fowned/input_items?after=item%2F1",
+            "/responses/resp%2Ftenant%3Fowned/input_items?after=item%2F1",
+            None,
+        ),
+        (
+            "namespaced response input items dot segment",
+            reqwest::Method::GET,
+            "/namespaces/tenant/openai/v1/responses/%2E%2E/input_items",
+            "/responses/%2E%2E/input_items",
+            None,
+        ),
+        (
+            "namespaced input tokens",
+            reqwest::Method::POST,
+            "/namespaces/tenant/openai/v1/responses/input_tokens?trace=tenant",
+            "/responses/input_tokens?trace=tenant",
+            Some(post_body),
+        ),
+        (
+            "namespaced create conversation",
+            reqwest::Method::POST,
+            "/namespaces/tenant/openai/v1/conversations?trace=tenant",
+            "/conversations?trace=tenant",
+            Some(serde_json::json!({ "metadata": { "tenant": "tenant" } })),
+        ),
+        (
+            "namespaced get conversation",
+            reqwest::Method::GET,
+            "/namespaces/tenant/openai/v1/conversations/conv%2Ftenant%3Fowned?include=items",
+            "/conversations/conv%2Ftenant%3Fowned?include=items",
+            None,
+        ),
+        (
+            "namespaced update conversation",
+            reqwest::Method::POST,
+            "/namespaces/tenant/openai/v1/conversations/conv%2Ftenant%3Fowned",
+            "/conversations/conv%2Ftenant%3Fowned",
+            Some(serde_json::json!({ "metadata": { "phase": "tenant-update" } })),
+        ),
+        (
+            "namespaced delete conversation",
+            reqwest::Method::DELETE,
+            "/namespaces/tenant/openai/v1/conversations/conv%2Ftenant%3Fowned?trace=tenant",
+            "/conversations/conv%2Ftenant%3Fowned?trace=tenant",
+            None,
+        ),
+        (
+            "namespaced list conversation items",
+            reqwest::Method::GET,
+            "/namespaces/tenant/openai/v1/conversations/conv%2Ftenant%3Fowned/items?after=item%2F0",
+            "/conversations/conv%2Ftenant%3Fowned/items?after=item%2F0",
+            None,
+        ),
+        (
+            "namespaced create conversation item",
+            reqwest::Method::POST,
+            "/namespaces/tenant/openai/v1/conversations/conv%2Ftenant%3Fowned/items",
+            "/conversations/conv%2Ftenant%3Fowned/items",
+            Some(serde_json::json!({
+                "items": [{ "type": "message", "role": "user", "content": "tenant item" }]
+            })),
+        ),
+        (
+            "namespaced get conversation item",
+            reqwest::Method::GET,
+            "/namespaces/tenant/openai/v1/conversations/conv%2Ftenant%3Fowned/items/item%2Ftenant%3Fowned?include=content",
+            "/conversations/conv%2Ftenant%3Fowned/items/item%2Ftenant%3Fowned?include=content",
+            None,
+        ),
+        (
+            "namespaced get conversation item dot segments",
+            reqwest::Method::GET,
+            "/namespaces/tenant/openai/v1/conversations/%2E/items/%2E%2E",
+            "/conversations/%2E/items/%2E%2E",
+            None,
+        ),
+        (
+            "namespaced delete conversation item",
+            reqwest::Method::DELETE,
+            "/namespaces/tenant/openai/v1/conversations/conv%2Ftenant%3Fowned/items/item%2Ftenant%3Fowned?trace=tenant",
+            "/conversations/conv%2Ftenant%3Fowned/items/item%2Ftenant%3Fowned?trace=tenant",
+            None,
+        ),
+    ];
+
+    for (label, method, proxy_path, _upstream_path, body) in &cases {
+        let (status, body_text) = if proxy_path.contains("%2E") || proxy_path.contains("%2e") {
+            send_raw_proxy_resource_request(proxy_addr, method, proxy_path, label, body.as_ref())
+                .await
+        } else {
+            let mut request = client
+                .request(method.clone(), format!("{proxy_base}{proxy_path}"))
+                .header("openai-api-key", "client-secret")
+                .header("x-stainless-helper-method", *label)
+                .header("OpenAI-Organization", "org-route-preserve")
+                .header("OpenAI-Project", "proj-route-preserve")
+                .header("Idempotency-Key", format!("idem-{label}"))
+                .header(data_auth::DATA_TOKEN_HEADER, "data-token-must-not-forward");
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = request.send().await.expect("proxy response");
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            (status, body_text)
+        };
+        assert!(
+            status.is_success(),
+            "{label}: status={status} body={body_text}"
+        );
+    }
+
+    let requests = recorded.lock().await;
+    assert_eq!(requests.len(), cases.len(), "requests = {requests:?}");
+    for (recorded, (label, method, _proxy_path, upstream_path, body)) in
+        requests.iter().zip(cases.iter())
+    {
+        assert_eq!(recorded.method.as_str(), method.as_str(), "{label}");
+        assert_eq!(recorded.uri.as_str(), *upstream_path, "{label}");
+        assert_eq!(&recorded.body, body, "{label}");
+        assert_eq!(
+            recorded.authorization.as_deref(),
+            Some("Bearer client-secret"),
+            "{label}"
+        );
+        assert_eq!(recorded.helper_method.as_deref(), Some(*label), "{label}");
+        assert_eq!(
+            recorded.openai_organization.as_deref(),
+            Some("org-route-preserve"),
+            "{label}"
+        );
+        assert_eq!(
+            recorded.openai_project.as_deref(),
+            Some("proj-route-preserve"),
+            "{label}"
+        );
+        let expected_idempotency_key = format!("idem-{label}");
+        assert_eq!(
+            recorded.idempotency_key.as_deref(),
+            Some(expected_idempotency_key.as_str()),
+            "{label}"
+        );
+        assert_eq!(recorded.data_token.as_deref(), None, "{label}");
+        if body.is_some() {
+            assert_eq!(
+                recorded.content_type.as_deref(),
+                Some("application/json"),
+                "{label}"
+            );
+        } else {
+            assert_eq!(recorded.content_type.as_deref(), None, "{label}");
+        }
+    }
+
+    proxy_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn openai_responses_state_resource_routes_fail_closed_without_unique_available_native_upstream(
+) {
+    let cases = [
+        (
+            "no native upstream",
+            runtime_namespace_state_for_tests(&[(
+                "anthropic",
+                crate::formats::UpstreamFormat::Anthropic,
+                true,
+            )]),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            "multiple native upstreams",
+            runtime_namespace_state_for_tests(&[
+                (
+                    "responses-a",
+                    crate::formats::UpstreamFormat::OpenAiResponses,
+                    true,
+                ),
+                (
+                    "responses-b",
+                    crate::formats::UpstreamFormat::OpenAiResponses,
+                    true,
+                ),
+            ]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "unavailable native upstream",
+            runtime_namespace_state_for_tests(&[(
+                "responses",
+                crate::formats::UpstreamFormat::OpenAiResponses,
+                false,
+            )]),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ];
+
+    for (label, namespace_state, expected_status) in cases {
+        let state = Arc::new(AppState {
+            runtime: Arc::new(RwLock::new(RuntimeState {
+                namespaces: BTreeMap::from([(DEFAULT_NAMESPACE.to_string(), namespace_state)]),
+            })),
+            metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
+            admin_access: AdminAccess::LoopbackOnly,
+            data_auth_policy: loopback_data_auth_policy_for_tests(),
+        });
+
+        let response = handle_openai_responses_resource(
+            state,
+            DEFAULT_NAMESPACE.to_string(),
+            HeaderMap::new(),
+            reqwest::Method::POST,
+            "responses/input_tokens".to_string(),
+            Some(serde_json::json!({ "input": "count me" })),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), expected_status, "{label}");
+    }
 }
 
 #[test]
@@ -344,6 +1156,7 @@ fn resolve_native_responses_stateful_route_or_error_rejects_multi_upstream_auto_
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
     let (responses_client, responses_streaming_client, responses_resolved_proxy) =
         crate::upstream::build_upstream_clients(
@@ -477,6 +1290,7 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
         &config,
@@ -518,6 +1332,7 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
         })),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
+        data_auth_policy: loopback_data_auth_policy_for_tests(),
     });
 
     let response = handle_openai_responses_resource(

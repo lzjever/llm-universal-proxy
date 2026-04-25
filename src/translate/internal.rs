@@ -1109,7 +1109,7 @@ fn anthropic_block_has_nonportable_thinking_provenance(block: &Value) -> bool {
         || block
             .get("thinking")
             .map(|thinking| !thinking.is_string())
-            .unwrap_or(false)
+            .unwrap_or(true)
 }
 
 fn anthropic_blocks_have_nonportable_thinking_provenance(blocks: &[Value]) -> bool {
@@ -1300,6 +1300,68 @@ fn gemini_request_nonportable_function_response_message(
     None
 }
 
+fn gemini_request_nonportable_provider_field_message(
+    body: &Value,
+    target_label: &str,
+) -> Option<String> {
+    for (camel, snake, risk) in [
+        ("cachedContent", "cached_content", "provider cache state"),
+        (
+            "safetySettings",
+            "safety_settings",
+            "provider safety policy",
+        ),
+    ] {
+        if body.get(camel).is_some() {
+            return Some(format!(
+                "Gemini request field `{camel}` carries {risk} and cannot be faithfully translated to {target_label}"
+            ));
+        }
+        if body.get(snake).is_some() {
+            return Some(format!(
+                "Gemini request field `{snake}` carries {risk} and cannot be faithfully translated to {target_label}"
+            ));
+        }
+    }
+
+    if let Some(field) = gemini_request_thought_signature_field(body) {
+        return Some(gemini_request_thought_signature_not_portable_message(
+            field,
+            target_label,
+        ));
+    }
+    None
+}
+
+fn gemini_request_thought_signature_field(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("thoughtSignature") {
+                return Some("thoughtSignature");
+            }
+            if object.contains_key("thought_signature") {
+                return Some("thought_signature");
+            }
+            object
+                .values()
+                .find_map(gemini_request_thought_signature_field)
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(gemini_request_thought_signature_field),
+        _ => None,
+    }
+}
+
+fn gemini_request_thought_signature_not_portable_message(
+    field: &str,
+    target_label: &str,
+) -> String {
+    format!(
+        "Gemini content part field `{field}` carries provider thought-signature state and cannot be faithfully translated to {target_label}"
+    )
+}
+
 fn gemini_request_nonportable_tool_message(body: &Value, target_label: &str) -> Option<String> {
     if let Some(tools) = gemini_request_tools(body) {
         for tool in tools {
@@ -1409,7 +1471,8 @@ fn gemini_request_nonportable_tool_message(body: &Value, target_label: &str) -> 
 }
 
 fn gemini_request_nonportable_message(body: &Value, target_label: &str) -> Option<String> {
-    gemini_request_nonportable_tool_message(body, target_label)
+    gemini_request_nonportable_provider_field_message(body, target_label)
+        .or_else(|| gemini_request_nonportable_tool_message(body, target_label))
         .or_else(|| gemini_request_nonportable_output_shape_message(body, target_label))
         .or_else(|| gemini_request_nonportable_function_response_message(body, target_label))
 }

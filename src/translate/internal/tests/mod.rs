@@ -4131,7 +4131,7 @@ fn translate_request_responses_to_openai_maps_shared_controls_and_drops_response
         "top_logprobs": 5,
         "service_tier": "priority",
         "stream_options": { "include_obfuscation": false },
-        "include": ["reasoning.encrypted_content"],
+        "include": ["message.input_image.image_url"],
         "text": {
             "format": { "type": "text" },
             "verbosity": "high"
@@ -4304,7 +4304,7 @@ fn translate_request_responses_to_non_responses_rejects_item_reference_items() {
 }
 
 #[test]
-fn translate_request_responses_to_openai_downgrades_reasoning_encrypted_content_items() {
+fn translate_request_responses_to_openai_rejects_reasoning_encrypted_content_items() {
     let mut body = json!({
         "model": "gpt-4o",
         "input": [{
@@ -4313,24 +4313,22 @@ fn translate_request_responses_to_openai_downgrades_reasoning_encrypted_content_
             "encrypted_content": "opaque_state"
         }]
     });
+    let original = body.clone();
 
-    translate_request(
+    let err = translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::OpenAiCompletion,
         "target-model",
         &mut body,
         false,
     )
-    .expect("Responses reasoning encrypted_content should downgrade on Chat-compatible upstreams");
-
-    let messages = body["messages"].as_array().expect("messages");
-    assert_eq!(messages.len(), 1, "messages = {messages:?}");
-    assert_eq!(messages[0]["role"], "assistant");
-    assert_eq!(messages[0]["reasoning_content"], "thinking");
-    assert!(
-        messages[0].get("_anthropic_reasoning_replay").is_none(),
-        "messages = {messages:?}"
+    .expect_err(
+        "Responses reasoning encrypted_content should fail closed on Chat-compatible upstreams",
     );
+
+    assert!(err.contains("encrypted_content"), "err = {err}");
+    assert!(err.contains("native OpenAI Responses"), "err = {err}");
+    assert_eq!(body, original);
 }
 
 #[test]
@@ -4357,7 +4355,7 @@ fn translate_request_responses_to_google_rejects_reasoning_encrypted_content_ite
 }
 
 #[test]
-fn translate_request_responses_to_claude_drops_malformed_reasoning_carrier_but_preserves_summary() {
+fn translate_request_responses_to_claude_rejects_malformed_reasoning_carrier() {
     let mut body = json!({
         "model": "claude-3",
         "input": [{
@@ -4370,27 +4368,19 @@ fn translate_request_responses_to_claude_drops_malformed_reasoning_carrier_but_p
             "content": [{ "type": "output_text", "text": "Visible answer" }]
         }]
     });
+    let original = body.clone();
 
-    translate_request(
+    let err = translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect("malformed Responses reasoning carrier should not fail closed for Anthropic");
+    .expect_err("malformed Responses reasoning carrier should fail closed for Anthropic");
 
-    let messages = body["messages"].as_array().expect("anthropic messages");
-    assert_eq!(messages.len(), 1, "messages = {messages:?}");
-    assert_eq!(messages[0]["role"], "assistant");
-    assert!(messages[0].get("reasoning_content").is_none());
-    let assistant_content = messages[0]["content"]
-        .as_array()
-        .expect("assistant content");
-    assert_eq!(assistant_content[0]["type"], "thinking");
-    assert_eq!(assistant_content[0]["thinking"], "thinking");
-    assert_eq!(assistant_content[1]["type"], "text");
-    assert_eq!(assistant_content[1]["text"], "Visible answer");
+    assert!(err.contains("encrypted_content"), "err = {err}");
+    assert_eq!(body, original);
 }
 
 #[test]
@@ -4429,26 +4419,86 @@ fn translate_request_responses_to_openai_preserves_function_tool_strict() {
 
 #[test]
 fn translate_request_responses_to_openai_rejects_stateful_responses_controls() {
+    let cases = [
+        (
+            "previous_response_id",
+            json!({
+                "model": "gpt-4o",
+                "input": "Hello",
+                "previous_response_id": "resp_123"
+            }),
+        ),
+        (
+            "conversation",
+            json!({
+                "model": "gpt-4o",
+                "input": "Hello",
+                "conversation": { "id": "conv_123" }
+            }),
+        ),
+        (
+            "background",
+            json!({
+                "model": "gpt-4o",
+                "input": "Hello",
+                "background": true
+            }),
+        ),
+        (
+            "prompt",
+            json!({
+                "model": "gpt-4o",
+                "prompt": { "id": "pmpt_123", "version": "1" },
+                "input": "Hello"
+            }),
+        ),
+    ];
+
+    for (field, original) in cases {
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::Google,
+        ] {
+            let mut body = original.clone();
+            let err = translate_request(
+                UpstreamFormat::OpenAiResponses,
+                upstream_format,
+                "gpt-4o",
+                &mut body,
+                true,
+            )
+            .expect_err("stateful responses controls should fail closed");
+
+            assert!(err.contains(field), "field = {field}, err = {err}");
+            assert_eq!(body, original);
+        }
+    }
+}
+
+#[test]
+fn translate_request_responses_passthrough_preserves_native_stateful_controls() {
     let mut body = json!({
         "model": "gpt-4o",
         "input": "Hello",
-        "previous_response_id": "resp_123"
+        "store": true,
+        "previous_response_id": "resp_123",
+        "conversation": { "id": "conv_123" },
+        "background": true,
+        "prompt": { "id": "pmpt_123", "version": "1" }
     });
+    let original = body.clone();
 
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiResponses,
-        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
         "gpt-4o",
         &mut body,
         true,
     )
-    .expect_err("stateful responses controls should fail closed");
+    .expect("same-protocol Responses passthrough should preserve native stateful controls");
 
-    assert_eq!(
-            err,
-            "Responses request controls `previous_response_id` require a native OpenAI Responses upstream and cannot be translated to openai-completion; the proxy does not reconstruct provider state"
-        );
-    assert_eq!(body["previous_response_id"], "resp_123");
+    assert_eq!(body, original);
 }
 
 #[test]
@@ -5342,7 +5392,7 @@ fn translate_request_openai_to_gemini_does_not_attach_allowlist_for_auto_or_none
 }
 
 #[test]
-fn translate_request_openai_to_gemini_tool_turns_use_dummy_signature_without_reasoning_replay() {
+fn translate_request_openai_to_gemini_tool_turns_do_not_inject_thought_signature() {
     let mut body = json!({
         "model": "gemini-1.5",
         "messages": [
@@ -5390,12 +5440,18 @@ fn translate_request_openai_to_gemini_tool_turns_use_dummy_signature_without_rea
     assert!(assistant_parts.iter().all(|part| part["thought"] != true));
     assert_eq!(assistant_parts[0]["text"], "Calling tool.");
     assert!(assistant_parts[1].get("functionCall").is_some());
-    assert_eq!(
-        assistant_parts[1]["thoughtSignature"],
-        "skip_thought_signature_validator"
-    );
     assert!(assistant_parts[2].get("functionCall").is_some());
-    assert!(assistant_parts[2].get("thoughtSignature").is_none());
+    let function_parts = assistant_parts
+        .iter()
+        .filter(|part| part.get("functionCall").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(function_parts.len(), 2, "body = {body:?}");
+    assert!(
+        function_parts
+            .iter()
+            .all(|part| part.get("thoughtSignature").is_none()),
+        "body = {body:?}"
+    );
 }
 
 #[test]
@@ -5804,9 +5860,9 @@ fn translate_request_openai_history_custom_tool_call_to_gemini_rejects() {
     .expect_err("custom tool calls in history should fail closed");
 
     assert_eq!(
-            err,
-            "OpenAI custom tools cannot be faithfully translated to Gemini; refusing to downgrade them to function tools"
-        );
+        err,
+        "OpenAI custom tools cannot be faithfully translated to Gemini; refusing to downgrade them to function tools"
+    );
 }
 
 #[test]
@@ -5833,9 +5889,9 @@ fn translate_request_openai_custom_tool_to_anthropic_rejects() {
     .expect_err("custom tools should fail closed for anthropic");
 
     assert_eq!(
-            err,
-            "OpenAI custom tools cannot be faithfully translated to Anthropic; refusing to downgrade them to function tools"
-        );
+        err,
+        "OpenAI custom tools cannot be faithfully translated to Anthropic; refusing to downgrade them to function tools"
+    );
 }
 
 #[test]
@@ -7768,6 +7824,158 @@ fn assess_request_translation_gemini_top_k_warns_and_translation_omits_it() {
 }
 
 #[test]
+fn translate_request_gemini_to_non_gemini_rejects_provider_state_safety_and_thought_signature_fields(
+) {
+    let cases = [
+        (
+            "cachedContent",
+            json!({
+                "model": "gemini-1.5",
+                "cachedContent": "cachedContents/abc123",
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+            }),
+        ),
+        (
+            "cached_content",
+            json!({
+                "model": "gemini-1.5",
+                "cached_content": "cachedContents/abc123",
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+            }),
+        ),
+        (
+            "safetySettings",
+            json!({
+                "model": "gemini-1.5",
+                "safetySettings": [{
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "threshold": "BLOCK_NONE"
+                }],
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+            }),
+        ),
+        (
+            "safety_settings",
+            json!({
+                "model": "gemini-1.5",
+                "safety_settings": [{
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "threshold": "BLOCK_NONE"
+                }],
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+            }),
+        ),
+        (
+            "thoughtSignature",
+            json!({
+                "model": "gemini-1.5",
+                "contents": [{
+                    "role": "model",
+                    "parts": [{
+                        "text": "Calling tool.",
+                        "thoughtSignature": "real_provider_signature"
+                    }]
+                }]
+            }),
+        ),
+        (
+            "thought_signature",
+            json!({
+                "model": "gemini-1.5",
+                "history": [{
+                    "role": "model",
+                    "parts": [{
+                        "text": "Calling tool.",
+                        "thought_signature": "real_provider_signature"
+                    }]
+                }],
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+            }),
+        ),
+        (
+            "thoughtSignature",
+            json!({
+                "model": "gemini-1.5",
+                "contents": [{
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": "lookup",
+                            "response": {
+                                "parts": [{
+                                    "text": "Tool result",
+                                    "thoughtSignature": "nested_provider_signature"
+                                }]
+                            }
+                        }
+                    }]
+                }]
+            }),
+        ),
+    ];
+
+    for (field, body) in cases {
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Anthropic,
+        ] {
+            let mut translated = body.clone();
+            let err = translate_request(
+                UpstreamFormat::Google,
+                upstream_format,
+                "target-model",
+                &mut translated,
+                false,
+            )
+            .expect_err(&format!(
+                "Gemini field {field} should fail closed when translating to {upstream_format:?}"
+            ));
+
+            assert!(err.contains(field), "field = {field}, err = {err}");
+        }
+    }
+}
+
+#[test]
+fn translate_request_gemini_passthrough_preserves_native_provider_fields() {
+    let mut body = json!({
+        "model": "gemini-1.5",
+        "cachedContent": "cachedContents/abc123",
+        "safetySettings": [{
+            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "threshold": "BLOCK_NONE"
+        }],
+        "contents": [{
+            "role": "model",
+            "parts": [{
+                "text": "Calling tool.",
+                "thoughtSignature": "real_provider_signature"
+            }]
+        }],
+        "history": [{
+            "role": "model",
+            "parts": [{
+                "text": "Prior tool call.",
+                "thought_signature": "prior_provider_signature"
+            }]
+        }]
+    });
+    let original = body.clone();
+
+    translate_request(
+        UpstreamFormat::Google,
+        UpstreamFormat::Google,
+        "gemini-1.5",
+        &mut body,
+        false,
+    )
+    .expect("same-protocol Gemini passthrough should preserve native fields");
+
+    assert_eq!(body, original);
+}
+
+#[test]
 fn assess_request_translation_gemini_to_anthropic_warns_on_dropped_logprobs_controls() {
     let body = json!({
         "model": "gemini-1.5",
@@ -7815,8 +8023,7 @@ fn assess_request_translation_openai_to_anthropic_reasoning_without_replay_prove
 }
 
 #[test]
-fn assess_request_translation_responses_to_openai_warns_when_reasoning_encrypted_content_is_dropped(
-) {
+fn assess_request_translation_responses_to_openai_rejects_reasoning_encrypted_content() {
     let body = json!({
         "model": "gpt-4o",
         "input": [{
@@ -7831,20 +8038,18 @@ fn assess_request_translation_responses_to_openai_warns_when_reasoning_encrypted
         UpstreamFormat::OpenAiCompletion,
         &body,
     );
-    let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
-        panic!("expected warning policy, got {assessment:?}");
+    let TranslationDecision::Reject(message) = assessment.decision() else {
+        panic!("expected reject policy, got {assessment:?}");
     };
-    let joined = warnings.join("\n");
+    assert!(message.contains("encrypted_content"), "message = {message}");
     assert!(
-        joined.contains("encrypted_content"),
-        "warnings = {warnings:?}"
+        message.contains("native OpenAI Responses"),
+        "message = {message}"
     );
-    assert!(joined.contains("dropped"), "warnings = {warnings:?}");
-    assert!(joined.contains("summary"), "warnings = {warnings:?}");
 }
 
 #[test]
-fn assess_request_translation_store_warns_and_cross_provider_translation_drops_it() {
+fn assess_request_translation_store_warns_except_responses_store_true_fails_closed() {
     let gemini_body = json!({
         "model": "gemini-1.5",
         "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }],
@@ -7881,7 +8086,7 @@ fn assess_request_translation_store_warns_and_cross_provider_translation_drops_i
         .iter()
         .any(|warning| warning.contains("store")));
 
-    let mut responses_body = json!({
+    let responses_body = json!({
         "model": "gpt-4o",
         "input": "Hi",
         "store": true
@@ -7891,14 +8096,13 @@ fn assess_request_translation_store_warns_and_cross_provider_translation_drops_i
         UpstreamFormat::OpenAiCompletion,
         &responses_body,
     );
-    let TranslationDecision::AllowWithWarnings(responses_warnings) =
-        responses_assessment.decision()
-    else {
-        panic!("expected Responses store warning, got {responses_assessment:?}");
+    let TranslationDecision::Reject(responses_message) = responses_assessment.decision() else {
+        panic!("expected Responses store=true reject, got {responses_assessment:?}");
     };
-    assert!(responses_warnings
-        .iter()
-        .any(|warning| warning.contains("store")));
+    assert!(
+        responses_message.contains("store"),
+        "message = {responses_message}"
+    );
 
     translate_request(
         UpstreamFormat::OpenAiCompletion,
@@ -7909,20 +8113,29 @@ fn assess_request_translation_store_warns_and_cross_provider_translation_drops_i
     )
     .unwrap();
 
-    translate_request(
+    let mut responses_cross_protocol = responses_body.clone();
+    let err = translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
-        &mut responses_body,
+        &mut responses_cross_protocol,
         false,
     )
-    .unwrap();
+    .expect_err("Responses store=true should fail closed cross-protocol");
+    assert!(err.contains("store"), "err = {err}");
 
     assert!(openai_body.get("store").is_none(), "body = {openai_body:?}");
-    assert!(
-        responses_body.get("store").is_none(),
-        "body = {responses_body:?}"
-    );
+
+    let mut responses_passthrough = responses_body;
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        &mut responses_passthrough,
+        false,
+    )
+    .expect("same-protocol Responses passthrough should preserve store");
+    assert_eq!(responses_passthrough["store"], true);
 }
 
 #[test]
@@ -8176,7 +8389,7 @@ fn assess_request_translation_openai_to_anthropic_warns_on_prediction_and_web_se
 }
 
 #[test]
-fn assess_request_translation_responses_to_non_responses_warns_on_context_management_drop() {
+fn assess_request_translation_responses_to_non_responses_rejects_context_management() {
     let body = json!({
         "model": "gpt-4o",
         "input": "Hi",
@@ -8192,20 +8405,89 @@ fn assess_request_translation_responses_to_non_responses_warns_on_context_manage
     ] {
         let assessment =
             assess_request_translation(UpstreamFormat::OpenAiResponses, upstream_format, &body);
-        let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
-            panic!("expected warning policy, got {assessment:?}");
+        let TranslationDecision::Reject(message) = assessment.decision() else {
+            panic!("expected reject policy, got {assessment:?}");
         };
-        let joined = warnings.join("\n");
         assert!(
-            joined.contains("context_management"),
-            "upstream = {upstream_format:?}, warnings = {warnings:?}"
+            message.contains("context_management"),
+            "upstream = {upstream_format:?}, message = {message}"
         );
     }
 }
 
 #[test]
-fn assess_request_translation_claude_to_openai_warns_on_dropped_thinking_context_management_and_cache_controls(
-) {
+fn assess_request_translation_responses_reasoning_encrypted_content_include_rejects_cross_provider()
+{
+    let body = json!({
+        "model": "gpt-4o",
+        "input": "Hi",
+        "include": ["reasoning.encrypted_content"]
+    });
+
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Google,
+    ] {
+        let assessment =
+            assess_request_translation(UpstreamFormat::OpenAiResponses, upstream_format, &body);
+        let TranslationDecision::Reject(message) = assessment.decision() else {
+            panic!("expected reject policy, got {assessment:?}");
+        };
+        assert!(
+            message.contains("reasoning.encrypted_content"),
+            "upstream = {upstream_format:?}, message = {message}"
+        );
+    }
+}
+
+#[test]
+fn assess_request_translation_responses_reasoning_encrypted_carrier_rejects_cross_provider() {
+    let valid_carrier = super::openai_responses::encode_anthropic_reasoning_carrier(&[json!({
+        "type": "thinking",
+        "thinking": "internal reasoning",
+        "signature": "sig_123"
+    })])
+    .expect("carrier should encode");
+
+    for (label, encrypted_content) in [
+        ("valid", valid_carrier.as_str()),
+        ("malformed", "not-a-valid-reasoning-carrier"),
+    ] {
+        let body = json!({
+            "model": "gpt-4o",
+            "input": [{
+                "type": "reasoning",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": "internal reasoning"
+                }],
+                "encrypted_content": encrypted_content
+            }]
+        });
+
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::Google,
+        ] {
+            let assessment =
+                assess_request_translation(UpstreamFormat::OpenAiResponses, upstream_format, &body);
+            let TranslationDecision::Reject(message) = assessment.decision() else {
+                panic!(
+                    "expected reject policy for {label} carrier to {upstream_format:?}, got {assessment:?}"
+                );
+            };
+            assert!(
+                message.contains("encrypted_content"),
+                "label = {label}, upstream = {upstream_format:?}, message = {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn assess_request_translation_claude_to_openai_rejects_top_level_thinking_and_context_management() {
     let body = json!({
         "model": "claude-3",
         "thinking": {
@@ -8215,6 +8497,28 @@ fn assess_request_translation_claude_to_openai_warns_on_dropped_thinking_context
         "context_management": {
             "type": "auto"
         },
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+
+    let assessment = assess_request_translation(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        &body,
+    );
+    let TranslationDecision::Reject(message) = assessment.decision() else {
+        panic!("expected reject policy, got {assessment:?}");
+    };
+    assert!(message.contains("thinking"), "message = {message}");
+    assert!(
+        message.contains("context_management"),
+        "message = {message}"
+    );
+}
+
+#[test]
+fn assess_request_translation_claude_to_openai_still_warns_on_dropped_cache_controls() {
+    let body = json!({
+        "model": "claude-3",
         "cache_control": {
             "type": "ephemeral"
         },
@@ -8237,61 +8541,77 @@ fn assess_request_translation_claude_to_openai_warns_on_dropped_thinking_context
         panic!("expected warning policy, got {assessment:?}");
     };
     let joined = warnings.join("\n");
-    assert!(joined.contains("thinking"), "warnings = {warnings:?}");
-    assert!(
-        joined.contains("context_management"),
-        "warnings = {warnings:?}"
-    );
     assert!(joined.contains("cache_control"), "warnings = {warnings:?}");
 }
 
 #[test]
-fn assess_request_translation_claude_to_openai_warns_on_dropped_thinking_provenance() {
-    let body = json!({
-        "model": "claude-3",
-        "messages": [{
-            "role": "assistant",
-            "content": [{
-                "type": "thinking",
-                "thinking": "internal reasoning",
-                "signature": "sig_123"
-            }]
-        }]
-    });
+fn assess_request_translation_claude_to_non_anthropic_rejects_non_lossless_thinking_blocks() {
+    let cases = [
+        (
+            "signature",
+            json!({
+                "model": "claude-3",
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{
+                        "type": "thinking",
+                        "thinking": "internal reasoning",
+                        "signature": "sig_123"
+                    }]
+                }]
+            }),
+        ),
+        (
+            "omitted",
+            json!({
+                "model": "claude-3",
+                "messages": [{
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": { "display": "omitted" },
+                            "signature": "sig_123"
+                        },
+                        { "type": "text", "text": "Visible answer" }
+                    ]
+                }]
+            }),
+        ),
+        (
+            "redacted_thinking",
+            json!({
+                "model": "claude-3",
+                "messages": [{
+                    "role": "assistant",
+                    "content": [{
+                        "type": "redacted_thinking",
+                        "data": "opaque_provider_state"
+                    }]
+                }]
+            }),
+        ),
+    ];
 
-    let assessment = assess_request_translation(
-        UpstreamFormat::Anthropic,
-        UpstreamFormat::OpenAiCompletion,
-        &body,
-    );
-    let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
-        panic!("expected warning policy, got {assessment:?}");
-    };
-    let joined = warnings.join("\n");
-    assert!(joined.contains("signature"), "warnings = {warnings:?}");
-    assert!(joined.contains("dropped"), "warnings = {warnings:?}");
-}
-
-#[test]
-fn assess_request_translation_claude_to_responses_allows_thinking_provenance_with_carrier() {
-    let body = json!({
-        "model": "claude-3",
-        "messages": [{
-            "role": "assistant",
-            "content": [{
-                "type": "thinking",
-                "thinking": "internal reasoning",
-                "signature": "sig_123"
-            }]
-        }]
-    });
-
-    let assessment = assess_request_translation(
-        UpstreamFormat::Anthropic,
-        UpstreamFormat::OpenAiResponses,
-        &body,
-    );
-    assert_eq!(assessment.decision(), TranslationDecision::Allow);
+    for (expected, body) in cases {
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Google,
+        ] {
+            let assessment =
+                assess_request_translation(UpstreamFormat::Anthropic, upstream_format, &body);
+            let TranslationDecision::Reject(message) = assessment.decision() else {
+                panic!(
+                    "expected reject policy for {expected} to {upstream_format:?}, got {assessment:?}"
+                );
+            };
+            assert!(
+                message.contains(expected),
+                "expected = {expected}, upstream = {upstream_format:?}, message = {message}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -8353,7 +8673,7 @@ fn assess_request_translation_responses_to_openai_warns_on_truly_dropped_control
         "frequency_penalty": 0.3,
         "top_logprobs": 5,
         "stream_options": { "include_obfuscation": true },
-        "include": ["reasoning.encrypted_content"],
+        "include": ["file_search_call.results"],
         "reasoning": { "effort": "medium" },
         "text": {
             "format": { "type": "text" },
@@ -9812,8 +10132,8 @@ fn translate_request_claude_to_openai_omitted_stream_defaults_false() {
 }
 
 #[test]
-fn translate_request_claude_signed_thinking_preserves_text_and_responses_carrier() {
-    let body = json!({
+fn translate_request_claude_signed_thinking_fails_closed_cross_protocol() {
+    let original = json!({
         "model": "claude-3",
         "messages": [{
             "role": "assistant",
@@ -9830,48 +10150,138 @@ fn translate_request_claude_signed_thinking_preserves_text_and_responses_carrier
         UpstreamFormat::Google,
         UpstreamFormat::OpenAiResponses,
     ] {
-        let mut translated = body.clone();
-        translate_request(
+        let mut translated = original.clone();
+        let err = translate_request(
             UpstreamFormat::Anthropic,
             upstream_format,
             "claude-3",
             &mut translated,
             false,
         )
-        .expect("signed thinking provenance should degrade instead of fail closed");
+        .expect_err("signed thinking provenance should fail closed cross-protocol");
 
-        match upstream_format {
-            UpstreamFormat::OpenAiCompletion => {
-                assert_eq!(
-                    translated["messages"][0]["reasoning_content"],
-                    "internal reasoning"
-                );
-                assert!(translated["messages"][0]
-                    .get("_anthropic_reasoning_replay")
-                    .is_none());
-            }
-            UpstreamFormat::Google => {
-                let parts = translated["contents"][0]["parts"]
-                    .as_array()
-                    .expect("gemini parts");
-                assert_eq!(parts[0]["thought"], true);
-                assert_eq!(parts[0]["text"], "internal reasoning");
-            }
-            UpstreamFormat::OpenAiResponses => {
-                assert_eq!(translated["input"][0]["type"], "reasoning");
-                assert_eq!(
-                    translated["input"][0]["summary"][0]["text"],
-                    "internal reasoning"
-                );
-                assert!(translated["input"][0]["encrypted_content"].is_string());
-            }
-            _ => unreachable!(),
+        assert!(err.contains("signature"), "err = {err}");
+        assert_eq!(translated, original);
+    }
+}
+
+#[test]
+fn translate_request_responses_passthrough_preserves_native_state_and_reasoning_continuity_fields()
+{
+    let mut body = json!({
+        "model": "gpt-4o",
+        "context_management": {
+            "type": "auto",
+            "compact_threshold": 0.75
+        },
+        "include": ["reasoning.encrypted_content"],
+        "input": [{
+            "type": "reasoning",
+            "summary": [{
+                "type": "summary_text",
+                "text": "internal reasoning"
+            }],
+            "encrypted_content": "opaque-provider-state"
+        }]
+    });
+    let original = body.clone();
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        &mut body,
+        false,
+    )
+    .expect("same-provider Responses passthrough should preserve native fields");
+
+    assert_eq!(body, original);
+}
+
+#[test]
+fn translate_request_responses_high_risk_state_and_reasoning_continuity_fail_closed_cross_provider()
+{
+    let valid_carrier = super::openai_responses::encode_anthropic_reasoning_carrier(&[json!({
+        "type": "thinking",
+        "thinking": "internal reasoning",
+        "signature": "sig_123"
+    })])
+    .expect("carrier should encode");
+
+    let cases = [
+        (
+            "context_management",
+            json!({
+                "model": "gpt-4o",
+                "context_management": { "type": "auto" },
+                "input": "Hi"
+            }),
+        ),
+        (
+            "reasoning.encrypted_content",
+            json!({
+                "model": "gpt-4o",
+                "include": ["reasoning.encrypted_content"],
+                "input": "Hi"
+            }),
+        ),
+        (
+            "encrypted_content",
+            json!({
+                "model": "gpt-4o",
+                "input": [{
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "internal reasoning"
+                    }],
+                    "encrypted_content": valid_carrier
+                }]
+            }),
+        ),
+        (
+            "encrypted_content",
+            json!({
+                "model": "gpt-4o",
+                "input": [{
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": "internal reasoning"
+                    }],
+                    "encrypted_content": "not-a-valid-reasoning-carrier"
+                }]
+            }),
+        ),
+    ];
+
+    for (expected, original) in cases {
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::Google,
+        ] {
+            let mut body = original.clone();
+            let err = translate_request(
+                UpstreamFormat::OpenAiResponses,
+                upstream_format,
+                "gpt-4o",
+                &mut body,
+                false,
+            )
+            .expect_err("high-risk Responses fields should fail closed cross-provider");
+
+            assert!(
+                err.contains(expected),
+                "expected = {expected}, upstream = {upstream_format:?}, err = {err}"
+            );
+            assert_eq!(body, original);
         }
     }
 }
 
 #[test]
-fn translate_request_responses_to_claude_replays_anthropic_reasoning_carrier() {
+fn translate_request_responses_to_claude_rejects_anthropic_reasoning_carrier() {
     let signed_response = json!({
         "id": "msg_sig",
         "content": [
@@ -9922,30 +10332,23 @@ fn translate_request_responses_to_claude_replays_anthropic_reasoning_carrier() {
             }
         ]
     });
+    let original = body.clone();
 
-    translate_request(
+    let err = translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect("Responses reasoning carrier should replay to Anthropic");
+    .expect_err("Responses reasoning carrier should fail closed cross-provider");
 
-    let messages = body["messages"].as_array().expect("anthropic messages");
-    assert_eq!(messages[1]["role"], "assistant");
-    let assistant_content = messages[1]["content"]
-        .as_array()
-        .expect("assistant content");
-    assert_eq!(assistant_content[0]["type"], "thinking");
-    assert_eq!(assistant_content[0]["thinking"], "internal reasoning");
-    assert_eq!(assistant_content[0]["signature"], "sig_123");
-    assert_eq!(assistant_content[1]["type"], "text");
-    assert_eq!(assistant_content[1]["text"], "Visible answer");
+    assert!(err.contains("encrypted_content"), "err = {err}");
+    assert_eq!(body, original);
 }
 
 #[test]
-fn translate_request_responses_to_claude_replays_anthropic_omitted_reasoning_carrier() {
+fn translate_request_responses_to_claude_rejects_anthropic_omitted_reasoning_carrier() {
     let omitted_response = json!({
         "id": "msg_omitted",
         "content": [
@@ -9996,35 +10399,24 @@ fn translate_request_responses_to_claude_replays_anthropic_omitted_reasoning_car
             }
         ]
     });
+    let original = body.clone();
 
-    translate_request(
+    let err = translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect("Responses omitted carrier should replay to Anthropic");
+    .expect_err("Responses omitted carrier should fail closed cross-provider");
 
-    let messages = body["messages"].as_array().expect("anthropic messages");
-    assert_eq!(messages[1]["role"], "assistant");
-    let assistant_content = messages[1]["content"]
-        .as_array()
-        .expect("assistant content");
-    assert_eq!(assistant_content[0]["type"], "thinking");
-    assert_eq!(
-        assistant_content[0]["thinking"],
-        json!({ "display": "omitted" })
-    );
-    assert_eq!(assistant_content[0]["signature"], "sig_omitted");
-    assert_eq!(assistant_content[1]["type"], "text");
-    assert_eq!(assistant_content[1]["text"], "Visible answer");
+    assert!(err.contains("encrypted_content"), "err = {err}");
+    assert_eq!(body, original);
 }
 
 #[test]
-fn translate_request_claude_omitted_thinking_drops_hidden_reasoning_and_preserves_responses_carrier(
-) {
-    let body = json!({
+fn translate_request_claude_omitted_thinking_fails_closed_cross_protocol() {
+    let original = json!({
         "model": "claude-3",
         "messages": [{
             "role": "assistant",
@@ -10044,42 +10436,18 @@ fn translate_request_claude_omitted_thinking_drops_hidden_reasoning_and_preserve
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Google,
     ] {
-        let mut translated = body.clone();
-        translate_request(
+        let mut translated = original.clone();
+        let err = translate_request(
             UpstreamFormat::Anthropic,
             upstream_format,
             "claude-3",
             &mut translated,
             false,
         )
-        .expect("omitted thinking should be dropped instead of fail closed");
+        .expect_err("omitted thinking should fail closed cross-protocol");
 
-        match upstream_format {
-            UpstreamFormat::OpenAiCompletion => {
-                assert_eq!(translated["messages"][0]["content"], "Visible answer");
-                assert!(translated["messages"][0].get("reasoning_content").is_none());
-            }
-            UpstreamFormat::OpenAiResponses => {
-                assert_eq!(translated["input"].as_array().unwrap().len(), 2);
-                assert_eq!(translated["input"][0]["type"], "reasoning");
-                assert_eq!(translated["input"][0]["summary"], json!([]));
-                assert!(translated["input"][0]["encrypted_content"].is_string());
-                assert_eq!(translated["input"][1]["type"], "message");
-                assert_eq!(
-                    translated["input"][1]["content"][0]["text"],
-                    "Visible answer"
-                );
-            }
-            UpstreamFormat::Google => {
-                let parts = translated["contents"][0]["parts"]
-                    .as_array()
-                    .expect("gemini parts");
-                assert_eq!(parts.len(), 1);
-                assert_eq!(parts[0]["text"], "Visible answer");
-                assert!(parts[0].get("thought").is_none());
-            }
-            _ => unreachable!(),
-        }
+        assert!(err.contains("omitted"), "err = {err}");
+        assert_eq!(translated, original);
     }
 }
 
@@ -10292,8 +10660,7 @@ fn translate_request_claude_to_gemini_preserves_multiblock_system_without_inject
 }
 
 #[test]
-fn translate_request_claude_to_openai_drops_warning_only_request_controls_on_openai_completion_lane(
-) {
+fn translate_request_claude_to_openai_rejects_top_level_thinking_and_context_management() {
     let mut body = json!({
         "model": "claude-3",
         "thinking": {
@@ -10319,28 +10686,81 @@ fn translate_request_claude_to_openai_drops_warning_only_request_controls_on_ope
         }]
     });
 
-    translate_request(
+    let err = translate_request(
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiCompletion,
         "claude-3",
         &mut body,
         false,
     )
-    .expect("warning-only Anthropic controls should be dropped for OpenAI completion lane");
+    .expect_err("top-level Anthropic thinking/context_management should fail closed");
 
-    assert!(body.get("thinking").is_none(), "body = {body:?}");
-    assert!(body.get("context_management").is_none(), "body = {body:?}");
-    assert!(body.get("cache_control").is_none(), "body = {body:?}");
+    assert!(err.contains("thinking"), "err = {err}");
+    assert!(err.contains("context_management"), "err = {err}");
+}
 
-    let messages = body["messages"].as_array().expect("messages");
-    assert_eq!(messages.len(), 2, "messages = {messages:?}");
-    assert_eq!(messages[0]["role"], "system");
-    let system_parts = messages[0]["content"].as_array().expect("system parts");
-    assert_eq!(system_parts.len(), 1, "system_parts = {system_parts:?}");
-    assert_eq!(system_parts[0]["type"], "text");
-    assert_eq!(system_parts[0]["text"], "System policy");
-    assert_eq!(messages[1]["role"], "user");
-    assert_eq!(messages[1]["content"], "Hi");
+#[test]
+fn translate_request_claude_passthrough_preserves_top_level_thinking_and_context_management() {
+    let mut body = json!({
+        "model": "claude-3",
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": 2048
+        },
+        "context_management": {
+            "type": "auto"
+        },
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let original = body.clone();
+
+    translate_request(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("same-protocol Anthropic passthrough should preserve native fields");
+
+    assert_eq!(body, original);
+}
+
+#[test]
+fn translate_request_claude_passthrough_preserves_native_thinking_blocks() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": { "display": "omitted" },
+                    "signature": "sig_123"
+                },
+                {
+                    "type": "redacted_thinking",
+                    "data": "opaque_provider_state"
+                },
+                {
+                    "type": "text",
+                    "text": "Visible answer"
+                }
+            ]
+        }]
+    });
+    let original = body.clone();
+
+    translate_request(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("same-protocol Anthropic passthrough should preserve native thinking blocks");
+
+    assert_eq!(body, original);
 }
 
 #[test]
@@ -14489,7 +14909,7 @@ fn translate_response_responses_to_gemini_maps_output_text_logprobs() {
 }
 
 #[test]
-fn translate_response_openai_to_gemini_tool_calls_include_dummy_signature() {
+fn translate_response_openai_to_gemini_tool_calls_do_not_inject_thought_signature() {
     let body = json!({
         "id": "chatcmpl_gem_fc",
         "object": "chat.completion",
@@ -14529,11 +14949,13 @@ fn translate_response_openai_to_gemini_tool_calls_include_dummy_signature() {
         .iter()
         .filter(|part| part.get("functionCall").is_some())
         .collect::<Vec<_>>();
-    assert_eq!(
-        function_parts[0]["thoughtSignature"],
-        "skip_thought_signature_validator"
+    assert_eq!(function_parts.len(), 2, "out = {out:?}");
+    assert!(
+        function_parts
+            .iter()
+            .all(|part| part.get("thoughtSignature").is_none()),
+        "out = {out:?}"
     );
-    assert!(function_parts[1].get("thoughtSignature").is_none());
 }
 
 #[test]

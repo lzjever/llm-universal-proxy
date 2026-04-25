@@ -127,6 +127,9 @@ pub(super) fn extract_forwardable_headers(headers: &HeaderMap) -> Vec<(String, S
         "anthropic-api-key",
         "anthropic-version",
         "anthropic-beta",
+        "openai-organization",
+        "openai-project",
+        "idempotency-key",
         "x-stainless-helper-method",
     ];
 

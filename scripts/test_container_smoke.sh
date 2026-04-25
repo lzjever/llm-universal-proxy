@@ -10,6 +10,7 @@ HOST="127.0.0.1"
 CONTAINER_PORT="8080"
 PROXY_PORT="${PROXY_PORT:-}"
 ADMIN_TOKEN="container-smoke-token"
+DATA_TOKEN="container-smoke-data-token"
 
 TMP_DIR=""
 MOCK_PID=""
@@ -279,6 +280,8 @@ upstreams:
   default:
     api_root: http://host.docker.internal:${MOCK_PORT}/v1
     format: anthropic
+    credential_env: CONTAINER_SMOKE_UPSTREAM_API_KEY
+    auth_policy: force_server
 EOF
 }
 
@@ -308,6 +311,8 @@ start_container() {
         --name "$CONTAINER_NAME" \
         --add-host=host.docker.internal:host-gateway \
         -e "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN=${ADMIN_TOKEN}" \
+        -e "LLM_UNIVERSAL_PROXY_DATA_TOKEN=${DATA_TOKEN}" \
+        -e "CONTAINER_SMOKE_UPSTREAM_API_KEY=dummy" \
         --health-interval=2s \
         --health-timeout=2s \
         --health-retries=15 \
@@ -393,6 +398,7 @@ run_responses_smoke() {
             -X POST "http://${HOST}:${PROXY_PORT}/openai/v1/responses" \
             -H "Accept: text/event-stream" \
             -H "Content-Type: application/json" \
+            -H "X-LLMUP-Data-Token: ${DATA_TOKEN}" \
             --data '{"model":"GLM-5","input":"Hi","stream":true}' \
             -w '%{http_code}'
     )"

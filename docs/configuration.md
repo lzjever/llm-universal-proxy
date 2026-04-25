@@ -20,6 +20,16 @@ The homepage quickstart config is also the recommended baseline here:
 listen: 127.0.0.1:8080
 upstream_timeout_secs: 120
 
+resource_limits:
+  max_request_body_bytes: 16777216
+  max_non_stream_response_bytes: 67108864
+  max_upstream_error_body_bytes: 65536
+  max_sse_frame_bytes: 1048576
+  stream_idle_timeout_secs: 300
+  stream_max_duration_secs: 3600
+  stream_max_events: 100000
+  max_accumulated_stream_state_bytes: 8388608
+
 upstreams:
   OPENAI:
     api_root: https://api.openai.com/v1
@@ -69,9 +79,23 @@ Minimal startup flow:
 ```bash
 export OPENAI_API_KEY="your-openai-key"
 export MINIMAX_API_KEY="your-minimax-key"
+export LLM_UNIVERSAL_PROXY_DATA_TOKEN="set-a-random-data-token"
 
 ./target/release/llm-universal-proxy --config examples/quickstart-openai-minimax.yaml
 ```
+
+## Data Plane Security
+
+The client-facing provider/model/resource routes use a data-plane boundary that is separate from the admin token. Set `LLM_UNIVERSAL_PROXY_DATA_TOKEN` for shared or remote deployments and send it as either:
+
+- `Authorization: Bearer <data-token>`
+- `X-LLMUP-Data-Token: <data-token>`
+
+`/health` remains unauthenticated. If the data token is unset, the data plane defaults to loopback-only local access. `LLM_UNIVERSAL_PROXY_DATA_AUTH=disabled` explicitly disables data-plane auth for trusted local/test setups, but a non-loopback listener with server-held credentials or `auth_policy: force_server` fails closed unless a data token is configured.
+
+Data tokens are not provider credentials. The proxy strips the data token before upstream calls and hook payloads; use `X-LLMUP-Data-Token` when you also need to pass a client provider credential in `Authorization`.
+
+CORS is off by default. To allow browser callers, set `LLM_UNIVERSAL_PROXY_CORS_ALLOWED_ORIGINS` to a comma-separated list of exact origins, for example `https://app.example,https://console.example`. Wildcard origins are not accepted, and CORS is not an auth mechanism.
 
 ## The Main Sections
 
@@ -82,6 +106,19 @@ The address the proxy binds to, for example `127.0.0.1:8080`.
 ### `upstream_timeout_secs`
 
 The request timeout for upstream calls.
+
+### `resource_limits`
+
+Resource boundaries for client request bodies, upstream response bodies, and streaming SSE translation. All values must be greater than zero.
+
+- `max_request_body_bytes`: maximum client JSON request body size
+- `max_non_stream_response_bytes`: maximum successful non-stream upstream response body size
+- `max_upstream_error_body_bytes`: maximum upstream error body captured before returning a bounded proxy error
+- `max_sse_frame_bytes`: maximum size of a single upstream SSE frame
+- `stream_idle_timeout_secs`: maximum idle time between upstream stream chunks
+- `stream_max_duration_secs`: maximum total lifetime for an upstream stream
+- `stream_max_events`: maximum upstream SSE frames processed for one stream
+- `max_accumulated_stream_state_bytes`: maximum accumulated translator state for one stream
 
 ### `compatibility_mode`
 
@@ -138,6 +175,7 @@ upstreams:
 Practical rules:
 
 - `api_root` should point at the provider API root, not a model-specific path
+- `upstream_headers` may add non-secret routing or tenant headers, but cannot override auth/secret headers such as `authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `openai-api-key`, `x-goog-api-key`, or `anthropic-api-key`
 - include the version segment such as `/v1` or `/v1beta`
 - use `credential_env` when you want secrets outside the YAML file
 - use `auth_policy: force_server` when the proxy should always use the server-side credential

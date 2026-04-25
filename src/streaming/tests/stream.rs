@@ -620,6 +620,338 @@ async fn collect_translated_sse_strings(
     frames
 }
 
+fn oversized_unterminated_sse_frame() -> Vec<u8> {
+    vec![b'x'; crate::streaming::stream::DEFAULT_MAX_SSE_FRAME_BYTES + 1]
+}
+
+fn assert_gemini_frame_too_large_error(frames: &[String]) {
+    assert!(
+        !frames.is_empty(),
+        "Gemini client must observe an error frame"
+    );
+    let payloads = frames
+        .iter()
+        .map(|frame| parse_sse_json_frame(frame.as_bytes()))
+        .collect::<Vec<_>>();
+    let error = payloads
+        .iter()
+        .find_map(|payload| payload.get("error"))
+        .unwrap_or_else(|| panic!("Gemini client must observe an error payload: {frames:?}"));
+    assert_eq!(error["code"], 3);
+    assert_eq!(error["status"], "INVALID_ARGUMENT");
+    assert_eq!(
+        error["message"],
+        "Upstream SSE frame exceeded the maximum supported size."
+    );
+    assert_eq!(
+        error["details"][0]["@type"],
+        "type.googleapis.com/google.rpc.ErrorInfo"
+    );
+    assert_eq!(
+        error["details"][0]["reason"],
+        "upstream_sse_frame_too_large"
+    );
+    assert_eq!(
+        error["details"][0]["metadata"]["code"],
+        "upstream_sse_frame_too_large"
+    );
+    assert_eq!(
+        error["details"][0]["metadata"]["type"],
+        "invalid_request_error"
+    );
+    let joined = payloads
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!joined.contains("\"type\":\"server_error\""), "{joined}");
+}
+
+#[tokio::test]
+async fn guarded_sse_stream_rejects_oversized_unterminated_frame_and_stops() {
+    const SENTINEL: &str = "SAFE_AFTER_OVERSIZED_GUARDED_FRAME";
+
+    let inner = futures_util::stream::iter(vec![
+        Ok::<Bytes, std::io::Error>(Bytes::from(oversized_unterminated_sse_frame())),
+        Ok::<Bytes, std::io::Error>(Bytes::from(format_sse_event(
+            "response.output_text.delta",
+            &serde_json::json!({
+                "type": "response.output_text.delta",
+                "sequence_number": 1,
+                "response_id": "resp_after_oversized_guarded",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": SENTINEL
+            }),
+        ))),
+    ]);
+    let mut stream = GuardedSseStream::new(inner, UpstreamFormat::OpenAiResponses);
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let frame = frame.expect("guarded frame");
+        frames.push(String::from_utf8(frame.to_vec()).expect("utf8 frame"));
+    }
+    let joined = frames.join("\n");
+
+    assert!(joined.contains("\"type\":\"response.failed\""), "{joined}");
+    assert!(
+        joined.contains("\"type\":\"invalid_request_error\""),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("\"code\":\"upstream_sse_frame_too_large\""),
+        "{joined}"
+    );
+    assert!(!joined.contains("\"type\":\"server_error\""), "{joined}");
+    assert!(!joined.contains(SENTINEL), "{joined}");
+}
+
+#[tokio::test]
+async fn guarded_sse_stream_google_rejects_oversized_unterminated_frame_observably() {
+    const SENTINEL: &str = "SAFE_AFTER_OVERSIZED_GUARDED_GEMINI_FRAME";
+
+    let inner = futures_util::stream::iter(vec![
+        Ok::<Bytes, std::io::Error>(Bytes::from(oversized_unterminated_sse_frame())),
+        Ok::<Bytes, std::io::Error>(Bytes::from(translated_sse_matrix_valid_frame(
+            UpstreamFormat::Google,
+            SENTINEL,
+        ))),
+    ]);
+    let mut stream = GuardedSseStream::new(inner, UpstreamFormat::Google);
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let frame = frame.expect("guarded frame");
+        frames.push(String::from_utf8(frame.to_vec()).expect("utf8 frame"));
+    }
+
+    assert_gemini_frame_too_large_error(&frames);
+    assert!(!frames.join("\n").contains(SENTINEL), "{frames:?}");
+}
+
+#[tokio::test]
+async fn translated_sse_stream_rejects_oversized_unterminated_frame_and_stops() {
+    const SENTINEL: &str = "SAFE_AFTER_OVERSIZED_TRANSLATED_FRAME";
+
+    let frames = collect_translated_sse_strings(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        vec![
+            oversized_unterminated_sse_frame(),
+            translated_sse_matrix_valid_frame(UpstreamFormat::OpenAiCompletion, SENTINEL),
+        ],
+    )
+    .await;
+    let joined = frames.join("\n");
+
+    assert!(joined.contains("\"type\":\"response.failed\""), "{joined}");
+    assert!(
+        joined.contains("\"type\":\"invalid_request_error\""),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("\"code\":\"upstream_sse_frame_too_large\""),
+        "{joined}"
+    );
+    assert!(!joined.contains("\"type\":\"server_error\""), "{joined}");
+    assert!(!joined.contains(SENTINEL), "{joined}");
+}
+
+#[tokio::test]
+async fn translated_sse_stream_uses_configured_sse_frame_limit() {
+    const SENTINEL: &str = "SAFE_AFTER_CONFIGURED_SMALL_FRAME_LIMIT";
+
+    let configured_oversized_frame = vec![b'x'; 65];
+    let inner = futures_util::stream::iter(vec![
+        Ok::<Bytes, std::io::Error>(Bytes::from(configured_oversized_frame)),
+        Ok::<Bytes, std::io::Error>(Bytes::from(translated_sse_matrix_valid_frame(
+            UpstreamFormat::OpenAiCompletion,
+            SENTINEL,
+        ))),
+    ]);
+    let mut stream = TranslateSseStream::new(
+        inner,
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+    )
+    .with_resource_limits(crate::config::ResourceLimits {
+        max_sse_frame_bytes: 64,
+        ..Default::default()
+    });
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let frame = frame.expect("translated frame");
+        frames.push(String::from_utf8(frame.to_vec()).expect("utf8 frame"));
+    }
+    let joined = frames.join("\n");
+
+    assert!(
+        joined.contains("\"code\":\"upstream_sse_frame_too_large\""),
+        "{joined}"
+    );
+    assert!(!joined.contains(SENTINEL), "{joined}");
+}
+
+#[tokio::test]
+async fn guarded_sse_stream_stops_after_configured_max_events() {
+    const FIRST: &str = "SAFE_FIRST_EVENT_BEFORE_EVENT_LIMIT";
+    const SECOND: &str = "SAFE_SECOND_EVENT_AFTER_EVENT_LIMIT";
+
+    let first = serde_json::json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 1,
+        "response_id": "resp_event_limit",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": FIRST
+    });
+    let second = serde_json::json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 2,
+        "response_id": "resp_event_limit",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": SECOND
+    });
+    let inner = futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+        [
+            format_sse_event("response.output_text.delta", &first),
+            format_sse_event("response.output_text.delta", &second),
+        ]
+        .concat(),
+    ))]);
+    let mut stream = GuardedSseStream::new(inner, UpstreamFormat::OpenAiResponses)
+        .with_resource_limits(crate::config::ResourceLimits {
+            stream_max_events: 1,
+            ..Default::default()
+        });
+
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let frame = frame.expect("guarded frame");
+        frames.push(String::from_utf8(frame.to_vec()).expect("utf8 frame"));
+    }
+    let joined = frames.join("\n");
+
+    assert!(joined.contains(FIRST), "{joined}");
+    assert!(
+        joined.contains("\"code\":\"upstream_stream_event_limit_exceeded\""),
+        "{joined}"
+    );
+    assert!(!joined.contains(SECOND), "{joined}");
+}
+
+#[tokio::test]
+async fn guarded_sse_stream_emits_configured_idle_timeout_error() {
+    let inner = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+    let mut stream = GuardedSseStream::new(inner, UpstreamFormat::OpenAiResponses)
+        .with_resource_limits(crate::config::ResourceLimits {
+            stream_idle_timeout_secs: 1,
+            stream_max_duration_secs: 60,
+            ..Default::default()
+        });
+
+    let frame = timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("idle timeout should fire")
+        .expect("idle timeout should emit one frame")
+        .expect("idle timeout frame");
+    let frame = String::from_utf8(frame.to_vec()).expect("utf8 frame");
+
+    assert!(
+        frame.contains("\"code\":\"upstream_stream_idle_timeout\""),
+        "{frame}"
+    );
+    let end = timeout(Duration::from_millis(50), stream.next())
+        .await
+        .expect("stream should close after idle timeout");
+    assert!(end.is_none(), "next = {end:?}");
+}
+
+#[tokio::test]
+async fn guarded_sse_stream_emits_configured_max_duration_error() {
+    let inner = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+    let mut stream = GuardedSseStream::new(inner, UpstreamFormat::OpenAiResponses)
+        .with_resource_limits(crate::config::ResourceLimits {
+            stream_idle_timeout_secs: 60,
+            stream_max_duration_secs: 1,
+            ..Default::default()
+        });
+
+    let frame = timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("max duration should fire")
+        .expect("max duration should emit one frame")
+        .expect("max duration frame");
+    let frame = String::from_utf8(frame.to_vec()).expect("utf8 frame");
+
+    assert!(
+        frame.contains("\"code\":\"upstream_stream_max_duration_exceeded\""),
+        "{frame}"
+    );
+    let end = timeout(Duration::from_millis(50), stream.next())
+        .await
+        .expect("stream should close after max duration");
+    assert!(end.is_none(), "next = {end:?}");
+}
+
+#[tokio::test]
+async fn translated_sse_stream_fails_closed_on_accumulated_state_cap() {
+    const SENTINEL: &str = "STREAM_STATE_SENTINEL_SHOULD_NOT_LEAK";
+
+    let event = serde_json::json!({
+        "id": "chatcmpl-state-limit",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "delta": { "content": format!("{SENTINEL}{}", "x".repeat(256)) },
+            "finish_reason": null
+        }]
+    });
+    let inner = futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(
+        format_sse_data(&event),
+    ))]);
+    let mut stream = TranslateSseStream::new(
+        inner,
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+    )
+    .with_resource_limits(crate::config::ResourceLimits {
+        max_accumulated_stream_state_bytes: 64,
+        ..Default::default()
+    });
+
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let frame = frame.expect("translated frame");
+        frames.push(String::from_utf8(frame.to_vec()).expect("utf8 frame"));
+    }
+    let joined = frames.join("\n");
+
+    assert!(
+        joined.contains("\"code\":\"upstream_stream_state_too_large\""),
+        "{joined}"
+    );
+    assert!(!joined.contains(SENTINEL), "{joined}");
+}
+
+#[tokio::test]
+async fn translated_sse_stream_google_rejects_oversized_unterminated_frame_observably() {
+    const SENTINEL: &str = "SAFE_AFTER_OVERSIZED_TRANSLATED_GEMINI_FRAME";
+
+    let frames = collect_translated_sse_strings(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Google,
+        vec![
+            oversized_unterminated_sse_frame(),
+            translated_sse_matrix_valid_frame(UpstreamFormat::OpenAiCompletion, SENTINEL),
+        ],
+    )
+    .await;
+
+    assert_gemini_frame_too_large_error(&frames);
+    assert!(!frames.join("\n").contains(SENTINEL), "{frames:?}");
+}
+
 #[tokio::test]
 async fn translated_sse_stream_malformed_raw_artifact_frames_fail_closed_for_all_cross_format_pairs(
 ) {

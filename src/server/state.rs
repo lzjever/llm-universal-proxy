@@ -21,6 +21,7 @@ pub(super) struct AppState {
     pub(super) runtime: Arc<RwLock<RuntimeState>>,
     pub(super) metrics: Arc<RuntimeMetrics>,
     pub(super) admin_access: AdminAccess,
+    pub(super) data_auth_policy: super::data_auth::RuntimeConfigValidationPolicy,
 }
 
 #[derive(Clone)]

@@ -6,6 +6,93 @@ use super::state::*;
 use super::wire::*;
 use super::*;
 
+use std::future::Future;
+
+use crate::config::ResourceLimits;
+
+#[cfg(test)]
+pub(super) const DEFAULT_MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+
+const SSE_FRAME_TOO_LARGE_CODE: &str = "upstream_sse_frame_too_large";
+const SSE_FRAME_TOO_LARGE_MESSAGE: &str = "Upstream SSE frame exceeded the maximum supported size.";
+const STREAM_IDLE_TIMEOUT_CODE: &str = "upstream_stream_idle_timeout";
+const STREAM_IDLE_TIMEOUT_MESSAGE: &str = "Upstream stream exceeded the configured idle timeout.";
+const STREAM_MAX_DURATION_CODE: &str = "upstream_stream_max_duration_exceeded";
+const STREAM_MAX_DURATION_MESSAGE: &str =
+    "Upstream stream exceeded the configured maximum duration.";
+const STREAM_MAX_EVENTS_CODE: &str = "upstream_stream_event_limit_exceeded";
+const STREAM_MAX_EVENTS_MESSAGE: &str =
+    "Upstream stream exceeded the configured maximum event count.";
+const STREAM_STATE_TOO_LARGE_CODE: &str = "upstream_stream_state_too_large";
+const STREAM_STATE_TOO_LARGE_MESSAGE: &str =
+    "Upstream stream exceeded the configured accumulated state size.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamResourceLimit {
+    SseFrameTooLarge,
+    IdleTimeout,
+    MaxDuration,
+    MaxEvents,
+    StateTooLarge,
+}
+
+impl StreamResourceLimit {
+    fn code(self) -> &'static str {
+        match self {
+            Self::SseFrameTooLarge => SSE_FRAME_TOO_LARGE_CODE,
+            Self::IdleTimeout => STREAM_IDLE_TIMEOUT_CODE,
+            Self::MaxDuration => STREAM_MAX_DURATION_CODE,
+            Self::MaxEvents => STREAM_MAX_EVENTS_CODE,
+            Self::StateTooLarge => STREAM_STATE_TOO_LARGE_CODE,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::SseFrameTooLarge => SSE_FRAME_TOO_LARGE_MESSAGE,
+            Self::IdleTimeout => STREAM_IDLE_TIMEOUT_MESSAGE,
+            Self::MaxDuration => STREAM_MAX_DURATION_MESSAGE,
+            Self::MaxEvents => STREAM_MAX_EVENTS_MESSAGE,
+            Self::StateTooLarge => STREAM_STATE_TOO_LARGE_MESSAGE,
+        }
+    }
+}
+
+struct StreamLimitTimers {
+    idle_timeout: std::time::Duration,
+    idle_sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    max_duration_sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl StreamLimitTimers {
+    fn new(limits: &ResourceLimits) -> Self {
+        let now = tokio::time::Instant::now();
+        let idle_timeout = std::time::Duration::from_secs(limits.stream_idle_timeout_secs);
+        let max_duration = std::time::Duration::from_secs(limits.stream_max_duration_secs);
+        Self {
+            idle_timeout,
+            idle_sleep: Box::pin(tokio::time::sleep_until(now + idle_timeout)),
+            max_duration_sleep: Box::pin(tokio::time::sleep_until(now + max_duration)),
+        }
+    }
+
+    fn reset_idle(&mut self) {
+        self.idle_sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + self.idle_timeout);
+    }
+
+    fn poll_expired(&mut self, cx: &mut Context<'_>) -> Option<StreamResourceLimit> {
+        if self.max_duration_sleep.as_mut().poll(cx).is_ready() {
+            return Some(StreamResourceLimit::MaxDuration);
+        }
+        if self.idle_sleep.as_mut().poll(cx).is_ready() {
+            return Some(StreamResourceLimit::IdleTimeout);
+        }
+        None
+    }
+}
+
 pub fn needs_stream_translation(
     upstream_format: UpstreamFormat,
     client_format: UpstreamFormat,
@@ -315,6 +402,76 @@ fn reject_public_stream_tool_name(
     openai_chunks_to_client_sse(client_format, chunks, state)
 }
 
+fn reject_stream_resource_limit(
+    client_format: UpstreamFormat,
+    state: &mut StreamState,
+    limit: StreamResourceLimit,
+) -> Vec<Vec<u8>> {
+    let event = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "code": limit.code(),
+            "message": limit.message()
+        }
+    });
+    anthropic_error_event_to_client_sse(&event, client_format, state)
+}
+
+fn gemini_stream_error_status(error_type: &str, code: Option<&str>) -> &'static str {
+    match code {
+        Some("rate_limit_exceeded") => "RESOURCE_EXHAUSTED",
+        Some(
+            "context_length_exceeded"
+            | "upstream_sse_frame_too_large"
+            | "upstream_stream_event_limit_exceeded"
+            | "upstream_stream_state_too_large",
+        ) => "INVALID_ARGUMENT",
+        Some("upstream_stream_idle_timeout" | "upstream_stream_max_duration_exceeded") => {
+            "DEADLINE_EXCEEDED"
+        }
+        Some("content_filter") => "FAILED_PRECONDITION",
+        Some("server_is_overloaded") => "UNAVAILABLE",
+        _ if error_type == "invalid_request_error" => "INVALID_ARGUMENT",
+        _ if error_type == "rate_limit_error" => "RESOURCE_EXHAUSTED",
+        _ if error_type == "server_error" => "UNAVAILABLE",
+        _ => "UNKNOWN",
+    }
+}
+
+fn gemini_stream_error_rpc_code(status: &str) -> u16 {
+    match status {
+        "INVALID_ARGUMENT" => 3,
+        "DEADLINE_EXCEEDED" => 4,
+        "RESOURCE_EXHAUSTED" => 8,
+        "FAILED_PRECONDITION" => 9,
+        "UNAVAILABLE" => 14,
+        _ => 2,
+    }
+}
+
+fn google_streaming_error_sse(error_type: &str, code: Option<&str>, message: &str) -> Vec<Vec<u8>> {
+    let stable_code = code.unwrap_or("upstream_stream_error");
+    let status = gemini_stream_error_status(error_type, code);
+    let payload = serde_json::json!({
+        "error": {
+            "code": gemini_stream_error_rpc_code(status),
+            "message": message,
+            "status": status,
+            "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": stable_code,
+                "domain": "llm-universal-proxy",
+                "metadata": {
+                    "code": stable_code,
+                    "type": error_type
+                }
+            }]
+        }
+    });
+    vec![format_sse_data(&payload)]
+}
+
 pub fn translate_sse_event(
     upstream_format: UpstreamFormat,
     client_format: UpstreamFormat,
@@ -474,6 +631,9 @@ pub struct GuardedSseStream<S, E> {
     buffer: Vec<u8>,
     client_format: UpstreamFormat,
     state: StreamState,
+    resource_limits: ResourceLimits,
+    limit_timers: StreamLimitTimers,
+    events_seen: usize,
     output_queue: Vec<Vec<u8>>,
     output_pos: usize,
     close_after_output: bool,
@@ -482,11 +642,16 @@ pub struct GuardedSseStream<S, E> {
 
 impl<S, E> GuardedSseStream<S, E> {
     pub fn new(inner: S, client_format: UpstreamFormat) -> Self {
+        let resource_limits = ResourceLimits::default();
+        let limit_timers = StreamLimitTimers::new(&resource_limits);
         Self {
             inner,
             buffer: Vec::new(),
             client_format,
             state: StreamState::default(),
+            resource_limits,
+            limit_timers,
+            events_seen: 0,
             output_queue: Vec::new(),
             output_pos: 0,
             close_after_output: false,
@@ -494,8 +659,47 @@ impl<S, E> GuardedSseStream<S, E> {
         }
     }
 
+    pub fn with_resource_limits(mut self, resource_limits: ResourceLimits) -> Self {
+        self.limit_timers = StreamLimitTimers::new(&resource_limits);
+        self.resource_limits = resource_limits;
+        self
+    }
+
+    fn reject_stream_resource_limit(&mut self, limit: StreamResourceLimit) {
+        self.output_queue.extend(reject_stream_resource_limit(
+            self.client_format,
+            &mut self.state,
+            limit,
+        ));
+        self.buffer.clear();
+        self.close_after_output = true;
+    }
+
+    fn register_sse_event_or_reject(&mut self) -> bool {
+        self.events_seen = self.events_seen.saturating_add(1);
+        if self.events_seen > self.resource_limits.stream_max_events {
+            self.reject_stream_resource_limit(StreamResourceLimit::MaxEvents);
+            return false;
+        }
+        true
+    }
+
+    fn reject_if_state_too_large(&mut self) -> bool {
+        if self.state.accumulated_bytes() > self.resource_limits.max_accumulated_stream_state_bytes
+        {
+            self.output_queue.clear();
+            self.output_pos = 0;
+            self.reject_stream_resource_limit(StreamResourceLimit::StateTooLarge);
+            return true;
+        }
+        false
+    }
+
     fn drain_validated_frames(&mut self) {
         while let Some((frame, event)) = take_one_sse_frame(&mut self.buffer) {
+            if !self.register_sse_event_or_reject() {
+                break;
+            }
             let raw_has_internal_artifact = sse_frame_contains_internal_artifact(&frame);
             let event_type = sse_frame_event_type(&frame);
             if event_type
@@ -548,7 +752,48 @@ impl<S, E> GuardedSseStream<S, E> {
             }
             self.output_queue
                 .push(canonical_sse_frame(event_type.as_deref(), &event));
+            if self.reject_if_state_too_large() {
+                break;
+            }
         }
+    }
+
+    fn reject_oversized_sse_frame(&mut self) {
+        self.reject_stream_resource_limit(StreamResourceLimit::SseFrameTooLarge);
+    }
+
+    fn push_chunk_with_frame_limit(&mut self, chunk: &[u8]) {
+        self.limit_timers.reset_idle();
+        let mut offset = 0;
+        while offset < chunk.len() && !self.close_after_output {
+            let remaining = self
+                .resource_limits
+                .max_sse_frame_bytes
+                .saturating_sub(self.buffer.len());
+            if remaining == 0 {
+                self.reject_oversized_sse_frame();
+                break;
+            }
+
+            let end = offset + remaining.min(chunk.len() - offset);
+            self.buffer.extend_from_slice(&chunk[offset..end]);
+            offset = end;
+
+            self.drain_validated_frames();
+            if !self.close_after_output
+                && self.buffer.len() == self.resource_limits.max_sse_frame_bytes
+            {
+                self.reject_oversized_sse_frame();
+            }
+        }
+    }
+
+    fn poll_stream_resource_timers(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(limit) = self.limit_timers.poll_expired(cx) else {
+            return false;
+        };
+        self.reject_stream_resource_limit(limit);
+        true
     }
 }
 
@@ -574,11 +819,13 @@ where
             if this.close_after_output {
                 return Poll::Ready(None);
             }
+            if this.poll_stream_resource_timers(cx) {
+                continue;
+            }
 
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    this.buffer.extend_from_slice(&chunk);
-                    this.drain_validated_frames();
+                    this.push_chunk_with_frame_limit(&chunk);
                     if !this.output_queue.is_empty() {
                         continue;
                     }
@@ -622,9 +869,19 @@ pub(super) fn anthropic_error_event_to_client_sse(
         .and_then(Value::as_str)
         .unwrap_or("Anthropic streaming error");
     let message = sanitize_public_error_message(message);
+    let explicit_code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .and_then(known_stream_resource_limit_code);
 
     let (normalized_type, normalized_code, finish_reason) =
         normalize_anthropic_stream_error(error_type, &message);
+    let normalized_type = if explicit_code.is_some() {
+        "invalid_request_error"
+    } else {
+        normalized_type
+    };
+    let normalized_code = explicit_code.or(normalized_code);
 
     match client_format {
         UpstreamFormat::OpenAiResponses => {
@@ -673,7 +930,20 @@ pub(super) fn anthropic_error_event_to_client_sse(
             });
             vec![format_sse_event("error", &sanitized)]
         }
-        UpstreamFormat::Google => vec![],
+        UpstreamFormat::Google => {
+            google_streaming_error_sse(normalized_type, normalized_code, &message)
+        }
+    }
+}
+
+fn known_stream_resource_limit_code(code: &str) -> Option<&'static str> {
+    match code {
+        SSE_FRAME_TOO_LARGE_CODE => Some(SSE_FRAME_TOO_LARGE_CODE),
+        STREAM_IDLE_TIMEOUT_CODE => Some(STREAM_IDLE_TIMEOUT_CODE),
+        STREAM_MAX_DURATION_CODE => Some(STREAM_MAX_DURATION_CODE),
+        STREAM_MAX_EVENTS_CODE => Some(STREAM_MAX_EVENTS_CODE),
+        STREAM_STATE_TOO_LARGE_CODE => Some(STREAM_STATE_TOO_LARGE_CODE),
+        _ => None,
     }
 }
 
@@ -683,6 +953,41 @@ pub(super) fn normalize_anthropic_stream_error(
 ) -> (&'static str, Option<&'static str>, &'static str) {
     let lower_type = error_type.to_ascii_lowercase();
     let lower_message = message.to_ascii_lowercase();
+    if lower_message.contains("sse frame") && lower_message.contains("maximum supported size") {
+        return (
+            "invalid_request_error",
+            Some(SSE_FRAME_TOO_LARGE_CODE),
+            "tool_error",
+        );
+    }
+    if lower_message.contains("idle timeout") {
+        return (
+            "invalid_request_error",
+            Some(STREAM_IDLE_TIMEOUT_CODE),
+            "tool_error",
+        );
+    }
+    if lower_message.contains("maximum duration") {
+        return (
+            "invalid_request_error",
+            Some(STREAM_MAX_DURATION_CODE),
+            "tool_error",
+        );
+    }
+    if lower_message.contains("maximum event count") {
+        return (
+            "invalid_request_error",
+            Some(STREAM_MAX_EVENTS_CODE),
+            "tool_error",
+        );
+    }
+    if lower_message.contains("accumulated state size") {
+        return (
+            "invalid_request_error",
+            Some(STREAM_STATE_TOO_LARGE_CODE),
+            "tool_error",
+        );
+    }
     if lower_type.contains("overloaded") || lower_type.contains("api_error") {
         let code = Some("server_is_overloaded");
         return (
@@ -735,6 +1040,9 @@ pub struct TranslateSseStream<S, E> {
     upstream_format: UpstreamFormat,
     client_format: UpstreamFormat,
     state: StreamState,
+    resource_limits: ResourceLimits,
+    limit_timers: StreamLimitTimers,
+    events_seen: usize,
     output_queue: Vec<Vec<u8>>,
     output_pos: usize,
     close_after_output: bool,
@@ -743,17 +1051,28 @@ pub struct TranslateSseStream<S, E> {
 
 impl<S, E> TranslateSseStream<S, E> {
     pub fn new(inner: S, upstream_format: UpstreamFormat, client_format: UpstreamFormat) -> Self {
+        let resource_limits = ResourceLimits::default();
+        let limit_timers = StreamLimitTimers::new(&resource_limits);
         Self {
             inner,
             buffer: Vec::new(),
             upstream_format,
             client_format,
             state: StreamState::default(),
+            resource_limits,
+            limit_timers,
+            events_seen: 0,
             output_queue: Vec::new(),
             output_pos: 0,
             close_after_output: false,
             _error: std::marker::PhantomData,
         }
+    }
+
+    pub fn with_resource_limits(mut self, resource_limits: ResourceLimits) -> Self {
+        self.limit_timers = StreamLimitTimers::new(&resource_limits);
+        self.resource_limits = resource_limits;
+        self
     }
 
     pub fn with_request_scoped_tool_bridge_context(
@@ -762,6 +1081,36 @@ impl<S, E> TranslateSseStream<S, E> {
     ) -> Self {
         self.state.request_scoped_tool_bridge_context = bridge_context;
         self
+    }
+
+    fn reject_stream_resource_limit(&mut self, limit: StreamResourceLimit) {
+        self.output_queue.extend(reject_stream_resource_limit(
+            self.client_format,
+            &mut self.state,
+            limit,
+        ));
+        self.buffer.clear();
+        self.close_after_output = true;
+    }
+
+    fn register_sse_event_or_reject(&mut self) -> bool {
+        self.events_seen = self.events_seen.saturating_add(1);
+        if self.events_seen > self.resource_limits.stream_max_events {
+            self.reject_stream_resource_limit(StreamResourceLimit::MaxEvents);
+            return false;
+        }
+        true
+    }
+
+    fn reject_if_state_too_large(&mut self) -> bool {
+        if self.state.accumulated_bytes() > self.resource_limits.max_accumulated_stream_state_bytes
+        {
+            self.output_queue.clear();
+            self.output_pos = 0;
+            self.reject_stream_resource_limit(StreamResourceLimit::StateTooLarge);
+            return true;
+        }
+        false
     }
 
     fn reject_internal_artifact_frame(&mut self) {
@@ -775,6 +1124,9 @@ impl<S, E> TranslateSseStream<S, E> {
 
     fn drain_translated_frames(&mut self) {
         while let Some((frame, event)) = take_one_sse_frame(&mut self.buffer) {
+            if !self.register_sse_event_or_reject() {
+                break;
+            }
             let event_type = sse_frame_event_type(&frame);
             if event_type
                 .as_deref()
@@ -803,7 +1155,48 @@ impl<S, E> TranslateSseStream<S, E> {
                 self.close_after_output = true;
                 break;
             }
+            if self.reject_if_state_too_large() {
+                break;
+            }
         }
+    }
+
+    fn reject_oversized_sse_frame(&mut self) {
+        self.reject_stream_resource_limit(StreamResourceLimit::SseFrameTooLarge);
+    }
+
+    fn push_chunk_with_frame_limit(&mut self, chunk: &[u8]) {
+        self.limit_timers.reset_idle();
+        let mut offset = 0;
+        while offset < chunk.len() && !self.close_after_output {
+            let remaining = self
+                .resource_limits
+                .max_sse_frame_bytes
+                .saturating_sub(self.buffer.len());
+            if remaining == 0 {
+                self.reject_oversized_sse_frame();
+                break;
+            }
+
+            let end = offset + remaining.min(chunk.len() - offset);
+            self.buffer.extend_from_slice(&chunk[offset..end]);
+            offset = end;
+
+            self.drain_translated_frames();
+            if !self.close_after_output
+                && self.buffer.len() == self.resource_limits.max_sse_frame_bytes
+            {
+                self.reject_oversized_sse_frame();
+            }
+        }
+    }
+
+    fn poll_stream_resource_timers(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(limit) = self.limit_timers.poll_expired(cx) else {
+            return false;
+        };
+        self.reject_stream_resource_limit(limit);
+        true
     }
 }
 
@@ -829,11 +1222,13 @@ where
             if this.close_after_output {
                 return Poll::Ready(None);
             }
+            if this.poll_stream_resource_timers(cx) {
+                continue;
+            }
 
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    this.buffer.extend_from_slice(&chunk);
-                    this.drain_translated_frames();
+                    this.push_chunk_with_frame_limit(&chunk);
                     if !this.output_queue.is_empty() {
                         continue;
                     }
@@ -859,6 +1254,9 @@ where
                                 }
                             };
                             this.output_queue.extend(translated);
+                            if this.reject_if_state_too_large() {
+                                continue;
+                            }
                         }
                     }
                     if !this.output_queue.is_empty() {

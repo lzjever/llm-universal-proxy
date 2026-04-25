@@ -10,7 +10,7 @@ upstreams:
   MINIMAX-ANTHROPIC:
     api_root: "https://api.minimaxi.com/anthropic/v1"
     format: anthropic
-    credential_actual: "sk-cp-3Iu7RGNidGRx7dv4fD5HuePsBNSxxzrrXzPW3xkJHIbmNqbl3IC0t3JIfR3CwnspiZroUWLkRIl0eV7Siyvw3X6hdAHU8pT253erOaPyDMDTgDiutunRb9U"
+    credential_env: MINIMAX_API_KEY
     auth_policy: force_server
     limits:
       context_window: 200000
@@ -28,7 +28,7 @@ upstreams:
   MINIMAX-OPENAI:
     api_root: "https://api.minimaxi.com/v1"
     format: openai-completion
-    credential_actual: "sk-cp-3Iu7RGNidGRx7dv4fD5HuePsBNSxxzrrXzPW3xkJHIbmNqbl3IC0t3JIfR3CwnspiZroUWLkRIl0eV7Siyvw3X6hdAHU8pT253erOaPyDMDTgDiutunRb9U"
+    credential_env: MINIMAX_API_KEY
     auth_policy: force_server
     limits:
       context_window: 200000

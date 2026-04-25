@@ -43,6 +43,163 @@ check_absent() {
     fi
 }
 
+scan_tracked_secret_risks() {
+    python3 - <<'PY'
+import pathlib
+import re
+import subprocess
+import sys
+
+provider_key_patterns = ("sk-cp-", "sk-ant-", "sk-proj-", "sk-live-", "sk-test-")
+provider_key_re = re.compile(
+    r"sk-(?:cp|ant|proj|live|test)-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{32,}"
+)
+credential_actual_re = re.compile(r"^\s*credential_actual:\s*(?P<value>.+)")
+dummy_credential_values = {
+    "dummy",
+    "dummy-key",
+    "example",
+    "example-key",
+    "not-needed",
+    "placeholder",
+    "redacted",
+    "test",
+    "test-key",
+}
+
+# Keep the scan limited to git ls-files under tracked fixtures, docs, examples, and scripts.
+tracked_paths = subprocess.check_output(
+    ["git", "ls-files", "scripts/fixtures", "docs", "examples", "scripts"],
+    text=True,
+).splitlines()
+failures = []
+
+for path_text in tracked_paths:
+    path = pathlib.Path(path_text)
+    if not path.is_file():
+        continue
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for match in provider_key_re.finditer(text):
+        line_no = text.count("\n", 0, match.start()) + 1
+        failures.append(f"{path_text}:{line_no}: provider key pattern detected")
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        match = credential_actual_re.search(line)
+        if not match:
+            continue
+        value = match.group("value").split("#", 1)[0].strip().strip('"').strip("'")
+        if not value or value.startswith(("{", "$")):
+            continue
+        if value not in dummy_credential_values:
+            failures.append(
+                f"{path_text}:{line_no}: non-dummy credential_actual is not allowed"
+            )
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+PY
+}
+
+check_release_publish_jobs_need_ga_gates() {
+    python3 - <<'PY'
+import pathlib
+import re
+import sys
+
+REQUIRED_RELEASE_GATE_NEEDS = (
+    "mock-endpoint-matrix",
+    "cli-wrapper-matrix",
+    "perf-gate",
+    "real-provider-smoke",
+    "supply-chain",
+)
+RELEASE_PUBLISH_JOB_MARKERS = (
+    "push: true",
+    "packages: write",
+    "action-gh-release",
+)
+
+
+def workflow_jobs(text):
+    matches = list(re.finditer(r"^  ([A-Za-z0-9_-]+):\n", text, re.MULTILINE))
+    jobs = {}
+    for index, match in enumerate(matches):
+        name = match.group(1)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        jobs[name] = text[match.start() : end]
+    return jobs
+
+
+def job_needs(job_block):
+    match = re.search(r"^    needs:\s*(?P<value>.*)$", job_block, re.MULTILINE)
+    if not match:
+        return set()
+
+    value = match.group("value").strip()
+    if value.startswith("[") and value.endswith("]"):
+        return {
+            item.strip().strip("\"'")
+            for item in value.removeprefix("[").removesuffix("]").split(",")
+            if item.strip()
+        }
+    if value:
+        return {value.strip("\"'")}
+
+    needs = set()
+    for line in job_block[match.end() :].splitlines():
+        if line.startswith("    ") and not line.startswith("      "):
+            break
+        item_match = re.match(r"^\s*-\s*([A-Za-z0-9_-]+)\s*$", line)
+        if item_match:
+            needs.add(item_match.group(1))
+    return needs
+
+
+workflow_path = pathlib.Path(".github/workflows/release.yml")
+jobs = workflow_jobs(workflow_path.read_text(encoding="utf-8"))
+publish_jobs = {
+    name: block
+    for name, block in jobs.items()
+    if any(marker in block for marker in RELEASE_PUBLISH_JOB_MARKERS)
+}
+
+failures = []
+for expected_job in ("container", "release"):
+    if expected_job not in publish_jobs:
+        failures.append(f"release workflow publishing job not found: {expected_job}")
+
+container = jobs.get("container", "")
+if "push: true" not in container:
+    failures.append("release workflow container job must remain a GHCR push boundary")
+if "${{ env.GHCR_IMAGE }}:latest" not in container:
+    failures.append("release workflow container job must govern the GHCR latest tag")
+
+for job_name, job_block in sorted(publish_jobs.items()):
+    missing = set(REQUIRED_RELEASE_GATE_NEEDS) - job_needs(job_block)
+    if missing:
+        failures.append(
+            f"release workflow publishing job '{job_name}' is missing needs: "
+            + ", ".join(sorted(missing))
+        )
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+PY
+}
+
+if ! SECRET_SCAN_OUTPUT="$(scan_tracked_secret_risks)"; then
+    while IFS= read -r failure; do
+        [[ -n "$failure" ]] && FAILURES+=("$failure")
+    done <<< "$SECRET_SCAN_OUTPUT"
+fi
+
+if ! RELEASE_PUBLISH_GATE_OUTPUT="$(check_release_publish_jobs_need_ga_gates)"; then
+    while IFS= read -r failure; do
+        [[ -n "$failure" ]] && FAILURES+=("$failure")
+    done <<< "$RELEASE_PUBLISH_GATE_OUTPUT"
+fi
+
 check_eq "Cargo.lock package version" "$LOCK_VERSION" "$VERSION"
 check_eq "CHANGELOG latest version" "$CHANGELOG_VERSION" "$VERSION"
 
@@ -87,6 +244,7 @@ check_absent "scripts/real_cli_matrix.py" 'DEFAULT_PROXY_BINARY = REPO_ROOT / "t
 check_contains "scripts/test_compatibility.sh" "cargo build --locked --release"
 
 check_contains ".github/workflows/ci.yml" "bash scripts/check-governance.sh"
+check_contains ".github/workflows/ci.yml" "Secret Scan"
 check_contains ".github/workflows/ci.yml" "id: repo_meta"
 check_contains ".github/workflows/ci.yml" "run: python scripts/repo_metadata.py github-output"
 check_absent ".github/workflows/ci.yml" '>> "$GITHUB_OUTPUT"'
@@ -96,18 +254,45 @@ check_absent ".github/workflows/ci.yml" "dtolnay/rust-toolchain@master"
 check_contains ".github/workflows/ci.yml" 'if: ${{ always() }}'
 check_contains ".github/workflows/ci.yml" "$PYTHON_CONTRACT_TEST_COMMAND"
 check_contains ".github/workflows/ci.yml" "bash scripts/test_binary_smoke.sh"
+check_contains ".github/workflows/ci.yml" "Mock Endpoint Matrix"
+check_contains ".github/workflows/ci.yml" "python3 scripts/real_endpoint_matrix.py --mock"
+check_contains ".github/workflows/ci.yml" "Perf Gate"
+check_contains ".github/workflows/ci.yml" "python3 scripts/real_endpoint_matrix.py --mock --perf"
+check_contains ".github/workflows/ci.yml" "Supply Chain"
+check_contains ".github/workflows/ci.yml" "cargo audit"
 check_contains ".github/workflows/ci.yml" "Container Image Smoke"
 check_contains ".github/workflows/ci.yml" "push: false"
 check_contains ".github/workflows/ci.yml" "IMAGE=llm-universal-proxy:ci bash scripts/test_container_smoke.sh"
 
 check_contains ".github/workflows/release.yml" "bash scripts/check-governance.sh"
+check_contains ".github/workflows/release.yml" "Secret Scan"
 check_contains ".github/workflows/release.yml" "id: repo_meta"
 check_contains ".github/workflows/release.yml" "run: python scripts/repo_metadata.py github-output"
 check_absent ".github/workflows/release.yml" '>> "$GITHUB_OUTPUT"'
 check_contains ".github/workflows/release.yml" 'toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}'
 check_contains ".github/workflows/release.yml" "dtolnay/rust-toolchain@${TOOLCHAIN_ACTION_REF}"
 check_absent ".github/workflows/release.yml" "dtolnay/rust-toolchain@master"
+check_contains ".github/workflows/release.yml" "Run Rust tests"
+check_contains ".github/workflows/release.yml" "cargo test --locked --verbose"
+check_contains ".github/workflows/release.yml" "Run Python contract tests"
+check_contains ".github/workflows/release.yml" "$PYTHON_CONTRACT_TEST_COMMAND"
+check_contains ".github/workflows/release.yml" 'if: ${{ always() }}'
 check_contains ".github/workflows/release.yml" "bash scripts/test_binary_smoke.sh"
+check_contains ".github/workflows/release.yml" "Mock Endpoint Matrix"
+check_contains ".github/workflows/release.yml" "python3 scripts/real_endpoint_matrix.py --mock"
+check_contains ".github/workflows/release.yml" "CLI Wrapper Matrix"
+check_contains ".github/workflows/release.yml" "python3 scripts/real_cli_matrix.py --test basic --skip-slow --list-matrix"
+check_contains ".github/workflows/release.yml" "Perf Gate"
+check_contains ".github/workflows/release.yml" "python3 scripts/real_endpoint_matrix.py --mock --perf"
+check_contains ".github/workflows/release.yml" "Supply Chain"
+check_contains ".github/workflows/release.yml" "cargo audit"
+check_contains ".github/workflows/release.yml" "anchore/sbom-action"
+check_contains ".github/workflows/release.yml" "Real Provider Smoke"
+check_contains ".github/workflows/release.yml" "environment: release-real-providers"
+check_contains ".github/workflows/release.yml" 'GLM_APIKEY: ${{ secrets.GLM_APIKEY }}'
+check_contains ".github/workflows/release.yml" "Validate protected real provider secrets"
+check_contains ".github/workflows/release.yml" 'test -n "${GLM_APIKEY:-}"'
+check_contains ".github/workflows/release.yml" "python3 scripts/real_endpoint_matrix.py --real-provider-smoke"
 check_contains ".github/workflows/release.yml" "ghcr.io/lzjever/llm-universal-proxy"
 check_contains ".github/workflows/release.yml" "platforms: linux/amd64,linux/arm64"
 check_contains ".github/workflows/release.yml" "push: true"

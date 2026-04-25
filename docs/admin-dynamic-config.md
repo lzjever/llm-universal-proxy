@@ -28,6 +28,8 @@ In other words:
 - local development can often use loopback admin access directly, without forwarding headers such as `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, or `X-Real-IP`
 - shared or remote deployments should normally set a non-empty admin bearer token
 
+The data plane has its own token, `LLM_UNIVERSAL_PROXY_DATA_TOKEN`, and does not accept the admin token for provider/model/resource calls. Dynamic namespace config can add server-held credentials, but those credentials are only usable through the data-plane boundary; non-loopback service mode without a data token fails closed.
+
 ## Admin Dashboard Boundary
 
 The Web Admin Dashboard uses the same admin plane and the same `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` boundary as the endpoints below.
@@ -37,6 +39,7 @@ Current product boundary:
 - keep `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`
 - do not introduce a separate service key
 - dashboard login is admin-token based
+- dashboard shell/admin actions are admin-plane operations, not a separate trust boundary
 - do not add multi-user accounts, readonly roles, or complex session behavior in this plan
 
 For container-specific runtime notes, see [Container Image and GHCR Release](./container.md).

@@ -1,7 +1,14 @@
 //! Upstream HTTP client: build request URLs and call upstream resources.
 
+use std::error::Error;
+use std::pin::Pin;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
+use http_body_util::{BodyExt, Full};
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::TokioExecutor;
 use reqwest::{Client, Proxy};
 use serde_json::Value;
 
@@ -176,6 +183,62 @@ pub(crate) enum DownstreamAwareError<E> {
     DownstreamCancelled,
 }
 
+type BoxError = Box<dyn Error + Send + Sync>;
+
+pub(crate) struct UpstreamResourceTarget {
+    reqwest_url: String,
+    raw_uri: hyper::Uri,
+    requires_raw_path_fidelity: bool,
+}
+
+pub(crate) struct UpstreamResourceRequest<'a> {
+    pub(crate) method: reqwest::Method,
+    pub(crate) target: &'a UpstreamResourceTarget,
+    pub(crate) body: Option<&'a Value>,
+    pub(crate) headers: &'a [(String, String)],
+    pub(crate) accept_event_stream: bool,
+    pub(crate) resolved_proxy: &'a ResolvedProxyMetadata,
+}
+
+pub(crate) enum UpstreamResourceResponse {
+    Reqwest(reqwest::Response),
+    Hyper(hyper::Response<hyper::body::Incoming>),
+}
+
+impl UpstreamResourceResponse {
+    pub(crate) fn status(&self) -> reqwest::StatusCode {
+        match self {
+            Self::Reqwest(response) => response.status(),
+            Self::Hyper(response) => response.status(),
+        }
+    }
+
+    pub(crate) fn headers(&self) -> &reqwest::header::HeaderMap {
+        match self {
+            Self::Reqwest(response) => response.headers(),
+            Self::Hyper(response) => response.headers(),
+        }
+    }
+
+    pub(crate) fn into_bytes_stream(
+        self,
+    ) -> Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>> {
+        match self {
+            Self::Reqwest(response) => Box::pin(
+                response
+                    .bytes_stream()
+                    .map(|result| result.map_err(|error| Box::new(error) as BoxError)),
+            ),
+            Self::Hyper(response) => Box::pin(
+                response
+                    .into_body()
+                    .into_data_stream()
+                    .map(|result| result.map_err(|error| Box::new(error) as BoxError)),
+            ),
+        }
+    }
+}
+
 async fn await_with_downstream_cancellation<F, T, E>(
     future: F,
     downstream_cancellation: &DownstreamCancellation,
@@ -205,6 +268,57 @@ pub(crate) async fn call_upstream_with_cancellation(
         req = req.header(name, value);
     }
     await_with_downstream_cancellation(req.send(), downstream_cancellation).await
+}
+
+pub(crate) fn build_upstream_resource_target(
+    api_root: &str,
+    resource_path: &str,
+    query: Option<&str>,
+) -> Result<UpstreamResourceTarget, String> {
+    let mut reqwest_url = crate::config::build_upstream_resource_url(api_root, resource_path);
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        reqwest_url.push('?');
+        reqwest_url.push_str(query);
+    }
+
+    let parsed = url::Url::parse(api_root)
+        .map_err(|error| format!("upstream api_root is not a valid URL: {error}"))?;
+    let origin = parsed.origin().ascii_serialization();
+    let base_path = parsed.path().trim_end_matches('/');
+    let resource_path = resource_path.trim_start_matches('/');
+    let mut path_and_query = if base_path.is_empty() || base_path == "/" {
+        format!("/{resource_path}")
+    } else {
+        format!("{base_path}/{resource_path}")
+    };
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    let raw_uri = format!("{origin}{path_and_query}")
+        .parse::<hyper::Uri>()
+        .map_err(|error| format!("upstream resource URI is invalid: {error}"))?;
+
+    Ok(UpstreamResourceTarget {
+        reqwest_url,
+        raw_uri,
+        requires_raw_path_fidelity: resource_path_requires_raw_path_fidelity(resource_path),
+    })
+}
+
+fn resource_path_requires_raw_path_fidelity(resource_path: &str) -> bool {
+    resource_path
+        .trim_matches('/')
+        .split('/')
+        .any(url_stack_normalizes_dot_segment)
+}
+
+fn url_stack_normalizes_dot_segment(segment: &str) -> bool {
+    let normalized = segment.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "." | ".." | "%2e" | "%2e%2e" | "%2e." | ".%2e"
+    )
 }
 
 /// Call an arbitrary upstream HTTP resource.
@@ -239,34 +353,200 @@ async fn send_upstream_resource_request(
     req.send().await
 }
 
-pub(crate) async fn call_upstream_resource_with_streaming_accept_and_cancellation(
+async fn send_upstream_resource_request_preserving_path(
     client: &Client,
     method: reqwest::Method,
-    url: &str,
+    target: &UpstreamResourceTarget,
     body: Option<&Value>,
     headers: &[(String, String)],
     accept_event_stream: bool,
+    resolved_proxy: &ResolvedProxyMetadata,
+) -> Result<UpstreamResourceResponse, BoxError> {
+    if target.requires_raw_path_fidelity {
+        if !raw_path_fidelity_sender_can_use_direct_connection(resolved_proxy) {
+            return Err("Responses resource path contains a dot segment that requires raw request-target fidelity, but the configured upstream proxy would route this request through the URL-normalizing client".into());
+        }
+        return send_raw_path_upstream_resource_request(
+            method,
+            target.raw_uri.clone(),
+            body,
+            headers,
+            accept_event_stream,
+        )
+        .await;
+    }
+
+    send_upstream_resource_request(
+        client,
+        method,
+        &target.reqwest_url,
+        body,
+        headers,
+        accept_event_stream,
+    )
+    .await
+    .map(UpstreamResourceResponse::Reqwest)
+    .map_err(|error| Box::new(error) as BoxError)
+}
+
+fn raw_path_fidelity_sender_can_use_direct_connection(
+    resolved_proxy: &ResolvedProxyMetadata,
+) -> bool {
+    matches!(
+        (&resolved_proxy.source, &resolved_proxy.target),
+        (ResolvedProxySource::None, ResolvedProxyTarget::Inherited)
+            | (_, ResolvedProxyTarget::Direct)
+    )
+}
+
+async fn send_raw_path_upstream_resource_request(
+    method: reqwest::Method,
+    uri: hyper::Uri,
+    body: Option<&Value>,
+    headers: &[(String, String)],
+    accept_event_stream: bool,
+) -> Result<UpstreamResourceResponse, BoxError> {
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    let client: HyperClient<_, Full<Bytes>> =
+        HyperClient::builder(TokioExecutor::new()).build(https);
+
+    let body_bytes = match body {
+        Some(body) => {
+            Bytes::from(serde_json::to_vec(body).map_err(|error| Box::new(error) as BoxError)?)
+        }
+        None => Bytes::new(),
+    };
+    let mut request = hyper::Request::builder().method(method.as_str()).uri(uri);
+    if accept_event_stream {
+        request = request.header(reqwest::header::ACCEPT, "text/event-stream");
+    }
+    if body.is_some() {
+        request = request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(
+                reqwest::header::CONTENT_LENGTH,
+                body_bytes.len().to_string(),
+            );
+    }
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+
+    let request = request
+        .body(Full::new(body_bytes))
+        .map_err(|error| Box::new(error) as BoxError)?;
+    let response = client
+        .request(request)
+        .await
+        .map_err(|error| Box::new(error) as BoxError)?;
+    Ok(UpstreamResourceResponse::Hyper(response))
+}
+
+pub(crate) async fn call_upstream_resource_target_with_streaming_accept_and_cancellation(
+    client: &Client,
+    request: UpstreamResourceRequest<'_>,
     downstream_cancellation: &DownstreamCancellation,
-) -> Result<reqwest::Response, DownstreamAwareError<reqwest::Error>> {
+) -> Result<UpstreamResourceResponse, DownstreamAwareError<BoxError>> {
     await_with_downstream_cancellation(
-        send_upstream_resource_request(client, method, url, body, headers, accept_event_stream),
+        send_upstream_resource_request_preserving_path(
+            client,
+            request.method,
+            request.target,
+            request.body,
+            request.headers,
+            request.accept_event_stream,
+            request.resolved_proxy,
+        ),
         downstream_cancellation,
     )
     .await
 }
 
-pub(crate) async fn read_response_text_with_cancellation(
-    response: reqwest::Response,
-    downstream_cancellation: &DownstreamCancellation,
-) -> Result<String, DownstreamAwareError<reqwest::Error>> {
-    await_with_downstream_cancellation(response.text(), downstream_cancellation).await
+#[derive(Debug)]
+pub(crate) enum ResponseBodyLimitError<E> {
+    Inner(E),
+    LimitExceeded { limit: usize },
 }
 
-pub(crate) async fn read_response_bytes_with_cancellation(
+async fn read_response_bytes_limited(
     response: reqwest::Response,
+    limit: usize,
+) -> Result<bytes::Bytes, ResponseBodyLimitError<reqwest::Error>> {
+    let mut stream = response.bytes_stream();
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ResponseBodyLimitError::Inner)?;
+        if out.len().saturating_add(chunk.len()) > limit {
+            return Err(ResponseBodyLimitError::LimitExceeded { limit });
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(bytes::Bytes::from(out))
+}
+
+pub(crate) async fn read_response_bytes_limited_with_cancellation(
+    response: reqwest::Response,
+    limit: usize,
     downstream_cancellation: &DownstreamCancellation,
-) -> Result<bytes::Bytes, DownstreamAwareError<reqwest::Error>> {
-    await_with_downstream_cancellation(response.bytes(), downstream_cancellation).await
+) -> Result<bytes::Bytes, DownstreamAwareError<ResponseBodyLimitError<reqwest::Error>>> {
+    await_with_downstream_cancellation(
+        read_response_bytes_limited(response, limit),
+        downstream_cancellation,
+    )
+    .await
+}
+
+pub(crate) async fn read_response_text_limited_with_cancellation(
+    response: reqwest::Response,
+    limit: usize,
+    downstream_cancellation: &DownstreamCancellation,
+) -> Result<String, DownstreamAwareError<ResponseBodyLimitError<reqwest::Error>>> {
+    read_response_bytes_limited_with_cancellation(response, limit, downstream_cancellation)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+}
+
+async fn read_resource_response_bytes_limited(
+    response: UpstreamResourceResponse,
+    limit: usize,
+) -> Result<bytes::Bytes, ResponseBodyLimitError<BoxError>> {
+    let mut stream = response.into_bytes_stream();
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ResponseBodyLimitError::Inner)?;
+        if out.len().saturating_add(chunk.len()) > limit {
+            return Err(ResponseBodyLimitError::LimitExceeded { limit });
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(bytes::Bytes::from(out))
+}
+
+pub(crate) async fn read_resource_response_bytes_limited_with_cancellation(
+    response: UpstreamResourceResponse,
+    limit: usize,
+    downstream_cancellation: &DownstreamCancellation,
+) -> Result<bytes::Bytes, DownstreamAwareError<ResponseBodyLimitError<BoxError>>> {
+    await_with_downstream_cancellation(
+        read_resource_response_bytes_limited(response, limit),
+        downstream_cancellation,
+    )
+    .await
+}
+
+pub(crate) async fn read_resource_response_text_limited_with_cancellation(
+    response: UpstreamResourceResponse,
+    limit: usize,
+    downstream_cancellation: &DownstreamCancellation,
+) -> Result<String, DownstreamAwareError<ResponseBodyLimitError<BoxError>>> {
+    read_resource_response_bytes_limited_with_cancellation(response, limit, downstream_cancellation)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
 }
 
 /// Resolve upstream URL for the given format using config base URL.
@@ -478,6 +758,7 @@ mod tests {
             model_aliases: Default::default(),
             hooks: Default::default(),
             debug_trace: crate::config::DebugTraceConfig::default(),
+            resource_limits: Default::default(),
         }
     }
 

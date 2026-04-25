@@ -26,6 +26,8 @@ Each wrapper supports two modes:
 
 If you already have a proxy process running, pass `--proxy-base`. If you omit it, the wrapper starts the proxy, waits for `/health`, launches the client, and stops the proxy when the session exits.
 
+Wrapper commands are safe by default: they do not pass no-sandbox, `yolo`, or permission-bypass flags. Disposable local harness runs that intentionally need client-specific bypass behavior must opt in with `--dangerous-harness`.
+
 ## Basic Client Commands
 
 ### Codex CLI
@@ -51,6 +53,8 @@ Managed mode, where the wrapper starts the proxy for you:
 
 Codex benefits the most from the wrapper because it fetches live `llmup.surface` metadata from the proxy model catalog and writes the temporary catalog payload from that runtime truth, instead of relying on legacy hard-coded Codex assumptions or the unknown-model fallback path.
 
+For throwaway harness work only, `--dangerous-harness` allows the wrapper to pass Codex's bypass flag. Leave it off for normal use.
+
 ### Claude Code
 
 ```bash
@@ -69,6 +73,8 @@ Managed mode:
   --workspace "$PWD" \
   --model gpt-5-4
 ```
+
+For throwaway harness work only, `--dangerous-harness` allows the wrapper to pass Claude's permission-skip flag. Leave it off for normal use.
 
 ### Gemini CLI
 
@@ -89,6 +95,8 @@ Managed mode:
   --model gpt-5-4
 ```
 
+For throwaway harness work only, `--dangerous-harness` allows the wrapper to pass Gemini's no-sandbox and `yolo` flags. Leave it off for normal use.
+
 ## Client Base URL vs Server Route
 
 The wrapper configures the client base URL, and the client appends its own protocol path on top.
@@ -108,6 +116,13 @@ That is why the homepage no longer presents one flat endpoint table for manual c
 ## Manual Wiring Without Wrappers
 
 Wrappers are still recommended, but the underlying client contracts are straightforward if you prefer to wire things by hand.
+
+The release CLI wrapper matrix currently gates the wrapper surface by expanding
+the tracked basic matrix for Codex CLI, Claude Code, and Gemini CLI. It is a
+structure gate: it verifies that the wrapper cases remain defined without
+requiring provider secrets or locally installed interactive clients in the
+release runner. Real client execution remains an operator/local validation step
+when those CLIs are installed.
 
 ### Codex
 

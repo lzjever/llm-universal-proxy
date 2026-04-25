@@ -1001,14 +1001,18 @@ def _runtime_upstreams(
         for name, values in config.upstreams.items()
     )
     if has_local_qwen(dotenv_env):
-        upstreams["LOCAL-QWEN"] = collections.OrderedDict(
+        qwen_upstream = collections.OrderedDict(
             [
                 ("api_root", dotenv_env["LOCAL_QWEN_BASE_URL"]),
                 ("format", "openai-completion"),
-                ("credential_actual", dotenv_env.get("LOCAL_QWEN_API_KEY", "not-needed")),
-                ("auth_policy", "force_server"),
             ]
         )
+        if dotenv_env.get("LOCAL_QWEN_API_KEY"):
+            qwen_upstream["credential_env"] = "LOCAL_QWEN_API_KEY"
+        else:
+            qwen_upstream["credential_actual"] = "not-needed"
+        qwen_upstream["auth_policy"] = "force_server"
+        upstreams["LOCAL-QWEN"] = qwen_upstream
     return upstreams
 
 
@@ -5010,6 +5014,7 @@ def build_client_command(
     fixture: TaskFixture,
     workspace_dir: pathlib.Path,
     client_home: pathlib.Path | None = None,
+    dangerous_harness: bool = False,
 ) -> list[str]:
     prompt_text = render_fixture_prompt(fixture, client_name)
     if client_name == "codex":
@@ -5022,20 +5027,27 @@ def build_client_command(
             "--ephemeral",
             "--json",
             "--skip-git-repo-check",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-C",
-            str(workspace_dir),
-            "-c",
-            'model_provider="proxy"',
-            "-c",
-            'model_providers.proxy.name="Proxy"',
-            "-c",
-            f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
-            "-c",
-            'model_providers.proxy.wire_api="responses"',
-            "-c",
-            "model_providers.proxy.supports_websockets=false",
         ]
+        if dangerous_harness:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            command.extend(["--sandbox", "workspace-write"])
+        command.extend(
+            [
+                "-C",
+                str(workspace_dir),
+                "-c",
+                'model_provider="proxy"',
+                "-c",
+                'model_providers.proxy.name="Proxy"',
+                "-c",
+                f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
+                "-c",
+                'model_providers.proxy.wire_api="responses"',
+                "-c",
+                "model_providers.proxy.supports_websockets=false",
+            ]
+        )
         command.extend(
             build_codex_catalog_args(
                 client_home,
@@ -5060,10 +5072,10 @@ def build_client_command(
             "--model",
             lane.proxy_model,
             "--no-session-persistence",
-            "--dangerously-skip-permissions",
-            "--add-dir",
-            str(workspace_dir),
         ]
+        if dangerous_harness:
+            command.append("--dangerously-skip-permissions")
+        command.extend(["--add-dir", str(workspace_dir)])
         ensure_no_public_internal_tool_artifacts(
             command, context="real CLI command"
         )
@@ -5075,13 +5087,17 @@ def build_client_command(
             prompt_text,
             "--model",
             lane.proxy_model,
-            "--sandbox=false",
-            "--yolo",
-            "--include-directories",
-            str(workspace_dir),
-            "--output-format",
-            "text",
         ]
+        if dangerous_harness:
+            command.extend(["--sandbox=false", "--yolo"])
+        command.extend(
+            [
+                "--include-directories",
+                str(workspace_dir),
+                "--output-format",
+                "text",
+            ]
+        )
         ensure_no_public_internal_tool_artifacts(
             command, context="real CLI command"
         )
@@ -5095,6 +5111,7 @@ def run_matrix_case(
     report_dir: pathlib.Path,
     base_env: dict[str, str],
     timeout_policy: TimeoutPolicy = DEFAULT_TIMEOUT_POLICY,
+    dangerous_harness: bool = False,
 ) -> dict[str, object]:
     report_dir = report_dir.resolve()
     cases_dir = report_dir / "cases"
@@ -5118,6 +5135,7 @@ def run_matrix_case(
         case.fixture,
         workspace_dir,
         client_home=home_dir,
+        dangerous_harness=dangerous_harness,
     )
     stdin_text = client_stdin_text(case.client_name, case.fixture)
     timeout_secs = resolve_case_timeout_secs(case, home_dir, timeout_policy)
@@ -5358,6 +5376,11 @@ def resolve_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--binary", default=str(default_proxy_binary_path()))
     parser.add_argument("--proxy-host", default="127.0.0.1")
     parser.add_argument(
+        "--dangerous-harness",
+        action="store_true",
+        help="allow client-specific no-sandbox or permission-bypass flags",
+    )
+    parser.add_argument(
         "--proxy-port",
         type=int,
         default=None,
@@ -5475,6 +5498,7 @@ def run(argv: list[str] | None = None) -> int:
                     report_dir,
                     base_env,
                     timeout_policy=timeout_policy,
+                    dangerous_harness=args.dangerous_harness,
                 )
             )
     finally:

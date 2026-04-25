@@ -23,7 +23,7 @@ State continuity is where protocol expectations diverge the most. "Conversation"
 
 | Surface | Why it is risky |
 | --- | --- |
-| OpenAI `previous_response_id`, conversations, and compaction | They imply upstream-managed state the proxy does not reconstruct today. |
+| OpenAI `previous_response_id`, conversations, `context_management`, and compaction | They imply upstream-managed state the proxy does not reconstruct today. |
 | Anthropic `context_management`, containers, and MCP server state | These are stateful beta surfaces with no safe OpenAI or Gemini mirror. |
 | Gemini `cachedContent` | It is a cache reference, not a conversation cursor. |
 

@@ -44,8 +44,6 @@ pub(super) fn openai_finish_reason_to_gemini(finish_reason: &str) -> &'static st
     }
 }
 
-pub(super) const GEMINI_DUMMY_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
-
 pub(crate) fn responses_failed_code_to_openai_finish(code: Option<&str>) -> &'static str {
     classify_portable_non_success_terminal(code)
 }
@@ -120,16 +118,13 @@ pub(super) fn push_gemini_function_call_part(
     }
     validate_openai_public_tool_identity(tool_call)?;
     let args_val = openai_tool_arguments_to_structured_value(tool_call, "Gemini")?;
-    let mut part = serde_json::json!({
+    let part = serde_json::json!({
         "functionCall": {
             "id": tool_call.get("id"),
             "name": tool_call.get("function").and_then(|f| f.get("name")),
             "args": args_val
         }
     });
-    if !parts.iter().any(|part| part.get("functionCall").is_some()) {
-        part["thoughtSignature"] = Value::String(GEMINI_DUMMY_THOUGHT_SIGNATURE.to_string());
-    }
     parts.push(part);
     Ok(())
 }

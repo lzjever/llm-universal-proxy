@@ -51,6 +51,8 @@ The captured Responses baseline spans both `/responses` and `/conversations` res
 
 This captured baseline includes the response lifecycle resources and the linked conversation resources, not just `POST /v1/responses`.
 
+Proxy support posture: these lifecycle and state resources are supported on `/openai/v1/...` and `/namespaces/{namespace}/openai/v1/...` only as native OpenAI Responses pass-through. The namespace must resolve to exactly one available upstream that natively supports OpenAI Responses. The proxy preserves method, query, JSON body, and forwardable protocol/auth headers, percent-encodes resource ID path segments before upstream forwarding, and fails closed rather than reconstructing response, conversation, or item ownership across providers.
+
 ## Request baseline
 
 ### Core envelope
@@ -139,6 +141,8 @@ In the captured create reference, `context_management` currently supports compac
 
 The captured compact endpoint returns a compacted response object. This is part of the formal surface, not just a guide-only idea.
 
+Proxy posture: `context_management` and compact resources are native OpenAI Responses state surfaces. Same-provider passthrough preserves them; cross-provider request translation fails closed instead of dropping or approximating compaction state.
+
 ### Tool surface
 
 The captured Responses tool surface includes both user-defined tools and built-in tools.
@@ -212,6 +216,8 @@ The captured `include` surface is especially important because it gates extra fi
 - `message.input_image.image_url`
 - `computer_call_output.output.image_url`
 - `code_interpreter_call.outputs`
+
+Proxy posture: `reasoning.encrypted_content` is opaque reasoning-continuity state. `include: ["reasoning.encrypted_content"]` and request input reasoning items with `encrypted_content` are preserved only on native OpenAI Responses passthrough; cross-provider request translation rejects them. This includes proxy-local carrier strings that encode Anthropic signed or omitted thinking provenance: they are never replayed into another provider's request history, and the proxy returns 400 before contacting the selected upstream.
 
 ## Response baseline
 

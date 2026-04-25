@@ -8,6 +8,11 @@ GOVERNANCE_SCRIPT = REPO_ROOT / "scripts" / "check-governance.sh"
 PYTHON_CONTRACT_TEST_COMMAND = (
     "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
 )
+PROVIDER_KEY_PATTERN_SNIPPETS = (
+    "sk-cp-",
+    "sk-ant-",
+    "sk-proj-",
+)
 ACTIVE_DOC_PATHS = (
     REPO_ROOT / "README.md",
     REPO_ROOT / "README_CN.md",
@@ -96,6 +101,20 @@ def claim_units(text: str):
             yield paragraph, paragraph_match.start()
 
 
+def curl_command_blocks(script: str):
+    block = []
+    for line in script.splitlines():
+        stripped = line.lstrip()
+        if not block and not re.search(r"(^|[^\w])curl\b", stripped):
+            continue
+        block.append(line)
+        if not line.rstrip().endswith("\\"):
+            yield "\n".join(block)
+            block = []
+    if block:
+        yield "\n".join(block)
+
+
 class GovernanceTests(unittest.TestCase):
     def test_default_test_entries_run_python_contract_tests_without_bytecode(self):
         entrypoints = {
@@ -167,13 +186,40 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("scripts/test_container_smoke.sh", makefile)
         self.assertIn("/etc/llmup/config.yaml", script)
         self.assertIn("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN=${ADMIN_TOKEN}", script)
+        self.assertIn("LLM_UNIVERSAL_PROXY_DATA_TOKEN=${DATA_TOKEN}", script)
+        self.assertIn("CONTAINER_SMOKE_UPSTREAM_API_KEY=dummy", script)
         self.assertIn("host.docker.internal:host-gateway", script)
         self.assertIn('CONTAINER_PORT="8080"', script)
         self.assertIn("listen: 0.0.0.0:${CONTAINER_PORT}", script)
+        self.assertIn("credential_env: CONTAINER_SMOKE_UPSTREAM_API_KEY", script)
+        self.assertIn("auth_policy: force_server", script)
         self.assertIn('-p "${HOST}:${PROXY_PORT}:${CONTAINER_PORT}"', script)
         self.assertIn("wait_for_container_healthy", script)
         self.assertNotIn("listen: 0.0.0.0:${PROXY_PORT}", script)
         self.assertIn("scripts/test_container_smoke.sh", governance)
+
+        data_route_curls = [
+            block
+            for block in curl_command_blocks(script)
+            if "http://${HOST}:${PROXY_PORT}" in block
+            and "/health" not in block
+            and "/admin/" not in block
+        ]
+        self.assertGreater(
+            len(data_route_curls),
+            0,
+            "Container smoke must exercise at least one data-plane route",
+        )
+        for block in data_route_curls:
+            with self.subTest(curl=block):
+                has_explicit_data_token = (
+                    "X-LLMUP-Data-Token: ${DATA_TOKEN}" in block
+                )
+                has_bearer_data_token = "Authorization: Bearer ${DATA_TOKEN}" in block
+                self.assertTrue(
+                    has_explicit_data_token or has_bearer_data_token,
+                    "Every data-plane smoke curl must send the data token",
+                )
 
     def test_ci_and_release_workflows_keep_container_publish_scope_tight(self):
         ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
@@ -201,6 +247,47 @@ class GovernanceTests(unittest.TestCase):
         )
         self.assertNotIn(":edge", release)
 
+    def test_release_test_gate_matches_ci_python_contract_gate(self):
+        ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        release = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("Run Rust tests", ci)
+        self.assertIn("cargo test --locked --verbose", ci)
+        self.assertIn("Run Python contract tests", ci)
+        self.assertIn(PYTHON_CONTRACT_TEST_COMMAND, ci)
+        self.assertIn("Run Rust tests", release)
+        self.assertIn("cargo test --locked --verbose", release)
+        self.assertIn("Run Python contract tests", release)
+        self.assertIn(PYTHON_CONTRACT_TEST_COMMAND, release)
+        self.assertRegex(ci, r"(?i)secret scan")
+        self.assertRegex(release, r"(?i)secret scan")
+
+    def test_governance_secret_scan_covers_tracked_fixtures_docs_examples_scripts(self):
+        script = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
+        default_config = (
+            REPO_ROOT
+            / "scripts"
+            / "fixtures"
+            / "cli_matrix"
+            / "default_proxy_test_matrix.yaml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("scan_tracked_secret_risks", script)
+        self.assertIn("git ls-files", script)
+        for path_prefix in ("scripts/fixtures", "docs", "examples", "scripts"):
+            with self.subTest(path_prefix=path_prefix):
+                self.assertIn(path_prefix, script)
+        for key_pattern in PROVIDER_KEY_PATTERN_SNIPPETS:
+            with self.subTest(key_pattern=key_pattern):
+                self.assertIn(key_pattern, script)
+                self.assertNotIn(key_pattern, default_config)
+        self.assertIn("credential_env: MINIMAX_API_KEY", default_config)
+        self.assertNotIn("credential_actual", default_config)
+
     def test_container_examples_and_docs_do_not_bake_secrets(self):
         container_config = (REPO_ROOT / "examples" / "container-config.yaml").read_text(
             encoding="utf-8"
@@ -223,8 +310,14 @@ class GovernanceTests(unittest.TestCase):
             "${LLM_UNIVERSAL_PROXY_ADMIN_TOKEN:?set LLM_UNIVERSAL_PROXY_ADMIN_TOKEN}",
             compose,
         )
+        self.assertIn(
+            "${LLM_UNIVERSAL_PROXY_DATA_TOKEN:?set LLM_UNIVERSAL_PROXY_DATA_TOKEN}",
+            compose,
+        )
         self.assertNotRegex(container_config + compose, r"sk-[A-Za-z0-9]")
         self.assertIn("ghcr.io/lzjever/llm-universal-proxy", container_doc)
+        self.assertIn("LLM_UNIVERSAL_PROXY_DATA_TOKEN", container_doc)
+        self.assertIn("X-LLMUP-Data-Token", container_doc)
         self.assertIn(
             "Do not mount the local quickstart config unchanged for container service mode",
             container_doc,

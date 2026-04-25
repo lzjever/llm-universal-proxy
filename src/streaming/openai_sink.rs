@@ -1189,14 +1189,9 @@ pub(super) fn openai_chunk_to_gemini_sse(chunk: &Value, state: &mut StreamState)
         let Some((name, args_val, id)) = next_part else {
             break;
         };
-        let mut part = serde_json::json!({
+        let part = serde_json::json!({
             "functionCall": { "name": name, "args": args_val, "id": id }
         });
-        if !state.gemini_dummy_signature_emitted {
-            part["thoughtSignature"] =
-                Value::String(GEMINI_DUMMY_THOUGHT_SIGNATURE_STREAM.to_string());
-            state.gemini_dummy_signature_emitted = true;
-        }
         parts.push(part);
         state.gemini_next_tool_call_to_emit += 1;
     }

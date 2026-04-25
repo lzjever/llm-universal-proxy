@@ -347,6 +347,13 @@ pub(super) async fn handle_admin_namespace_config(
             );
         }
     };
+    if let Err(error) = state.data_auth_policy.validate(&config) {
+        return error_response(
+            UpstreamFormat::OpenAiCompletion,
+            StatusCode::BAD_REQUEST,
+            &format!("invalid runtime config: {error}"),
+        );
+    }
     let current = {
         let runtime = state.runtime.read().await;
         runtime

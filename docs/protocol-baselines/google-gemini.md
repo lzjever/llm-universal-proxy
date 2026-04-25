@@ -164,7 +164,7 @@ Key rules:
 | `executableCode` | output | Code generated for the `codeExecution` tool. |
 | `codeExecutionResult` | output | Result returned by server-side code execution. |
 | `thought` | output metadata | Boolean marker that this part is model thought. |
-| `thoughtSignature` | output or echoed input | Opaque bytes that must sometimes be returned verbatim in later turns. |
+| `thoughtSignature` | Gemini output or trusted replay input | Opaque Gemini bytes that must sometimes be returned verbatim in later turns. Do not fabricate them. |
 | `partMetadata` | both | Opaque metadata; docs mention file/source identity and multiplexing use cases. Preserve it. |
 | `mediaResolution` | input | Input media resolution hint. |
 | `videoMetadata` | input | Only valid when the part carries video data. |
@@ -177,7 +177,8 @@ Media sub-objects:
 Proxy rules:
 
 - Preserve part order exactly.
-- Preserve unknown or opaque fields such as `partMetadata` and `thoughtSignature`.
+- On Gemini-native traffic and same-provider passthrough, preserve unknown or opaque fields such as `partMetadata` and real Gemini `thoughtSignature` values.
+- Cross-protocol request translators must not synthesize or replay Gemini `thoughtSignature` / `thought_signature` values. If those fields appear anywhere in translated request content or history, fail closed instead of guessing provenance or part placement.
 - Do not coerce a union branch into another branch.
 - Do not flatten multimodal messages into plain text.
 
@@ -379,12 +380,12 @@ Non-function-call signatures:
 - Returning those signatures is recommended for reasoning quality.
 - Validation is not strict for those non-function signatures; omission does not block the request.
 
-Escape hatches documented by Google for manually injected or foreign traces:
+Proxy portability rules:
 
-- `"context_engineering_is_the_way_to_go"`
-- `"skip_thought_signature_validator"`
-
-These are documented as dummy signatures that skip validation. They are last-resort interop tools, not the normal baseline path.
+- OpenAI-to-Gemini conversion must not add synthetic `thoughtSignature` values to tool-call history, reasoning parts, or replayed assistant turns.
+- A real Gemini `thoughtSignature` may be preserved only on Gemini-native / same-provider passthrough traffic.
+- Cross-protocol Gemini requests containing `thoughtSignature` or `thought_signature`, including nested `history[].parts[]` or function-response payloads, fail closed.
+- Documented dummy validator signatures are not part of the current proxy behavior. They must not be generated as a compatibility shortcut for foreign or manually constructed traces.
 
 ## Safety settings and blocking
 

@@ -18,7 +18,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Check version and toolchain governance
+      - name: Check version, toolchain, and Secret Scan governance
         run: bash scripts/check-governance.sh
 
   fmt:
@@ -169,13 +169,168 @@ jobs:
         with:
           toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
 
-      - name: Run tests
+      - name: Run Rust tests
         run: cargo test --locked --verbose
+
+      - name: Run Python contract tests
+        if: ${{ always() }}
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'
+
+  mock-endpoint-matrix:
+    name: Mock Endpoint Matrix
+    runs-on: ubuntu-latest
+    needs: [governance, test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Read repo metadata
+        id: repo_meta
+        run: python scripts/repo_metadata.py github-output
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --verbose
+
+      - name: Run mock endpoint matrix
+        run: python3 scripts/real_endpoint_matrix.py --mock --binary ./target/release/llm-universal-proxy --json-out artifacts/mock-endpoint-matrix.json
+
+      - name: Upload mock endpoint matrix result
+        uses: actions/upload-artifact@v4
+        with:
+          name: mock-endpoint-matrix
+          path: artifacts/mock-endpoint-matrix.json
+
+  cli-wrapper-matrix:
+    name: CLI Wrapper Matrix
+    runs-on: ubuntu-latest
+    needs: [governance, test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Run CLI wrapper matrix
+        run: |
+          python3 scripts/real_cli_matrix.py --test basic --skip-slow --list-matrix | tee cli-wrapper-matrix.txt
+          test "$(wc -l < cli-wrapper-matrix.txt)" -gt 0
+
+      - name: Upload CLI wrapper matrix listing
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-wrapper-matrix
+          path: cli-wrapper-matrix.txt
+
+  perf-gate:
+    name: Perf Gate
+    runs-on: ubuntu-latest
+    needs: [governance, test]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Read repo metadata
+        id: repo_meta
+        run: python scripts/repo_metadata.py github-output
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --verbose
+
+      - name: Run perf gate
+        run: python3 scripts/real_endpoint_matrix.py --mock --perf --binary ./target/release/llm-universal-proxy --json-out artifacts/perf-gate.json
+
+      - name: Upload perf gate result
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-gate
+          path: artifacts/perf-gate.json
+
+  supply-chain:
+    name: Supply Chain
+    runs-on: ubuntu-latest
+    needs: governance
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Read repo metadata
+        id: repo_meta
+        run: python scripts/repo_metadata.py github-output
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit --locked
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+  real-provider-smoke:
+    name: Real Provider Smoke
+    runs-on: ubuntu-latest
+    needs: [governance, test]
+    if: startsWith(github.ref, 'refs/tags/')
+    environment: release-real-providers
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Read repo metadata
+        id: repo_meta
+        run: python scripts/repo_metadata.py github-output
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: ${{ steps.repo_meta.outputs.rust_toolchain }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --verbose
+
+      - name: Validate protected real provider secrets
+        env:
+          GLM_APIKEY: ${{ secrets.GLM_APIKEY }}
+        run: |
+          test -n "${GLM_APIKEY:-}" || {
+            echo "GLM_APIKEY is required in the release-real-providers environment" >&2
+            exit 1
+          }
+
+      - name: Run real provider smoke
+        env:
+          GLM_APIKEY: ${{ secrets.GLM_APIKEY }}
+        run: python3 scripts/real_endpoint_matrix.py --real-provider-smoke --binary ./target/release/llm-universal-proxy
 
   container:
     name: Publish GHCR Image
     runs-on: ubuntu-latest
-    needs: [governance, fmt, clippy, test]
+    needs: [governance, fmt, clippy, test, mock-endpoint-matrix, cli-wrapper-matrix, perf-gate, real-provider-smoke, supply-chain]
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
@@ -241,7 +396,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [governance, fmt, clippy, build, test, container]
+    needs: [governance, fmt, clippy, build, test, container, mock-endpoint-matrix, cli-wrapper-matrix, perf-gate, real-provider-smoke, supply-chain]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:

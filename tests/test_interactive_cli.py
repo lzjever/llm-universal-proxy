@@ -16,6 +16,12 @@ WRAPPER_PATHS = (
     REPO_ROOT / "scripts" / "run_claude_proxy.sh",
     REPO_ROOT / "scripts" / "run_gemini_proxy.sh",
 )
+FORBIDDEN_DANGEROUS_ARGS = (
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-skip-permissions",
+    "--sandbox=false",
+    "--yolo",
+)
 
 
 def load_module():
@@ -40,6 +46,15 @@ class InteractiveCliTests(unittest.TestCase):
 
         self.assertEqual(args.binary, "/tmp/fresh-proxy")
 
+    def test_parse_args_requires_explicit_dangerous_harness_opt_in(self):
+        module = load_module()
+
+        safe_args = module.parse_args(["--client", "codex"])
+        dangerous_args = module.parse_args(["--client", "codex", "--dangerous-harness"])
+
+        self.assertFalse(safe_args.dangerous_harness)
+        self.assertTrue(dangerous_args.dangerous_harness)
+
     def test_wrapper_scripts_resolve_interactive_cli_relative_to_script_dir(self):
         for wrapper_path in WRAPPER_PATHS:
             with self.subTest(wrapper=wrapper_path.name):
@@ -59,7 +74,7 @@ class InteractiveCliTests(unittest.TestCase):
                 )
                 self.assertIn("interactive_cli.py", completed.stdout)
 
-    def test_build_interactive_command_shapes(self):
+    def test_build_interactive_command_safe_default_shapes(self):
         module = load_module()
         workspace = pathlib.Path("/tmp/workspace").resolve()
         proxy_base = "http://127.0.0.1:18888"
@@ -79,7 +94,8 @@ class InteractiveCliTests(unittest.TestCase):
                 str(workspace),
                 "-m",
                 "minimax-openai",
-                "--dangerously-bypass-approvals-and-sandbox",
+                "--sandbox",
+                "workspace-write",
                 "-c",
                 'model_provider="proxy"',
                 "-c",
@@ -106,7 +122,6 @@ class InteractiveCliTests(unittest.TestCase):
                 "user",
                 "--model",
                 "claude-haiku-4-5",
-                "--dangerously-skip-permissions",
                 "--add-dir",
                 str(workspace),
             ],
@@ -124,12 +139,68 @@ class InteractiveCliTests(unittest.TestCase):
                 "gemini",
                 "--model",
                 "minimax-openai",
-                "--sandbox=false",
-                "--yolo",
                 "--include-directories",
                 str(workspace),
             ],
         )
+
+    def test_build_interactive_command_omits_dangerous_flags_by_default(self):
+        module = load_module()
+        workspace = pathlib.Path("/tmp/workspace").resolve()
+
+        for client_name, model in (
+            ("codex", "minimax-openai"),
+            ("claude", "claude-haiku-4-5"),
+            ("gemini", "minimax-openai"),
+        ):
+            with self.subTest(client=client_name):
+                command = module.build_interactive_command(
+                    client_name,
+                    workspace,
+                    model,
+                    "http://127.0.0.1:18888",
+                    client_home=pathlib.Path("/tmp/codex-home"),
+                    model_limits=None,
+                )
+                for forbidden_arg in FORBIDDEN_DANGEROUS_ARGS:
+                    self.assertNotIn(forbidden_arg, command)
+
+    def test_build_interactive_command_allows_explicit_dangerous_harness(self):
+        module = load_module()
+        workspace = pathlib.Path("/tmp/workspace").resolve()
+
+        codex = module.build_interactive_command(
+            "codex",
+            workspace,
+            "minimax-openai",
+            "http://127.0.0.1:18888",
+            client_home=pathlib.Path("/tmp/codex-home"),
+            model_limits=None,
+            dangerous_harness=True,
+        )
+        claude = module.build_interactive_command(
+            "claude",
+            workspace,
+            "claude-haiku-4-5",
+            "http://127.0.0.1:18888",
+            client_home=None,
+            model_limits=None,
+            dangerous_harness=True,
+        )
+        gemini = module.build_interactive_command(
+            "gemini",
+            workspace,
+            "minimax-openai",
+            "http://127.0.0.1:18888",
+            client_home=None,
+            model_limits=None,
+            dangerous_harness=True,
+        )
+
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", codex)
+        self.assertIn("--dangerously-skip-permissions", claude)
+        self.assertIn("--sandbox=false", gemini)
+        self.assertIn("--yolo", gemini)
 
     def test_build_interactive_command_injects_codex_catalog_when_limits_exist(self):
         module = load_module()

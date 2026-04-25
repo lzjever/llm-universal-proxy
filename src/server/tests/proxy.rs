@@ -113,6 +113,62 @@ async fn spawn_openai_responses_mock(
     (format!("http://{addr}"), requests, server)
 }
 
+async fn spawn_openai_completion_raw_mock(
+    status: StatusCode,
+    response_body: String,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    #[derive(Clone)]
+    struct MockState {
+        requests: Arc<Mutex<Vec<Value>>>,
+        status: StatusCode,
+        response_body: String,
+    }
+
+    async fn handle_chat_completions(
+        State(state): State<MockState>,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        state.requests.lock().await.push(body);
+        Response::builder()
+            .status(state.status)
+            .header("Content-Type", "application/json")
+            .body(Body::from(state.response_body))
+            .expect("raw OpenAI completion mock response")
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/chat/completions", post(handle_chat_completions))
+        .with_state(MockState {
+            requests: requests.clone(),
+            status,
+            response_body,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw OpenAI completion mock upstream");
+    let addr = listener
+        .local_addr()
+        .expect("raw OpenAI completion mock local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("raw OpenAI completion mock server");
+    });
+
+    (format!("http://{addr}"), requests, server)
+}
+
+async fn set_resource_limits(state: &Arc<AppState>, limits: crate::config::ResourceLimits) {
+    let mut runtime = state.runtime.write().await;
+    runtime
+        .namespaces
+        .get_mut(DEFAULT_NAMESPACE)
+        .expect("default namespace")
+        .config
+        .resource_limits = limits;
+}
+
 async fn spawn_google_generate_content_mock(
     response_body: Value,
 ) -> (
@@ -287,6 +343,165 @@ fn anthropic_commentary_then_tool_use_events() -> Vec<Value> {
     ]
 }
 
+#[tokio::test]
+async fn openai_chat_request_body_limit_rejects_before_upstream() {
+    let response_body = serde_json::json!({
+        "id": "chatcmpl_1",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hi" },
+            "finish_reason": "stop"
+        }]
+    });
+    let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+    set_resource_limits(
+        &state,
+        crate::config::ResourceLimits {
+            max_request_body_bytes: 96,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let oversized_secret = "REQUEST_BODY_SENTINEL_SHOULD_NOT_LEAK";
+    let request_body = serde_json::json!({
+        "model": "gpt-4o-mini",
+        "messages": [{ "role": "user", "content": format!("{oversized_secret}{}", "x".repeat(512)) }],
+        "stream": false
+    })
+    .to_string();
+    let request = axum::http::Request::builder()
+        .header("Content-Type", "application/json")
+        .body(Body::from(request_body))
+        .expect("request");
+
+    let response =
+        crate::server::proxy::handle_openai_chat_completions(State(state), None, request).await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 response");
+    assert!(
+        body_text.contains("request body exceeded"),
+        "body = {body_text}"
+    );
+    assert!(!body_text.contains(oversized_secret), "body = {body_text}");
+    assert!(requests.lock().await.is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn non_stream_upstream_response_body_limit_fails_closed_without_payload_leak() {
+    let upstream_sentinel = "NON_STREAM_RESPONSE_SENTINEL_SHOULD_NOT_LEAK";
+    let raw_body = serde_json::json!({
+        "id": "chatcmpl_large",
+        "object": "chat.completion",
+        "created": 123,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": format!("{upstream_sentinel}{}", "x".repeat(1024)) },
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (mock_base, requests, server) =
+        spawn_openai_completion_raw_mock(StatusCode::OK, raw_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+    set_resource_limits(
+        &state,
+        crate::config::ResourceLimits {
+            max_non_stream_response_bytes: 256,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/chat/completions".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 response");
+    assert!(
+        body_text.contains("upstream response body exceeded"),
+        "body = {body_text}"
+    );
+    assert!(!body_text.contains(upstream_sentinel), "body = {body_text}");
+    assert_eq!(requests.lock().await.len(), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn upstream_error_body_limit_fails_closed_without_error_payload_leak() {
+    let upstream_sentinel = "UPSTREAM_ERROR_BODY_SENTINEL_SHOULD_NOT_LEAK";
+    let raw_body = format!("{upstream_sentinel}{}", "x".repeat(1024));
+    let (mock_base, requests, server) =
+        spawn_openai_completion_raw_mock(StatusCode::BAD_REQUEST, raw_body).await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+    set_resource_limits(
+        &state,
+        crate::config::ResourceLimits {
+            max_upstream_error_body_bytes: 64,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/chat/completions".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("utf8 response");
+    assert!(
+        body_text.contains("upstream error body exceeded"),
+        "body = {body_text}"
+    );
+    assert!(!body_text.contains(upstream_sentinel), "body = {body_text}");
+    assert_eq!(requests.lock().await.len(), 1);
+    server.abort();
+}
+
 #[test]
 fn classify_request_boundary_rejects_translated_stateful_responses_controls() {
     let decision = classify_request_boundary(
@@ -294,7 +509,8 @@ fn classify_request_boundary_rejects_translated_stateful_responses_controls() {
         crate::formats::UpstreamFormat::Anthropic,
         &serde_json::json!({
             "conversation": { "id": "conv_1" },
-            "background": true
+            "background": true,
+            "store": true
         }),
     );
 
@@ -303,6 +519,7 @@ fn classify_request_boundary_rejects_translated_stateful_responses_controls() {
     };
     assert!(message.contains("conversation"));
     assert!(message.contains("background"));
+    assert!(message.contains("store"));
     assert!(message.contains("native OpenAI Responses"));
 }
 
@@ -312,7 +529,6 @@ fn classify_request_boundary_keeps_warning_path_for_allowed_degradation() {
         crate::formats::UpstreamFormat::OpenAiResponses,
         crate::formats::UpstreamFormat::Anthropic,
         &serde_json::json!({
-            "store": true,
             "tools": [{ "type": "web_search" }]
         }),
     );
@@ -320,7 +536,6 @@ fn classify_request_boundary_keeps_warning_path_for_allowed_degradation() {
     let RequestBoundaryDecision::AllowWithWarnings(warnings) = decision else {
         panic!("expected warning path, got {decision:?}");
     };
-    assert!(warnings.iter().any(|warning| warning.contains("store")));
     assert!(warnings
         .iter()
         .any(|warning| warning.contains("non-function Responses tools")));
@@ -530,7 +745,7 @@ async fn live_gemini_same_format_empty_policy_rejects_reserved_top_level_respons
 }
 
 #[tokio::test]
-async fn live_responses_store_drop_surfaces_warning_header() {
+async fn live_responses_store_true_fails_closed_before_upstream() {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
         "object": "chat.completion",
@@ -567,25 +782,29 @@ async fn live_responses_store_drop_surfaces_warning_header() {
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let warnings = response
         .headers()
         .get_all("x-proxy-compat-warning")
         .iter()
         .filter_map(|value| value.to_str().ok())
         .collect::<Vec<_>>();
+    assert!(warnings.is_empty(), "warnings = {warnings:?}");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("json body bytes");
+    let body: Value = serde_json::from_slice(&body).expect("json body");
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("error message string");
+    assert!(message.contains("store"), "message = {message}");
     assert!(
-        warnings.iter().any(|warning| warning.contains("store")),
-        "warnings = {warnings:?}"
+        message.contains("native OpenAI Responses"),
+        "message = {message}"
     );
 
     let recorded = requests.lock().await;
-    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
-    assert!(
-        recorded[0].get("store").is_none(),
-        "translated request should drop store: {:?}",
-        recorded[0]
-    );
+    assert!(recorded.is_empty(), "requests = {recorded:?}");
 
     server.abort();
 }
@@ -2153,6 +2372,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
 
     let error = resolve_requested_model_or_error(
@@ -2204,6 +2424,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
 
     let error = resolve_requested_model_or_error(

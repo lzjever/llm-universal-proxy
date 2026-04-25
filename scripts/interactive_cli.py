@@ -70,6 +70,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--binary", default=str(default_proxy_binary_path()))
     parser.add_argument("--proxy-host", default="127.0.0.1")
     parser.add_argument(
+        "--dangerous-harness",
+        action="store_true",
+        help="allow client-specific no-sandbox or permission-bypass flags",
+    )
+    parser.add_argument(
         "--proxy-port",
         type=int,
         default=int(os.environ.get("PROXY_PORT", "18888")),
@@ -100,6 +105,7 @@ def build_interactive_command(
     client_home: pathlib.Path | None = None,
     model_limits: ModelLimits | None = None,
     codex_metadata: CodexModelMetadata | None = None,
+    dangerous_harness: bool = False,
 ) -> list[str]:
     workspace = pathlib.Path(workspace).resolve()
     proxy_base = normalize_proxy_base(proxy_base)
@@ -111,16 +117,23 @@ def build_interactive_command(
             str(workspace),
             "-m",
             model,
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-c",
-            'model_provider="proxy"',
-            "-c",
-            'model_providers.proxy.name="Proxy"',
-            "-c",
-            f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
-            "-c",
-            'model_providers.proxy.wire_api="responses"',
         ]
+        if dangerous_harness:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            command.extend(["--sandbox", "workspace-write"])
+        command.extend(
+            [
+                "-c",
+                'model_provider="proxy"',
+                "-c",
+                'model_providers.proxy.name="Proxy"',
+                "-c",
+                f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
+                "-c",
+                'model_providers.proxy.wire_api="responses"',
+            ]
+        )
         command.extend(
             build_codex_catalog_args(
                 client_home, model, model_limits, codex_metadata
@@ -139,10 +152,10 @@ def build_interactive_command(
             "user",
             "--model",
             model,
-            "--dangerously-skip-permissions",
-            "--add-dir",
-            str(workspace),
         ]
+        if dangerous_harness:
+            command.append("--dangerously-skip-permissions")
+        command.extend(["--add-dir", str(workspace)])
         ensure_no_public_internal_tool_artifacts(
             command, context="interactive CLI command"
         )
@@ -153,11 +166,10 @@ def build_interactive_command(
             "gemini",
             "--model",
             model,
-            "--sandbox=false",
-            "--yolo",
-            "--include-directories",
-            str(workspace),
         ]
+        if dangerous_harness:
+            command.extend(["--sandbox=false", "--yolo"])
+        command.extend(["--include-directories", str(workspace)])
         ensure_no_public_internal_tool_artifacts(
             command, context="interactive CLI command"
         )
@@ -255,6 +267,7 @@ def run(argv: list[str] | None = None) -> int:
                 client_home=client_home,
                 model_limits=live_profile.limits,
                 codex_metadata=live_profile.codex_metadata,
+                dangerous_harness=args.dangerous_harness,
             )
             return launch_interactive_client(command, workspace, client_env)
         finally:

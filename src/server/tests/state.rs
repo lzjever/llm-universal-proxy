@@ -45,6 +45,7 @@ async fn build_runtime_namespace_state_exposes_resolved_per_upstream_clients() {
         model_aliases: Default::default(),
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
 
     let namespace_state =
@@ -134,6 +135,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
             ..Default::default()
         },
         debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     };
     config.model_aliases.insert(
         "alias-1".to_string(),

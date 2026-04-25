@@ -954,6 +954,7 @@ fn runtime_namespace_config(
         model_aliases: std::collections::BTreeMap::new(),
         hooks: RuntimeHookConfig::default(),
         debug_trace: DebugTraceConfig::default(),
+        resource_limits: Default::default(),
     }
 }
 

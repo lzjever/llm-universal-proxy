@@ -223,8 +223,8 @@ async fn anthropic_signed_thinking_to_responses_non_streaming_returns_carrier() 
 }
 
 #[tokio::test]
-async fn anthropic_signed_thinking_responses_round_trip_non_streaming_replays_carrier_to_upstream()
-{
+async fn anthropic_signed_thinking_responses_round_trip_non_streaming_rejects_carrier_before_upstream(
+) {
     let (source_base, _source_mock) = spawn_anthropic_signed_thinking_mock().await;
     let source_config = proxy_config(&source_base, UpstreamFormat::Anthropic);
     let (source_proxy_base, _source_proxy) = start_proxy(source_config).await;
@@ -246,7 +246,7 @@ async fn anthropic_signed_thinking_responses_round_trip_non_streaming_replays_ca
     let reasoning_item = output[0].clone();
     let message_item = output[1].clone();
 
-    let (capture_base, _capture_mock, mut captured) = spawn_capture_anthropic_mock().await;
+    let (capture_base, _capture_mock, captured) = spawn_capture_anthropic_mock().await;
     let capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
     let (capture_proxy_base, _capture_proxy) = start_proxy(capture_config).await;
 
@@ -273,35 +273,23 @@ async fn anthropic_signed_thinking_responses_round_trip_non_streaming_replays_ca
         .send()
         .await
         .unwrap();
+    assert_eq!(second_response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = second_response.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("encrypted_content"), "body = {body:?}");
     assert!(
-        second_response.status().is_success(),
-        "status: {status}",
-        status = second_response.status()
+        message.contains("native OpenAI Responses"),
+        "body = {body:?}"
     );
-    let _: Value = second_response.json().await.unwrap();
-
-    captured.changed().await.unwrap();
-    let request = captured
-        .borrow()
-        .clone()
-        .expect("captured anthropic request");
-    let messages = request["messages"].as_array().expect("anthropic messages");
-    assert_eq!(messages[1]["role"], "assistant");
-    let assistant_content = messages[1]["content"]
-        .as_array()
-        .expect("assistant content");
-    assert_eq!(assistant_content[0]["type"], "thinking");
-    assert_eq!(assistant_content[0]["thinking"], "internal reasoning");
-    assert_eq!(assistant_content[0]["signature"], "sig_123");
-    assert_eq!(assistant_content[1]["type"], "text");
-    assert_eq!(assistant_content[1]["text"], "Visible answer");
-    assert_eq!(messages[2]["role"], "user");
-    assert_eq!(messages[2]["content"][0]["text"], "Continue");
+    assert!(
+        captured.borrow().is_none(),
+        "signed thinking carrier fail-closed path must not reach Anthropic upstream"
+    );
 }
 
 #[tokio::test]
-async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_replays_carrier_to_upstream()
-{
+async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_rejects_carrier_before_upstream(
+) {
     let (source_base, _source_mock) = spawn_anthropic_omitted_thinking_mock().await;
     let source_config = proxy_config(&source_base, UpstreamFormat::Anthropic);
     let (source_proxy_base, _source_proxy) = start_proxy(source_config).await;
@@ -329,7 +317,7 @@ async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_replays_c
     let reasoning_item = output[0].clone();
     let message_item = output[1].clone();
 
-    let (capture_base, _capture_mock, mut captured) = spawn_capture_anthropic_mock().await;
+    let (capture_base, _capture_mock, captured) = spawn_capture_anthropic_mock().await;
     let capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
     let (capture_proxy_base, _capture_proxy) = start_proxy(capture_config).await;
 
@@ -356,33 +344,18 @@ async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_replays_c
         .send()
         .await
         .unwrap();
+    assert_eq!(second_response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = second_response.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("encrypted_content"), "body = {body:?}");
     assert!(
-        second_response.status().is_success(),
-        "status: {status}",
-        status = second_response.status()
+        message.contains("native OpenAI Responses"),
+        "body = {body:?}"
     );
-    let _: Value = second_response.json().await.unwrap();
-
-    captured.changed().await.unwrap();
-    let request = captured
-        .borrow()
-        .clone()
-        .expect("captured anthropic request");
-    let messages = request["messages"].as_array().expect("anthropic messages");
-    assert_eq!(messages[1]["role"], "assistant");
-    let assistant_content = messages[1]["content"]
-        .as_array()
-        .expect("assistant content");
-    assert_eq!(assistant_content[0]["type"], "thinking");
-    assert_eq!(
-        assistant_content[0]["thinking"],
-        json!({ "display": "omitted" })
+    assert!(
+        captured.borrow().is_none(),
+        "omitted thinking carrier fail-closed path must not reach Anthropic upstream"
     );
-    assert_eq!(assistant_content[0]["signature"], "sig_omitted");
-    assert_eq!(assistant_content[1]["type"], "text");
-    assert_eq!(assistant_content[1]["text"], "Visible answer");
-    assert_eq!(messages[2]["role"], "user");
-    assert_eq!(messages[2]["content"][0]["text"], "Continue");
 }
 
 #[tokio::test]
@@ -1189,7 +1162,7 @@ async fn multi_turn_gemini_thought_in_history_to_claude_preserves_unsigned_think
 }
 
 #[tokio::test]
-async fn openai_reasoning_tool_turns_replay_to_gemini_with_dummy_signature() {
+async fn openai_reasoning_tool_turns_replay_to_gemini_does_not_inject_thought_signature() {
     let (mock_base, _mock, mut captured) = spawn_capture_google_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -1252,9 +1225,17 @@ async fn openai_reasoning_tool_turns_replay_to_gemini_with_dummy_signature() {
         .all(|part| part.get("thought").is_none()));
     assert_eq!(assistant_parts[0]["text"], "Calling weather tool.");
     assert_eq!(assistant_parts[1]["functionCall"]["name"], "get_weather");
-    assert_eq!(
-        assistant_parts[1]["thoughtSignature"],
-        "skip_thought_signature_validator"
+    let has_thought_signature = request["contents"]
+        .as_array()
+        .expect("gemini contents")
+        .iter()
+        .flat_map(|content| content["parts"].as_array().into_iter().flatten())
+        .any(|part| {
+            part.get("thoughtSignature").is_some() || part.get("thought_signature").is_some()
+        });
+    assert!(
+        !has_thought_signature,
+        "OpenAI replay to Gemini must not synthesize thought signatures: {request:?}"
     );
     let tool_parts = request["contents"][2]["parts"]
         .as_array()

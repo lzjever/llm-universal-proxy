@@ -1,5 +1,29 @@
 use super::*;
 
+fn assert_no_gemini_thought_signature(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            assert!(
+                !map.contains_key("thoughtSignature"),
+                "unexpected thoughtSignature in {value}"
+            );
+            assert!(
+                !map.contains_key("thought_signature"),
+                "unexpected thought_signature in {value}"
+            );
+            for child in map.values() {
+                assert_no_gemini_thought_signature(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                assert_no_gemini_thought_signature(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn openai_chunk_to_gemini_sse_emits_thought_parts() {
     let chunk = serde_json::json!({
@@ -37,13 +61,19 @@ fn openai_chunk_to_gemini_sse_maps_portable_finish_reason_names() {
 }
 
 #[test]
-fn openai_chunk_to_gemini_sse_adds_dummy_signature_to_first_tool_call() {
+fn openai_chunk_to_gemini_sse_does_not_add_fake_signature_to_tool_calls() {
     let chunk = serde_json::json!({
         "id": "chatcmpl-msg123",
         "model": "gpt-4o",
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "total_tokens": 18
+        },
         "choices": [{
             "index": 0,
             "delta": {
+                "content": "Weather: ",
                 "tool_calls": [
                     {
                         "index": 0,
@@ -57,18 +87,30 @@ fn openai_chunk_to_gemini_sse_adds_dummy_signature_to_first_tool_call() {
                     }
                 ]
             },
-            "finish_reason": null
+            "finish_reason": "tool_calls"
         }]
     });
     let mut state = StreamState::default();
     let out = openai_chunk_to_gemini_sse(&chunk, &mut state);
-    let joined = out
-        .iter()
-        .map(|b| String::from_utf8_lossy(b).to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(joined.contains("\"thoughtSignature\":\"skip_thought_signature_validator\""));
-    assert_eq!(joined.matches("\"thoughtSignature\"").count(), 1);
+    assert_eq!(out.len(), 1);
+    let payload = parse_sse_json(&out[0]);
+    assert_no_gemini_thought_signature(&payload);
+    let candidate = &payload["candidates"][0];
+    assert_eq!(candidate["finishReason"], "STOP");
+    assert_eq!(payload["usageMetadata"]["promptTokenCount"], 11);
+    assert_eq!(payload["usageMetadata"]["candidatesTokenCount"], 7);
+    assert_eq!(payload["usageMetadata"]["totalTokenCount"], 18);
+    let parts = candidate["content"]["parts"]
+        .as_array()
+        .expect("gemini parts");
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0]["text"], "Weather: ");
+    assert_eq!(parts[1]["functionCall"]["id"], "call_1");
+    assert_eq!(parts[1]["functionCall"]["name"], "lookup_weather");
+    assert_eq!(parts[1]["functionCall"]["args"]["city"], "Tokyo");
+    assert_eq!(parts[2]["functionCall"]["id"], "call_2");
+    assert_eq!(parts[2]["functionCall"]["name"], "lookup_time");
+    assert_eq!(parts[2]["functionCall"]["args"]["city"], "Tokyo");
 }
 
 #[test]
@@ -122,12 +164,8 @@ fn openai_chunk_to_gemini_sse_emits_tool_calls_in_call_index_order() {
         .expect("parts");
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["functionCall"]["id"], "call_0");
-    assert_eq!(
-        parts[0]["thoughtSignature"],
-        "skip_thought_signature_validator"
-    );
     assert_eq!(parts[1]["functionCall"]["id"], "call_1");
-    assert!(parts[1].get("thoughtSignature").is_none());
+    assert_no_gemini_thought_signature(&payload);
 }
 
 #[test]
@@ -202,11 +240,7 @@ fn openai_chunk_to_gemini_sse_waits_for_earlier_incomplete_tool_before_later_par
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["functionCall"]["id"], "call_0");
     assert_eq!(parts[1]["functionCall"]["id"], "call_1");
-    assert_eq!(
-        parts[0]["thoughtSignature"],
-        "skip_thought_signature_validator"
-    );
-    assert!(parts[1].get("thoughtSignature").is_none());
+    assert_no_gemini_thought_signature(&payload);
 }
 
 #[test]
@@ -260,13 +294,10 @@ fn openai_chunk_to_gemini_sse_waits_for_complete_tool_call_arguments() {
         .as_array()
         .expect("gemini parts");
     assert_eq!(parts.len(), 1);
-    assert_eq!(
-        parts[0]["thoughtSignature"],
-        "skip_thought_signature_validator"
-    );
     assert_eq!(parts[0]["functionCall"]["id"], "call_1");
     assert_eq!(parts[0]["functionCall"]["name"], "lookup_weather");
     assert_eq!(parts[0]["functionCall"]["args"]["city"], "Tokyo");
+    assert_no_gemini_thought_signature(&payload);
 }
 
 #[test]
@@ -362,7 +393,7 @@ fn openai_chunk_to_gemini_sse_rejects_nonportable_tool_kinds_without_emitting_fu
 }
 
 #[test]
-fn openai_chunk_to_gemini_sse_adds_dummy_signature_to_first_parseable_tool_call() {
+fn openai_chunk_to_gemini_sse_does_not_add_fake_signature_to_first_parseable_tool_call() {
     let mut state = StreamState::default();
     let first_chunk = serde_json::json!({
         "id": "chatcmpl-msg123",
@@ -435,11 +466,7 @@ fn openai_chunk_to_gemini_sse_adds_dummy_signature_to_first_parseable_tool_call(
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["functionCall"]["id"], "call_0");
     assert_eq!(parts[1]["functionCall"]["id"], "call_1");
-    assert_eq!(
-        parts[0]["thoughtSignature"],
-        "skip_thought_signature_validator"
-    );
-    assert!(parts[1].get("thoughtSignature").is_none());
+    assert_no_gemini_thought_signature(&payload);
 }
 
 #[test]
