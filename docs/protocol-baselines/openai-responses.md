@@ -269,6 +269,7 @@ The formal response surface includes retrieval helpers that matter for correctne
 
 - `GET /v1/responses/{response_id}/input_items` returns the normalized input items associated with a response
 - `POST /v1/responses/input_tokens` estimates token usage for the Responses input surface, including conversation-aware requests
+- `GET /v1/responses/{response_id}?stream=true` retrieves a stored or in-progress response as semantic SSE; `starting_after` and `include_obfuscation` are stream-specific query controls
 
 ## Streaming events
 

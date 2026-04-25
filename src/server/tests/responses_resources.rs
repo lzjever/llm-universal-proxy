@@ -2,6 +2,16 @@ use super::*;
 use crate::server::responses_resources::handle_openai_responses_resource;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+type RecordedStreamRequests = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+#[derive(Clone)]
+struct RecordedResponsesResourceStreamState {
+    status: StatusCode,
+    content_type: &'static str,
+    body: &'static str,
+    seen_requests: RecordedStreamRequests,
+}
+
 async fn spawn_raw_responses_resource_mock(
     status: StatusCode,
     body: &'static str,
@@ -39,6 +49,54 @@ async fn spawn_raw_responses_resource_mock(
     });
 
     (format!("http://{addr}"), server)
+}
+
+async fn spawn_recorded_responses_resource_stream_mock(
+    status: StatusCode,
+    content_type: &'static str,
+    body: &'static str,
+) -> (String, RecordedStreamRequests, tokio::task::JoinHandle<()>) {
+    async fn handle_resource(
+        axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+        headers: HeaderMap,
+        State(state): State<RecordedResponsesResourceStreamState>,
+    ) -> Response<Body> {
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        state
+            .seen_requests
+            .lock()
+            .await
+            .push((uri.to_string(), accept));
+        Response::builder()
+            .status(state.status)
+            .header("Content-Type", state.content_type)
+            .body(Body::from(state.body))
+            .expect("streaming resource response")
+    }
+
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/responses/:id", axum::routing::get(handle_resource))
+        .with_state(RecordedResponsesResourceStreamState {
+            status,
+            content_type,
+            body,
+            seen_requests: seen_requests.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind streaming responses resource mock");
+    let addr = listener.local_addr().expect("stream resource mock addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("streaming responses resource mock server");
+    });
+
+    (format!("http://{addr}"), seen_requests, server)
 }
 
 async fn call_raw_responses_resource(
@@ -672,6 +730,144 @@ async fn handle_openai_responses_resource_success_preserves_regular_text_metadat
         "schema docs mention __llmup_custom__apply_patch literally"
     );
     assert!(body_text.contains("__llmup_custom__apply_patch"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_stream_true_forwards_guarded_sse() {
+    let upstream_body = r#"event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_stream","object":"response","created_at":0,"status":"in_progress","output":[],"metadata":{}}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_stream","object":"response","created_at":0,"status":"completed","output":[],"metadata":{}}}
+
+"#;
+    let (mock_base, seen_requests, server) = spawn_recorded_responses_resource_stream_mock(
+        StatusCode::OK,
+        "text/event-stream",
+        upstream_body,
+    )
+    .await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_stream".to_string(),
+        None,
+        Some("stream=true&starting_after=7&include_obfuscation=false".to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body_text = response_body_text(response).await;
+    assert!(body_text.contains("event: response.created"), "{body_text}");
+    assert!(
+        body_text.contains("event: response.completed"),
+        "{body_text}"
+    );
+    assert!(
+        body_text.contains("\"status\":\"completed\""),
+        "{body_text}"
+    );
+
+    let recorded = seen_requests.lock().await;
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    assert_eq!(
+        recorded[0].0,
+        "/responses/resp_stream?stream=true&starting_after=7&include_obfuscation=false"
+    );
+    assert_eq!(recorded[0].1.as_deref(), Some("text/event-stream"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_stream_true_rejects_public_boundary_artifacts() {
+    let upstream_body = r#"event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"__llmup_custom__apply_patch","arguments":"{}"}}
+
+"#;
+    let (mock_base, _seen_requests, server) = spawn_recorded_responses_resource_stream_mock(
+        StatusCode::OK,
+        "text/event-stream",
+        upstream_body,
+    )
+    .await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_stream".to_string(),
+        None,
+        Some("stream=true".to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response_body_text(response).await;
+    assert!(body_text.contains("response.failed"), "{body_text}");
+    assert!(
+        body_text.contains("\"code\":\"reserved_openai_custom_bridge_prefix\""),
+        "{body_text}"
+    );
+    assert!(!body_text.contains("__llmup_custom__"), "{body_text}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_stream_true_fails_closed_on_non_sse_success() {
+    let (mock_base, _seen_requests, server) = spawn_recorded_responses_resource_stream_mock(
+        StatusCode::OK,
+        "application/json",
+        r#"{"id":"resp_json","object":"response","status":"completed"}"#,
+    )
+    .await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiResponses);
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_stream".to_string(),
+        None,
+        Some("stream=true".to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body_text = response_body_text(response).await;
+    assert!(body_text.contains("response.failed"), "{body_text}");
+    assert!(
+        body_text.contains("upstream returned non-SSE response for streamed Responses resource"),
+        "{body_text}"
+    );
+    assert!(!body_text.contains("resp_json"), "{body_text}");
 
     server.abort();
 }

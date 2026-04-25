@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Supported native OpenAI Responses retrieval streaming for `GET /v1/responses/{response_id}?stream=true`, including upstream `Accept: text/event-stream`, guarded same-format SSE passthrough, and fail-closed handling when an upstream returns non-SSE success bodies.
+
 ## v0.2.14 - 2026-04-24
 
 - Tightened the `max_compat` public boundary so client-visible tool identity stays stable, while proxy-private `__llmup_custom__*` transport names and `_llmup_tool_bridge_context` state no longer leak across or get trusted at external boundaries.

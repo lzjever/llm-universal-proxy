@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use axum::{
     body::Body,
@@ -13,7 +12,7 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::debug_trace::DebugTraceContext;
 use crate::downstream::DownstreamCancellation;
@@ -45,6 +44,7 @@ use super::responses_resources::{
     resolve_native_responses_stateful_route_or_error, responses_stateful_request_controls,
 };
 use super::state::{AppState, RuntimeNamespaceState, DEFAULT_NAMESPACE};
+use super::tracked_body::TrackedBodyStream;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrustedToolBridgeContextEntry {
@@ -153,67 +153,6 @@ pub(super) enum RequestBoundaryDecision {
     Allow,
     AllowWithWarnings(Vec<String>),
     Reject(String),
-}
-
-struct TrackedBodyStream<S> {
-    inner: S,
-    tracker: Option<crate::telemetry::RequestTracker>,
-    status: u16,
-}
-
-impl<S> TrackedBodyStream<S> {
-    fn new(inner: S, tracker: crate::telemetry::RequestTracker, status: u16) -> Self {
-        Self {
-            inner,
-            tracker: Some(tracker),
-            status,
-        }
-    }
-}
-
-impl<S> futures_util::Stream for TrackedBodyStream<S>
-where
-    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
-{
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
-            Poll::Ready(Some(Err(err))) => {
-                if let Some(mut tracker) = this.tracker.take() {
-                    info!(
-                        "stream terminated with upstream error status={}",
-                        this.status
-                    );
-                    tracker.finish_error(502);
-                }
-                Poll::Ready(Some(Err(err)))
-            }
-            Poll::Ready(None) => {
-                if let Some(mut tracker) = this.tracker.take() {
-                    info!("stream completed status={}", this.status);
-                    if (200..400).contains(&this.status) {
-                        tracker.finish_success(this.status);
-                    } else {
-                        tracker.finish_error(this.status);
-                    }
-                }
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<S> Drop for TrackedBodyStream<S> {
-    fn drop(&mut self) {
-        if let Some(mut tracker) = self.tracker.take() {
-            info!("stream cancelled by downstream client");
-            tracker.finish_cancelled();
-        }
-    }
 }
 
 pub(super) async fn health() -> impl IntoResponse {

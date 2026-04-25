@@ -199,6 +199,8 @@ Selection rules:
 - 1 match => use that upstream
 - multiple matches => `400 Bad Request` ambiguous
 
+`GET /openai/v1/responses/:response_id?stream=true` MUST be treated as a native streaming resource request. The proxy MUST forward it only to the selected native OpenAI Responses upstream, send `Accept: text/event-stream`, stream the upstream SSE response through the public-boundary guard, and fail closed if a successful upstream response is not SSE.
+
 ### 2.9 Admin Control Plane
 
 The proxy MUST expose a separate admin control plane with these properties:

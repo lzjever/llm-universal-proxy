@@ -143,7 +143,7 @@ The current flow is:
 9. Call upstream through the selected upstream state's unary or streaming HTTP client.
 10. Normalize non-stream responses or wrap stream responses in the runtime chain.
 
-OpenAI Responses lifecycle resources are a special case. They do not use the generic "translate anything anywhere" path. `src/server/responses_resources.rs` only proxies those resource routes when the namespace can identify a unique native OpenAI Responses upstream. The server does not invent response-session ownership state.
+OpenAI Responses lifecycle resources are a special case. They do not use the generic "translate anything anywhere" path. `src/server/responses_resources.rs` only proxies those resource routes when the namespace can identify a unique native OpenAI Responses upstream. The server does not invent response-session ownership state. Retrieval streaming (`GET /responses/{response_id}?stream=true`) stays same-format and is guarded as SSE rather than being buffered through the JSON lifecycle path.
 
 ## Translation Layer
 

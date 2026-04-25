@@ -10,6 +10,7 @@ mod responses_resources;
 mod state;
 #[cfg(test)]
 mod tests;
+mod tracked_body;
 
 use std::sync::Arc;
 use std::{convert::Infallible, io, time::Duration};

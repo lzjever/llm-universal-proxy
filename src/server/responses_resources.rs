@@ -1,19 +1,26 @@
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::{
     body::Body,
     extract::{OriginalUri, Path, State},
-    http::{HeaderMap, Response, StatusCode},
+    http::{header, HeaderMap, Response, StatusCode},
     response::IntoResponse,
     Extension, Json,
 };
+use bytes::Bytes;
 use serde_json::Value;
+use url::form_urlencoded;
 
 use crate::downstream::DownstreamCancellation;
 use crate::formats::UpstreamFormat;
+use crate::streaming::GuardedSseStream;
 use crate::upstream;
 
-use super::errors::{client_closed_response, error_response, format_upstream_unavailable_message};
+use super::errors::{
+    client_closed_response, error_response, format_upstream_unavailable_message,
+    streaming_error_response,
+};
 use super::headers::{
     append_upstream_protocol_response_headers, apply_upstream_headers, build_auth_headers,
 };
@@ -22,6 +29,7 @@ use super::public_boundary::{
     validate_openai_responses_resource_response_body,
 };
 use super::state::{AppState, RuntimeNamespaceState, UpstreamState, DEFAULT_NAMESPACE};
+use super::tracked_body::TrackedBodyStream;
 
 struct OpenAiResponsesResourceRequest {
     method: reqwest::Method,
@@ -317,10 +325,11 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
         body,
         query,
     } = request;
+    let stream_resource = is_streamed_responses_retrieve(&method, &resource_path, query.as_deref());
     let request_path = format!("/openai/v1/{resource_path}");
     let mut tracker = state
         .metrics
-        .start_request(&request_path, String::new(), false);
+        .start_request(&request_path, String::new(), stream_resource);
     if let Some(body) = body.as_ref() {
         if let Err(message) = validate_openai_responses_resource_request_body(body) {
             tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
@@ -404,12 +413,18 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
         url.push_str(&query);
     }
 
-    let response = match upstream::call_upstream_resource_with_cancellation(
-        &upstream_state.no_auto_decompression_client,
+    let upstream_client = if stream_resource {
+        &upstream_state.streaming_client
+    } else {
+        &upstream_state.no_auto_decompression_client
+    };
+    let response = match upstream::call_upstream_resource_with_streaming_accept_and_cancellation(
+        upstream_client,
         method,
         &url,
         body.as_ref(),
         &auth_headers,
+        stream_resource,
         &downstream_cancellation,
     )
     .await
@@ -431,6 +446,16 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
 
     let status = response.status();
     let upstream_response_headers = response.headers().clone();
+    if stream_resource {
+        return handle_openai_responses_resource_stream_response(
+            response,
+            status,
+            upstream_response_headers,
+            tracker,
+            downstream_cancellation,
+        )
+        .await;
+    }
     if status_allows_empty_success_body(status)
         && no_content_response_framing_is_invalid(&upstream_response_headers)
     {
@@ -550,8 +575,112 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
     response
 }
 
+async fn handle_openai_responses_resource_stream_response(
+    response: reqwest::Response,
+    status: StatusCode,
+    upstream_response_headers: reqwest::header::HeaderMap,
+    mut tracker: crate::telemetry::RequestTracker,
+    downstream_cancellation: DownstreamCancellation,
+) -> Response<Body> {
+    if !status.is_success() {
+        let error_body = match upstream::read_response_text_with_cancellation(
+            response,
+            &downstream_cancellation,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(upstream::DownstreamAwareError::Inner(_)) => "Unknown error".to_string(),
+            Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
+                tracker.finish_cancelled();
+                return client_closed_response(UpstreamFormat::OpenAiResponses);
+            }
+        };
+        tracker.finish_error(status.as_u16());
+        let public_error_body = if serde_json::from_str::<Value>(&error_body).is_ok() {
+            error_body
+        } else {
+            format!("upstream streaming resource error body: {error_body}")
+        };
+        let mut response = streaming_error_response(
+            UpstreamFormat::OpenAiResponses,
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            &public_error_body,
+        );
+        append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+        return response;
+    }
+
+    if !response_is_event_stream(&upstream_response_headers) {
+        tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+        return streaming_error_response(
+            UpstreamFormat::OpenAiResponses,
+            StatusCode::BAD_GATEWAY,
+            "upstream returned non-SSE response for streamed Responses resource",
+        );
+    }
+
+    let guarded = GuardedSseStream::new(response.bytes_stream(), UpstreamFormat::OpenAiResponses);
+    let body_stream: Pin<
+        Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
+    > = Box::pin(guarded);
+    let body = Body::from_stream(TrackedBodyStream::new(
+        body_stream,
+        tracker,
+        status.as_u16(),
+    ));
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(body)
+        .unwrap_or_else(|_| {
+            error_response(
+                UpstreamFormat::OpenAiResponses,
+                StatusCode::BAD_GATEWAY,
+                "failed to build upstream resource stream response",
+            )
+        });
+    append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+    response
+}
+
 fn status_allows_empty_success_body(status: StatusCode) -> bool {
     matches!(status, StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT)
+}
+
+fn is_streamed_responses_retrieve(
+    method: &reqwest::Method,
+    resource_path: &str,
+    query: Option<&str>,
+) -> bool {
+    if *method != reqwest::Method::GET || !resource_path_is_response_retrieve(resource_path) {
+        return false;
+    }
+    query
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes()).any(|(name, value)| {
+                name.eq_ignore_ascii_case("stream") && value.eq_ignore_ascii_case("true")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn resource_path_is_response_retrieve(resource_path: &str) -> bool {
+    let Some(response_id) = resource_path.strip_prefix("responses/") else {
+        return false;
+    };
+    !response_id.is_empty() && !response_id.contains('/')
+}
+
+fn response_is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+        .unwrap_or(false)
 }
 
 fn no_content_response_framing_is_invalid(headers: &reqwest::header::HeaderMap) -> bool {

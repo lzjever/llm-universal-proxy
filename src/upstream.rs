@@ -215,7 +215,21 @@ pub async fn call_upstream_resource(
     body: Option<&Value>,
     headers: &[(String, String)],
 ) -> Result<reqwest::Response, reqwest::Error> {
+    send_upstream_resource_request(client, method, url, body, headers, false).await
+}
+
+async fn send_upstream_resource_request(
+    client: &Client,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&Value>,
+    headers: &[(String, String)],
+    accept_event_stream: bool,
+) -> Result<reqwest::Response, reqwest::Error> {
     let mut req = client.request(method, url);
+    if accept_event_stream {
+        req = req.header("Accept", "text/event-stream");
+    }
     if let Some(body) = body {
         req = req.json(body);
     }
@@ -225,22 +239,20 @@ pub async fn call_upstream_resource(
     req.send().await
 }
 
-pub(crate) async fn call_upstream_resource_with_cancellation(
+pub(crate) async fn call_upstream_resource_with_streaming_accept_and_cancellation(
     client: &Client,
     method: reqwest::Method,
     url: &str,
     body: Option<&Value>,
     headers: &[(String, String)],
+    accept_event_stream: bool,
     downstream_cancellation: &DownstreamCancellation,
 ) -> Result<reqwest::Response, DownstreamAwareError<reqwest::Error>> {
-    let mut req = client.request(method, url);
-    if let Some(body) = body {
-        req = req.json(body);
-    }
-    for (name, value) in headers {
-        req = req.header(name, value);
-    }
-    await_with_downstream_cancellation(req.send(), downstream_cancellation).await
+    await_with_downstream_cancellation(
+        send_upstream_resource_request(client, method, url, body, headers, accept_event_stream),
+        downstream_cancellation,
+    )
+    .await
 }
 
 pub(crate) async fn read_response_text_with_cancellation(
