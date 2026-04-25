@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.2.18 - 2026-04-25
+
+- Hardened the release workflow so Docker Buildx diagnostic records do not get uploaded as release artifacts.
+- Limited GitHub Release artifact downloads to packaged `llm-universal-proxy-*` binaries, preventing Docker build records from breaking release creation.
+
 ## v0.2.17 - 2026-04-25
 
 - Added an embedded Web Admin Dashboard at `/dashboard` as a single-binary static shell that uses the existing admin API and `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` boundary without introducing service keys, multi-user auth, sessions, or a separate frontend runtime.

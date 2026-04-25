@@ -193,6 +193,8 @@ class GovernanceTests(unittest.TestCase):
         self.assertIn("platforms: linux/amd64,linux/arm64", release)
         self.assertIn("push: true", release)
         self.assertIn("${{ env.GHCR_IMAGE }}:latest", release)
+        self.assertIn('DOCKER_BUILD_RECORD_UPLOAD: "false"', release)
+        self.assertIn("pattern: llm-universal-proxy-*", release)
         self.assertIn(
             "IMAGE=llm-universal-proxy:release-smoke bash scripts/test_container_smoke.sh",
             release,

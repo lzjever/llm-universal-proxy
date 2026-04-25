@@ -112,6 +112,8 @@ check_contains ".github/workflows/release.yml" "ghcr.io/lzjever/llm-universal-pr
 check_contains ".github/workflows/release.yml" "platforms: linux/amd64,linux/arm64"
 check_contains ".github/workflows/release.yml" "push: true"
 check_contains ".github/workflows/release.yml" '${{ env.GHCR_IMAGE }}:latest'
+check_contains ".github/workflows/release.yml" 'DOCKER_BUILD_RECORD_UPLOAD: "false"'
+check_contains ".github/workflows/release.yml" "pattern: llm-universal-proxy-*"
 check_contains ".github/workflows/release.yml" "IMAGE=llm-universal-proxy:release-smoke bash scripts/test_container_smoke.sh"
 
 check_contains "docs/README.md" "container.md"
