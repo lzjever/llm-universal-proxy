@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.2.16 - 2026-04-25
+
+- Hardened translated multimodal media-source boundaries so polluted URI-like references fail closed before upstream routing, including raw and percent-encoded control characters, Unicode separators, zero-width spaces, and invalid `data:` URI fallbacks across Anthropic, OpenAI Chat, OpenAI Responses, and Gemini paths.
+- Centralized canonical inline base64 validation for translated media inputs, requiring non-empty canonical payloads for data URIs, bare base64, Anthropic `source.data`, Gemini `inlineData.data`, OpenAI `input_audio.data`, and tool-result media instead of trimming or forwarding noncanonical payloads.
+- Extended OpenAI Chat <-> Responses media conversion checks so translated `image_url`, `input_image.image_url`, `file_data`, `file_url`, and `input_audio.data` fields share the same sanitizer while preserving same-format passthrough behavior.
+- Added broad unit and end-to-end regression coverage for polluted multimodal URLs, provider/local file URIs, data URI metadata, empty media payloads, and raw inline base64 across OpenAI, Anthropic, and Gemini translation paths.
+
 ## v0.2.15 - 2026-04-25
 
 - Supported native OpenAI Responses retrieval streaming for `GET /v1/responses/{response_id}?stream=true`, including upstream `Accept: text/event-stream`, guarded same-format SSE passthrough, and fail-closed handling when an upstream returns non-SSE success bodies.

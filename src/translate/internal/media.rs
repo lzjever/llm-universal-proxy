@@ -1,3 +1,5 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use serde_json::Value;
 use url::Url;
 
@@ -56,18 +58,37 @@ pub(super) enum OpenAiFileSource<'a> {
     Missing,
 }
 
+fn canonical_base64_payload(value: &str, allow_empty: bool) -> bool {
+    if value.is_empty() {
+        return allow_empty;
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return false;
+    }
+    let Ok(decoded) = BASE64_STANDARD.decode(value) else {
+        return false;
+    };
+    BASE64_STANDARD.encode(decoded) == value
+}
+
+pub(super) fn validate_inline_base64_payload(value: &str) -> Option<&str> {
+    canonical_base64_payload(value, false).then_some(value)
+}
+
 pub(super) fn base64_data_uri_parts(value: &str) -> Option<(&str, &str)> {
-    let value = value.trim_start();
     if !value.get(..5)?.eq_ignore_ascii_case("data:") {
         return None;
     }
     let rest = value.get(5..)?;
     let (metadata, data) = rest.split_once(',')?;
+    let metadata = clean_uri_like_source_reference(metadata)?;
+    validate_inline_base64_payload(data)?;
     let mut metadata_parts = metadata.split(';');
-    let mime_type = metadata_parts.next()?.trim();
-    if mime_type.is_empty()
-        || !metadata_parts.any(|part| part.trim().eq_ignore_ascii_case("base64"))
-    {
+    let mime_type = metadata_parts.next()?;
+    if mime_type.is_empty() || !metadata_parts.any(|part| part.eq_ignore_ascii_case("base64")) {
         return None;
     }
     Some((mime_type, data))
@@ -120,7 +141,6 @@ pub(super) fn mime_type_from_filename(filename: &str) -> Option<&'static str> {
 }
 
 fn uri_scheme(value: &str) -> Option<&str> {
-    let value = value.trim_start();
     let (scheme, _) = value.split_once(':')?;
     let mut chars = scheme.chars();
     let first = chars.next()?;
@@ -132,16 +152,62 @@ fn uri_scheme(value: &str) -> Option<&str> {
         .then_some(scheme)
 }
 
-pub(super) fn http_or_https_remote_url(value: &str) -> Option<&str> {
-    let value = value.trim();
-    if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+fn forbidden_uri_format_char(ch: char) -> bool {
+    matches!(ch, '\u{200B}')
+}
+
+fn has_raw_forbidden_uri_char(value: &str) -> bool {
+    value
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || forbidden_uri_format_char(ch))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn has_percent_encoded_c0_or_del(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] == b'%' {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                let decoded = (high << 4) | low;
+                if decoded <= 0x1f || decoded == 0x7f {
+                    return true;
+                }
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+pub(super) fn clean_uri_like_source_reference(value: &str) -> Option<&str> {
+    if value.is_empty() {
+        return None;
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     {
         return None;
     }
+    if has_raw_forbidden_uri_char(value) || has_percent_encoded_c0_or_del(value) {
+        return None;
+    }
+    Some(value)
+}
 
+pub(super) fn http_or_https_remote_url(value: &str) -> Option<&str> {
+    let value = clean_uri_like_source_reference(value)?;
     let parsed = Url::parse(value).ok()?;
     matches!(parsed.scheme(), "http" | "https")
         .then_some(())
@@ -153,18 +219,22 @@ pub(super) fn classify_media_source_reference(value: &str) -> MediaSourceReferen
     if let Some((mime_type, data)) = base64_data_uri_parts(value) {
         return MediaSourceReference::MimeDataUri { mime_type, data };
     }
+    if value
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        return MediaSourceReference::Unsupported { value };
+    }
     if let Some(url) = http_or_https_remote_url(value) {
         return MediaSourceReference::HttpRemoteUrl { url };
     }
-    if let Some(scheme) = uri_scheme(value) {
-        if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
-            return MediaSourceReference::Unsupported {
-                value: value.trim(),
-            };
+    if let Some(value) = clean_uri_like_source_reference(value) {
+        if let Some(scheme) = uri_scheme(value) {
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+                return MediaSourceReference::Unsupported { value };
+            }
+            return MediaSourceReference::ProviderOrLocalUri { uri: value };
         }
-        return MediaSourceReference::ProviderOrLocalUri {
-            uri: value.trim_start(),
-        };
     }
     if looks_like_base64_payload(value) {
         return MediaSourceReference::BareBase64 { data: value };
@@ -172,12 +242,15 @@ pub(super) fn classify_media_source_reference(value: &str) -> MediaSourceReferen
     MediaSourceReference::Unsupported { value }
 }
 
+pub(super) fn validate_media_source_reference(value: &str) -> bool {
+    !matches!(
+        classify_media_source_reference(value),
+        MediaSourceReference::Unsupported { .. }
+    )
+}
+
 pub(super) fn looks_like_base64_payload(value: &str) -> bool {
-    let compact = value.trim();
-    !compact.is_empty()
-        && compact
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '\r' | '\n'))
+    validate_inline_base64_payload(value).is_some()
 }
 
 pub(super) fn openai_file_part_maps(

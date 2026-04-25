@@ -3,7 +3,9 @@
 mod common;
 
 use common::mock_upstream::{
-    spawn_asserting_anthropic_mock, spawn_asserting_google_mock, CapturedMockRequest,
+    spawn_asserting_anthropic_mock, spawn_asserting_google_mock,
+    spawn_asserting_openai_completion_mock, spawn_asserting_openai_responses_mock,
+    CapturedMockRequest,
 };
 use common::proxy_helpers::proxy_config;
 use common::runtime_proxy::start_proxy;
@@ -13,12 +15,20 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 const PNG_B64: &str = "iVBORw0KGgo=";
+const POLLUTED_PNG_B64: &str = "iVBORw0K\r\nGgo=";
 const PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgo=";
+const EMPTY_PNG_DATA_URI: &str = "data:image/png;base64,";
+const METADATA_POLLUTED_PNG_DATA_URI: &str = "data:image/png%0A;base64,AAAA";
 const AUDIO_WAV_B64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 const PDF_B64: &str = "JVBERi0x";
 const PDF_DATA_URI: &str = "data:application/pdf;base64,JVBERi0x";
 const GEMINI_FILE_URI: &str = "gs://llmup-test/doc.pdf";
 const REMOTE_IMAGE_URL: &str = "https://example.com/cat.png";
+const POLLUTED_REMOTE_IMAGE_URL: &str = "https://example.com/cat.png\nfile:///tmp/cat.png";
+const LEADING_WHITESPACE_REMOTE_IMAGE_URL: &str = " https://example.com/cat.png";
+const TRAILING_CONTROL_REMOTE_IMAGE_URL: &str = "https://example.com/cat.png\n";
+const ENCODED_CONTROL_REMOTE_IMAGE_URL: &str = "https://example.com/cat%0A.png";
+const ENCODED_CONTROL_REMOTE_PDF_URL: &str = "https://example.com/doc%00.pdf";
 const TEXT_DATA_URI: &str = "data:text/plain;base64,SGVsbG8=";
 
 #[tokio::test]
@@ -162,6 +172,232 @@ async fn multimodal_openai_remote_image_to_anthropic_maps_to_url_source() {
 }
 
 #[tokio::test]
+async fn multimodal_openai_polluted_data_uri_image_fails_closed_before_translated_upstream() {
+    for image_url in [EMPTY_PNG_DATA_URI, METADATA_POLLUTED_PNG_DATA_URI] {
+        let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(|_| {
+            Err("polluted OpenAI data URI reached Anthropic upstream".to_string())
+        })
+        .await;
+        let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+        let (proxy_base, _proxy) = start_proxy(config).await;
+
+        let response = send_openai_chat_image_request(&proxy_base, image_url).await;
+        assert_failure_response(response).await;
+        assert_no_upstream_request(&captured).await;
+
+        let (mock_base, _mock, captured) = spawn_asserting_google_mock(|_| {
+            Err("polluted OpenAI data URI reached Gemini upstream".to_string())
+        })
+        .await;
+        let config = proxy_config(&mock_base, UpstreamFormat::Google);
+        let (proxy_base, _proxy) = start_proxy(config).await;
+
+        let response = send_openai_chat_image_request(&proxy_base, image_url).await;
+        assert_failure_response(response).await;
+        assert_no_upstream_request(&captured).await;
+
+        let (mock_base, _mock, captured) = spawn_asserting_openai_responses_mock(|_| {
+            Err("polluted OpenAI data URI reached OpenAI Responses upstream".to_string())
+        })
+        .await;
+        let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+        let (proxy_base, _proxy) = start_proxy(config).await;
+
+        let response = send_openai_chat_image_request(&proxy_base, image_url).await;
+        assert_failure_response(response).await;
+        assert_no_upstream_request(&captured).await;
+    }
+}
+
+#[tokio::test]
+async fn multimodal_anthropic_polluted_url_image_to_openai_targets_fails_closed_before_upstream() {
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+    ] {
+        for image_url in [
+            POLLUTED_REMOTE_IMAGE_URL,
+            LEADING_WHITESPACE_REMOTE_IMAGE_URL,
+            TRAILING_CONTROL_REMOTE_IMAGE_URL,
+        ] {
+            match upstream_format {
+                UpstreamFormat::OpenAiCompletion => {
+                    let (mock_base, _mock, captured) =
+                        spawn_asserting_openai_completion_mock(|_| {
+                            Err("polluted Anthropic image URL reached OpenAI Chat upstream"
+                                .to_string())
+                        })
+                        .await;
+                    let config = proxy_config(&mock_base, upstream_format);
+                    let (proxy_base, _proxy) = start_proxy(config).await;
+
+                    let response = send_anthropic_url_image_request(&proxy_base, image_url).await;
+                    assert_failure_response(response).await;
+                    assert_no_upstream_request(&captured).await;
+                }
+                UpstreamFormat::OpenAiResponses => {
+                    let (mock_base, _mock, captured) =
+                        spawn_asserting_openai_responses_mock(|_| {
+                            Err(
+                                "polluted Anthropic image URL reached OpenAI Responses upstream"
+                                    .to_string(),
+                            )
+                        })
+                        .await;
+                    let config = proxy_config(&mock_base, upstream_format);
+                    let (proxy_base, _proxy) = start_proxy(config).await;
+
+                    let response = send_anthropic_url_image_request(&proxy_base, image_url).await;
+                    assert_failure_response(response).await;
+                    assert_no_upstream_request(&captured).await;
+                }
+                _ => unreachable!("only OpenAI targets are covered here"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn multimodal_anthropic_polluted_base64_image_fails_closed_before_openai_or_gemini_upstream()
+{
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Google,
+    ] {
+        match upstream_format {
+            UpstreamFormat::OpenAiCompletion => {
+                let (mock_base, _mock, captured) = spawn_asserting_openai_completion_mock(|_| {
+                    Err("polluted Anthropic base64 reached OpenAI Chat upstream".to_string())
+                })
+                .await;
+                let config = proxy_config(&mock_base, upstream_format);
+                let (proxy_base, _proxy) = start_proxy(config).await;
+
+                let response =
+                    send_anthropic_base64_image_request(&proxy_base, POLLUTED_PNG_B64).await;
+                assert_failure_response(response).await;
+                assert_no_upstream_request(&captured).await;
+            }
+            UpstreamFormat::OpenAiResponses => {
+                let (mock_base, _mock, captured) = spawn_asserting_openai_responses_mock(|_| {
+                    Err("polluted Anthropic base64 reached OpenAI Responses upstream".to_string())
+                })
+                .await;
+                let config = proxy_config(&mock_base, upstream_format);
+                let (proxy_base, _proxy) = start_proxy(config).await;
+
+                let response =
+                    send_anthropic_base64_image_request(&proxy_base, POLLUTED_PNG_B64).await;
+                assert_failure_response(response).await;
+                assert_no_upstream_request(&captured).await;
+            }
+            UpstreamFormat::Google => {
+                let (mock_base, _mock, captured) = spawn_asserting_google_mock(|_| {
+                    Err("polluted Anthropic base64 reached Gemini upstream".to_string())
+                })
+                .await;
+                let config = proxy_config(&mock_base, upstream_format);
+                let (proxy_base, _proxy) = start_proxy(config).await;
+
+                let response =
+                    send_anthropic_base64_image_request(&proxy_base, POLLUTED_PNG_B64).await;
+                assert_failure_response(response).await;
+                assert_no_upstream_request(&captured).await;
+            }
+            _ => unreachable!("covered upstream formats are explicit"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn multimodal_openai_chat_responses_polluted_media_sources_fail_closed_before_upstream() {
+    let (mock_base, _mock, captured) = spawn_asserting_openai_responses_mock(|_| {
+        Err("polluted Chat media source reached OpenAI Responses upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": { "url": ENCODED_CONTROL_REMOTE_IMAGE_URL }
+                }]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+
+    let (mock_base, _mock, captured) = spawn_asserting_openai_completion_mock(|_| {
+        Err("polluted Responses media source reached OpenAI Chat upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4o",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_file",
+                    "file_url": ENCODED_CONTROL_REMOTE_PDF_URL,
+                    "filename": "doc.pdf"
+                }]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+}
+
+#[tokio::test]
+async fn multimodal_openai_polluted_input_audio_to_gemini_fails_closed_before_upstream() {
+    let (mock_base, _mock, captured) = spawn_asserting_google_mock(|_| {
+        Err("polluted OpenAI input_audio reached Gemini upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": { "data": " AAAA", "format": "wav" }
+                }]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+}
+
+#[tokio::test]
 async fn multimodal_openai_audio_and_non_pdf_file_to_anthropic_fail_closed_before_upstream() {
     for (label, content) in [
         (
@@ -206,7 +442,61 @@ async fn multimodal_openai_audio_and_non_pdf_file_to_anthropic_fail_closed_befor
     }
 }
 
+async fn send_anthropic_url_image_request(proxy_base: &str, image_url: &str) -> reqwest::Response {
+    Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "multimodal-test",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Describe this remote image" },
+                    { "type": "image", "source": {
+                        "type": "url",
+                        "url": image_url,
+                        "media_type": "image/png"
+                    }}
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn send_anthropic_base64_image_request(proxy_base: &str, data: &str) -> reqwest::Response {
+    Client::new()
+        .post(format!("{proxy_base}/anthropic/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "multimodal-test",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Describe this image" },
+                    { "type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": data
+                    }}
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
 async fn send_remote_image_chat_request(proxy_base: &str) -> reqwest::Response {
+    send_openai_chat_image_request(proxy_base, REMOTE_IMAGE_URL).await
+}
+
+async fn send_openai_chat_image_request(proxy_base: &str, image_url: &str) -> reqwest::Response {
     Client::new()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -215,7 +505,7 @@ async fn send_remote_image_chat_request(proxy_base: &str) -> reqwest::Response {
                 "role": "user",
                 "content": [
                     { "type": "text", "text": "Describe this remote image" },
-                    { "type": "image_url", "image_url": { "url": REMOTE_IMAGE_URL } }
+                    { "type": "image_url", "image_url": { "url": image_url } }
                 ]
             }],
             "stream": false

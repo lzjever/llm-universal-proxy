@@ -14,12 +14,17 @@ use std::time::Duration;
 
 const AUDIO_WAV_B64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 const PDF_B64: &str = "JVBERi0x";
+const POLLUTED_PDF_B64: &str = "JVBE\r\nRi0x";
 const PDF_DATA_URI: &str = "data:application/pdf;base64,JVBERi0x";
 const POLLUTED_REMOTE_IMAGE_URL: &str = "https://example.test/assets/cat.png\nfile:///tmp/cat.png";
 const CONTROL_POLLUTED_REMOTE_IMAGE_URL: &str = "https://example.test/assets/\u{0007}cat.png";
+const ENCODED_CONTROL_REMOTE_IMAGE_URL: &str = "https://example.test/assets/cat%0A.png";
+const UNICODE_POLLUTED_REMOTE_IMAGE_URL: &str = "https://example.test/assets/a\u{200B}cat.png";
 const POLLUTED_REMOTE_PDF_URL: &str =
     "https://example.test/papers/policy.pdf\nfile:///tmp/policy.pdf";
 const CONTROL_POLLUTED_REMOTE_PDF_URL: &str = "https://example.test/papers/\u{0007}policy.pdf";
+const ENCODED_CONTROL_REMOTE_PDF_URL: &str = "https://example.test/papers/policy%00.pdf";
+const UNICODE_POLLUTED_REMOTE_PDF_URL: &str = "https://example.test/papers/a\u{2028}policy.pdf";
 const REMOTE_IMAGE_URL: &str = "https://example.test/assets/cat.png";
 const REMOTE_PDF_URL: &str = "https://example.test/papers/policy.pdf";
 const TEXT_DATA_URI: &str = "data:text/plain;base64,SGVsbG8=";
@@ -111,6 +116,37 @@ async fn openai_polluted_http_image_urls_to_anthropic_fail_closed_before_upstrea
                     "content": [
                         { "type": "input_text", "text": "Describe this remote image" },
                         { "type": "input_image", "image_url": CONTROL_POLLUTED_REMOTE_IMAGE_URL }
+                    ]
+                }],
+                "stream": false
+            }),
+        ),
+        (
+            "chat image_url with percent-encoded control",
+            "/openai/v1/chat/completions",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "Describe this remote image" },
+                        { "type": "image_url", "image_url": { "url": ENCODED_CONTROL_REMOTE_IMAGE_URL } }
+                    ]
+                }],
+                "stream": false
+            }),
+        ),
+        (
+            "responses image_url with Unicode invisible",
+            "/openai/v1/responses",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Describe this remote image" },
+                        { "type": "input_image", "image_url": UNICODE_POLLUTED_REMOTE_IMAGE_URL }
                     ]
                 }],
                 "stream": false
@@ -414,6 +450,44 @@ async fn openai_polluted_http_pdf_urls_to_anthropic_fail_closed_before_upstream(
                         { "type": "input_text", "text": "Summarize this PDF" },
                         { "type": "input_file",
                           "file_url": CONTROL_POLLUTED_REMOTE_PDF_URL,
+                          "filename": "policy.pdf",
+                          "mime_type": "application/pdf" }
+                    ]
+                }],
+                "stream": false
+            }),
+        ),
+        (
+            "chat pdf file_data with percent-encoded NUL",
+            "/openai/v1/chat/completions",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "Summarize this PDF" },
+                        { "type": "file", "file": {
+                            "file_data": ENCODED_CONTROL_REMOTE_PDF_URL,
+                            "filename": "policy.pdf",
+                            "mime_type": "application/pdf"
+                        }}
+                    ]
+                }],
+                "stream": false
+            }),
+        ),
+        (
+            "responses pdf file_url with Unicode separator",
+            "/openai/v1/responses",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Summarize this PDF" },
+                        { "type": "input_file",
+                          "file_url": UNICODE_POLLUTED_REMOTE_PDF_URL,
                           "filename": "policy.pdf",
                           "mime_type": "application/pdf" }
                     ]
@@ -855,6 +929,37 @@ async fn gemini_pdf_inline_and_file_data_to_anthropic_documents() {
 
     assert_success_response(response).await;
     assert_upstream_called_once(&captured).await;
+}
+
+#[tokio::test]
+async fn gemini_polluted_inline_data_to_anthropic_fails_closed_before_upstream() {
+    let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(|_| {
+        Err("polluted Gemini inlineData reached Anthropic upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!(
+            "{proxy_base}/google/v1beta/models/claude-3-5-sonnet:generateContent"
+        ))
+        .json(&json!({
+            "model": "claude-3-5-sonnet",
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "text": "Summarize this PDF" },
+                    { "inlineData": { "mimeType": "application/pdf", "data": POLLUTED_PDF_B64 } }
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
 }
 
 #[tokio::test]

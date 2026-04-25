@@ -127,6 +127,131 @@ fn assert_openai_file_mime_conflict_variant(
 }
 
 #[test]
+fn media_source_validator_rejects_encoded_controls_and_raw_unicode_boundaries() {
+    for value in [
+        "https://example.test/assets/cat%0A.png",
+        "https://example.test/assets/cat%0d.png",
+        "https://example.test/assets/cat%00.png",
+        "https://example.test/assets/cat%09.png",
+        "https://example.test/assets/cat%7F.png",
+        "https://example.test/assets/cat%7f.png",
+        "https://example.test/assets/a\u{00A0}b.png",
+        "https://example.test/assets/a\u{2028}b.png",
+        "https://example.test/assets/a\u{200B}b.png",
+    ] {
+        assert!(
+            super::media::http_or_https_remote_url(value).is_none(),
+            "polluted HTTP(S) URL should be rejected: {value:?}"
+        );
+        assert!(
+            !matches!(
+                super::media::classify_media_source_reference(value),
+                super::media::MediaSourceReference::HttpRemoteUrl { .. }
+            ),
+            "polluted HTTP(S) URL should not classify as clean: {value:?}"
+        );
+    }
+
+    for value in [
+        "gs://bucket/a\u{00A0}b.pdf",
+        "gs://bucket/a\u{2028}b.pdf",
+        "gs://bucket/a\u{200B}b.pdf",
+        "s3://bucket/a%00b.pdf",
+        "s3://bucket/a%09b.pdf",
+        "s3://bucket/a%7fb.pdf",
+    ] {
+        assert!(
+            !matches!(
+                super::media::classify_media_source_reference(value),
+                super::media::MediaSourceReference::ProviderOrLocalUri { .. }
+            ),
+            "polluted provider/local URI should not classify as clean: {value:?}"
+        );
+    }
+}
+
+#[test]
+fn media_source_validator_allows_clean_unicode_and_percent_encoded_sources() {
+    assert_eq!(
+        super::media::http_or_https_remote_url(
+            "https://example.test/%E6%96%87%E4%BB%B6.pdf?x=%E2%9C%93"
+        ),
+        Some("https://example.test/%E6%96%87%E4%BB%B6.pdf?x=%E2%9C%93")
+    );
+
+    assert!(matches!(
+        super::media::classify_media_source_reference("gs://bucket/文件.pdf"),
+        super::media::MediaSourceReference::ProviderOrLocalUri {
+            uri: "gs://bucket/文件.pdf"
+        }
+    ));
+    assert!(matches!(
+        super::media::classify_media_source_reference("s3://bucket/a%20b.pdf"),
+        super::media::MediaSourceReference::ProviderOrLocalUri {
+            uri: "s3://bucket/a%20b.pdf"
+        }
+    ));
+}
+
+#[test]
+fn base64_data_uri_and_bare_base64_reject_implicit_trim_and_noncanonical_payloads() {
+    assert_eq!(
+        super::media::base64_data_uri_parts("data:image/png;base64,AAAA"),
+        Some(("image/png", "AAAA"))
+    );
+    assert!(super::media::looks_like_base64_payload("JVBERi0x"));
+
+    for value in [
+        "data:image/png;base64,",
+        "data:application/pdf;base64,",
+        " data:image/png;base64,AAAA",
+        "data: image/png ; base64,AAAA",
+        "data:image/png; base64,AAAA",
+        "data:image/png%0A;base64,AAAA",
+        "data:image/png\u{200B};base64,AAAA",
+        "data:image/png\u{7f};base64,AAAA",
+        "data:image/png\n;base64,AAAA",
+        "data:image/png\u{000b};base64,AAAA",
+        "data:image/png;base64,AA\nAA",
+        "data:image/png;base64,AA AA",
+    ] {
+        assert!(
+            super::media::base64_data_uri_parts(value).is_none(),
+            "data URI should be strict and canonical at media boundaries: {value:?}"
+        );
+        assert!(
+            !super::media::validate_media_source_reference(value),
+            "invalid data URI should not fall through as a provider/local URI: {value:?}"
+        );
+    }
+
+    for value in [" JVBERi0x", "JVBERi0x\n", "JVBE\nRi0x", "JVBE Ri0x"] {
+        assert!(
+            !super::media::looks_like_base64_payload(value),
+            "bare base64 should not be implicitly trimmed or whitespace-normalized: {value:?}"
+        );
+    }
+}
+
+#[test]
+fn inline_base64_helper_rejects_raw_pollution_and_empty_payloads() {
+    for value in ["iVBORw0KGgo=", "JVBERi0x", "AAAA"] {
+        assert_eq!(
+            super::media::validate_inline_base64_payload(value),
+            Some(value),
+            "clean inline base64 should be accepted: {value:?}"
+        );
+    }
+
+    for value in ["", " AAAA", "AAAA ", "AA\nAA", "AA\r\nAA", "AA AA", "AAAA="] {
+        assert!(
+            super::media::validate_inline_base64_payload(value).is_none(),
+            "polluted or non-canonical inline base64 should be rejected: {value:?}"
+        );
+    }
+}
+
+#[test]
 fn request_translation_policy_default_uses_default_compatibility_mode() {
     assert_eq!(
         crate::config::CompatibilityMode::default(),
@@ -1398,6 +1523,173 @@ fn translate_request_chat_to_responses_maps_user_image_to_input_image_legally() 
 }
 
 #[test]
+fn translate_request_chat_to_responses_rejects_polluted_uri_like_media_sources() {
+    for (label, mut body) in [
+        (
+            "image_url percent-encoded newline",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": { "url": "https://example.test/cat%0A.png" }
+                    }]
+                }]
+            }),
+        ),
+        (
+            "file_url percent-encoded NUL",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "file_url": "https://example.test/doc%00.pdf",
+                            "filename": "doc.pdf"
+                        }
+                    }]
+                }]
+            }),
+        ),
+        (
+            "file_data provider URI with zero-width space",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "file_data": "s3://bucket/a\u{200B}.pdf",
+                            "filename": "doc.pdf"
+                        }
+                    }]
+                }]
+            }),
+        ),
+    ] {
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            &mut body,
+            false,
+        )
+        .expect_err("polluted media source should fail during Chat to Responses");
+        assert!(err.contains("media source"), "label = {label}; err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_responses_to_chat_rejects_polluted_uri_like_media_sources() {
+    for (label, mut body) in [
+        (
+            "input_image percent-encoded DEL",
+            json!({
+                "model": "gpt-4o",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_image",
+                        "image_url": "https://example.test/cat%7F.png"
+                    }]
+                }]
+            }),
+        ),
+        (
+            "input_file file_url with Unicode line separator",
+            json!({
+                "model": "gpt-4o",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_file",
+                        "file_url": "https://example.test/a\u{2028}b.pdf",
+                        "filename": "doc.pdf"
+                    }]
+                }]
+            }),
+        ),
+        (
+            "input_file file_data provider URI with NBSP",
+            json!({
+                "model": "gpt-4o",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_file",
+                        "file_data": "gs://bucket/a\u{00A0}b.pdf",
+                        "filename": "doc.pdf"
+                    }]
+                }]
+            }),
+        ),
+    ] {
+        let err = translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            false,
+        )
+        .expect_err("polluted media source should fail during Responses to Chat");
+        assert!(err.contains("media source"), "label = {label}; err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_chat_responses_reject_polluted_input_audio_data() {
+    let mut chat_body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": { "data": "AA\nAA", "format": "wav" }
+            }]
+        }]
+    });
+    let err = translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        &mut chat_body,
+        false,
+    )
+    .expect_err("polluted input_audio.data should fail during Chat to Responses");
+    assert!(err.contains("input_audio"), "err = {err}");
+    assert!(err.contains("base64"), "err = {err}");
+
+    let mut responses_body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": { "data": " AAAA", "format": "wav" }
+            }]
+        }]
+    });
+    let err = translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut responses_body,
+        false,
+    )
+    .expect_err("polluted input_audio.data should fail during Responses to Chat");
+    assert!(err.contains("input_audio"), "err = {err}");
+    assert!(err.contains("base64"), "err = {err}");
+}
+
+#[test]
 fn translate_request_chat_to_responses_uses_custom_tool_call_output_for_custom_tool_results() {
     let mut body = json!({
         "model": "gpt-4o",
@@ -2077,6 +2369,43 @@ fn translate_request_gemini_to_openai_maps_inline_media_without_image_spoofing()
 }
 
 #[test]
+fn translate_request_gemini_to_openai_rejects_polluted_inline_data() {
+    for (label, inline_data) in [
+        (
+            "image CRLF",
+            json!({ "mimeType": "image/png", "data": "iVBORw0K\r\nGgo=" }),
+        ),
+        (
+            "audio leading whitespace",
+            json!({ "mimeType": "audio/wav", "data": " AAAA" }),
+        ),
+        (
+            "pdf non-canonical padding",
+            json!({ "mimeType": "application/pdf", "data": "JVBERi0x=" }),
+        ),
+    ] {
+        let mut body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{
+                "role": "user",
+                "parts": [{ "inlineData": inline_data }]
+            }]
+        });
+
+        let err = translate_request(
+            UpstreamFormat::Google,
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            &mut body,
+            false,
+        )
+        .expect_err("polluted Gemini inlineData.data should fail for OpenAI");
+        assert!(err.contains("inlineData"), "label = {label}; err = {err}");
+        assert!(err.contains("base64"), "label = {label}; err = {err}");
+    }
+}
+
+#[test]
 fn translate_request_gemini_file_data_gs_uri_to_openai_rejects() {
     let mut body = json!({
         "model": "gemini-2.5-flash",
@@ -2163,6 +2492,33 @@ fn translate_request_openai_to_gemini_maps_input_audio_and_file_parts() {
     assert_eq!(parts[1]["inlineData"]["data"], "AAAA");
     assert_eq!(parts[2]["inlineData"]["mimeType"], "application/pdf");
     assert_eq!(parts[2]["inlineData"]["data"], "JVBERi0x");
+}
+
+#[test]
+fn translate_request_openai_to_gemini_rejects_polluted_input_audio_data() {
+    for data in ["", " AAAA", "AA\nAA", "AAAA="] {
+        let mut body = json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": { "data": data, "format": "wav" }
+                }]
+            }]
+        });
+
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            "gemini-2.5-flash",
+            &mut body,
+            false,
+        )
+        .expect_err("polluted input_audio.data should fail closed for Gemini");
+        assert!(err.contains("input_audio"), "err = {err}");
+        assert!(err.contains("base64"), "err = {err}");
+    }
 }
 
 #[test]
@@ -2291,6 +2647,111 @@ fn translate_request_openai_to_gemini_maps_file_uris_to_file_data() {
     let parts = body["contents"][0]["parts"].as_array().expect("parts");
     assert_eq!(parts[0]["fileData"]["fileUri"], "gs://bucket/doc.pdf");
     assert_eq!(parts[0]["fileData"]["displayName"], "doc.pdf");
+}
+
+#[test]
+fn translate_request_openai_to_gemini_rejects_polluted_provider_file_uris() {
+    for (client_format, mut body) in [
+        (
+            UpstreamFormat::OpenAiCompletion,
+            json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "file_data": "gs://bucket/doc.pdf\nfile:///tmp/doc.pdf",
+                            "filename": "doc.pdf"
+                        }
+                    }]
+                }]
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiCompletion,
+            json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "file_data": " gs://bucket/doc.pdf",
+                            "filename": "doc.pdf"
+                        }
+                    }]
+                }]
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiCompletion,
+            json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "file_data": "\u{00A0}gs://bucket/doc.pdf",
+                            "filename": "doc.pdf"
+                        }
+                    }]
+                }]
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiResponses,
+            json!({
+                "model": "gemini-2.5-flash",
+                "input": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_file",
+                        "file_url": "s3://bucket/doc\u{0007}.pdf",
+                        "filename": "doc.pdf"
+                    }]
+                }]
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiResponses,
+            json!({
+                "model": "gemini-2.5-flash",
+                "input": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_file",
+                        "file_url": "s3://bucket/doc.pdf\n",
+                        "filename": "doc.pdf"
+                    }]
+                }]
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiResponses,
+            json!({
+                "model": "gemini-2.5-flash",
+                "input": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_file",
+                        "file_url": "s3://bucket/doc.pdf\u{00A0}",
+                        "filename": "doc.pdf"
+                    }]
+                }]
+            }),
+        ),
+    ] {
+        translate_request(
+            client_format,
+            UpstreamFormat::Google,
+            "gemini-2.5-flash",
+            &mut body,
+            false,
+        )
+        .expect_err("polluted provider/local URI references should fail closed for Gemini");
+    }
 }
 
 #[test]
@@ -9950,6 +10411,50 @@ fn translate_request_claude_to_openai_preserves_url_image_source() {
 }
 
 #[test]
+fn translate_request_claude_url_image_source_rejects_non_http_remote_urls_for_openai_targets() {
+    for target in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+    ] {
+        for url in [
+            "gs://bucket/cat.png",
+            "file:///tmp/cat.png",
+            "s3://bucket/cat.png",
+            " https://example.com/cat.png",
+            "https://example.com/cat.png\n",
+            "\u{00A0}https://example.com/cat.png",
+            "https://example.com/cat.png\u{00A0}",
+            "https://example.com/cat.png\nfile:///tmp/cat.png",
+        ] {
+            let mut body = json!({
+                "model": "claude-3",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": url
+                        }
+                    }]
+                }]
+            });
+
+            translate_request(
+                UpstreamFormat::Anthropic,
+                target,
+                "gpt-4o",
+                &mut body,
+                false,
+            )
+            .expect_err(
+                "Anthropic URL image sources must fail closed unless they are clean HTTP(S)",
+            );
+        }
+    }
+}
+
+#[test]
 fn translate_request_claude_to_responses_preserves_url_image_source() {
     let mut body = json!({
         "model": "claude-3",
@@ -10387,7 +10892,7 @@ fn translate_request_gemini_to_openai_accepts_snake_case_parts() {
                 {
                     "inline_data": {
                         "mime_type": "image/jpeg",
-                        "data": "abc123"
+                        "data": "YWJjMTIz"
                     }
                 },
                 {
@@ -11177,6 +11682,90 @@ fn translate_request_claude_to_gemini_moves_inline_multimodal_tool_results_into_
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0]["inlineData"]["displayName"], "toolu_1_part_1.png");
     assert_eq!(parts[0]["inlineData"]["mimeType"], "image/png");
+}
+
+#[test]
+fn translate_request_openai_to_gemini_rejects_polluted_tool_result_input_audio_data() {
+    let mut body = json!({
+        "model": "gemini-3-pro",
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "inspect_media", "arguments": "{\"city\":\"Tokyo\"}" }
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": { "data": "BB\r\nBB", "format": "wav" }
+                }]
+            }
+        ]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Google,
+        "gemini-3-pro",
+        &mut body,
+        false,
+    )
+    .expect_err("polluted tool-result input_audio.data should fail closed");
+
+    assert!(err.contains("input_audio"), "err = {err}");
+    assert!(err.contains("base64"), "err = {err}");
+}
+
+#[test]
+fn translate_request_claude_to_gemini_rejects_polluted_tool_result_image_base64_data() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "inspect_media",
+                    "input": { "city": "Tokyo" }
+                }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "AA\nAA"
+                            }
+                        }
+                    ]
+                }]
+            }
+        ]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Google,
+        "gemini-3-pro",
+        &mut body,
+        false,
+    )
+    .expect_err("polluted Anthropic tool-result image base64 should fail closed");
+
+    assert!(err.contains("image"), "err = {err}");
+    assert!(err.contains("base64"), "err = {err}");
 }
 
 #[test]

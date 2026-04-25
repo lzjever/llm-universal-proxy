@@ -682,9 +682,10 @@ pub(crate) mod response_protocols;
 pub(crate) mod tools;
 
 use media::{
-    classify_media_source_reference, is_pdf_mime, openai_file_data_reference_from_part,
-    openai_file_part_field, openai_file_part_resolved_mime_type, openai_file_reference_payload,
-    MediaSourceReference, OpenAiFileDataReference,
+    classify_media_source_reference, http_or_https_remote_url, is_pdf_mime,
+    openai_file_data_reference_from_part, openai_file_part_field,
+    openai_file_part_resolved_mime_type, openai_file_reference_payload,
+    validate_inline_base64_payload, MediaSourceReference, OpenAiFileDataReference,
 };
 use messages::{
     anthropic_request_tool_definition_not_portable_message,
@@ -2158,6 +2159,12 @@ fn anthropic_image_block_to_openai_part(block: &Value) -> Result<Value, String> 
                 .and_then(Value::as_str)
                 .unwrap_or("image/png");
             let data = source.get("data").and_then(Value::as_str).unwrap_or("");
+            let Some(data) = validate_inline_base64_payload(data) else {
+                return Err(
+                    "Anthropic image source.type=base64 requires canonical non-empty base64 `data`."
+                        .to_string(),
+                );
+            };
             Ok(serde_json::json!({
                 "type": "image_url",
                 "image_url": { "url": format!("data:{};base64,{}", media, data) }
@@ -2168,6 +2175,12 @@ fn anthropic_image_block_to_openai_part(block: &Value) -> Result<Value, String> 
                 "Anthropic image source.type=url requires a string `url` to translate to OpenAI Chat Completions."
                     .to_string()
             })?;
+            let Some(url) = http_or_https_remote_url(url) else {
+                return Err(
+                    "Anthropic image source.type=url only supports clean http:// or https:// remote URLs for OpenAI targets."
+                        .to_string(),
+                );
+            };
             Ok(serde_json::json!({
                 "type": "image_url",
                 "image_url": { "url": url }

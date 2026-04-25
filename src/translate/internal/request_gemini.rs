@@ -5,7 +5,7 @@ use crate::formats::UpstreamFormat;
 use super::assessment::{gemini_normalized_logprobs_controls, normalized_openai_audio_contract};
 use super::media::{
     base64_data_uri_parts, http_or_https_remote_url, openai_file_data_reference_from_part,
-    OpenAiFileDataReference,
+    validate_inline_base64_payload, OpenAiFileDataReference,
 };
 use super::messages::{
     custom_tools_not_portable_message, gemini_function_response_parts_not_portable_message,
@@ -797,6 +797,16 @@ fn gemini_mime_type_is_video(mime: &str) -> bool {
         .starts_with("video/")
 }
 
+fn validated_inline_base64_data<'a>(
+    data: Option<&'a str>,
+    source_label: &str,
+) -> Result<&'a str, String> {
+    let data = data.unwrap_or("");
+    validate_inline_base64_payload(data).ok_or_else(|| {
+        format!("{source_label} requires canonical non-empty base64 `data` to translate media.")
+    })
+}
+
 pub(super) fn openai_file_part_from_gemini_inline_data(mime: &str, data: &str) -> Value {
     serde_json::json!({
         "type": "file",
@@ -908,7 +918,10 @@ pub(super) fn convert_gemini_content_to_openai_for_target(
                 .or_else(|| inline.get("mime_type"))
                 .and_then(Value::as_str)
                 .unwrap_or("application/octet-stream");
-            let data = inline.get("data").and_then(Value::as_str).unwrap_or("");
+            let data = validated_inline_base64_data(
+                inline.get("data").and_then(Value::as_str),
+                "Gemini inlineData.data",
+            )?;
             if gemini_mime_type_is_video(mime) {
                 return Err(gemini_video_not_portable_message("inlineData", mime));
             }
@@ -1093,16 +1106,10 @@ pub(super) fn openai_content_part_to_gemini_part(part: &Value) -> Result<Option<
         }
         "input_audio" => {
             let input_audio = part.get("input_audio").unwrap_or(&Value::Null);
-            let data = input_audio
-                .get("data")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if data.is_empty() {
-                return Err(
-                    "OpenAI input_audio parts require inline base64 audio data to translate to Gemini."
-                        .to_string(),
-                );
-            }
+            let data = validated_inline_base64_data(
+                input_audio.get("data").and_then(Value::as_str),
+                "OpenAI input_audio.data",
+            )?;
             let format = input_audio
                 .get("format")
                 .and_then(Value::as_str)
@@ -1359,16 +1366,10 @@ pub(super) fn gemini_tool_result_block_to_response_and_part(
         }
         "input_audio" => {
             let input_audio = block.get("input_audio").unwrap_or(&Value::Null);
-            let data = input_audio
-                .get("data")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if data.is_empty() {
-                return Err(
-                    "Gemini tool result `input_audio` parts require inline base64 data to translate to Gemini."
-                        .to_string(),
-                );
-            }
+            let data = validated_inline_base64_data(
+                input_audio.get("data").and_then(Value::as_str),
+                "Gemini tool result `input_audio.data`",
+            )?;
             let mime_type = openai_audio_mime_type(
                 input_audio
                     .get("format")
@@ -1450,8 +1451,11 @@ pub(super) fn gemini_tool_result_block_to_response_and_part(
             let data = source
                 .get("data")
                 .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
+            let data = validated_inline_base64_data(
+                Some(data),
+                "Gemini tool result `image.source.data`",
+            )?;
             ensure_gemini_function_response_part_supported(target_model, &mime_type)?;
             let display_name = gemini_tool_result_display_name(call_id, media_index, &mime_type);
             Ok((
@@ -1459,7 +1463,7 @@ pub(super) fn gemini_tool_result_block_to_response_and_part(
                 Some(gemini_tool_result_inline_part(
                     &display_name,
                     &mime_type,
-                    &data,
+                    data,
                 )),
             ))
         }

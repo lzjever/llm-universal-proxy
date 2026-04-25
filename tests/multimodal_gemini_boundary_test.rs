@@ -14,8 +14,16 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 const GEMINI_FILE_URI: &str = "gs://llmup-test/policy.pdf";
+const POLLUTED_GEMINI_FILE_URI: &str = "gs://llmup-test/policy.pdf\nfile:///tmp/policy.pdf";
+const LEADING_WHITESPACE_GEMINI_FILE_URI: &str = " gs://llmup-test/policy.pdf";
+const LEADING_UNICODE_WHITESPACE_GEMINI_FILE_URI: &str = "\u{00A0}gs://llmup-test/policy.pdf";
+const POLLUTED_S3_FILE_URI: &str = "s3://llmup-test/policy\u{0007}.pdf";
+const TRAILING_CONTROL_S3_FILE_URI: &str = "s3://llmup-test/policy.pdf\n";
+const TRAILING_UNICODE_WHITESPACE_S3_FILE_URI: &str = "s3://llmup-test/policy.pdf\u{00A0}";
 const PNG_B64: &str = "iVBORw0KGgo=";
+const POLLUTED_PNG_B64: &str = "iVBORw0K\r\nGgo=";
 const PDF_B64: &str = "JVBERi0x";
+const POLLUTED_PDF_B64: &str = "JVBE\r\nRi0x";
 const REMOTE_IMAGE_URL: &str = "https://example.test/assets/cat.png";
 const REMOTE_PDF_URL: &str = "https://example.test/papers/policy.pdf";
 
@@ -86,6 +94,264 @@ async fn anthropic_remote_image_url_to_gemini_fails_closed_before_upstream() {
 
     assert_failure_response(response).await;
     assert_no_upstream_request(&captured).await;
+}
+
+#[tokio::test]
+async fn openai_provider_file_uri_to_gemini_fails_closed_when_polluted_before_upstream() {
+    let (mock_base, _mock, captured) = spawn_asserting_google_mock(|_| {
+        Err("polluted provider URI reached Gemini upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Read this PDF" },
+                    { "type": "file", "file": {
+                        "file_data": POLLUTED_GEMINI_FILE_URI,
+                        "filename": "policy.pdf"
+                    }}
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+
+    let (mock_base, _mock, captured) = spawn_asserting_google_mock(|_| {
+        Err("polluted provider URI reached Gemini upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Read this PDF" },
+                    {
+                        "type": "input_file",
+                        "file_url": POLLUTED_S3_FILE_URI,
+                        "filename": "policy.pdf"
+                    }
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+}
+
+#[tokio::test]
+async fn openai_provider_file_uri_to_gemini_fails_closed_for_edge_ascii_whitespace_before_upstream()
+{
+    let (mock_base, _mock, captured) = spawn_asserting_google_mock(|_| {
+        Err("edge-whitespace provider URI reached Gemini upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Read this PDF" },
+                    { "type": "file", "file": {
+                        "file_data": LEADING_WHITESPACE_GEMINI_FILE_URI,
+                        "filename": "policy.pdf"
+                    }}
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+
+    let (mock_base, _mock, captured) = spawn_asserting_google_mock(|_| {
+        Err("edge-whitespace provider URI reached Gemini upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Read this PDF" },
+                    {
+                        "type": "input_file",
+                        "file_url": TRAILING_CONTROL_S3_FILE_URI,
+                        "filename": "policy.pdf"
+                    }
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+}
+
+#[tokio::test]
+async fn openai_provider_file_uri_to_gemini_fails_closed_for_edge_unicode_whitespace_before_upstream(
+) {
+    let (mock_base, _mock, captured) = spawn_asserting_google_mock(|_| {
+        Err("edge Unicode whitespace provider URI reached Gemini upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Read this PDF" },
+                    { "type": "file", "file": {
+                        "file_data": LEADING_UNICODE_WHITESPACE_GEMINI_FILE_URI,
+                        "filename": "policy.pdf"
+                    }}
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+
+    let (mock_base, _mock, captured) = spawn_asserting_google_mock(|_| {
+        Err("edge Unicode whitespace provider URI reached Gemini upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Read this PDF" },
+                    {
+                        "type": "input_file",
+                        "file_url": TRAILING_UNICODE_WHITESPACE_S3_FILE_URI,
+                        "filename": "policy.pdf"
+                    }
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+}
+
+#[tokio::test]
+async fn openai_provider_file_uri_to_gemini_allows_clean_gs_uri() {
+    let (mock_base, _mock, captured) =
+        spawn_asserting_google_mock(assert_gemini_clean_gs_file_data).await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Read this PDF" },
+                    { "type": "file", "file": {
+                        "file_data": GEMINI_FILE_URI,
+                        "filename": "policy.pdf"
+                    }}
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_success_response(response).await;
+    assert_upstream_called_once(&captured).await;
+
+    let (mock_base, _mock, captured) =
+        spawn_asserting_google_mock(assert_gemini_clean_gs_file_data).await;
+    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Read this PDF" },
+                    {
+                        "type": "input_file",
+                        "file_url": GEMINI_FILE_URI,
+                        "filename": "policy.pdf"
+                    }
+                ]
+            }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_success_response(response).await;
+    assert_upstream_called_once(&captured).await;
 }
 
 #[tokio::test]
@@ -271,6 +537,65 @@ async fn gemini_inline_data_image_and_pdf_to_openai_chat_still_succeeds() {
 }
 
 #[tokio::test]
+async fn gemini_polluted_inline_data_to_openai_chat_and_responses_fails_closed_before_upstream() {
+    let (mock_base, _mock, captured) = spawn_asserting_openai_completion_mock(|_| {
+        Err("polluted Gemini inlineData reached OpenAI Chat upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!(
+            "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
+        ))
+        .json(&json!({
+            "model": "gpt-4o",
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "text": "Inspect this image" },
+                    { "inlineData": { "mimeType": "image/png", "data": POLLUTED_PNG_B64 } }
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+
+    let (mock_base, _mock, captured) = spawn_asserting_openai_responses_mock(|_| {
+        Err("polluted Gemini inlineData reached OpenAI Responses upstream".to_string())
+    })
+    .await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!(
+            "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
+        ))
+        .json(&json!({
+            "model": "gpt-4o",
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    { "text": "Inspect this PDF" },
+                    { "inlineData": { "mimeType": "application/pdf", "data": POLLUTED_PDF_B64 } }
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_failure_response(response).await;
+    assert_no_upstream_request(&captured).await;
+}
+
+#[tokio::test]
 async fn gemini_inline_data_image_and_pdf_to_openai_responses_still_succeeds() {
     let (mock_base, _mock, captured) =
         spawn_asserting_openai_responses_mock(assert_openai_responses_inline_data_media).await;
@@ -346,6 +671,30 @@ fn assert_gemini_inline_image_part(request: &CapturedMockRequest) -> Result<(), 
         &request.body,
         "/contents/0/parts/1/inlineData/data",
         json!(PNG_B64),
+    )
+}
+
+fn assert_gemini_clean_gs_file_data(request: &CapturedMockRequest) -> Result<(), String> {
+    expect_pointer(&request.body, "/contents/0/role", json!("user"))?;
+    expect_pointer(
+        &request.body,
+        "/contents/0/parts/0/text",
+        json!("Read this PDF"),
+    )?;
+    expect_pointer(
+        &request.body,
+        "/contents/0/parts/1/fileData/fileUri",
+        json!(GEMINI_FILE_URI),
+    )?;
+    expect_pointer(
+        &request.body,
+        "/contents/0/parts/1/fileData/mimeType",
+        json!("application/pdf"),
+    )?;
+    expect_pointer(
+        &request.body,
+        "/contents/0/parts/1/fileData/displayName",
+        json!("policy.pdf"),
     )
 }
 

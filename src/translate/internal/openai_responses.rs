@@ -3,6 +3,7 @@ use serde_json::Value;
 use crate::formats::UpstreamFormat;
 
 use super::assessment::{openai_named_tool_choice_name, shared_control_profile_for_target};
+use super::media::{validate_inline_base64_payload, validate_media_source_reference};
 use super::messages::{
     custom_tools_not_portable_message, openai_assistant_audio_field_not_portable_message,
     responses_multiple_output_audio_items_not_portable_message, single_required_array_item,
@@ -248,12 +249,28 @@ fn openai_assistant_audio_to_responses_output_item(
             }
         }
         if let Some(data) = audio_obj.get("data").cloned() {
+            if let Some(data) = data.as_str() {
+                if validate_inline_base64_payload(data).is_none() {
+                    return Err(
+                        "OpenAI assistant audio.data requires canonical non-empty base64 data to translate to OpenAI Responses."
+                            .to_string(),
+                    );
+                }
+            }
             item.insert("data".to_string(), data);
         }
         if let Some(transcript) = audio_obj.get("transcript").cloned() {
             item.insert("transcript".to_string(), transcript);
         }
     } else {
+        if let Some(data) = audio.as_str() {
+            if validate_inline_base64_payload(data).is_none() {
+                return Err(
+                    "OpenAI assistant audio requires canonical non-empty base64 data to translate to OpenAI Responses."
+                        .to_string(),
+                );
+            }
+        }
         item.insert("data".to_string(), audio.clone());
     }
     Ok(Some(Value::Object(item)))
@@ -280,15 +297,76 @@ fn extract_responses_refusal_text(content: Option<&Value>) -> String {
         .join("")
 }
 
-fn openai_message_to_responses_content(msg: &Value, content_type: &str) -> Vec<Value> {
-    let mut content = map_openai_content_to_responses(msg.get("content").cloned(), content_type);
+fn validate_openai_media_source_field(field: &str, value: &Value) -> Result<(), String> {
+    let Some(source) = value.as_str() else {
+        return Ok(());
+    };
+    if validate_media_source_reference(source) {
+        return Ok(());
+    }
+    Err(format!(
+        "OpenAI {field} media source must be a clean data URI, HTTP(S) URL, provider/local URI, or canonical base64 payload."
+    ))
+}
+
+fn validate_openai_image_source_field(field: &str, value: Option<&Value>) -> Result<(), String> {
+    match value {
+        Some(value @ Value::String(_)) => validate_openai_media_source_field(field, value),
+        Some(Value::Object(obj)) => {
+            if let Some(url) = obj.get("url") {
+                validate_openai_media_source_field(field, url)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_openai_file_source_fields(
+    map: Option<&serde_json::Map<String, Value>>,
+) -> Result<(), String> {
+    let Some(map) = map else {
+        return Ok(());
+    };
+    for field in ["file_data", "file_url"] {
+        if let Some(value) = map.get(field) {
+            validate_openai_media_source_field(field, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_input_audio_data(
+    field: &str,
+    input_audio: Option<&Value>,
+) -> Result<(), String> {
+    let Some(data) = input_audio
+        .and_then(Value::as_object)
+        .and_then(|audio| audio.get("data"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    if validate_inline_base64_payload(data).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "OpenAI {field}.data requires canonical non-empty base64 data."
+    ))
+}
+
+fn openai_message_to_responses_content(
+    msg: &Value,
+    content_type: &str,
+) -> Result<Vec<Value>, String> {
+    let mut content = map_openai_content_to_responses(msg.get("content").cloned(), content_type)?;
     if let Some(refusal) = extract_openai_refusal(msg) {
         content.push(serde_json::json!({
             "type": "refusal",
             "refusal": refusal
         }));
     }
-    content
+    Ok(content)
 }
 
 pub(super) fn responses_response_to_openai(body: &Value) -> Result<Value, String> {
@@ -473,7 +551,7 @@ pub(super) fn openai_response_to_responses(
         }));
     }
     let audio_output = openai_assistant_audio_to_responses_output_item(message)?;
-    let mut content = openai_message_to_responses_content(message, "output_text");
+    let mut content = openai_message_to_responses_content(message, "output_text")?;
     if let Some(content_logprobs) =
         normalized_response_logprobs_from_openai_choice(choice, "OpenAI Responses")?
     {
@@ -650,7 +728,7 @@ pub(super) fn responses_to_messages(
             "message" => {
                 let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let refusal = extract_responses_refusal_text(item.get("content"));
-                let content = map_responses_content_to_openai(item.get("content").cloned());
+                let content = map_responses_content_to_openai(item.get("content").cloned())?;
                 if role == "assistant" {
                     let assistant = current_assistant.get_or_insert_with(|| {
                         serde_json::json!({
@@ -1136,11 +1214,11 @@ fn append_assistant_text_content(message: &mut Value, text: &str) {
     append_openai_message_content(message, Value::String(text.to_string()));
 }
 
-fn map_responses_content_to_openai(content: Option<Value>) -> Value {
+fn map_responses_content_to_openai(content: Option<Value>) -> Result<Value, String> {
     let arr = match content {
-        None => return Value::Array(vec![]),
+        None => return Ok(Value::Array(vec![])),
         Some(Value::Array(a)) => a,
-        Some(v) => return v,
+        Some(v) => return Ok(v),
     };
     let mut plain_text_parts: Vec<String> = Vec::new();
     let mut has_non_text_part = false;
@@ -1164,13 +1242,17 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
                 } else {
                     has_non_text_part = true;
                 }
-                return semantic_text_part_to_openai_value(&SemanticTextPart { text, annotations });
+                return Ok(semantic_text_part_to_openai_value(&SemanticTextPart {
+                    text,
+                    annotations,
+                }));
             }
             if ty == Some("refusal") {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             if ty == Some("input_image") {
                 has_non_text_part = true;
+                validate_openai_image_source_field("input_image.image_url", c.get("image_url"))?;
                 let mut image_url = match c.get("image_url").cloned().unwrap_or(Value::Null) {
                     Value::Object(obj) => Value::Object(obj),
                     value => serde_json::json!({ "url": value }),
@@ -1184,17 +1266,19 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
                     "type": "image_url",
                     "image_url": image_url
                 });
-                return image;
+                return Ok(image);
             }
             if ty == Some("input_audio") {
                 has_non_text_part = true;
-                return serde_json::json!({
+                validate_openai_input_audio_data("input_audio", c.get("input_audio"))?;
+                return Ok(serde_json::json!({
                     "type": "input_audio",
                     "input_audio": c.get("input_audio").cloned().unwrap_or(Value::Null)
-                });
+                }));
             }
             if ty == Some("input_file") {
                 has_non_text_part = true;
+                validate_openai_file_source_fields(c.as_object())?;
                 let mut file = serde_json::Map::new();
                 for key in [
                     "file_id",
@@ -1208,19 +1292,21 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
                         file.insert(key.to_string(), value);
                     }
                 }
-                return serde_json::json!({
+                return Ok(serde_json::json!({
                     "type": "file",
                     "file": Value::Object(file)
-                });
+                }));
             }
             has_non_text_part = true;
-            c
+            Ok(c)
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     if !has_non_text_part {
-        return Value::String(plain_text_parts.join(""));
+        return Ok(Value::String(plain_text_parts.join("")));
     }
-    Value::Array(out.into_iter().filter(|item| !item.is_null()).collect())
+    Ok(Value::Array(
+        out.into_iter().filter(|item| !item.is_null()).collect(),
+    ))
 }
 
 pub(super) fn messages_to_responses(body: &mut Value) -> Result<(), String> {
@@ -1268,7 +1354,7 @@ pub(super) fn messages_to_responses(body: &mut Value) -> Result<(), String> {
             } else {
                 "input_text"
             };
-            let content_arr = openai_message_to_responses_content(msg, content_type);
+            let content_arr = openai_message_to_responses_content(msg, content_type)?;
             if !content_arr.is_empty() {
                 input.push(serde_json::json!({
                     "type": "message",
@@ -1762,14 +1848,17 @@ fn insert_responses_reasoning_effort(
     }
 }
 
-fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -> Vec<Value> {
+fn map_openai_content_to_responses(
+    content: Option<Value>,
+    content_type: &str,
+) -> Result<Vec<Value>, String> {
     let content = match content {
-        None => return vec![],
+        None => return Ok(vec![]),
         Some(Value::String(s)) => {
-            return vec![serde_json::json!({ "type": content_type, "text": s })]
+            return Ok(vec![serde_json::json!({ "type": content_type, "text": s })]);
         }
         Some(Value::Array(a)) => a,
-        Some(_) => return vec![],
+        Some(_) => return Ok(vec![]),
     };
     content
         .into_iter()
@@ -1782,18 +1871,19 @@ fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                return semantic_text_part_to_responses_value(
+                return Ok(semantic_text_part_to_responses_value(
                     &SemanticTextPart { text, annotations },
                     content_type,
-                );
+                ));
             }
             if ty == Some("refusal") {
-                return serde_json::json!({
+                return Ok(serde_json::json!({
                     "type": "refusal",
                     "refusal": c.get("refusal").cloned().unwrap_or_else(|| Value::String(String::new()))
-                });
+                }));
             }
             if ty == Some("image_url") {
+                validate_openai_image_source_field("image_url", c.get("image_url"))?;
                 let image_url = c
                     .get("image_url")
                     .and_then(|image| image.get("url").cloned())
@@ -1809,19 +1899,21 @@ fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -
                 {
                     image["detail"] = detail;
                 }
-                return image;
+                return Ok(image);
             }
             if ty == Some("input_audio") {
-                return serde_json::json!({
+                validate_openai_input_audio_data("input_audio", c.get("input_audio"))?;
+                return Ok(serde_json::json!({
                     "type": "input_audio",
                     "input_audio": c.get("input_audio").cloned().unwrap_or(Value::Null)
-                });
+                }));
             }
             if ty == Some("file") {
                 let file = c.get("file").cloned().unwrap_or(Value::Null);
                 let mut out = serde_json::Map::new();
                 out.insert("type".to_string(), Value::String("input_file".to_string()));
                 if let Some(file_obj) = file.as_object() {
+                    validate_openai_file_source_fields(Some(file_obj))?;
                     for key in [
                         "file_id",
                         "file_data",
@@ -1835,15 +1927,15 @@ fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -
                         }
                     }
                 }
-                return Value::Object(out);
+                return Ok(Value::Object(out));
             }
             let text = c.get("text").or(c.get("content")).cloned();
             let text = text
                 .and_then(|t| t.as_str().map(String::from))
                 .unwrap_or_else(|| serde_json::to_string(&c).unwrap_or_default());
-            serde_json::json!({ "type": content_type, "text": text })
+            Ok(serde_json::json!({ "type": content_type, "text": text }))
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()
 }
 
 fn responses_usage_to_openai_usage(usage: &Value) -> Value {
