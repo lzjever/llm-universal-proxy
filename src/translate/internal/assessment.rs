@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 use crate::config::{CompatibilityMode, ModelModality, ModelSurface};
@@ -1056,30 +1058,30 @@ fn assess_surface_request_policy(
         );
     }
 
-    for modality in [ModelModality::Image, ModelModality::Audio] {
+    for modality in request_input_modalities(client_format, body) {
         if !surface_allows_modality(
             surface
                 .modalities
                 .as_ref()
                 .and_then(|modalities| modalities.input.as_ref()),
             modality,
-        ) && request_uses_input_modality(client_format, body, modality)
-        {
+        ) {
             assessment.reject(format!(
                 "request uses {} input, but model surface `modalities.input` does not include `{}`",
                 modality_label(modality),
                 modality_label(modality),
             ));
         }
+    }
 
+    for modality in request_output_modalities(client_format, body) {
         if !surface_allows_modality(
             surface
                 .modalities
                 .as_ref()
                 .and_then(|modalities| modalities.output.as_ref()),
             modality,
-        ) && request_uses_output_modality(client_format, body, modality)
-        {
+        ) {
             assessment.reject(format!(
                 "request asks for {} output, but model surface `modalities.output` does not include `{}`",
                 modality_label(modality),
@@ -1091,7 +1093,10 @@ fn assess_surface_request_policy(
 
 fn surface_allows_modality(allowed: Option<&Vec<ModelModality>>, modality: ModelModality) -> bool {
     allowed
-        .map(|allowed| allowed.contains(&modality))
+        .map(|allowed| {
+            allowed.contains(&modality)
+                || (modality == ModelModality::Pdf && allowed.contains(&ModelModality::File))
+        })
         .unwrap_or(true)
 }
 
@@ -1100,6 +1105,9 @@ fn modality_label(modality: ModelModality) -> &'static str {
         ModelModality::Text => "text",
         ModelModality::Image => "image",
         ModelModality::Audio => "audio",
+        ModelModality::Pdf => "pdf",
+        ModelModality::File => "file",
+        ModelModality::Video => "video",
     }
 }
 
@@ -1134,222 +1142,382 @@ fn request_explicitly_enables_parallel_tool_calls(
     }
 }
 
-fn request_uses_input_modality(
+fn request_input_modalities(
     client_format: UpstreamFormat,
     body: &Value,
-    modality: ModelModality,
-) -> bool {
+) -> BTreeSet<ModelModality> {
+    let mut modalities = BTreeSet::new();
     match client_format {
         UpstreamFormat::OpenAiCompletion => {
-            openai_completion_request_uses_input_modality(body, modality)
+            openai_collect_completion_input_modalities(body, &mut modalities);
         }
         UpstreamFormat::OpenAiResponses => {
-            openai_responses_request_uses_input_modality(body, modality)
+            openai_collect_responses_input_modalities(body, &mut modalities);
         }
-        UpstreamFormat::Anthropic => anthropic_request_uses_input_modality(body, modality),
-        UpstreamFormat::Google => google_request_uses_input_modality(body, modality),
+        UpstreamFormat::Anthropic => {
+            anthropic_collect_request_input_modalities(body, &mut modalities);
+        }
+        UpstreamFormat::Google => {
+            google_collect_request_input_modalities(body, &mut modalities);
+        }
+    }
+    modalities
+}
+
+fn insert_input_modality(modalities: &mut BTreeSet<ModelModality>, modality: ModelModality) {
+    if modality != ModelModality::Text {
+        modalities.insert(modality);
     }
 }
 
-fn anthropic_request_uses_input_modality(body: &Value, modality: ModelModality) -> bool {
-    anthropic_content_uses_input_modality(body.get("system"), modality)
-        || body
-            .get("messages")
-            .and_then(Value::as_array)
-            .is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    anthropic_content_uses_input_modality(message.get("content"), modality)
-                })
-            })
+fn anthropic_collect_request_input_modalities(
+    body: &Value,
+    modalities: &mut BTreeSet<ModelModality>,
+) {
+    anthropic_collect_content_input_modalities(body.get("system"), modalities);
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            anthropic_collect_content_input_modalities(message.get("content"), modalities);
+        }
+    }
 }
 
-fn anthropic_content_uses_input_modality(content: Option<&Value>, modality: ModelModality) -> bool {
+fn anthropic_collect_content_input_modalities(
+    content: Option<&Value>,
+    modalities: &mut BTreeSet<ModelModality>,
+) {
     match content {
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .any(|block| anthropic_block_uses_input_modality(block, modality)),
-        Some(Value::Object(_)) => {
-            content.is_some_and(|block| anthropic_block_uses_input_modality(block, modality))
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                anthropic_collect_block_input_modalities(block, modalities);
+            }
         }
-        _ => false,
+        Some(Value::Object(_)) => {
+            if let Some(block) = content {
+                anthropic_collect_block_input_modalities(block, modalities);
+            }
+        }
+        _ => {}
     }
 }
 
-fn anthropic_block_uses_input_modality(block: &Value, modality: ModelModality) -> bool {
-    matches!(
-        (modality, block.get("type").and_then(Value::as_str)),
-        (ModelModality::Image, Some("image")) | (ModelModality::Audio, Some("audio"))
-    ) || block
-        .get("source")
-        .and_then(|source| source.get("media_type"))
-        .and_then(Value::as_str)
-        .is_some_and(|mime_type| mime_type_matches_modality(mime_type, modality))
+fn anthropic_collect_block_input_modalities(
+    block: &Value,
+    modalities: &mut BTreeSet<ModelModality>,
+) {
+    match block.get("type").and_then(Value::as_str) {
+        Some("image") => insert_input_modality(modalities, ModelModality::Image),
+        Some("audio") => insert_input_modality(modalities, ModelModality::Audio),
+        Some("document") => {
+            let modality = block
+                .get("source")
+                .and_then(|source| source.get("media_type"))
+                .and_then(Value::as_str)
+                .and_then(mime_type_to_input_modality)
+                .filter(|modality| *modality == ModelModality::Pdf)
+                .unwrap_or(ModelModality::File);
+            insert_input_modality(modalities, modality);
+        }
+        _ => {
+            if let Some(modality) = block
+                .get("source")
+                .and_then(|source| source.get("media_type"))
+                .and_then(Value::as_str)
+                .and_then(mime_type_to_input_modality)
+            {
+                insert_input_modality(modalities, modality);
+            }
+        }
+    }
 }
 
-fn openai_completion_request_uses_input_modality(body: &Value, modality: ModelModality) -> bool {
-    if modality == ModelModality::Audio && openai_assistant_history_audio_present(body) {
-        return true;
+fn openai_collect_completion_input_modalities(
+    body: &Value,
+    modalities: &mut BTreeSet<ModelModality>,
+) {
+    if openai_assistant_history_audio_present(body) {
+        insert_input_modality(modalities, ModelModality::Audio);
     }
 
-    body.get("messages")
-        .and_then(Value::as_array)
-        .is_some_and(|messages| {
-            messages
-                .iter()
-                .any(|message| openai_completion_message_uses_input_modality(message, modality))
-        })
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            openai_collect_completion_message_input_modalities(message, modalities);
+        }
+    }
 }
 
-fn openai_completion_message_uses_input_modality(message: &Value, modality: ModelModality) -> bool {
-    if modality == ModelModality::Audio
-        && message
-            .get("audio")
-            .filter(|audio| !audio.is_null())
-            .is_some()
+fn openai_collect_completion_message_input_modalities(
+    message: &Value,
+    modalities: &mut BTreeSet<ModelModality>,
+) {
+    if message
+        .get("audio")
+        .filter(|audio| !audio.is_null())
+        .is_some()
     {
-        return true;
+        insert_input_modality(modalities, ModelModality::Audio);
     }
 
-    message
-        .get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|parts| {
-            parts
-                .iter()
-                .any(|part| openai_input_part_uses_modality(part, modality))
-        })
+    if let Some(parts) = message.get("content").and_then(Value::as_array) {
+        for part in parts {
+            openai_collect_input_part_modalities(part, modalities);
+        }
+    }
 }
 
-fn openai_responses_request_uses_input_modality(body: &Value, modality: ModelModality) -> bool {
-    body.get("input")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| openai_responses_input_item_uses_modality(item, modality))
-        })
+fn openai_collect_responses_input_modalities(
+    body: &Value,
+    modalities: &mut BTreeSet<ModelModality>,
+) {
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items {
+            openai_collect_responses_input_item_modalities(item, modalities);
+        }
+    }
 }
 
-fn openai_responses_input_item_uses_modality(item: &Value, modality: ModelModality) -> bool {
+fn openai_collect_responses_input_item_modalities(
+    item: &Value,
+    modalities: &mut BTreeSet<ModelModality>,
+) {
+    openai_collect_input_part_modalities(item, modalities);
+
     match item.get("type").and_then(Value::as_str) {
-        Some("message") => item
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|parts| {
-                parts
-                    .iter()
-                    .any(|part| openai_input_part_uses_modality(part, modality))
-            }),
-        Some("output_audio") => modality == ModelModality::Audio,
-        _ => false,
+        Some("message") => {
+            if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                for part in parts {
+                    openai_collect_input_part_modalities(part, modalities);
+                }
+            }
+        }
+        Some("output_audio") => insert_input_modality(modalities, ModelModality::Audio),
+        _ => {}
     }
 }
 
-fn openai_input_part_uses_modality(part: &Value, modality: ModelModality) -> bool {
-    matches!(
-        (modality, part.get("type").and_then(Value::as_str)),
-        (ModelModality::Image, Some("image_url"))
-            | (ModelModality::Image, Some("input_image"))
-            | (ModelModality::Audio, Some("input_audio"))
-    )
+fn openai_collect_input_part_modalities(part: &Value, modalities: &mut BTreeSet<ModelModality>) {
+    match part.get("type").and_then(Value::as_str) {
+        Some("image_url") | Some("input_image") => {
+            insert_input_modality(modalities, ModelModality::Image);
+        }
+        Some("input_audio") => {
+            insert_input_modality(modalities, ModelModality::Audio);
+        }
+        Some("file") | Some("input_file") => {
+            insert_input_modality(modalities, openai_file_part_modality(part));
+        }
+        _ => {}
+    }
 }
 
-fn google_request_uses_input_modality(body: &Value, modality: ModelModality) -> bool {
-    google_content_uses_input_modality(
+fn openai_file_part_modality(part: &Value) -> ModelModality {
+    openai_file_part_explicit_mime_modality(part)
+        .or_else(|| openai_file_part_data_uri_modality(part))
+        .or_else(|| openai_file_part_filename_modality(part))
+        .unwrap_or(ModelModality::File)
+}
+
+fn openai_file_part_containers(part: &Value) -> impl Iterator<Item = &Value> {
+    std::iter::once(part).chain(part.get("file"))
+}
+
+fn openai_file_part_explicit_mime_modality(part: &Value) -> Option<ModelModality> {
+    openai_file_part_containers(part).find_map(|value| {
+        value
+            .get("mime_type")
+            .or_else(|| value.get("mimeType"))
+            .and_then(Value::as_str)
+            .and_then(mime_type_to_input_modality)
+    })
+}
+
+fn openai_file_part_data_uri_modality(part: &Value) -> Option<ModelModality> {
+    openai_file_part_containers(part).find_map(|value| {
+        value
+            .get("file_data")
+            .and_then(Value::as_str)
+            .and_then(openai_file_data_uri_mime_type)
+            .and_then(mime_type_to_input_modality)
+    })
+}
+
+fn openai_file_part_filename_modality(part: &Value) -> Option<ModelModality> {
+    openai_file_part_containers(part).find_map(|value| {
+        value
+            .get("filename")
+            .and_then(Value::as_str)
+            .and_then(filename_to_input_modality)
+    })
+}
+
+fn openai_file_data_uri_mime_type(file_data: &str) -> Option<&str> {
+    let file_data = file_data.trim_start();
+    if !file_data.get(..5)?.eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    let metadata = file_data.get(5..)?.split_once(',')?.0;
+    let mime_type = metadata
+        .split_once(';')
+        .map_or(metadata, |(mime_type, _)| mime_type);
+    let mime_type = mime_type.trim();
+    if mime_type.is_empty() {
+        None
+    } else {
+        Some(mime_type)
+    }
+}
+
+fn filename_to_input_modality(filename: &str) -> Option<ModelModality> {
+    let extension = filename.rsplit('.').next()?.trim().to_ascii_lowercase();
+    match extension.as_str() {
+        "pdf" => Some(ModelModality::Pdf),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic" | "heif"
+        | "svg" => Some(ModelModality::Image),
+        "wav" | "mp3" | "m4a" | "aac" | "ogg" | "oga" | "flac" | "opus" => {
+            Some(ModelModality::Audio)
+        }
+        "mp4" | "m4v" | "mov" | "webm" | "mpeg" | "mpg" | "avi" | "mkv" => {
+            Some(ModelModality::Video)
+        }
+        _ => None,
+    }
+}
+
+fn google_collect_request_input_modalities(body: &Value, modalities: &mut BTreeSet<ModelModality>) {
+    google_collect_content_input_modalities(
         body.get("systemInstruction")
             .or_else(|| body.get("system_instruction")),
-        modality,
-    ) || body
-        .get("contents")
-        .and_then(Value::as_array)
-        .is_some_and(|contents| {
-            contents
-                .iter()
-                .any(|content| google_content_uses_input_modality(Some(content), modality))
-        })
+        modalities,
+    );
+    if let Some(contents) = body.get("contents").and_then(Value::as_array) {
+        for content in contents {
+            google_collect_content_input_modalities(Some(content), modalities);
+        }
+    }
 }
 
-fn google_content_uses_input_modality(content: Option<&Value>, modality: ModelModality) -> bool {
-    content
-        .and_then(|content| content.get("parts").and_then(Value::as_array))
-        .is_some_and(|parts| {
-            parts
-                .iter()
-                .any(|part| google_part_uses_input_modality(part, modality))
-        })
+fn google_collect_content_input_modalities(
+    content: Option<&Value>,
+    modalities: &mut BTreeSet<ModelModality>,
+) {
+    let Some(parts) = content.and_then(|content| content.get("parts").and_then(Value::as_array))
+    else {
+        return;
+    };
+    for part in parts {
+        google_collect_part_input_modalities(part, modalities);
+    }
 }
 
-fn google_part_uses_input_modality(part: &Value, modality: ModelModality) -> bool {
-    google_part_data_uses_input_modality(part, "inlineData", "inline_data", modality)
-        || google_part_data_uses_input_modality(part, "fileData", "file_data", modality)
+fn google_collect_part_input_modalities(part: &Value, modalities: &mut BTreeSet<ModelModality>) {
+    if let Some(modality) = google_part_data_input_modality(part, "inlineData", "inline_data") {
+        insert_input_modality(modalities, modality);
+    }
+    if let Some(modality) = google_part_data_input_modality(part, "fileData", "file_data") {
+        insert_input_modality(modalities, modality);
+    }
 }
 
-fn google_part_data_uses_input_modality(
+fn google_part_data_input_modality(
     part: &Value,
     camel: &str,
     snake: &str,
-    modality: ModelModality,
-) -> bool {
-    gemini_part_field(part, camel, snake)
-        .and_then(|data| data.get("mimeType").or_else(|| data.get("mime_type")))
+) -> Option<ModelModality> {
+    let data = gemini_part_field(part, camel, snake)?;
+    data.get("mimeType")
+        .or_else(|| data.get("mime_type"))
         .and_then(Value::as_str)
-        .is_some_and(|mime_type| mime_type_matches_modality(mime_type, modality))
+        .and_then(mime_type_to_input_modality)
+        .or_else(|| google_part_data_name_modality(data))
+        .or(Some(ModelModality::File))
 }
 
-fn mime_type_matches_modality(mime_type: &str, modality: ModelModality) -> bool {
-    let mime_type = mime_type.trim().to_ascii_lowercase();
-    match modality {
-        ModelModality::Text => mime_type.starts_with("text/"),
-        ModelModality::Image => mime_type.starts_with("image/"),
-        ModelModality::Audio => mime_type.starts_with("audio/"),
+fn google_part_data_name_modality(data: &Value) -> Option<ModelModality> {
+    ["displayName", "display_name", "name", "filename"]
+        .iter()
+        .find_map(|field| data.get(*field).and_then(Value::as_str))
+        .and_then(filename_to_input_modality)
+}
+
+fn mime_type_to_input_modality(mime_type: &str) -> Option<ModelModality> {
+    let mime_type = mime_type
+        .split_once(';')
+        .map_or(mime_type, |(mime_type, _)| mime_type)
+        .trim()
+        .to_ascii_lowercase();
+    if mime_type.is_empty() {
+        return None;
+    }
+    if mime_type.starts_with("text/") {
+        Some(ModelModality::Text)
+    } else if mime_type.starts_with("image/") {
+        Some(ModelModality::Image)
+    } else if mime_type.starts_with("audio/") {
+        Some(ModelModality::Audio)
+    } else if mime_type.starts_with("video/") {
+        Some(ModelModality::Video)
+    } else if mime_type == "application/pdf" {
+        Some(ModelModality::Pdf)
+    } else {
+        Some(ModelModality::File)
     }
 }
 
-fn request_uses_output_modality(
+fn request_output_modalities(
     client_format: UpstreamFormat,
     body: &Value,
-    modality: ModelModality,
-) -> bool {
+) -> BTreeSet<ModelModality> {
+    let mut modalities = BTreeSet::new();
     match client_format {
         UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses => {
-            openai_request_uses_output_modality(body, modality)
+            openai_collect_output_modalities(body, &mut modalities);
         }
-        UpstreamFormat::Anthropic => false,
-        UpstreamFormat::Google => google_request_uses_output_modality(body, modality),
+        UpstreamFormat::Anthropic => {}
+        UpstreamFormat::Google => google_collect_output_modalities(body, &mut modalities),
+    }
+    modalities
+}
+
+fn openai_collect_output_modalities(body: &Value, modalities: &mut BTreeSet<ModelModality>) {
+    if body.get("audio").is_some()
+        || body
+            .get("modalities")
+            .and_then(Value::as_array)
+            .is_some_and(|modalities| {
+                modalities.iter().any(|requested_modality| {
+                    requested_modality
+                        .as_str()
+                        .is_some_and(|requested_modality| {
+                            requested_modality.eq_ignore_ascii_case("audio")
+                        })
+                })
+            })
+    {
+        modalities.insert(ModelModality::Audio);
     }
 }
 
-fn openai_request_uses_output_modality(body: &Value, modality: ModelModality) -> bool {
-    modality == ModelModality::Audio
-        && (body.get("audio").is_some()
-            || body
-                .get("modalities")
-                .and_then(Value::as_array)
-                .is_some_and(|modalities| {
-                    modalities.iter().any(|requested_modality| {
-                        requested_modality
-                            .as_str()
-                            .is_some_and(|requested_modality| {
-                                requested_modality.eq_ignore_ascii_case("audio")
-                            })
-                    })
-                }))
-}
+fn google_collect_output_modalities(body: &Value, modalities: &mut BTreeSet<ModelModality>) {
+    if let Some(requested_modalities) =
+        gemini_generation_config_field(body, "responseModalities", "response_modalities")
+            .and_then(Value::as_array)
+    {
+        for requested_modality in requested_modalities {
+            match requested_modality.as_str() {
+                Some(modality) if modality.eq_ignore_ascii_case("image") => {
+                    modalities.insert(ModelModality::Image);
+                }
+                Some(modality) if modality.eq_ignore_ascii_case("audio") => {
+                    modalities.insert(ModelModality::Audio);
+                }
+                _ => {}
+            }
+        }
+    }
 
-fn google_request_uses_output_modality(body: &Value, modality: ModelModality) -> bool {
-    gemini_generation_config_field(body, "responseModalities", "response_modalities")
-        .and_then(Value::as_array)
-        .is_some_and(|modalities| {
-            modalities.iter().any(|requested_modality| {
-                requested_modality
-                    .as_str()
-                    .is_some_and(|requested_modality| {
-                        requested_modality.eq_ignore_ascii_case(modality_label(modality))
-                    })
-            })
-        })
-        || (modality == ModelModality::Audio
-            && gemini_generation_config_field(body, "speechConfig", "speech_config").is_some())
+    if gemini_generation_config_field(body, "speechConfig", "speech_config").is_some() {
+        modalities.insert(ModelModality::Audio);
+    }
 }
 
 pub(crate) fn assess_request_translation_with_surface(

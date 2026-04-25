@@ -704,7 +704,7 @@ use openai_responses::{
 #[cfg(test)]
 use request_gemini::convert_gemini_content_to_openai;
 use request_gemini::{
-    gemini_function_declaration_output_schema_field,
+    base64_data_uri_parts, gemini_function_declaration_output_schema_field,
     gemini_function_output_schema_not_portable_message,
     gemini_function_response_has_nonportable_parts, gemini_openai_function_tools_from_request,
     gemini_part_field, gemini_request_function_calling_config_from_object,
@@ -2215,14 +2215,10 @@ fn openai_to_claude(body: &mut Value) -> Result<(), String> {
         if !matches!(role, Some("system") | Some("developer")) {
             continue;
         }
-        let c = msg.get("content");
-        let text = c
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_else(|| extract_text_content(c));
-        if !text.is_empty() {
-            system_blocks.push(serde_json::json!({ "type": "text", "text": text }));
-        }
+        system_blocks.extend(openai_system_content_to_claude_blocks(
+            role.unwrap_or("system"),
+            msg.get("content"),
+        )?);
     }
     if !system_blocks.is_empty() {
         result["system"] = Value::Array(system_blocks);
@@ -2343,28 +2339,170 @@ fn can_attach_cache_control_to_content_block(block: &Value) -> bool {
     )
 }
 
-fn extract_text_content(content: Option<&Value>) -> String {
-    let content = match content {
-        Some(c) => c,
-        None => return String::new(),
-    };
-    if let Some(s) = content.as_str() {
-        return s.to_string();
+fn openai_content_part_not_portable_to_anthropic_message(part_type: &str, reason: &str) -> String {
+    format!(
+        "OpenAI content part `{part_type}` cannot be faithfully translated to Anthropic: {reason}"
+    )
+}
+
+fn openai_image_url_part_url(part: &Value) -> Option<&str> {
+    match part.get("image_url") {
+        Some(Value::String(url)) => Some(url.as_str()),
+        Some(Value::Object(image_url)) => image_url.get("url").and_then(Value::as_str),
+        _ => None,
     }
-    let arr = match content.as_array() {
-        Some(a) => a,
-        None => return String::new(),
+}
+
+fn openai_image_url_part_to_claude_block(part: &Value) -> Result<Value, String> {
+    let Some(url) = openai_image_url_part_url(part) else {
+        return Err(openai_content_part_not_portable_to_anthropic_message(
+            "image_url",
+            "missing image URL; Anthropic image blocks require inline base64 image data.",
+        ));
     };
-    arr.iter()
-        .filter_map(|c| {
-            if c.get("type").and_then(Value::as_str) == Some("text") {
-                c.get("text").and_then(Value::as_str)
+    let Some((media, data)) = base64_data_uri_parts(url) else {
+        let reason = if url.starts_with("data:") {
+            "image URLs must be base64 data URIs; non-base64 data URIs are not portable."
+        } else {
+            "remote image URLs require explicit upload/provenance and must not be silently dropped."
+        };
+        return Err(openai_content_part_not_portable_to_anthropic_message(
+            "image_url",
+            reason,
+        ));
+    };
+    if !media.starts_with("image/") {
+        return Err(openai_content_part_not_portable_to_anthropic_message(
+            "image_url",
+            &format!("data URI MIME `{media}` is not an image MIME type."),
+        ));
+    }
+    Ok(serde_json::json!({
+        "type": "image",
+        "source": { "type": "base64", "media_type": media, "data": data }
+    }))
+}
+
+fn openai_audio_part_not_portable_to_anthropic_message(part: &Value) -> String {
+    let format = part
+        .get("input_audio")
+        .and_then(|audio| audio.get("format"))
+        .and_then(Value::as_str)
+        .filter(|format| !format.is_empty())
+        .map(|format| format!(" with format `{format}`"))
+        .unwrap_or_default();
+    openai_content_part_not_portable_to_anthropic_message(
+        "input_audio",
+        &format!("audio input{format} has no native Anthropic request mapping in this translator."),
+    )
+}
+
+fn openai_file_part_not_portable_to_anthropic_message(part: &Value) -> String {
+    let file = part.get("file").and_then(Value::as_object);
+    let mime = file
+        .and_then(|file| file.get("file_data"))
+        .and_then(Value::as_str)
+        .and_then(|file_data| base64_data_uri_parts(file_data).map(|(mime, _)| mime))
+        .map(|mime| format!(" with MIME `{mime}`"))
+        .unwrap_or_default();
+    let reference = if file
+        .and_then(|file| file.get("file_id"))
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        " file_id references"
+    } else {
+        ""
+    };
+    openai_content_part_not_portable_to_anthropic_message(
+        "file/input_file",
+        &format!(
+            "file{mime}{reference} cannot be coerced into Anthropic document semantics; document/fileData mapping is not implemented yet."
+        ),
+    )
+}
+
+fn openai_text_part_to_claude_text_block(part: &Value) -> Result<Value, String> {
+    let text_part =
+        semantic_text_part_from_openai_part(part).ok_or("invalid OpenAI text content part")?;
+    let mut block = serde_json::json!({ "type": "text", "text": text_part.text });
+    if !text_part.annotations.is_empty() {
+        block["citations"] = Value::Array(text_part.annotations);
+    }
+    Ok(block)
+}
+
+fn openai_refusal_part_to_claude_text_block(part: &Value) -> Value {
+    serde_json::json!({
+        "type": "text",
+        "text": part.get("refusal").cloned().unwrap_or_else(|| Value::String(String::new()))
+    })
+}
+
+fn openai_system_content_part_not_portable_to_anthropic_message(
+    role: &str,
+    part_type: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "OpenAI {role} content part `{part_type}` cannot be faithfully translated to Anthropic system blocks: {reason}"
+    )
+}
+
+fn openai_system_content_part_label(part_type: &str) -> &str {
+    if part_type == "file" {
+        "file/input_file"
+    } else {
+        part_type
+    }
+}
+
+fn openai_system_part_to_claude_block(role: &str, part: &Value) -> Result<Option<Value>, String> {
+    let Some(part_type) = part.get("type").and_then(Value::as_str) else {
+        return Err(format!(
+            "OpenAI {role} content array entries require a string `type` to translate to Anthropic system blocks."
+        ));
+    };
+    match part_type {
+        "text" => openai_text_part_to_claude_text_block(part).map(Some),
+        "refusal" => Ok(Some(openai_refusal_part_to_claude_text_block(part))),
+        other => Err(openai_system_content_part_not_portable_to_anthropic_message(
+            role,
+            openai_system_content_part_label(other),
+            "system/developer content arrays only support text/refusal parts; unsupported typed parts must not be silently dropped.",
+        )),
+    }
+}
+
+fn openai_system_content_to_claude_blocks(
+    role: &str,
+    content: Option<&Value>,
+) -> Result<Vec<Value>, String> {
+    let Some(content) = content else {
+        return Ok(Vec::new());
+    };
+    match content {
+        Value::String(text) => {
+            if text.is_empty() {
+                Ok(Vec::new())
             } else {
-                None
+                Ok(vec![serde_json::json!({ "type": "text", "text": text })])
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        }
+        Value::Array(parts) => {
+            let mut blocks = Vec::new();
+            for part in parts {
+                if let Some(block) = openai_system_part_to_claude_block(role, part)? {
+                    blocks.push(block);
+                }
+            }
+            Ok(blocks)
+        }
+        Value::Object(_) => Ok(openai_system_part_to_claude_block(role, content)?
+            .into_iter()
+            .collect()),
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn openai_message_to_claude_blocks(msg: &Value) -> Result<Option<Vec<Value>>, String> {
@@ -2407,32 +2545,33 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Result<Option<Vec<Value>>, St
         }
         Some(Value::Array(arr)) => {
             for c in arr {
-                let ty = c.get("type").and_then(Value::as_str);
-                if ty == Some("text") {
-                    let text_part = semantic_text_part_from_openai_part(c)
-                        .ok_or("invalid OpenAI text content part")?;
-                    let mut block = serde_json::json!({ "type": "text", "text": text_part.text });
-                    if !text_part.annotations.is_empty() {
-                        block["citations"] = Value::Array(text_part.annotations);
+                let Some(ty) = c.get("type").and_then(Value::as_str) else {
+                    return Err(
+                        "OpenAI content array entries require a string `type` to translate to Anthropic."
+                            .to_string(),
+                    );
+                };
+                match ty {
+                    "text" => {
+                        blocks.push(openai_text_part_to_claude_text_block(c)?);
                     }
-                    blocks.push(block);
-                } else if ty == Some("refusal") {
-                    blocks.push(serde_json::json!({
-                        "type": "text",
-                        "text": c.get("refusal").cloned().unwrap_or_else(|| Value::String(String::new()))
-                    }));
-                } else if ty == Some("image_url") {
-                    let url = c
-                        .get("image_url")
-                        .and_then(|u| u.get("url").and_then(Value::as_str))
-                        .unwrap_or("");
-                    if url.starts_with("data:") {
-                        let rest = url.strip_prefix("data:").unwrap_or("");
-                        let (media, b64) = rest.split_once(";base64,").unwrap_or(("image/png", ""));
-                        blocks.push(serde_json::json!({
-                            "type": "image",
-                            "source": { "type": "base64", "media_type": media, "data": b64 }
-                        }));
+                    "refusal" => {
+                        blocks.push(openai_refusal_part_to_claude_text_block(c));
+                    }
+                    "image_url" => {
+                        blocks.push(openai_image_url_part_to_claude_block(c)?);
+                    }
+                    "input_audio" => {
+                        return Err(openai_audio_part_not_portable_to_anthropic_message(c));
+                    }
+                    "file" | "input_file" => {
+                        return Err(openai_file_part_not_portable_to_anthropic_message(c));
+                    }
+                    other => {
+                        return Err(openai_content_part_not_portable_to_anthropic_message(
+                            other,
+                            "unsupported typed content parts must not be silently dropped.",
+                        ));
                     }
                 }
             }

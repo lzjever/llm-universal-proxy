@@ -74,6 +74,7 @@ The product promise is bounded: protocol coverage means native passthrough for s
 Portable core:
 
 - text
+- first-phase typed media input only when both request policy and the effective model surface allow the media kind
 - system instructions
 - function tools
 - portable tool results
@@ -86,6 +87,30 @@ Native extensions:
 - Anthropic server tools and pause-turn semantics
 - Gemini built-in tools, caches, and interaction-specific state
 - provider-owned conversation or compaction resources
+
+## Multimodal Phase 1 Boundary
+
+Multimodal support is currently a protocol compatibility layer feature, not a blanket provider capability promise. The request policy gate recognizes typed media across OpenAI Chat/Responses, Anthropic Messages, and Gemini request shapes, then checks the effective `surface.modalities.input` for the routed alias.
+
+Current input modality meanings:
+
+| Surface value | Compatibility meaning |
+| --- | --- |
+| `pdf` | Narrow document capability for PDF media. |
+| `file` | Generic file capability and includes PDF. |
+| `video` | First-phase gate for video media; Gemini video routed to non-Gemini targets must fail closed. |
+
+Current translator boundaries:
+
+| Path | First-phase behavior |
+| --- | --- |
+| OpenAI Chat/Responses to Anthropic | Data URI images can become Anthropic image blocks. Remote images, `input_audio`, `file`/`input_file`, and unknown typed parts fail closed. |
+| OpenAI/Gemini | Existing image, audio, PDF, and Gemini `fileData` mappings remain supported when the effective surface allows them. |
+| Gemini video to non-Gemini | Fail closed before contacting upstream. |
+
+Provider/model availability still comes from configuration. Do not mark a live upstream as multimodal unless that provider integration and selected model are validated for the media shape. In particular, the live MiniMax test provider should remain text-only in first-party docs; current multimodal e2e coverage uses first-party mock upstreams rather than real MiniMax.
+
+Unsupported media is a hard boundary. Unknown typed parts, remote media forms that the target translator cannot represent, and media missing from the effective surface must be rejected before the upstream call instead of being silently dropped.
 
 ## Recommended Runtime Policy
 

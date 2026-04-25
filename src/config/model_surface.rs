@@ -23,6 +23,15 @@ pub enum ModelModality {
     Image,
     #[serde(rename = "audio")]
     Audio,
+    /// Narrow document capability for PDF inputs.
+    #[serde(rename = "pdf")]
+    Pdf,
+    /// Generic file capability. This is a superset for PDF inputs at policy time.
+    #[serde(rename = "file")]
+    File,
+    /// Video input capability. Phase one uses this for request gating only.
+    #[serde(rename = "video")]
+    Video,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

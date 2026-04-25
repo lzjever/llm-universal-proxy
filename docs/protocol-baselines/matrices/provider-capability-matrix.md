@@ -10,7 +10,8 @@ Legend: provider-status cells answer only whether the capability is officially d
 | Capability | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Gemini `generateContent` | Proxy note |
 | --- | --- | --- | --- | --- | --- |
 | Stateless text conversation | Native | Native | Native | Native | Common portability floor |
-| Typed multimodal input parts | Native | Native | Native | Native | Shapes still differ by provider |
+| Typed multimodal input parts | Native | Native | Native | Native | First-phase proxy support is gated by `surface.modalities.input`; model/provider availability is not implied |
+| PDF, generic file, and video inputs | Native | Native | Limited | Native | `pdf` is narrow, `file` includes PDF, and video currently stays gate-only; Gemini video is allowed only on Gemini-routed paths |
 | Function calling | Native | Native | Native | Native | Best common tool surface |
 | Hosted / server tools | Native | No official surface | Native | Native | Treat as vendor-specific |
 | Remote MCP tools | Native | No official surface | Guide/Beta | Native | Same-provider passthrough only |

@@ -20,18 +20,61 @@ use super::tools::{
     semantic_tool_kind_from_value, validate_public_tool_name_not_reserved,
 };
 
-pub(super) fn extract_gemini_text(content: &Value) -> String {
+fn gemini_system_instruction_non_text_part_message(part: &Value, label: &str) -> String {
+    let mime = gemini_part_field(part, "inlineData", "inline_data")
+        .or_else(|| gemini_part_field(part, "fileData", "file_data"))
+        .and_then(|data| {
+            data.get("mimeType")
+                .or_else(|| data.get("mime_type"))
+                .and_then(Value::as_str)
+        })
+        .map(|mime| format!(" with MIME `{mime}`"))
+        .unwrap_or_default();
+    format!(
+        "Gemini systemInstruction part `{label}`{mime} cannot be faithfully translated to non-Gemini targets; systemInstruction.parts only support text parts."
+    )
+}
+
+fn extract_gemini_system_instruction_text(content: &Value) -> Result<String, String> {
     if let Some(s) = content.as_str() {
-        return s.to_string();
+        return Ok(s.to_string());
     }
-    if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-        return parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("");
+    let Some(parts) = content.get("parts").and_then(Value::as_array) else {
+        return Ok(String::new());
+    };
+    let mut text_parts = Vec::new();
+    for part in parts {
+        for (camel, snake, label) in [
+            ("inlineData", "inline_data", "inlineData"),
+            ("fileData", "file_data", "fileData"),
+            ("functionCall", "function_call", "functionCall"),
+            ("functionResponse", "function_response", "functionResponse"),
+        ] {
+            if part.get(camel).is_some() || part.get(snake).is_some() {
+                return Err(gemini_system_instruction_non_text_part_message(part, label));
+            }
+        }
+        if part.get("thought").is_some() {
+            return Err(gemini_system_instruction_non_text_part_message(
+                part, "thought",
+            ));
+        }
+        if let Some(text) = part.get("text") {
+            let Some(text) = text.as_str() else {
+                return Err(
+                    "Gemini systemInstruction text parts require string `text` values to translate to non-Gemini targets."
+                        .to_string(),
+                );
+            };
+            text_parts.push(text);
+            continue;
+        }
+        return Err(gemini_system_instruction_non_text_part_message(
+            part,
+            &gemini_part_kind_label(part),
+        ));
     }
-    String::new()
+    Ok(text_parts.join(""))
 }
 
 pub(super) fn gemini_function_response_has_nonportable_parts(function_response: &Value) -> bool {
@@ -599,7 +642,7 @@ pub(super) fn gemini_to_openai(body: &mut Value) -> Result<(), String> {
         }
     }
     if let Some(si) = gemini_request_system_instruction(body) {
-        let text = extract_gemini_text(si);
+        let text = extract_gemini_system_instruction_text(si)?;
         if !text.is_empty() {
             result["messages"]
                 .as_array_mut()
@@ -781,6 +824,21 @@ pub(super) fn mime_type_from_filename(filename: &str) -> Option<&'static str> {
     }
 }
 
+fn gemini_video_not_portable_message(part_kind: &str, mime: &str) -> String {
+    format!(
+        "Gemini {part_kind} MIME `{mime}` is video input and cannot be faithfully translated to non-Gemini targets; video/* must not be coerced into generic file parts."
+    )
+}
+
+fn gemini_mime_type_is_video(mime: &str) -> bool {
+    mime.split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("video/")
+}
+
 pub(super) fn openai_file_data_reference<'a>(
     file_data: &'a str,
     filename: Option<&str>,
@@ -810,6 +868,23 @@ pub(super) fn openai_file_data_reference<'a>(
         "OpenAI file_data must be a MIME-bearing data URI, a recognized fileUri-style reference, or a base64 payload with filename provenance to translate to Gemini."
             .to_string(),
     )
+}
+
+fn openai_file_uri_mime_type_from_provenance(
+    file: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    file.get("mime_type")
+        .or_else(|| file.get("mimeType"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|mime_type| !mime_type.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            file.get("filename")
+                .and_then(Value::as_str)
+                .and_then(mime_type_from_filename)
+                .map(str::to_string)
+        })
 }
 
 pub(super) fn openai_file_part_from_gemini_inline_data(mime: &str, data: &str) -> Value {
@@ -877,6 +952,9 @@ pub(super) fn convert_gemini_content_to_openai(content: &Value) -> Result<Vec<Va
                 .and_then(Value::as_str)
                 .unwrap_or("application/octet-stream");
             let data = inline.get("data").and_then(Value::as_str).unwrap_or("");
+            if gemini_mime_type_is_video(mime) {
+                return Err(gemini_video_not_portable_message("inlineData", mime));
+            }
             if mime.starts_with("image/") {
                 openai_parts.push(serde_json::json!({
                     "type": "image_url",
@@ -896,6 +974,14 @@ pub(super) fn convert_gemini_content_to_openai(content: &Value) -> Result<Vec<Va
         }
         if let Some(file_data) = gemini_part_field(part, "fileData", "file_data") {
             recognized = true;
+            let mime = file_data
+                .get("mimeType")
+                .or_else(|| file_data.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            if gemini_mime_type_is_video(mime) {
+                return Err(gemini_video_not_portable_message("fileData", mime));
+            }
             openai_parts.push(gemini_file_data_to_openai_part(file_data));
         }
         if let Some(fc) = gemini_part_field(part, "functionCall", "function_call") {
@@ -1087,8 +1173,15 @@ pub(super) fn openai_content_part_to_gemini_part(part: &Value) -> Result<Option<
                         })))
                     }
                     OpenAiFileDataReference::FileUri(file_uri) => {
+                        let Some(mime_type) = openai_file_uri_mime_type_from_provenance(file)
+                        else {
+                            return Err(
+                                "OpenAI file_data URI references need mimeType or filename provenance to translate to Gemini fileData; include file.mime_type/file.mimeType or a filename with a known extension."
+                                    .to_string(),
+                            );
+                        };
                         let mut file_data_part = serde_json::json!({
-                            "fileData": { "fileUri": file_uri }
+                            "fileData": { "mimeType": mime_type, "fileUri": file_uri }
                         });
                         if let Some(filename) = file.get("filename").cloned() {
                             file_data_part["fileData"]["displayName"] = filename;

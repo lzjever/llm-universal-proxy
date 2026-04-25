@@ -74,6 +74,32 @@ fn request_translation_policy_with_surface(
     }
 }
 
+fn same_format_surface_input_result(
+    client_format: UpstreamFormat,
+    model: &str,
+    mut body: serde_json::Value,
+    input: Vec<crate::config::ModelModality>,
+) -> Result<(), String> {
+    translate_request_with_policy(
+        client_format,
+        client_format,
+        model,
+        &mut body,
+        request_translation_policy_with_surface(
+            crate::config::CompatibilityMode::MaxCompat,
+            crate::config::ModelSurface {
+                limits: None,
+                modalities: Some(crate::config::ModelModalities {
+                    input: Some(input),
+                    output: None,
+                }),
+                tools: None,
+            },
+        ),
+        false,
+    )
+}
+
 #[test]
 fn request_translation_policy_default_uses_default_compatibility_mode() {
     assert_eq!(
@@ -584,6 +610,371 @@ fn translate_request_google_passthrough_rejects_image_output_when_surface_is_tex
 
     assert!(err.contains("modalities.output"), "err = {err}");
     assert!(err.contains("image"), "err = {err}");
+}
+
+#[test]
+fn surface_policy_text_only_rejects_file_pdf_video_inputs() {
+    use crate::config::ModelModality::Text;
+
+    let cases = [
+        (
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "Summarize this PDF" },
+                        {
+                            "type": "file",
+                            "file": {
+                                "filename": "paper.pdf",
+                                "file_data": "data:application/pdf;base64,JVBERi0x"
+                            }
+                        }
+                    ]
+                }]
+            }),
+            "pdf",
+        ),
+        (
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "Summarize this PDF" },
+                        {
+                            "type": "input_file",
+                            "filename": "paper.pdf",
+                            "file_data": "data:application/pdf;base64,JVBERi0x"
+                        }
+                    ]
+                }]
+            }),
+            "pdf",
+        ),
+        (
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            json!({
+                "model": "gpt-4o",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Summarize this PDF" },
+                        {
+                            "type": "input_file",
+                            "filename": "paper.pdf",
+                            "file_data": "data:application/pdf;base64,JVBERi0x"
+                        }
+                    ]
+                }]
+            }),
+            "pdf",
+        ),
+        (
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            json!({
+                "model": "claude-3",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "JVBERi0x"
+                        }
+                    }]
+                }]
+            }),
+            "pdf",
+        ),
+        (
+            UpstreamFormat::Google,
+            "gemini-1.5",
+            json!({
+                "model": "gemini-1.5",
+                "contents": [{
+                    "role": "user",
+                    "parts": [{
+                        "inlineData": {
+                            "mimeType": "application/pdf",
+                            "data": "JVBERi0x"
+                        }
+                    }]
+                }]
+            }),
+            "pdf",
+        ),
+        (
+            UpstreamFormat::Google,
+            "gemini-1.5",
+            json!({
+                "model": "gemini-1.5",
+                "contents": [{
+                    "role": "user",
+                    "parts": [{
+                        "inlineData": {
+                            "mimeType": "video/mp4",
+                            "data": "AAAA"
+                        }
+                    }]
+                }]
+            }),
+            "video",
+        ),
+    ];
+
+    for (client_format, model, body, expected_modality) in cases {
+        let err = same_format_surface_input_result(client_format, model, body, vec![Text])
+            .expect_err("surface should reject unsupported non-text input");
+
+        assert!(err.contains("modalities.input"), "err = {err}");
+        assert!(err.contains(expected_modality), "err = {err}");
+    }
+}
+
+#[test]
+fn surface_policy_distinguishes_pdf_from_generic_file_input() {
+    use crate::config::ModelModality::{File, Pdf, Text};
+
+    let pdf_body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Summarize this PDF" },
+                {
+                    "type": "input_file",
+                    "filename": "paper.pdf",
+                    "file_data": "data:application/pdf;base64,JVBERi0x"
+                }
+            ]
+        }]
+    });
+    let generic_file_body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Summarize this file" },
+                {
+                    "type": "input_file",
+                    "file_id": "file_123"
+                }
+            ]
+        }]
+    });
+
+    same_format_surface_input_result(
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        pdf_body.clone(),
+        vec![Text, Pdf],
+    )
+    .expect("pdf input surface should allow PDF files");
+
+    let err = same_format_surface_input_result(
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        generic_file_body.clone(),
+        vec![Text, Pdf],
+    )
+    .expect_err("pdf input surface should reject generic file references");
+    assert!(err.contains("modalities.input"), "err = {err}");
+    assert!(err.contains("file"), "err = {err}");
+
+    same_format_surface_input_result(
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        generic_file_body,
+        vec![Text, File],
+    )
+    .expect("file input surface should allow generic file references");
+
+    same_format_surface_input_result(
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        pdf_body,
+        vec![Text, File],
+    )
+    .expect("file input surface should allow PDF files");
+}
+
+#[test]
+fn surface_policy_file_surface_rejects_openai_video_file_input() {
+    use crate::config::ModelModality::{File, Text};
+
+    let cases = [
+        json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Describe this video" },
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": "clip.mp4",
+                            "file_data": "data:video/mp4;base64,AAAA"
+                        }
+                    }
+                ]
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Describe this video" },
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": "opaque.bin",
+                            "mime_type": "video/mp4",
+                            "file_data": "AAAA"
+                        }
+                    }
+                ]
+            }]
+        }),
+    ];
+
+    for body in cases {
+        let err = same_format_surface_input_result(
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            body,
+            vec![Text, File],
+        )
+        .expect_err("file-only input surface should reject OpenAI video file parts");
+
+        assert!(err.contains("modalities.input"), "err = {err}");
+        assert!(err.contains("video"), "err = {err}");
+    }
+}
+
+#[test]
+fn surface_policy_file_surface_rejects_openai_responses_video_input_file() {
+    use crate::config::ModelModality::{File, Text};
+
+    let cases = [
+        json!({
+            "model": "gpt-4o",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Describe this video" },
+                    {
+                        "type": "input_file",
+                        "filename": "clip.mp4",
+                        "file_data": "data:video/mp4;base64,AAAA"
+                    }
+                ]
+            }]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Describe this video" },
+                    {
+                        "type": "input_file",
+                        "filename": "opaque.bin",
+                        "mimeType": "video/mp4",
+                        "file_data": "AAAA"
+                    }
+                ]
+            }]
+        }),
+    ];
+
+    for body in cases {
+        let err = same_format_surface_input_result(
+            UpstreamFormat::OpenAiResponses,
+            "gpt-4o",
+            body,
+            vec![Text, File],
+        )
+        .expect_err("file-only input surface should reject Responses video input_file parts");
+
+        assert!(err.contains("modalities.input"), "err = {err}");
+        assert!(err.contains("video"), "err = {err}");
+    }
+}
+
+#[test]
+fn surface_policy_text_only_rejects_gemini_file_data_without_mime_type() {
+    use crate::config::ModelModality::Text;
+
+    let body = json!({
+        "model": "gemini-1.5",
+        "contents": [{
+            "role": "user",
+            "parts": [{
+                "fileData": {
+                    "fileUri": "gs://bucket/opaque"
+                }
+            }]
+        }]
+    });
+
+    let err =
+        same_format_surface_input_result(UpstreamFormat::Google, "gemini-1.5", body, vec![Text])
+            .expect_err("text-only input surface should reject MIME-less Gemini fileData");
+
+    assert!(err.contains("modalities.input"), "err = {err}");
+    assert!(err.contains("file"), "err = {err}");
+}
+
+#[test]
+fn surface_policy_gemini_file_data_without_mime_type_infers_pdf_from_display_name() {
+    use crate::config::ModelModality::{File, Pdf, Text};
+
+    let body = json!({
+        "model": "gemini-1.5",
+        "contents": [{
+            "role": "user",
+            "parts": [{
+                "fileData": {
+                    "fileUri": "gs://bucket/opaque",
+                    "displayName": "doc.pdf"
+                }
+            }]
+        }]
+    });
+
+    let err = same_format_surface_input_result(
+        UpstreamFormat::Google,
+        "gemini-1.5",
+        body.clone(),
+        vec![Text],
+    )
+    .expect_err("text-only input surface should reject inferred Gemini PDF fileData");
+    assert!(err.contains("modalities.input"), "err = {err}");
+    assert!(err.contains("pdf"), "err = {err}");
+
+    same_format_surface_input_result(
+        UpstreamFormat::Google,
+        "gemini-1.5",
+        body.clone(),
+        vec![Text, Pdf],
+    )
+    .expect("pdf input surface should allow Gemini PDF fileData inferred from displayName");
+
+    same_format_surface_input_result(UpstreamFormat::Google, "gemini-1.5", body, vec![Text, File])
+        .expect("file input surface should allow Gemini PDF fileData inferred from displayName");
 }
 
 #[test]
@@ -1525,6 +1916,54 @@ fn translate_request_openai_to_gemini_maps_file_uris_to_file_data() {
 }
 
 #[test]
+fn translate_request_openai_to_gemini_file_uri_requires_mime_provenance() {
+    let mut body = json!({
+        "model": "gemini-2.5-flash",
+        "messages": [{
+            "role": "user",
+            "content": [{ "type": "file", "file": { "file_data": "gs://bucket/opaque" } }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Google,
+        "gemini-2.5-flash",
+        &mut body,
+        false,
+    )
+    .expect_err("fileUri without MIME or filename provenance should fail closed");
+
+    assert!(err.contains("mimeType"), "err = {err}");
+    assert!(err.contains("filename"), "err = {err}");
+}
+
+#[test]
+fn translate_request_openai_to_gemini_file_uri_emits_mime_type_from_filename() {
+    let mut body = json!({
+        "model": "gemini-2.5-flash",
+        "messages": [{
+            "role": "user",
+            "content": [{ "type": "file", "file": { "file_data": "gs://bucket/doc.pdf", "filename": "doc.pdf" } }]
+        }]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Google,
+        "gemini-2.5-flash",
+        &mut body,
+        false,
+    )
+    .unwrap();
+
+    let parts = body["contents"][0]["parts"].as_array().expect("parts");
+    assert_eq!(parts[0]["fileData"]["fileUri"], "gs://bucket/doc.pdf");
+    assert_eq!(parts[0]["fileData"]["displayName"], "doc.pdf");
+    assert_eq!(parts[0]["fileData"]["mimeType"], "application/pdf");
+}
+
+#[test]
 fn translate_request_openai_to_gemini_maps_plain_base64_file_data_with_filename() {
     let mut body = json!({
         "model": "gemini-2.5-flash",
@@ -1591,6 +2030,353 @@ fn translate_request_openai_to_gemini_rejects_unmappable_file_references() {
     .expect_err("unmappable file references should fail closed");
 
     assert!(err.contains("file"), "err = {err}");
+}
+
+#[test]
+fn translate_request_openai_to_anthropic_maps_data_uri_image() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Describe this image" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+            ]
+        }]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("data URI images should map to Anthropic image blocks");
+
+    let content = body["messages"][0]["content"]
+        .as_array()
+        .expect("anthropic content");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "AAAA");
+}
+
+#[test]
+fn translate_request_openai_to_anthropic_rejects_remote_image_url_without_upload() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": { "url": "https://example.com/cat.png" }
+            }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect_err("remote image URLs should fail closed for Anthropic");
+
+    assert!(err.contains("remote"), "err = {err}");
+    assert!(err.contains("image"), "err = {err}");
+    assert!(err.contains("Anthropic"), "err = {err}");
+}
+
+#[test]
+fn translate_request_openai_to_anthropic_rejects_input_audio_without_native_mapping() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": { "data": "BBBB", "format": "wav" }
+            }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect_err("input_audio should fail closed for Anthropic");
+
+    assert!(err.contains("input_audio"), "err = {err}");
+    assert!(err.contains("Anthropic"), "err = {err}");
+}
+
+#[test]
+fn translate_request_openai_to_anthropic_rejects_file_without_document_mapping() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "file",
+                "file": {
+                    "file_data": "data:application/pdf;base64,JVBERi0x",
+                    "filename": "doc.pdf"
+                }
+            }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect_err("file parts should fail closed for Anthropic until document mapping exists");
+
+    assert!(err.contains("file"), "err = {err}");
+    assert!(err.contains("document"), "err = {err}");
+    assert!(err.contains("Anthropic"), "err = {err}");
+}
+
+#[test]
+fn translate_request_openai_to_anthropic_rejects_typed_system_media() {
+    let cases = [
+        (
+            UpstreamFormat::OpenAiCompletion,
+            "image_url",
+            json!({
+                "model": "claude-3",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            { "type": "text", "text": "System policy" },
+                            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+                        ]
+                    },
+                    { "role": "user", "content": "Hi" }
+                ]
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiCompletion,
+            "input_audio",
+            json!({
+                "model": "claude-3",
+                "messages": [
+                    {
+                        "role": "developer",
+                        "content": [
+                            { "type": "text", "text": "Developer policy" },
+                            { "type": "input_audio", "input_audio": { "data": "BBBB", "format": "wav" } }
+                        ]
+                    },
+                    { "role": "user", "content": "Hi" }
+                ]
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiCompletion,
+            "future_part",
+            json!({
+                "model": "claude-3",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            { "type": "text", "text": "System policy" },
+                            { "type": "future_part", "payload": "???" }
+                        ]
+                    },
+                    { "role": "user", "content": "Hi" }
+                ]
+            }),
+        ),
+        (
+            UpstreamFormat::OpenAiResponses,
+            "input_file",
+            json!({
+                "model": "claude-3",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "system",
+                        "content": [
+                            { "type": "input_text", "text": "System policy" },
+                            {
+                                "type": "input_file",
+                                "file_data": "data:application/pdf;base64,JVBERi0x",
+                                "filename": "policy.pdf"
+                            }
+                        ]
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Hi" }]
+                    }
+                ]
+            }),
+        ),
+    ];
+
+    for (client_format, label, mut body) in cases {
+        let err = translate_request(
+            client_format,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .expect_err("typed system/developer media should fail closed for Anthropic");
+
+        assert!(err.contains(label), "err = {err}");
+        assert!(err.contains("system"), "err = {err}");
+        assert!(err.contains("Anthropic"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_responses_to_anthropic_rejects_input_audio_and_input_file() {
+    let cases = [
+        (
+            "input_audio",
+            json!({
+                "model": "gpt-4o",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_audio",
+                        "input_audio": { "data": "BBBB", "format": "wav" }
+                    }]
+                }]
+            }),
+        ),
+        (
+            "input_file",
+            json!({
+                "model": "gpt-4o",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_file",
+                        "file_data": "data:application/pdf;base64,JVBERi0x",
+                        "filename": "doc.pdf"
+                    }]
+                }]
+            }),
+        ),
+    ];
+
+    for (label, mut body) in cases {
+        let err = translate_request(
+            UpstreamFormat::OpenAiResponses,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .expect_err("Responses media should fail closed for Anthropic");
+
+        assert!(err.contains(label), "err = {err}");
+        assert!(err.contains("Anthropic"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_gemini_to_anthropic_rejects_audio_pdf_filedata_until_document_mapping() {
+    let cases = [
+        (
+            "audio",
+            json!({
+                "model": "gemini-2.5-flash",
+                "contents": [{
+                    "role": "user",
+                    "parts": [{ "inlineData": { "mimeType": "audio/wav", "data": "BBBB" } }]
+                }]
+            }),
+        ),
+        (
+            "application/pdf",
+            json!({
+                "model": "gemini-2.5-flash",
+                "contents": [{
+                    "role": "user",
+                    "parts": [{ "inlineData": { "mimeType": "application/pdf", "data": "JVBERi0x" } }]
+                }]
+            }),
+        ),
+        (
+            "fileData",
+            json!({
+                "model": "gemini-2.5-flash",
+                "contents": [{
+                    "role": "user",
+                    "parts": [{
+                        "fileData": {
+                            "mimeType": "application/pdf",
+                            "fileUri": "gs://bucket/doc.pdf",
+                            "displayName": "doc.pdf"
+                        }
+                    }]
+                }]
+            }),
+        ),
+    ];
+
+    for (label, mut body) in cases {
+        let err = translate_request(
+            UpstreamFormat::Google,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .expect_err("Gemini non-image media should fail closed for Anthropic");
+
+        assert!(err.contains(label), "err = {err}");
+        assert!(err.contains("Anthropic"), "err = {err}");
+    }
+}
+
+#[test]
+fn translate_request_gemini_inline_video_rejects_for_non_gemini_targets() {
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+    ] {
+        let mut body = json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{
+                "role": "user",
+                "parts": [{ "inlineData": { "mimeType": "video/mp4", "data": "AAAA" } }]
+            }]
+        });
+
+        let err = translate_request(
+            UpstreamFormat::Google,
+            upstream_format,
+            "target-model",
+            &mut body,
+            false,
+        )
+        .expect_err("Gemini video should fail closed for non-Gemini targets");
+
+        assert!(err.contains("video"), "err = {err}");
+        assert!(err.contains("Gemini"), "err = {err}");
+    }
 }
 
 #[test]
@@ -5034,6 +5820,72 @@ fn translate_request_gemini_to_anthropic_maps_snake_case_request_fields_without_
     assert_eq!(tools[0]["name"], "lookup_weather");
     assert_eq!(tools[1]["name"], "lookup_time");
     assert_eq!(body["tool_choice"]["type"], "any");
+}
+
+#[test]
+fn translate_request_gemini_system_instruction_media_fails_closed_for_non_gemini_targets() {
+    let cases = [
+        (
+            "inlineData",
+            json!({
+                "model": "gemini-2.5-flash",
+                "systemInstruction": {
+                    "parts": [
+                        { "text": "System policy" },
+                        { "inlineData": { "mimeType": "video/mp4", "data": "AAAA" } }
+                    ]
+                },
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+            }),
+        ),
+        (
+            "fileData",
+            json!({
+                "model": "gemini-2.5-flash",
+                "systemInstruction": {
+                    "parts": [
+                        { "text": "System policy" },
+                        { "fileData": { "mimeType": "application/pdf", "fileUri": "gs://bucket/policy.pdf" } }
+                    ]
+                },
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+            }),
+        ),
+        (
+            "functionCall",
+            json!({
+                "model": "gemini-2.5-flash",
+                "systemInstruction": {
+                    "parts": [
+                        { "text": "System policy" },
+                        { "functionCall": { "name": "lookup", "args": {} } }
+                    ]
+                },
+                "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+            }),
+        ),
+    ];
+
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+    ] {
+        for (label, body) in &cases {
+            let mut translated = body.clone();
+            let err = translate_request(
+                UpstreamFormat::Google,
+                upstream_format,
+                "target-model",
+                &mut translated,
+                false,
+            )
+            .expect_err("Gemini systemInstruction media/function parts should fail closed");
+
+            assert!(err.contains("systemInstruction"), "err = {err}");
+            assert!(err.contains(label), "err = {err}");
+        }
+    }
 }
 
 #[test]

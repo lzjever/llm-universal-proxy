@@ -13,6 +13,7 @@ Status cells in the quick matrix answer whether the capability is officially doc
 | Capability | OpenAI Responses | OpenAI Chat | Anthropic Messages | Gemini `generateContent` | Where to read more |
 | --- | --- | --- | --- | --- | --- |
 | Core text conversation | Native | Native | Native | Native | [`overview.md`](protocol-baselines/overview.md) |
+| Typed multimodal input | Native | Native | Native | Native | [`provider-capability-matrix.md`](protocol-baselines/matrices/provider-capability-matrix.md) |
 | Function calling | Native | Native | Native | Native | [`tools.md`](protocol-baselines/capabilities/tools.md) |
 | Hosted / server tools | Native | No official surface | Native | Native | [`tools.md`](protocol-baselines/capabilities/tools.md) |
 | Reasoning controls and output | Native | Limited | Native | Native | [`reasoning.md`](protocol-baselines/capabilities/reasoning.md) |
@@ -34,5 +35,8 @@ Status cells in the quick matrix answer whether the capability is officially doc
 
 The proxy should treat function calling and explicit transcript replay as the common denominator. Hosted tools, provider-managed state, compaction, and cache-control semantics are increasingly vendor-specific and should be preserved only on same-provider paths or documented as intentional degradations.
 
+- First-phase multimodal support is bounded by request-policy gating and the effective `surface.modalities.input` for the selected alias. `pdf` means PDF-only, `file` means generic files including PDFs, and `video` is currently gate-first rather than a broad cross-provider translation promise.
+- OpenAI/Responses to Anthropic currently translates data URI images, but remote images, audio, file parts, and unknown typed parts fail closed; OpenAI/Gemini image, audio, PDF, and `fileData` mappings remain the supported first-phase media lane.
 - Reasoning text and continuity should be preserved where possible, but request-side reasoning knobs remain vendor-specific. Translation should keep the model-visible reasoning trail when portable without implying that all providers expose equivalent control surfaces.
 - Replayable tool history requires a complete and trusted structured call. Non-replayable or truncated tool calls should intentionally degrade to text/context preservation rather than masquerade as valid structured replay across providers.
+- Unsupported media, unknown typed parts, and Gemini video routed to non-Gemini targets should fail closed before contacting the upstream rather than being silently dropped.

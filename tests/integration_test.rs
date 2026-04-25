@@ -182,7 +182,7 @@ model_aliases:
       max_output_tokens: 64000
     surface:
       modalities:
-        input: [text, image]
+        input: [text, image, audio, pdf, file, video]
       tools:
         supports_search: false
         apply_patch_transport: freeform
@@ -221,7 +221,14 @@ model_aliases:
                 max_output_tokens: Some(64_000),
             }),
             modalities: Some(ModelModalities {
-                input: Some(vec![ModelModality::Text, ModelModality::Image]),
+                input: Some(vec![
+                    ModelModality::Text,
+                    ModelModality::Image,
+                    ModelModality::Audio,
+                    ModelModality::Pdf,
+                    ModelModality::File,
+                    ModelModality::Video,
+                ]),
                 output: Some(vec![ModelModality::Text]),
             }),
             tools: Some(ModelToolSurface {
@@ -249,7 +256,14 @@ fn runtime_config_round_trip_preserves_model_alias_limits() {
     payload.upstreams[0].proxy = Some(ProxyConfig::Direct);
     payload.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
         modalities: Some(ModelModalities {
-            input: Some(vec![ModelModality::Text]),
+            input: Some(vec![
+                ModelModality::Text,
+                ModelModality::Image,
+                ModelModality::Audio,
+                ModelModality::Pdf,
+                ModelModality::File,
+                ModelModality::Video,
+            ]),
             output: Some(vec![ModelModality::Text]),
         }),
         tools: Some(ModelToolSurface {
@@ -306,7 +320,14 @@ fn runtime_config_round_trip_preserves_model_alias_limits() {
         round_trip.upstreams[0].surface_defaults,
         Some(ModelSurfacePatch {
             modalities: Some(ModelModalities {
-                input: Some(vec![ModelModality::Text]),
+                input: Some(vec![
+                    ModelModality::Text,
+                    ModelModality::Image,
+                    ModelModality::Audio,
+                    ModelModality::Pdf,
+                    ModelModality::File,
+                    ModelModality::Video,
+                ]),
                 output: Some(vec![ModelModality::Text]),
             }),
             tools: Some(ModelToolSurface {
@@ -316,6 +337,11 @@ fn runtime_config_round_trip_preserves_model_alias_limits() {
                 supports_parallel_calls: Some(true),
             }),
         })
+    );
+    let round_trip_json = serde_json::to_value(&round_trip).unwrap();
+    assert_eq!(
+        round_trip_json["upstreams"][0]["surface_defaults"]["modalities"]["input"],
+        json!(["text", "image", "audio", "pdf", "file", "video"])
     );
     assert_eq!(
         round_trip.model_aliases["minimax-anth"].limits,

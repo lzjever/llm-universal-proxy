@@ -189,6 +189,21 @@ Use `surface_defaults` on an upstream, or `surface` on an alias, when you want t
 
 Raw HTTP smoke tests can omit these fields, but wrapper/live-profile flows should provide at least the minimal text-only surface used by the quickstart. Add richer values only when the model surface really supports them.
 
+Supported `surface.modalities.input` values:
+
+| Value | Meaning |
+| --- | --- |
+| `text` | Plain text input. |
+| `image` | Image input parts. |
+| `audio` | Audio input parts. |
+| `pdf` | Narrow PDF input capability. Use this when the model supports PDF documents but not arbitrary files. |
+| `file` | Generic file input capability. This includes PDF; use `pdf` when you need to advertise only the narrower PDF shape. |
+| `video` | Video input capability. In the current first multimodal phase, video is primarily a request-policy gate and is not a promise of cross-provider video translation. |
+
+These values describe the proxy's protocol compatibility layer and the configured client-visible alias surface. They do not prove that a real upstream provider or model accepts that media; configure only what the selected upstream model actually supports. The live MiniMax quickstart/provider profile should remain text-only unless a future MiniMax integration is explicitly validated for multimodal input; current multimodal e2e coverage uses first-party mock upstreams rather than the live MiniMax provider.
+
+Unsupported media must fail closed. The proxy should reject unsupported or unknown typed media parts instead of silently dropping them, flattening them into text, or forwarding them to an upstream surface that cannot represent them.
+
 Example:
 
 ```yaml

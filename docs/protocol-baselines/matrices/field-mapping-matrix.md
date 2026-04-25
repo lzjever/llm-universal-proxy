@@ -5,13 +5,14 @@
 - Last refreshed: 2026-04-16
 - Scope: high-risk field mappings, intentional drops, and downgrade notes
 
-Legend: `Exact` means the proxy can preserve intent closely. `Approx` means important behavior is preserved but not the exact provider contract. `Drop` means there is no safe cross-provider translation.
+Legend: `Exact` means the proxy can preserve intent closely. `Approx` means important behavior is preserved but not the exact provider contract. `Drop` means there is no safe cross-provider translation; high-risk request inputs should be rejected rather than silently omitted.
 
 Provider columns name the official field family on that surface. `Mapping status` is where cross-provider portability is judged.
 
 | Intent | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Gemini `generateContent` | Mapping status | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | Core conversation input | `input` | `messages` | `messages` plus top-level `system` | `contents` plus `systemInstruction` | Approx | Same concept, different wire shape |
+| Typed media input parts | `input_image`, `input_audio`, `input_file` | image, audio, and file content parts | image and document blocks | `inlineData` and `fileData` parts | Approx / Drop | Translate only supported media in the effective surface. Unsupported media, unknown typed parts, and Gemini video to non-Gemini targets fail closed. |
 | System / developer instruction | `instructions` or high-priority input roles | `system` message | top-level `system` | `systemInstruction` | Approx | Hierarchy and placement differ |
 | Function tool definitions | `tools` | `tools` | `tools` with `input_schema` | `tools.functionDeclarations` | Approx | Function-only portability |
 | Hosted / server tool definitions | Rich Responses tool families | No official hosted/server tool family on Chat create | Server tools and MCP connector | Official built-in/server-side `Tool` branches plus `toolConfig` and `mcpServers` | Drop | Keep same-provider only |

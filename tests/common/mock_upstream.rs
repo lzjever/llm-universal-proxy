@@ -4,13 +4,17 @@
 
 use axum::{
     body::Body,
-    extract::{Json, Path},
-    http::StatusCode,
+    extract::{Json, Path, State},
+    http::{Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use serde_json::Value;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::net::TcpListener;
 
 /// Spawns a mock upstream that speaks OpenAI Chat Completions API.
@@ -939,4 +943,184 @@ async fn capture_anthropic_handler(
         "usage": { "input_tokens": 1, "output_tokens": 1 }
     });
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Request captured by a spec-aware asserting mock upstream.
+#[derive(Clone, Debug)]
+pub struct CapturedMockRequest {
+    pub method: String,
+    pub path: String,
+    pub body: Value,
+}
+
+/// Thread-safe request log for asserting mock upstreams.
+#[derive(Clone, Default)]
+pub struct CapturedMockRequests {
+    requests: Arc<Mutex<Vec<CapturedMockRequest>>>,
+}
+
+impl CapturedMockRequests {
+    fn push(&self, request: CapturedMockRequest) {
+        self.requests.lock().unwrap().push(request);
+    }
+
+    pub fn snapshot(&self) -> Vec<CapturedMockRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    pub async fn wait_for_count(
+        &self,
+        count: usize,
+        timeout: Duration,
+    ) -> Vec<CapturedMockRequest> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let snapshot = self.snapshot();
+            if snapshot.len() >= count || tokio::time::Instant::now() >= deadline {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+type RequestAssertion =
+    Arc<dyn Fn(&CapturedMockRequest) -> Result<(), String> + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct AssertingMockState {
+    captured: CapturedMockRequests,
+    assertion: RequestAssertion,
+}
+
+/// Spawns a Gemini mock that captures and asserts the upstream request shape.
+///
+/// Assertion failures are returned as 400 JSON so e2e tests see the mock-side
+/// contract reason through the proxy response path.
+pub async fn spawn_asserting_google_mock(
+    assertion: impl Fn(&CapturedMockRequest) -> Result<(), String> + Send + Sync + 'static,
+) -> (String, tokio::task::JoinHandle<()>, CapturedMockRequests) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let captured = CapturedMockRequests::default();
+    let state = AssertingMockState {
+        captured: captured.clone(),
+        assertion: Arc::new(assertion),
+    };
+
+    let app = Router::new()
+        .route(
+            "/v1beta/models/:model_action",
+            post(asserting_google_handler),
+        )
+        .route("/models/:model_action", post(asserting_google_handler))
+        .route("/generateContent", post(asserting_google_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.with_state(state)).await.ok();
+    });
+    (base, handle, captured)
+}
+
+async fn asserting_google_handler(
+    State(state): State<AssertingMockState>,
+    method: Method,
+    uri: Uri,
+    Json(body): Json<Value>,
+) -> Response {
+    let request = CapturedMockRequest {
+        method: method.to_string(),
+        path: uri.path().to_string(),
+        body,
+    };
+    state.captured.push(request.clone());
+
+    if let Err(message) = (state.assertion)(&request) {
+        return assertion_failure_response(message);
+    }
+
+    let resp = serde_json::json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{ "text": "OK" }]
+            },
+            "finishReason": "STOP"
+        }],
+        "modelVersion": "gemini-asserting-mock",
+        "responseId": "gem-asserting-mock",
+        "usageMetadata": {
+            "promptTokenCount": 1,
+            "candidatesTokenCount": 1,
+            "totalTokenCount": 2
+        }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Spawns an Anthropic Messages mock that captures and asserts request shape.
+///
+/// Assertion failures are returned as 400 JSON so e2e tests see the mock-side
+/// contract reason through the proxy response path.
+pub async fn spawn_asserting_anthropic_mock(
+    assertion: impl Fn(&CapturedMockRequest) -> Result<(), String> + Send + Sync + 'static,
+) -> (String, tokio::task::JoinHandle<()>, CapturedMockRequests) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let captured = CapturedMockRequests::default();
+    let state = AssertingMockState {
+        captured: captured.clone(),
+        assertion: Arc::new(assertion),
+    };
+
+    let app = Router::new()
+        .route("/v1/messages", post(asserting_anthropic_handler))
+        .route("/messages", post(asserting_anthropic_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.with_state(state)).await.ok();
+    });
+    (base, handle, captured)
+}
+
+async fn asserting_anthropic_handler(
+    State(state): State<AssertingMockState>,
+    method: Method,
+    uri: Uri,
+    Json(body): Json<Value>,
+) -> Response {
+    let request = CapturedMockRequest {
+        method: method.to_string(),
+        path: uri.path().to_string(),
+        body,
+    };
+    state.captured.push(request.clone());
+
+    if let Err(message) = (state.assertion)(&request) {
+        return assertion_failure_response(message);
+    }
+
+    let resp = serde_json::json!({
+        "id": "msg_asserting_mock",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "OK" }],
+        "model": request.body.get("model").unwrap_or(&serde_json::json!("claude-3")),
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+fn assertion_failure_response(message: String) -> Response {
+    let resp = serde_json::json!({
+        "error": {
+            "type": "mock_assertion_failed",
+            "message": message
+        }
+    });
+    (StatusCode::BAD_REQUEST, Json(resp)).into_response()
 }
