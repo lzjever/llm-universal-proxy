@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+## v0.2.15 - 2026-04-25
+
 - Supported native OpenAI Responses retrieval streaming for `GET /v1/responses/{response_id}?stream=true`, including upstream `Accept: text/event-stream`, guarded same-format SSE passthrough, and fail-closed handling when an upstream returns non-SSE success bodies.
+- Hardened OpenAI Chat `file` and OpenAI Responses `input_file` MIME provenance checks so conflicting `mime_type` / `mimeType`, `file_data` data URI MIME, or filename-derived hints are rejected before upstream routing, including same-format Responses passthrough and OpenAI-to-Gemini translation paths.
+- Expanded MIME provenance regression coverage for camelCase metadata, top-level versus nested file metadata, filename conflicts, and Gemini conversion paths, then re-verified Codex, Claude Code, and Gemini real-client smoke coverage plus a Codex long-horizon 6502 emulator task through MiniMax lanes.
 - Documented the typed-media MIME provenance safety rule across user, configuration, compatibility, and architecture docs so conflicting `mime_type` / `mimeType`, data URI MIME, or filename hints are clearly described as fail-closed request errors.
 
 ## v0.2.14 - 2026-04-24

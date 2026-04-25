@@ -110,6 +110,22 @@ fn assert_openai_file_mime_conflict(err: &str) {
     assert!(err.contains("video/mp4"), "err = {err}");
 }
 
+fn assert_openai_file_mime_conflict_variant(
+    err: &str,
+    expected_sources: &[&str],
+    expected_mimes: &[&str],
+) {
+    let lower = err.to_ascii_lowercase();
+    assert!(lower.contains("conflict"), "err = {err}");
+    assert!(lower.contains("mime"), "err = {err}");
+    for source in expected_sources {
+        assert!(err.contains(source), "err = {err}; missing source {source}");
+    }
+    for mime in expected_mimes {
+        assert!(err.contains(mime), "err = {err}; missing MIME {mime}");
+    }
+}
+
 #[test]
 fn request_translation_policy_default_uses_default_compatibility_mode() {
     assert_eq!(
@@ -906,6 +922,100 @@ fn surface_policy_file_surface_rejects_openai_file_data_uri_mime_conflict() {
 }
 
 #[test]
+fn surface_policy_file_surface_rejects_openai_file_mime_provenance_conflict_variants() {
+    use crate::config::ModelModality::{File, Text};
+
+    let cases = [
+        (
+            "camelCase explicit MIME vs data URI",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "filename": "paper.pdf",
+                            "mimeType": "application/pdf",
+                            "file_data": "data:video/mp4;base64,AAAA"
+                        }
+                    }]
+                }]
+            }),
+            vec!["mimeType", "file_data"],
+            vec!["application/pdf", "video/mp4"],
+        ),
+        (
+            "top-level explicit MIME vs nested data URI",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "mime_type": "application/pdf",
+                        "file": {
+                            "file_data": "data:video/mp4;base64,AAAA"
+                        }
+                    }]
+                }]
+            }),
+            vec!["mime_type", "file_data"],
+            vec!["application/pdf", "video/mp4"],
+        ),
+        (
+            "filename MIME vs data URI",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "filename": "paper.pdf",
+                            "file_data": "data:video/mp4;base64,AAAA"
+                        }
+                    }]
+                }]
+            }),
+            vec!["filename", "file_data"],
+            vec!["application/pdf", "video/mp4"],
+        ),
+        (
+            "explicit MIME vs filename",
+            json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "filename": "clip.mp4",
+                            "mime_type": "application/pdf",
+                            "file_data": "AAAA"
+                        }
+                    }]
+                }]
+            }),
+            vec!["mime_type", "filename"],
+            vec!["application/pdf", "video/mp4"],
+        ),
+    ];
+
+    for (_label, body, sources, mimes) in cases {
+        let err = same_format_surface_input_result(
+            UpstreamFormat::OpenAiCompletion,
+            "gpt-4o",
+            body,
+            vec![Text, File],
+        )
+        .unwrap_err();
+
+        assert_openai_file_mime_conflict_variant(&err, &sources, &mimes);
+    }
+}
+
+#[test]
 fn surface_policy_file_surface_rejects_openai_responses_video_input_file() {
     use crate::config::ModelModality::{File, Text};
 
@@ -986,6 +1096,35 @@ fn surface_policy_file_surface_rejects_openai_responses_input_file_data_uri_mime
     .expect_err("file surface should fail closed on Responses input_file MIME conflicts");
 
     assert_openai_file_mime_conflict(&err);
+}
+
+#[test]
+fn surface_policy_file_surface_rejects_top_level_openai_responses_input_file_mime_conflict() {
+    use crate::config::ModelModality::{File, Text};
+
+    let body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "input_file",
+            "filename": "paper.pdf",
+            "mimeType": "application/pdf",
+            "file_data": "data:video/mp4;base64,AAAA"
+        }]
+    });
+
+    let err = same_format_surface_input_result(
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        body,
+        vec![Text, File],
+    )
+    .expect_err("top-level Responses input_file should fail closed on MIME conflicts");
+
+    assert_openai_file_mime_conflict_variant(
+        &err,
+        &["mimeType", "file_data"],
+        &["application/pdf", "video/mp4"],
+    );
 }
 
 #[test]
@@ -1993,6 +2132,81 @@ fn translate_request_openai_to_gemini_rejects_file_data_uri_mime_conflict() {
     .expect_err("OpenAI to Gemini should fail closed on file MIME conflicts");
 
     assert_openai_file_mime_conflict(&err);
+}
+
+#[test]
+fn translate_request_openai_to_gemini_rejects_file_mime_provenance_conflict_variants() {
+    let cases = [
+        (
+            "filename MIME vs data URI",
+            json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "file_data": "data:video/mp4;base64,AAAA",
+                            "filename": "doc.pdf"
+                        }
+                    }]
+                }]
+            }),
+            vec!["filename", "file_data"],
+            vec!["application/pdf", "video/mp4"],
+        ),
+        (
+            "explicit MIME vs filename",
+            json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "file_data": "AAAA",
+                            "filename": "clip.mp4",
+                            "mime_type": "application/pdf"
+                        }
+                    }]
+                }]
+            }),
+            vec!["mime_type", "filename"],
+            vec!["application/pdf", "video/mp4"],
+        ),
+        (
+            "camelCase explicit MIME vs data URI",
+            json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "file",
+                        "file": {
+                            "file_data": "data:video/mp4;base64,AAAA",
+                            "filename": "doc.pdf",
+                            "mimeType": "application/pdf"
+                        }
+                    }]
+                }]
+            }),
+            vec!["mimeType", "file_data"],
+            vec!["application/pdf", "video/mp4"],
+        ),
+    ];
+
+    for (_label, mut body, sources, mimes) in cases {
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            "gemini-2.5-flash",
+            &mut body,
+            false,
+        )
+        .unwrap_err();
+
+        assert_openai_file_mime_conflict_variant(&err, &sources, &mimes);
+    }
 }
 
 #[test]
