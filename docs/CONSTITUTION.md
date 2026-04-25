@@ -32,6 +32,7 @@ When translating between protocols, the proxy must preserve as much semantic fid
 - **Text content** — preserve portable user-visible text content; warn or reject when a field cannot be represented safely
 - **Tool calls / function calling** — preserve portable function definitions, arguments, and results across supported protocols
 - **Tool identity** — preserve the stable visible tool name supplied by the client; internal bridge names must never become the live model-visible or client-visible contract
+- **Media identity** — typed media hints must be self-consistent; conflicting MIME provenance must fail closed instead of being normalized by guesswork
 - **Thinking / reasoning** — preserve reasoning output in whatever form the upstream provides
 - **Usage / token counting** — map token metrics to the client's expected format
 - **Stop reasons / finish reasons** — map between protocol-specific stop reason semantics
@@ -77,6 +78,7 @@ These are non-negotiable properties that all future development must preserve:
 5. **Streaming is first-class**: Streaming (SSE) support is mandatory for supported protocol pairs within the same portability and reject rules as non-streaming translation.
 6. **Backward compatibility**: Adding a new protocol or feature must not break existing client-upstream combinations.
 7. **Degradation is visible**: When the proxy must drop or approximate request/response fields, it must emit compatibility warnings rather than silently failing.
+8. **Typed media fails closed on conflicting identity**: If MIME provenance disagrees across explicit metadata, data URIs, or filename hints, the proxy must reject before contacting the upstream.
 
 Locked tool identity contract:
 

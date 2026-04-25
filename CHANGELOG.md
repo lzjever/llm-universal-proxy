@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Supported native OpenAI Responses retrieval streaming for `GET /v1/responses/{response_id}?stream=true`, including upstream `Accept: text/event-stream`, guarded same-format SSE passthrough, and fail-closed handling when an upstream returns non-SSE success bodies.
+- Documented the typed-media MIME provenance safety rule across user, configuration, compatibility, and architecture docs so conflicting `mime_type` / `mimeType`, data URI MIME, or filename hints are clearly described as fail-closed request errors.
 
 ## v0.2.14 - 2026-04-24
 

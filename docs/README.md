@@ -14,6 +14,8 @@ Start here based on what you need:
   Public quickstart config for the homepage OpenAI + MiniMax example
 - [protocol-compatibility-matrix.md](./protocol-compatibility-matrix.md)
   Compatibility boundaries and portability summary
+- [max-compat-design.md](./max-compat-design.md)
+  Maximum-compatibility design, visible tool identity contract, and current multimodal boundaries
 - [DESIGN.md](./DESIGN.md)
   Current architecture map for the running system
 

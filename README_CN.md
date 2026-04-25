@@ -120,6 +120,7 @@ curl http://127.0.0.1:8080/openai/v1/responses \
 - 跨协议翻译路径以 portable core 为主，遇到不可移植能力会 warning 或 reject
 - native extension 和厂商托管的 lifecycle state 默认只留在同厂商路径，除非有明确 documented shim
 - quickstart 里的 `surface_defaults` 是保守的 text-only 默认值；只有确认模型 surface 支持时，才打开 search、image 或 parallel-tool 标志
+- typed media 的元数据必须自洽；例如 `mime_type` 和 `file_data` data URI 里声明的 MIME 冲突时，代理会在请求上游前拒绝
 
 ## Codex / Claude Code / Gemini 基本接法
 

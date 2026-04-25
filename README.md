@@ -120,6 +120,7 @@ Reasoning effort such as `xhigh` is a client/request-side setting, not part of t
 - translated paths target a portable core and may warn or reject non-portable provider-native features
 - native extensions and provider-owned lifecycle state stay on same-provider paths unless a documented shim says otherwise
 - the quickstart includes conservative text-only `surface_defaults`; turn on search, image, or parallel-tool flags only when that model surface really supports them
+- typed media metadata must be internally consistent; conflicting MIME hints such as `mime_type` versus a `file_data` data URI are rejected before the upstream call
 
 ## Codex / Claude Code / Gemini Basic Setup
 

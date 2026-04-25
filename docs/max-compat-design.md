@@ -1,7 +1,7 @@
 # Maximum Compatibility Design
 
 Status: active  
-Last updated: 2026-04-23
+Last updated: 2026-04-25
 
 ## Summary
 
@@ -111,6 +111,8 @@ Current translator boundaries:
 Provider/model availability still comes from configuration. Do not mark a live upstream as multimodal unless that provider integration and selected model are validated for the media shape. In particular, the live MiniMax test provider should remain text-only in first-party docs; current multimodal e2e coverage uses first-party mock upstreams rather than real MiniMax.
 
 Unsupported media is a hard boundary. Unknown typed parts, remote media forms that the target translator cannot represent, and media missing from the effective surface must be rejected before the upstream call instead of being silently dropped.
+
+MIME provenance is part of that boundary. OpenAI Chat `file` and OpenAI Responses `input_file` parts may carry explicit `mime_type` / `mimeType`, MIME-bearing `file_data` data URIs, and filename-derived hints. The proxy treats disagreement between those sources as unsafe and rejects the request before translation, including same-format Responses passthrough. That prevents a request from passing a PDF-only surface gate while the translator later emits video, audio, image, or another concrete media type from the actual data URI.
 
 ## Recommended Runtime Policy
 

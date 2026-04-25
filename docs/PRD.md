@@ -108,6 +108,7 @@ The proxy MUST translate the following request fields across protocols:
 | `max_output_tokens` / `max_tokens` | Must | Normalize field names |
 | `temperature`, `top_p` | Should | Pass through generation config where applicable |
 | Image content | Should | Map between `image_url` (OpenAI), `source.base64` (Anthropic), `inlineData` (Gemini) |
+| Typed media MIME provenance | Must | Reject conflicting MIME hints before routing so surface gates and translators cannot disagree about the actual media kind |
 | Thinking/reasoning config | May | Preserve where upstream supports it |
 | Built-in / non-function tools | Won't | Dropped during cross-protocol translation with compat warning unless a documented bridge can preserve the original visible tool identity |
 
@@ -414,6 +415,7 @@ When the proxy must drop or approximate fields, it MUST:
 | `truncation` policy | Provider-specific context management |
 | Reasoning request config | Only reasoning output is mapped, not request policy |
 | `store` / persistence | Provider-specific outside OpenAI family |
+| Conflicting typed-media MIME hints | Unsafe request semantics; reject before upstream routing instead of guessing |
 
 ---
 

@@ -204,6 +204,8 @@ These values describe the proxy's protocol compatibility layer and the configure
 
 Unsupported media must fail closed. The proxy should reject unsupported or unknown typed media parts instead of silently dropping them, flattening them into text, or forwarding them to an upstream surface that cannot represent them.
 
+Media metadata must also be self-consistent. For OpenAI Chat `file` parts and OpenAI Responses `input_file` parts, the proxy compares explicit `mime_type` / `mimeType`, MIME-bearing `file_data` data URIs, and filename-derived hints. If those sources disagree, the request is rejected before any upstream call. This keeps the effective `surface.modalities.input` gate aligned with the media bytes or URI that would actually be translated.
+
 Example:
 
 ```yaml

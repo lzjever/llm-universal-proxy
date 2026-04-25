@@ -37,6 +37,7 @@ The proxy should treat function calling and explicit transcript replay as the co
 
 - First-phase multimodal support is bounded by request-policy gating and the effective `surface.modalities.input` for the selected alias. `pdf` means PDF-only, `file` means generic files including PDFs, and `video` is currently gate-first rather than a broad cross-provider translation promise.
 - OpenAI/Responses to Anthropic currently translates data URI images, but remote images, audio, file parts, and unknown typed parts fail closed; OpenAI/Gemini image, audio, PDF, and `fileData` mappings remain the supported first-phase media lane.
+- OpenAI `file` and Responses `input_file` MIME provenance must be self-consistent. Conflicting explicit MIME metadata, MIME-bearing data URIs, or filename hints fail closed instead of allowing the request-policy gate and downstream translator to disagree.
 - Reasoning text and continuity should be preserved where possible, but request-side reasoning knobs remain vendor-specific. Translation should keep the model-visible reasoning trail when portable without implying that all providers expose equivalent control surfaces.
 - Replayable tool history requires a complete and trusted structured call. Non-replayable or truncated tool calls should intentionally degrade to text/context preservation rather than masquerade as valid structured replay across providers.
 - Unsupported media, unknown typed parts, and Gemini video routed to non-Gemini targets should fail closed before contacting the upstream rather than being silently dropped.
