@@ -776,14 +776,31 @@ pub(super) fn openai_audio_mime_type(format: &str) -> String {
 }
 
 pub(super) fn base64_data_uri_parts(value: &str) -> Option<(&str, &str)> {
-    value
-        .strip_prefix("data:")
-        .and_then(|rest| rest.split_once(";base64,"))
+    let value = value.trim_start();
+    if !value.get(..5)?.eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    let rest = value.get(5..)?;
+    let (metadata, data) = rest.split_once(',')?;
+    let mut metadata_parts = metadata.split(';');
+    let mime_type = metadata_parts.next()?.trim();
+    if mime_type.is_empty()
+        || !metadata_parts.any(|part| part.trim().eq_ignore_ascii_case("base64"))
+    {
+        return None;
+    }
+    Some((mime_type, data))
 }
 
 pub(super) enum OpenAiFileDataReference<'a> {
-    InlineData { mime_type: String, data: &'a str },
-    FileUri(&'a str),
+    InlineData {
+        mime_type: String,
+        data: &'a str,
+    },
+    FileUri {
+        mime_type: String,
+        file_uri: &'a str,
+    },
 }
 
 pub(super) fn looks_like_uri_reference(value: &str) -> bool {
@@ -818,10 +835,150 @@ pub(super) fn mime_type_from_filename(filename: &str) -> Option<&'static str> {
         "jpg" | "jpeg" => Some("image/jpeg"),
         "gif" => Some("image/gif"),
         "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "heic" => Some("image/heic"),
+        "heif" => Some("image/heif"),
+        "svg" => Some("image/svg+xml"),
         "wav" => Some("audio/wav"),
         "mp3" => Some("audio/mpeg"),
+        "m4a" => Some("audio/mp4"),
+        "aac" => Some("audio/aac"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "flac" => Some("audio/flac"),
+        "opus" => Some("audio/opus"),
+        "mp4" => Some("video/mp4"),
+        "m4v" => Some("video/x-m4v"),
+        "mov" => Some("video/quicktime"),
+        "webm" => Some("video/webm"),
+        "mpeg" | "mpg" => Some("video/mpeg"),
+        "avi" => Some("video/x-msvideo"),
+        "mkv" => Some("video/x-matroska"),
         _ => None,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenAiFileMimeSource {
+    Explicit,
+    FileData,
+    Filename,
+}
+
+struct OpenAiFileMimeCandidate {
+    source: OpenAiFileMimeSource,
+    source_label: &'static str,
+    mime_type: String,
+}
+
+fn normalized_mime_type(value: &str) -> Option<String> {
+    let mime_type = value
+        .split_once(';')
+        .map_or(value, |(mime_type, _)| mime_type)
+        .trim()
+        .to_ascii_lowercase();
+    (!mime_type.is_empty()).then_some(mime_type)
+}
+
+fn collect_openai_file_mime_candidates_from_maps<'a>(
+    maps: impl IntoIterator<Item = &'a serde_json::Map<String, Value>>,
+) -> Vec<OpenAiFileMimeCandidate> {
+    let mut candidates = Vec::new();
+    for map in maps {
+        for field in ["mime_type", "mimeType"] {
+            if let Some(mime_type) = map
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(normalized_mime_type)
+            {
+                candidates.push(OpenAiFileMimeCandidate {
+                    source: OpenAiFileMimeSource::Explicit,
+                    source_label: "`mime_type`/`mimeType`",
+                    mime_type,
+                });
+            }
+        }
+        if let Some((mime_type, _)) = map
+            .get("file_data")
+            .and_then(Value::as_str)
+            .and_then(base64_data_uri_parts)
+            .and_then(|(mime_type, data)| normalized_mime_type(mime_type).map(|mime| (mime, data)))
+        {
+            candidates.push(OpenAiFileMimeCandidate {
+                source: OpenAiFileMimeSource::FileData,
+                source_label: "`file_data` data URI",
+                mime_type,
+            });
+        }
+        if let Some(mime_type) = map
+            .get("filename")
+            .and_then(Value::as_str)
+            .and_then(mime_type_from_filename)
+            .and_then(normalized_mime_type)
+        {
+            candidates.push(OpenAiFileMimeCandidate {
+                source: OpenAiFileMimeSource::Filename,
+                source_label: "`filename`",
+                mime_type,
+            });
+        }
+    }
+    candidates
+}
+
+fn openai_file_part_maps(part: &Value) -> impl Iterator<Item = &serde_json::Map<String, Value>> {
+    part.as_object()
+        .into_iter()
+        .chain(part.get("file").and_then(Value::as_object))
+}
+
+fn openai_file_part_field<'a>(part: &'a Value, field: &str) -> Option<&'a Value> {
+    openai_file_part_maps(part).find_map(|map| map.get(field))
+}
+
+fn openai_file_mime_conflict_message(
+    left: &OpenAiFileMimeCandidate,
+    right: &OpenAiFileMimeCandidate,
+) -> String {
+    format!(
+        "OpenAI file MIME conflict: {} MIME `{}` conflicts with {} MIME `{}`; `mime_type`/`mimeType`, `file_data`, and `filename` MIME provenance must agree.",
+        left.source_label, left.mime_type, right.source_label, right.mime_type
+    )
+}
+
+fn resolve_openai_file_mime(
+    candidates: &[OpenAiFileMimeCandidate],
+) -> Result<Option<String>, String> {
+    let Some(first) = candidates.first() else {
+        return Ok(None);
+    };
+    for candidate in candidates.iter().skip(1) {
+        if candidate.mime_type != first.mime_type {
+            return Err(openai_file_mime_conflict_message(first, candidate));
+        }
+    }
+    Ok([
+        OpenAiFileMimeSource::FileData,
+        OpenAiFileMimeSource::Explicit,
+        OpenAiFileMimeSource::Filename,
+    ]
+    .iter()
+    .find_map(|source| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.source == *source)
+            .map(|candidate| candidate.mime_type.clone())
+    }))
+}
+
+pub(super) fn openai_file_part_resolved_mime_type(part: &Value) -> Result<Option<String>, String> {
+    resolve_openai_file_mime(&collect_openai_file_mime_candidates_from_maps(
+        openai_file_part_maps(part),
+    ))
+}
+
+pub(super) fn openai_file_part_mime_conflict_message(part: &Value) -> Option<String> {
+    openai_file_part_resolved_mime_type(part).err()
 }
 
 fn gemini_video_not_portable_message(part_kind: &str, mime: &str) -> String {
@@ -839,21 +996,40 @@ fn gemini_mime_type_is_video(mime: &str) -> bool {
         .starts_with("video/")
 }
 
-pub(super) fn openai_file_data_reference<'a>(
+pub(super) fn openai_file_data_reference_from_part<'a>(
+    part: &'a Value,
+) -> Result<OpenAiFileDataReference<'a>, String> {
+    let file_data = openai_file_part_field(part, "file_data")
+        .and_then(Value::as_str)
+        .ok_or("OpenAI file parts require file_data to translate to Gemini.")?;
+    let resolved_mime_type = openai_file_part_resolved_mime_type(part)?;
+    openai_file_data_reference_from_payload(file_data, resolved_mime_type)
+}
+
+fn openai_file_data_reference_from_payload<'a>(
     file_data: &'a str,
-    filename: Option<&str>,
+    resolved_mime_type: Option<String>,
 ) -> Result<OpenAiFileDataReference<'a>, String> {
     if let Some((mime_type, data)) = base64_data_uri_parts(file_data) {
-        return Ok(OpenAiFileDataReference::InlineData {
-            mime_type: mime_type.to_string(),
-            data,
-        });
+        let mime_type = normalized_mime_type(mime_type).ok_or(
+            "OpenAI file_data data URIs need a non-empty MIME type to translate to Gemini.",
+        )?;
+        return Ok(OpenAiFileDataReference::InlineData { mime_type, data });
     }
     if looks_like_uri_reference(file_data) {
-        return Ok(OpenAiFileDataReference::FileUri(file_data));
+        let Some(mime_type) = resolved_mime_type else {
+            return Err(
+                "OpenAI file_data URI references need mime_type/mimeType or filename provenance to translate to Gemini fileData; include file.mime_type/file.mimeType or a filename with a known extension."
+                    .to_string(),
+            );
+        };
+        return Ok(OpenAiFileDataReference::FileUri {
+            mime_type,
+            file_uri: file_data,
+        });
     }
     if looks_like_base64_payload(file_data) {
-        let Some(mime_type) = filename.and_then(mime_type_from_filename) else {
+        let Some(mime_type) = resolved_mime_type else {
             return Err(
                 "OpenAI file_data payloads need MIME or filename provenance to translate to Gemini; use a MIME-bearing data URI or include a filename with a known extension."
                     .to_string(),
@@ -868,23 +1044,6 @@ pub(super) fn openai_file_data_reference<'a>(
         "OpenAI file_data must be a MIME-bearing data URI, a recognized fileUri-style reference, or a base64 payload with filename provenance to translate to Gemini."
             .to_string(),
     )
-}
-
-fn openai_file_uri_mime_type_from_provenance(
-    file: &serde_json::Map<String, Value>,
-) -> Option<String> {
-    file.get("mime_type")
-        .or_else(|| file.get("mimeType"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|mime_type| !mime_type.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            file.get("filename")
-                .and_then(Value::as_str)
-                .and_then(mime_type_from_filename)
-                .map(str::to_string)
-        })
 }
 
 pub(super) fn openai_file_part_from_gemini_inline_data(mime: &str, data: &str) -> Value {
@@ -1162,24 +1321,20 @@ pub(super) fn openai_content_part_to_gemini_part(part: &Value) -> Result<Option<
                 .get("file")
                 .and_then(Value::as_object)
                 .ok_or("OpenAI file parts require a file object to translate to Gemini.")?;
-            if let Some(file_data) = file.get("file_data").and_then(Value::as_str) {
-                return match openai_file_data_reference(
-                    file_data,
-                    file.get("filename").and_then(Value::as_str),
-                )? {
+            if openai_file_part_field(part, "file_data")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                return match openai_file_data_reference_from_part(part)? {
                     OpenAiFileDataReference::InlineData { mime_type, data } => {
                         Ok(Some(serde_json::json!({
                             "inlineData": { "mimeType": mime_type, "data": data }
                         })))
                     }
-                    OpenAiFileDataReference::FileUri(file_uri) => {
-                        let Some(mime_type) = openai_file_uri_mime_type_from_provenance(file)
-                        else {
-                            return Err(
-                                "OpenAI file_data URI references need mimeType or filename provenance to translate to Gemini fileData; include file.mime_type/file.mimeType or a filename with a known extension."
-                                    .to_string(),
-                            );
-                        };
+                    OpenAiFileDataReference::FileUri {
+                        mime_type,
+                        file_uri,
+                    } => {
                         let mut file_data_part = serde_json::json!({
                             "fileData": { "mimeType": mime_type, "fileUri": file_uri }
                         });
@@ -1450,17 +1605,17 @@ pub(super) fn gemini_tool_result_block_to_response_and_part(
                 ));
             }
             let filename = file.get("filename").and_then(Value::as_str);
-            let Some(file_data) = file.get("file_data").and_then(Value::as_str) else {
+            if file.get("file_data").and_then(Value::as_str).is_none() {
                 return Err(
                     "Gemini tool result `file` blocks require inline file_data to translate to Gemini."
                         .to_string(),
                 );
             };
-            let (mime_type, data) = match openai_file_data_reference(file_data, filename)? {
+            let (mime_type, data) = match openai_file_data_reference_from_part(block)? {
                 OpenAiFileDataReference::InlineData { mime_type, data } => {
                     (mime_type, data.to_string())
                 }
-                OpenAiFileDataReference::FileUri(file_uri) => {
+                OpenAiFileDataReference::FileUri { file_uri, .. } => {
                     return Err(format!(
                         "Gemini tool result file reference `{file_uri}` cannot be faithfully translated without inline file bytes."
                     ));

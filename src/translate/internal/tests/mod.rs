@@ -100,6 +100,16 @@ fn same_format_surface_input_result(
     )
 }
 
+fn assert_openai_file_mime_conflict(err: &str) {
+    let lower = err.to_ascii_lowercase();
+    assert!(lower.contains("conflict"), "err = {err}");
+    assert!(lower.contains("mime"), "err = {err}");
+    assert!(err.contains("file_data"), "err = {err}");
+    assert!(err.contains("mime_type"), "err = {err}");
+    assert!(err.contains("application/pdf"), "err = {err}");
+    assert!(err.contains("video/mp4"), "err = {err}");
+}
+
 #[test]
 fn request_translation_policy_default_uses_default_compatibility_mode() {
     assert_eq!(
@@ -863,6 +873,39 @@ fn surface_policy_file_surface_rejects_openai_video_file_input() {
 }
 
 #[test]
+fn surface_policy_file_surface_rejects_openai_file_data_uri_mime_conflict() {
+    use crate::config::ModelModality::{File, Text};
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Summarize this file" },
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "paper.pdf",
+                        "mime_type": "application/pdf",
+                        "file_data": "data:video/mp4;base64,AAAA"
+                    }
+                }
+            ]
+        }]
+    });
+
+    let err = same_format_surface_input_result(
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        body,
+        vec![Text, File],
+    )
+    .expect_err("file surface should fail closed on OpenAI file MIME conflicts");
+
+    assert_openai_file_mime_conflict(&err);
+}
+
+#[test]
 fn surface_policy_file_surface_rejects_openai_responses_video_input_file() {
     use crate::config::ModelModality::{File, Text};
 
@@ -912,6 +955,37 @@ fn surface_policy_file_surface_rejects_openai_responses_video_input_file() {
         assert!(err.contains("modalities.input"), "err = {err}");
         assert!(err.contains("video"), "err = {err}");
     }
+}
+
+#[test]
+fn surface_policy_file_surface_rejects_openai_responses_input_file_data_uri_mime_conflict() {
+    use crate::config::ModelModality::{File, Text};
+
+    let body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "role": "user",
+            "content": [
+                { "type": "input_text", "text": "Summarize this file" },
+                {
+                    "type": "input_file",
+                    "filename": "paper.pdf",
+                    "mime_type": "application/pdf",
+                    "file_data": "data:video/mp4;base64,AAAA"
+                }
+            ]
+        }]
+    });
+
+    let err = same_format_surface_input_result(
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        body,
+        vec![Text, File],
+    )
+    .expect_err("file surface should fail closed on Responses input_file MIME conflicts");
+
+    assert_openai_file_mime_conflict(&err);
 }
 
 #[test]
@@ -1125,7 +1199,7 @@ fn translate_request_chat_to_responses_maps_user_image_audio_and_file_legally() 
                 { "type": "text", "text": "Describe these inputs" },
                 { "type": "image_url", "image_url": { "url": "https://example.com/cat.png", "detail": "high" } },
                 { "type": "input_audio", "input_audio": { "data": "AAAA", "format": "wav" } },
-                { "type": "file", "file": { "file_id": "file_123" } }
+                { "type": "file", "file": { "file_id": "file_123", "mime_type": "application/pdf" } }
             ]
         }]
     });
@@ -1151,6 +1225,7 @@ fn translate_request_chat_to_responses_maps_user_image_audio_and_file_legally() 
     assert_eq!(content[2]["input_audio"]["format"], "wav");
     assert_eq!(content[3]["type"], "input_file");
     assert_eq!(content[3]["file_id"], "file_123");
+    assert_eq!(content[3]["mime_type"], "application/pdf");
 }
 
 #[test]
@@ -1889,6 +1964,35 @@ fn translate_request_openai_to_gemini_maps_input_audio_and_file_parts() {
     assert_eq!(parts[1]["inlineData"]["data"], "AAAA");
     assert_eq!(parts[2]["inlineData"]["mimeType"], "application/pdf");
     assert_eq!(parts[2]["inlineData"]["data"], "JVBERi0x");
+}
+
+#[test]
+fn translate_request_openai_to_gemini_rejects_file_data_uri_mime_conflict() {
+    let mut body = json!({
+        "model": "gemini-2.5-flash",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "file",
+                "file": {
+                    "file_data": "data:video/mp4;base64,AAAA",
+                    "filename": "doc.pdf",
+                    "mime_type": "application/pdf"
+                }
+            }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Google,
+        "gemini-2.5-flash",
+        &mut body,
+        false,
+    )
+    .expect_err("OpenAI to Gemini should fail closed on file MIME conflicts");
+
+    assert_openai_file_mime_conflict(&err);
 }
 
 #[test]
@@ -6585,6 +6689,33 @@ fn translate_request_openai_json_object_output_shape_to_claude_rejects() {
 
         assert!(err.contains("json_object"), "err = {err}");
     }
+}
+
+#[test]
+fn translate_request_responses_to_gemini_rejects_input_file_data_uri_mime_conflict() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "file_data": "data:video/mp4;base64,AAAA",
+                "filename": "doc.pdf",
+                "mime_type": "application/pdf"
+            }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Google,
+        "gemini-2.5-flash",
+        &mut body,
+        false,
+    )
+    .expect_err("Responses to Gemini should fail closed on input_file MIME conflicts");
+
+    assert_openai_file_mime_conflict(&err);
 }
 
 #[test]

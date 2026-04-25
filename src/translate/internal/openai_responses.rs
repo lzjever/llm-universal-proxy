@@ -148,6 +148,16 @@ pub(super) fn append_openai_message_anthropic_reasoning_replay_blocks(
     }
 }
 
+pub(super) fn responses_input_item_type(item: &Value) -> Option<&str> {
+    item.get("type")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("role").and_then(Value::as_str).map(|_| "message"))
+}
+
+pub(super) fn responses_input_item_is_message(item: &Value) -> bool {
+    responses_input_item_type(item) == Some("message")
+}
+
 fn responses_output_audio_item_to_openai_audio(item: &Value) -> Option<Value> {
     if item.get("type").and_then(Value::as_str) != Some("output_audio") {
         return None;
@@ -631,10 +641,7 @@ pub(super) fn responses_to_messages(
     let mut idx = 0;
     while idx < items.len() {
         let item = items[idx].clone();
-        let item_type = item
-            .get("type")
-            .and_then(Value::as_str)
-            .or_else(|| item.get("role").and_then(Value::as_str).map(|_| "message"));
+        let item_type = responses_input_item_type(&item);
         let Some(ty) = item_type else {
             idx += 1;
             continue;
@@ -1189,7 +1196,7 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
             if ty == Some("input_file") {
                 has_non_text_part = true;
                 let mut file = serde_json::Map::new();
-                for key in ["file_id", "file_data", "filename"] {
+                for key in ["file_id", "file_data", "filename", "mime_type", "mimeType"] {
                     if let Some(value) = c.get(key).cloned() {
                         file.insert(key.to_string(), value);
                     }
@@ -1808,7 +1815,7 @@ fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -
                 let mut out = serde_json::Map::new();
                 out.insert("type".to_string(), Value::String("input_file".to_string()));
                 if let Some(file_obj) = file.as_object() {
-                    for key in ["file_id", "file_data", "filename"] {
+                    for key in ["file_id", "file_data", "filename", "mime_type", "mimeType"] {
                         if let Some(value) = file_obj.get(key).cloned() {
                             out.insert(key.to_string(), value);
                         }

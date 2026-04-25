@@ -16,8 +16,13 @@ use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
     SemanticToolKind, SharedControlProfile, TranslationAssessment,
 };
-use super::openai_responses::decode_anthropic_reasoning_carrier;
-use super::request_gemini::{gemini_generation_config_field, gemini_part_field};
+use super::openai_responses::{
+    decode_anthropic_reasoning_carrier, responses_input_item_is_message, responses_input_item_type,
+};
+use super::request_gemini::{
+    gemini_generation_config_field, gemini_part_field, mime_type_from_filename,
+    openai_file_part_mime_conflict_message, openai_file_part_resolved_mime_type,
+};
 use super::tools::{
     normalized_responses_tool_definition, openai_custom_tool_format_is_plain_text,
     openai_custom_tool_format_supports_anthropic_bridge, openai_tool_arguments_to_structured_value,
@@ -795,10 +800,7 @@ pub(super) fn responses_nonportable_input_item_message(
     let target_label = translation_target_label(target_format);
     let items = body.get("input").and_then(Value::as_array)?;
     items.iter().find_map(|item| {
-        let item_type = item
-            .get("type")
-            .and_then(Value::as_str)
-            .or_else(|| item.get("role").and_then(Value::as_str).map(|_| "message"))?;
+        let item_type = responses_input_item_type(item)?;
         if item_type == "reasoning" && item.get("encrypted_content").is_some() {
             match target_format {
                 UpstreamFormat::Anthropic => {
@@ -1142,6 +1144,58 @@ fn request_explicitly_enables_parallel_tool_calls(
     }
 }
 
+fn openai_request_file_mime_conflict_message(
+    client_format: UpstreamFormat,
+    body: &Value,
+) -> Option<String> {
+    match client_format {
+        UpstreamFormat::OpenAiCompletion => openai_completion_file_mime_conflict_message(body),
+        UpstreamFormat::OpenAiResponses => openai_responses_file_mime_conflict_message(body),
+        UpstreamFormat::Anthropic | UpstreamFormat::Google => None,
+    }
+}
+
+fn openai_completion_file_mime_conflict_message(body: &Value) -> Option<String> {
+    body.get("messages")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|message| openai_content_file_mime_conflict_message(message.get("content")))
+}
+
+fn openai_responses_file_mime_conflict_message(body: &Value) -> Option<String> {
+    body.get("input")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(openai_responses_input_item_file_mime_conflict_message)
+}
+
+fn openai_responses_input_item_file_mime_conflict_message(item: &Value) -> Option<String> {
+    openai_input_part_file_mime_conflict_message(item).or_else(|| {
+        responses_input_item_is_message(item)
+            .then(|| openai_content_file_mime_conflict_message(item.get("content")))
+            .flatten()
+    })
+}
+
+fn openai_content_file_mime_conflict_message(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .find_map(openai_input_part_file_mime_conflict_message),
+        Some(Value::Object(_)) => content.and_then(openai_input_part_file_mime_conflict_message),
+        _ => None,
+    }
+}
+
+fn openai_input_part_file_mime_conflict_message(part: &Value) -> Option<String> {
+    matches!(
+        part.get("type").and_then(Value::as_str),
+        Some("file") | Some("input_file")
+    )
+    .then(|| openai_file_part_mime_conflict_message(part))
+    .flatten()
+}
+
 fn request_input_modalities(
     client_format: UpstreamFormat,
     body: &Value,
@@ -1282,7 +1336,7 @@ fn openai_collect_responses_input_item_modalities(
 ) {
     openai_collect_input_part_modalities(item, modalities);
 
-    match item.get("type").and_then(Value::as_str) {
+    match responses_input_item_type(item) {
         Some("message") => {
             if let Some(parts) = item.get("content").and_then(Value::as_array) {
                 for part in parts {
@@ -1311,76 +1365,15 @@ fn openai_collect_input_part_modalities(part: &Value, modalities: &mut BTreeSet<
 }
 
 fn openai_file_part_modality(part: &Value) -> ModelModality {
-    openai_file_part_explicit_mime_modality(part)
-        .or_else(|| openai_file_part_data_uri_modality(part))
-        .or_else(|| openai_file_part_filename_modality(part))
+    openai_file_part_resolved_mime_type(part)
+        .ok()
+        .flatten()
+        .and_then(|mime_type| mime_type_to_input_modality(&mime_type))
         .unwrap_or(ModelModality::File)
 }
 
-fn openai_file_part_containers(part: &Value) -> impl Iterator<Item = &Value> {
-    std::iter::once(part).chain(part.get("file"))
-}
-
-fn openai_file_part_explicit_mime_modality(part: &Value) -> Option<ModelModality> {
-    openai_file_part_containers(part).find_map(|value| {
-        value
-            .get("mime_type")
-            .or_else(|| value.get("mimeType"))
-            .and_then(Value::as_str)
-            .and_then(mime_type_to_input_modality)
-    })
-}
-
-fn openai_file_part_data_uri_modality(part: &Value) -> Option<ModelModality> {
-    openai_file_part_containers(part).find_map(|value| {
-        value
-            .get("file_data")
-            .and_then(Value::as_str)
-            .and_then(openai_file_data_uri_mime_type)
-            .and_then(mime_type_to_input_modality)
-    })
-}
-
-fn openai_file_part_filename_modality(part: &Value) -> Option<ModelModality> {
-    openai_file_part_containers(part).find_map(|value| {
-        value
-            .get("filename")
-            .and_then(Value::as_str)
-            .and_then(filename_to_input_modality)
-    })
-}
-
-fn openai_file_data_uri_mime_type(file_data: &str) -> Option<&str> {
-    let file_data = file_data.trim_start();
-    if !file_data.get(..5)?.eq_ignore_ascii_case("data:") {
-        return None;
-    }
-    let metadata = file_data.get(5..)?.split_once(',')?.0;
-    let mime_type = metadata
-        .split_once(';')
-        .map_or(metadata, |(mime_type, _)| mime_type);
-    let mime_type = mime_type.trim();
-    if mime_type.is_empty() {
-        None
-    } else {
-        Some(mime_type)
-    }
-}
-
 fn filename_to_input_modality(filename: &str) -> Option<ModelModality> {
-    let extension = filename.rsplit('.').next()?.trim().to_ascii_lowercase();
-    match extension.as_str() {
-        "pdf" => Some(ModelModality::Pdf),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "heic" | "heif"
-        | "svg" => Some(ModelModality::Image),
-        "wav" | "mp3" | "m4a" | "aac" | "ogg" | "oga" | "flac" | "opus" => {
-            Some(ModelModality::Audio)
-        }
-        "mp4" | "m4v" | "mov" | "webm" | "mpeg" | "mpg" | "avi" | "mkv" => {
-            Some(ModelModality::Video)
-        }
-        _ => None,
-    }
+    mime_type_from_filename(filename).and_then(mime_type_to_input_modality)
 }
 
 fn google_collect_request_input_modalities(body: &Value, modalities: &mut BTreeSet<ModelModality>) {
@@ -1569,6 +1562,10 @@ pub(crate) fn assess_request_translation(
     compatibility_mode: CompatibilityMode,
 ) -> TranslationAssessment {
     let mut assessment = TranslationAssessment::default();
+
+    if let Some(message) = openai_request_file_mime_conflict_message(client_format, body) {
+        assessment.reject(message);
+    }
 
     if client_format == upstream_format {
         return assessment;
