@@ -13,6 +13,13 @@ PROVIDER_KEY_PATTERN_SNIPPETS = (
     "sk-ant-",
     "sk-proj-",
 )
+REAL_PROVIDER_REQUIRED_SECRETS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "MINIMAX_API_KEY",
+)
+REAL_PROVIDER_SMOKE_JSON = "artifacts/real-provider-smoke.json"
 ACTIVE_DOC_PATHS = (
     REPO_ROOT / "README.md",
     REPO_ROOT / "README_CN.md",
@@ -113,6 +120,30 @@ def curl_command_blocks(script: str):
             block = []
     if block:
         yield "\n".join(block)
+
+
+def has_real_provider_smoke_invocation(text: str) -> bool:
+    return any(
+        "python3 scripts/real_endpoint_matrix.py" in line
+        and (
+            "--real-provider-smoke" in line
+            or "--mode real-provider-smoke" in line
+        )
+        and "--json-out" in line
+        and REAL_PROVIDER_SMOKE_JSON in line
+        for line in text.splitlines()
+    )
+
+
+def workflow_step_block(text: str, step_name: str) -> str:
+    marker = f"      - name: {step_name}"
+    start = text.find(marker)
+    if start == -1:
+        return ""
+    next_step = text.find("\n      - name: ", start + len(marker))
+    if next_step == -1:
+        return text[start:]
+    return text[start:next_step]
 
 
 class GovernanceTests(unittest.TestCase):
@@ -246,6 +277,52 @@ class GovernanceTests(unittest.TestCase):
             release,
         )
         self.assertNotIn(":edge", release)
+
+    def test_real_provider_release_gate_contract_is_governed(self):
+        release = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        governance = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("real-provider-smoke:", release)
+        self.assertIn("environment: release-real-providers", release)
+        self.assertNotIn("Validate protected real provider secrets", release)
+        run_step = workflow_step_block(release, "Run real provider smoke")
+        self.assertTrue(run_step)
+        for secret_name in REAL_PROVIDER_REQUIRED_SECRETS:
+            with self.subTest(secret=secret_name):
+                self.assertIn(f"{secret_name}: ${{{{ secrets.{secret_name} }}}}", run_step)
+                self.assertNotIn(f'test -n "${{{secret_name}:-}}"', release)
+                self.assertIn(f'check_contains ".github/workflows/release.yml" \'{secret_name}: ${{{{ secrets.{secret_name} }}}}\'', governance)
+                self.assertIn(f'check_absent ".github/workflows/release.yml" \'test -n "${{{secret_name}:-}}"\'', governance)
+        self.assertNotIn("GLM_APIKEY", run_step)
+        self.assertNotIn("secrets.GLM_APIKEY", release)
+        self.assertIn(
+            'check_absent ".github/workflows/release.yml" \'GLM_APIKEY: ${{ secrets.GLM_APIKEY }}\'',
+            governance,
+        )
+
+        self.assertTrue(has_real_provider_smoke_invocation(release))
+        upload_step = workflow_step_block(release, "Upload real provider smoke result")
+        self.assertTrue(upload_step)
+        self.assertIn('if: ${{ always() }}', upload_step)
+        self.assertIn("name: real-provider-smoke", upload_step)
+        self.assertIn(f"path: {REAL_PROVIDER_SMOKE_JSON}", upload_step)
+        self.assertIn("if-no-files-found: error", upload_step)
+
+        for snippet in (
+            "REAL_PROVIDER_REQUIRED_SECRETS",
+            "REAL_PROVIDER_SMOKE_JSON",
+            "check_real_provider_smoke_invocation",
+            'check_absent ".github/workflows/release.yml" "Validate protected real provider secrets"',
+            "Upload real provider smoke result",
+            'if: ${{ always() }}',
+            "name: real-provider-smoke",
+            f"path: {REAL_PROVIDER_SMOKE_JSON}",
+            "if-no-files-found: error",
+        ):
+            with self.subTest(governance_snippet=snippet):
+                self.assertIn(snippet, governance)
 
     def test_release_test_gate_matches_ci_python_contract_gate(self):
         ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(

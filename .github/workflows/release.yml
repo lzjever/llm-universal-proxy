@@ -313,19 +313,21 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --verbose
 
-      - name: Validate protected real provider secrets
-        env:
-          GLM_APIKEY: ${{ secrets.GLM_APIKEY }}
-        run: |
-          test -n "${GLM_APIKEY:-}" || {
-            echo "GLM_APIKEY is required in the release-real-providers environment" >&2
-            exit 1
-          }
-
       - name: Run real provider smoke
         env:
-          GLM_APIKEY: ${{ secrets.GLM_APIKEY }}
-        run: python3 scripts/real_endpoint_matrix.py --real-provider-smoke --binary ./target/release/llm-universal-proxy
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+        run: python3 scripts/real_endpoint_matrix.py --real-provider-smoke --binary ./target/release/llm-universal-proxy --json-out artifacts/real-provider-smoke.json
+
+      - name: Upload real provider smoke result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-provider-smoke
+          path: artifacts/real-provider-smoke.json
+          if-no-files-found: error
 
   container:
     name: Publish GHCR Image

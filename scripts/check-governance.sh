@@ -15,6 +15,13 @@ CHANGELOG_VERSION="$(meta changelog_version)"
 TOOLCHAIN="$(meta rust_toolchain)"
 TOOLCHAIN_ACTION_REF="$(meta rust_toolchain_action_ref)"
 PYTHON_CONTRACT_TEST_COMMAND="PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
+REAL_PROVIDER_REQUIRED_SECRETS=(
+    "OPENAI_API_KEY"
+    "ANTHROPIC_API_KEY"
+    "GEMINI_API_KEY"
+    "MINIMAX_API_KEY"
+)
+REAL_PROVIDER_SMOKE_JSON="artifacts/real-provider-smoke.json"
 
 FAILURES=()
 
@@ -188,6 +195,137 @@ if failures:
 PY
 }
 
+check_real_provider_smoke_invocation() {
+    local workflow=".github/workflows/release.yml"
+    local legacy_invocation="python3 scripts/real_endpoint_matrix.py --real-provider-smoke --binary ./target/release/llm-universal-proxy --json-out artifacts/real-provider-smoke.json"
+    local mode_invocation="python3 scripts/real_endpoint_matrix.py --mode real-provider-smoke --binary ./target/release/llm-universal-proxy --json-out artifacts/real-provider-smoke.json"
+    local contract_output
+
+    if ! grep -Fq -- "$legacy_invocation" "$workflow" && ! grep -Fq -- "$mode_invocation" "$workflow"; then
+        FAILURES+=("$workflow is missing an explicit real provider smoke invocation with --json-out ${REAL_PROVIDER_SMOKE_JSON}")
+    fi
+
+    check_contains "$workflow" "Upload real provider smoke result"
+    check_contains "$workflow" "uses: actions/upload-artifact@v4"
+    check_contains "$workflow" "name: real-provider-smoke"
+    check_contains "$workflow" "path: ${REAL_PROVIDER_SMOKE_JSON}"
+    check_contains "$workflow" "if-no-files-found: error"
+
+    if ! contract_output="$(python3 - <<'PY'
+import pathlib
+import re
+import sys
+
+REAL_PROVIDER_REQUIRED_SECRETS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "MINIMAX_API_KEY",
+)
+REAL_PROVIDER_SMOKE_JSON = "artifacts/real-provider-smoke.json"
+
+
+def workflow_jobs(text):
+    matches = list(re.finditer(r"^  ([A-Za-z0-9_-]+):\n", text, re.MULTILINE))
+    jobs = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        jobs[match.group(1)] = text[match.start() : end]
+    return jobs
+
+
+def workflow_step_block(text, step_name):
+    marker = f"      - name: {step_name}"
+    start = text.find(marker)
+    if start == -1:
+        return ""
+    next_step = text.find("\n      - name: ", start + len(marker))
+    if next_step == -1:
+        return text[start:]
+    return text[start:next_step]
+
+
+workflow = pathlib.Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+job = workflow_jobs(workflow).get("real-provider-smoke", "")
+failures = []
+
+if not job:
+    failures.append("release workflow is missing real-provider-smoke job")
+
+run_step = workflow_step_block(job, "Run real provider smoke")
+if not run_step:
+    failures.append("real-provider-smoke job is missing the script run step")
+else:
+    for secret_name in REAL_PROVIDER_REQUIRED_SECRETS:
+        expected = f"{secret_name}: ${{{{ secrets.{secret_name} }}}}"
+        if expected not in run_step:
+            failures.append(
+                "real provider smoke must inject protected secret env into the script step: "
+                + secret_name
+            )
+    if "GLM_APIKEY" in run_step or "secrets.GLM_APIKEY" in job:
+        failures.append(
+            "real provider smoke must not inject legacy GLM_APIKEY into the script step"
+        )
+
+invocation_lines = [
+    line.strip()
+    for line in job.splitlines()
+    if "python3 scripts/real_endpoint_matrix.py" in line
+    and ("--real-provider-smoke" in line or "--mode real-provider-smoke" in line)
+]
+if not invocation_lines:
+    failures.append("real provider smoke must invoke scripts/real_endpoint_matrix.py")
+elif not any("--json-out" in line and REAL_PROVIDER_SMOKE_JSON in line for line in invocation_lines):
+    failures.append("real provider smoke invocation must write real-provider-smoke JSON")
+else:
+    invocation_index = job.find(invocation_lines[0])
+    before_invocation = job[:invocation_index]
+    for forbidden in (
+        "Validate protected real provider secrets",
+        "is required in the release-real-providers environment",
+        "exit 1",
+    ):
+        if forbidden in before_invocation:
+            failures.append(
+                "real provider smoke must not fail before real_endpoint_matrix.py can write JSON: "
+                + forbidden
+            )
+    for secret_name in REAL_PROVIDER_REQUIRED_SECRETS:
+        shell_check = f'test -n "${{{secret_name}:-}}"'
+        if shell_check in before_invocation:
+            failures.append(
+                "missing real provider secret checks must be delegated to real_endpoint_matrix.py: "
+                + secret_name
+            )
+
+upload_step = workflow_step_block(job, "Upload real provider smoke result")
+if not upload_step:
+    failures.append("real-provider-smoke job must upload the machine-readable JSON result")
+else:
+    for expected in (
+        "if: ${{ always() }}",
+        "uses: actions/upload-artifact@v4",
+        "name: real-provider-smoke",
+        f"path: {REAL_PROVIDER_SMOKE_JSON}",
+        "if-no-files-found: error",
+    ):
+        if expected not in upload_step:
+            failures.append(
+                "real provider smoke upload artifact step is missing: " + expected
+            )
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+PY
+    )"; then
+        while IFS= read -r failure; do
+            [[ -n "$failure" ]] && FAILURES+=("$failure")
+        done <<< "$contract_output"
+    fi
+}
+
 if ! SECRET_SCAN_OUTPUT="$(scan_tracked_secret_risks)"; then
     while IFS= read -r failure; do
         [[ -n "$failure" ]] && FAILURES+=("$failure")
@@ -199,6 +337,8 @@ if ! RELEASE_PUBLISH_GATE_OUTPUT="$(check_release_publish_jobs_need_ga_gates)"; 
         [[ -n "$failure" ]] && FAILURES+=("$failure")
     done <<< "$RELEASE_PUBLISH_GATE_OUTPUT"
 fi
+
+check_real_provider_smoke_invocation
 
 check_eq "Cargo.lock package version" "$LOCK_VERSION" "$VERSION"
 check_eq "CHANGELOG latest version" "$CHANGELOG_VERSION" "$VERSION"
@@ -289,10 +429,20 @@ check_contains ".github/workflows/release.yml" "cargo audit"
 check_contains ".github/workflows/release.yml" "anchore/sbom-action"
 check_contains ".github/workflows/release.yml" "Real Provider Smoke"
 check_contains ".github/workflows/release.yml" "environment: release-real-providers"
-check_contains ".github/workflows/release.yml" 'GLM_APIKEY: ${{ secrets.GLM_APIKEY }}'
-check_contains ".github/workflows/release.yml" "Validate protected real provider secrets"
-check_contains ".github/workflows/release.yml" 'test -n "${GLM_APIKEY:-}"'
-check_contains ".github/workflows/release.yml" "python3 scripts/real_endpoint_matrix.py --real-provider-smoke"
+check_contains ".github/workflows/release.yml" 'OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}'
+check_contains ".github/workflows/release.yml" 'ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}'
+check_contains ".github/workflows/release.yml" 'GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}'
+check_contains ".github/workflows/release.yml" 'MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}'
+check_absent ".github/workflows/release.yml" 'GLM_APIKEY: ${{ secrets.GLM_APIKEY }}'
+check_absent ".github/workflows/release.yml" "Validate protected real provider secrets"
+check_absent ".github/workflows/release.yml" 'test -n "${OPENAI_API_KEY:-}"'
+check_absent ".github/workflows/release.yml" 'test -n "${ANTHROPIC_API_KEY:-}"'
+check_absent ".github/workflows/release.yml" 'test -n "${GEMINI_API_KEY:-}"'
+check_absent ".github/workflows/release.yml" 'test -n "${MINIMAX_API_KEY:-}"'
+check_contains ".github/workflows/release.yml" "Upload real provider smoke result"
+check_contains ".github/workflows/release.yml" "path: ${REAL_PROVIDER_SMOKE_JSON}"
+check_contains ".github/workflows/release.yml" "path: artifacts/real-provider-smoke.json"
+check_contains ".github/workflows/release.yml" "if-no-files-found: error"
 check_contains ".github/workflows/release.yml" "ghcr.io/lzjever/llm-universal-proxy"
 check_contains ".github/workflows/release.yml" "platforms: linux/amd64,linux/arm64"
 check_contains ".github/workflows/release.yml" "push: true"

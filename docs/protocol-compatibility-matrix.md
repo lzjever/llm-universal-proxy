@@ -33,6 +33,13 @@ Status cells in the quick matrix answer whether the capability is officially doc
 
 ## Current compatibility posture
 
+The GA claim is portable-core production GA. Same-provider native passthrough is
+the path for preserving provider-native fields and lifecycle resources.
+Cross-provider documented compatibility/fail-closed is the portability contract:
+the proxy documents supported mappings and rejects high-risk unsupported fields
+before contacting upstream. MiniMax is an OpenAI-compatible lane, not an OpenAI
+Responses certified clone.
+
 The proxy should treat function calling and explicit transcript replay as the common denominator. Hosted tools, provider-managed state, compaction, and cache-control semantics are increasingly vendor-specific and should be preserved only on same-provider paths or documented as intentional degradations.
 
 - First-phase multimodal support is bounded by request-policy gating and the effective `surface.modalities.input` for the selected alias. `pdf` means PDF-only, `file` means generic files including PDFs, and `video` is currently gate-first rather than a broad cross-provider translation promise. These values are media-type gates, not source transport guarantees.

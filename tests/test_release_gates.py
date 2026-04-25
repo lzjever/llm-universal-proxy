@@ -20,6 +20,13 @@ REQUIRED_RELEASE_GATE_NEEDS = (
     "real-provider-smoke",
     "supply-chain",
 )
+REAL_PROVIDER_REQUIRED_SECRETS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "MINIMAX_API_KEY",
+)
+REAL_PROVIDER_SMOKE_JSON = "artifacts/real-provider-smoke.json"
 RELEASE_PUBLISH_JOB_MARKERS = (
     "push: true",
     "packages: write",
@@ -74,9 +81,44 @@ def job_needs(job_block: str):
     return needs
 
 
+def real_provider_smoke_invocation_lines(text: str):
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if "python3 scripts/real_endpoint_matrix.py" in line
+        and (
+            "--real-provider-smoke" in line
+            or "--mode real-provider-smoke" in line
+        )
+    ]
+
+
+def workflow_step_block(text: str, step_name: str) -> str:
+    marker = f"      - name: {step_name}"
+    start = text.find(marker)
+    if start == -1:
+        return ""
+    next_step = text.find("\n      - name: ", start + len(marker))
+    if next_step == -1:
+        return text[start:]
+    return text[start:next_step]
+
+
 class ReleaseGateWorkflowContractTests(unittest.TestCase):
     def read_text(self, relative_path: str) -> str:
         return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+
+    def assert_has_real_provider_smoke_invocation(self, text: str):
+        invocation_lines = real_provider_smoke_invocation_lines(text)
+        self.assertTrue(
+            invocation_lines,
+            "real provider smoke must invoke real_endpoint_matrix.py with "
+            "--real-provider-smoke or --mode real-provider-smoke",
+        )
+        self.assertTrue(
+            any("--json-out" in line and REAL_PROVIDER_SMOKE_JSON in line for line in invocation_lines),
+            "real provider smoke must emit the machine-readable JSON artifact",
+        )
 
     def test_release_workflow_contains_ga_release_gates(self):
         release = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -101,15 +143,13 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "anchore/sbom-action",
             "Real Provider Smoke",
             "environment: release-real-providers",
-            "GLM_APIKEY: ${{ secrets.GLM_APIKEY }}",
-            "Validate protected real provider secrets",
-            'test -n "${GLM_APIKEY:-}"',
-            "python3 scripts/real_endpoint_matrix.py --real-provider-smoke",
+            REAL_PROVIDER_SMOKE_JSON,
         )
 
         for snippet in required_snippets:
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, release)
+        self.assert_has_real_provider_smoke_invocation(release)
 
         self.assertRegex(
             release,
@@ -117,6 +157,48 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             r"cli-wrapper-matrix[^\]]*perf-gate[^\]]*real-provider-smoke[^\]]*"
             r"supply-chain[^\]]*\]",
         )
+
+    def test_release_real_provider_smoke_delegates_missing_secret_json_to_script(self):
+        jobs = release_workflow_jobs()
+        job = jobs.get("real-provider-smoke", "")
+        self.assertTrue(job, "release workflow must define real-provider-smoke")
+
+        run_step = workflow_step_block(job, "Run real provider smoke")
+        self.assertTrue(run_step, "real provider smoke must have a script run step")
+        for secret_name in REAL_PROVIDER_REQUIRED_SECRETS:
+            with self.subTest(secret=secret_name):
+                self.assertIn(f"{secret_name}: ${{{{ secrets.{secret_name} }}}}", run_step)
+        self.assertNotIn("GLM_APIKEY", run_step)
+        self.assertNotIn("secrets.GLM_APIKEY", job)
+
+        invocation_lines = real_provider_smoke_invocation_lines(job)
+        self.assertTrue(invocation_lines)
+        invocation_index = job.find(invocation_lines[0])
+        self.assertGreaterEqual(invocation_index, 0)
+        before_invocation = job[:invocation_index]
+
+        self.assertNotIn("Validate protected real provider secrets", before_invocation)
+        self.assertNotIn("is required in the release-real-providers environment", before_invocation)
+        self.assertNotIn("exit 1", before_invocation)
+        for secret_name in REAL_PROVIDER_REQUIRED_SECRETS:
+            with self.subTest(no_preflight=secret_name):
+                self.assertNotIn(f'test -n "${{{secret_name}:-}}"', before_invocation)
+
+        self.assert_has_real_provider_smoke_invocation(job)
+
+    def test_release_real_provider_smoke_uploads_json_artifact_always(self):
+        jobs = release_workflow_jobs()
+        job = jobs.get("real-provider-smoke", "")
+        self.assertTrue(job, "release workflow must define real-provider-smoke")
+
+        upload_step = workflow_step_block(job, "Upload real provider smoke result")
+        self.assertTrue(upload_step, "real provider smoke JSON artifact must be uploaded")
+        self.assertIn("Upload real provider smoke result", job)
+        self.assertIn('if: ${{ always() }}', upload_step)
+        self.assertIn("uses: actions/upload-artifact@v4", upload_step)
+        self.assertIn("name: real-provider-smoke", upload_step)
+        self.assertIn(f"path: {REAL_PROVIDER_SMOKE_JSON}", upload_step)
+        self.assertIn("if-no-files-found: error", upload_step)
 
     def test_release_publish_jobs_need_ga_gates_before_publishing(self):
         jobs = release_workflow_jobs()
@@ -188,10 +270,14 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "PERF_DEFAULT_TOTAL_MS",
             "build_mock_matrix_cases",
             '"status"',
-            "GLM_APIKEY is required",
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, script)
+
+        self.assertTrue(
+            "--real-provider-smoke" in script or "--mode" in script,
+            "real endpoint matrix must expose a real-provider smoke CLI mode",
+        )
 
         self.assertNotIn("sk-proj-", script)
         self.assertNotIn("sk-ant-", script)
@@ -204,8 +290,11 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "python3 scripts/real_endpoint_matrix.py --mock",
             "python3 scripts/real_cli_matrix.py --test basic --skip-slow --list-matrix",
             "python3 scripts/real_endpoint_matrix.py --mock --perf",
-            "python3 scripts/real_endpoint_matrix.py --real-provider-smoke",
             "environment: release-real-providers",
+            "REAL_PROVIDER_REQUIRED_SECRETS",
+            "REAL_PROVIDER_SMOKE_JSON",
+            "check_real_provider_smoke_invocation",
+            "if-no-files-found: error",
             "REQUIRED_RELEASE_GATE_NEEDS",
             "check_release_publish_jobs_need_ga_gates",
             "cargo audit",
@@ -213,6 +302,7 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, governance)
+        self.assert_has_real_provider_smoke_invocation(governance)
 
     def test_docs_record_local_and_protected_release_gates(self):
         ga_review = self.read_text("docs/ga-readiness-review.md")
@@ -225,14 +315,19 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "perf gate",
             "real provider smoke",
             "release-real-providers",
+            "portable-core production GA",
+            "same-provider native passthrough",
+            "cross-provider documented compatibility/fail-closed",
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, ga_review)
 
         self.assertIn("CLI wrapper matrix", clients)
+        self.assertIn("MiniMax is an OpenAI-compatible lane", clients)
         self.assertIn("CLI wrapper matrix", container)
         self.assertIn("mock endpoint matrix", container)
         self.assertIn("perf gate", container)
+        self.assertIn("real-provider-smoke.json", container)
         self.assertNotIn("not yet mandatory release gates", ga_review)
         self.assertNotIn("not mandatory", ga_review)
         self.assertNotIn("not mandatory", container)

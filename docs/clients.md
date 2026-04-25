@@ -10,6 +10,9 @@ The quickstart config used throughout this guide is [examples/quickstart-openai-
 - `gpt-5-4-mini` as a local alias that routes to MiniMax `MiniMax-M2.7-highspeed`
 
 If you want the MiniMax lane, swap `--model gpt-5-4` for `--model gpt-5-4-mini`.
+MiniMax is an OpenAI-compatible lane, not an OpenAI Responses certified clone;
+use the same documented portability and fail-closed boundaries as other
+cross-provider routes.
 
 ## Recommended Path: Start With the Wrapper Scripts
 

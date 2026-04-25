@@ -88,7 +88,7 @@ CI uses the same shape as local smoke:
 - The mock endpoint matrix runs `scripts/real_endpoint_matrix.py --mock` against a local mock upstream and covers unary, stream, tool, and error paths before release publication.
 - The CLI wrapper matrix expands the supported wrapper surface before release publication.
 - The perf gate runs `scripts/real_endpoint_matrix.py --mock --perf` against the same local mock path and emits threshold-checked JSON.
-- The real provider smoke gate is separate from container smoke and runs only in the protected `release-real-providers` environment.
+- The real provider smoke gate is separate from container smoke and runs only in the protected `release-real-providers` environment. It requires `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and `MINIMAX_API_KEY`, then uploads `real-provider-smoke.json` as release evidence.
 - The GHCR image tags, including `latest`, are published only after those release gates pass.
 - Governance runs a local secret scan over tracked fixtures, docs, examples, and scripts before CI or release jobs proceed.
 - Release metadata is passed through Docker build args for OCI labels: `VERSION` and `VCS_REF`.

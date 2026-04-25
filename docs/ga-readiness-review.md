@@ -1,167 +1,110 @@
 # GA Readiness Review
 
-- Status: baseline review
+- Status: converged GA scope review
 - Review date: 2026-04-25
-- Release recommendation: do not GA yet
-- Current posture: Beta / RC candidate
+- Release recommendation: portable-core production GA after external release prerequisites are completed
+- Current posture: local gates, security defaults, limits, and release-gate structure are complete; protected real-provider evidence is still pending
 
 ## Executive Summary
 
-The product direction is clear and the core proxy shape is strong, but the
-current implementation should not be declared Generally Available yet. The
-main gap is not a single missing endpoint; it is the distance between the
-documentation promises, protocol fidelity, security defaults, performance
-boundaries, and release validation gates.
+The GA claim is intentionally narrow: portable-core production GA. That means
+the proxy is suitable for production deployment when operators use the
+documented secure defaults, bounded resource behavior, release gates, and
+compatibility boundaries.
 
-The project is closer to a Beta or RC posture: suitable for focused testing,
-compatibility hardening, and controlled rollout, but not yet ready for a broad
-GA claim.
+This is not a provider-certified compatibility claim. The compatibility promise
+is same-provider native passthrough for native fields and lifecycle resources,
+and cross-provider documented compatibility/fail-closed for portability:
+supported mappings are documented, high-risk unsupported fields fail before
+upstream calls, and low-risk degradation must be visible rather than silent.
 
-## What Is Already Ready
+## Completed Local Baseline
 
-- Unified proxy surfaces for OpenAI-, Anthropic-, Gemini-, and MiniMax-style
-  interfaces.
-- Stable model aliases and namespace endpoints.
-- A portable-core philosophy with fail-closed behavior and explicit warning
-  signaling when behavior is degraded.
-- Multi-protocol mapping work across the major provider families.
-- Early CI coverage and test matrix structure.
+- Admin and data-plane boundaries are documented and covered by local
+  governance checks.
+- Data routes require the data-token boundary for non-loopback production use,
+  while admin routes remain behind the admin-token boundary.
+- CORS is opt-in by exact origin rather than broadly emitted by default.
+- Server-held credential forwarding is explicit through configured
+  `credential_env` and `auth_policy` behavior.
+- Local limit work is represented in the gate set and compatibility contracts:
+  request, response, stream, hook, and trace paths must fail predictably when
+  they exceed supported bounds.
+- GA release gates now cover Rust tests, Python contract tests, governance and
+  local secret scan, mock endpoint matrix, CLI wrapper matrix, perf gate, real
+  provider smoke, container smoke, and supply-chain checks.
 
-These are meaningful foundations for GA. The remaining work should preserve
-this direction while tightening the places where the proxy can currently
-overpromise, silently degrade, or expose unsafe defaults.
+## Remaining External Prerequisites
 
-## GA Blockers
-
-| Area | Finding | GA expectation |
+| Area | Required before final GA release | Non-claim until complete |
 | --- | --- | --- |
-| Secrets | The tracked CLI matrix fixture now uses `credential_env` instead of inline provider credentials, and governance scans tracked fixtures, docs, examples, and scripts for provider key patterns or non-dummy `credential_actual` values. | Rotate any potentially exposed credential and keep secret scanning mandatory in CI/release. |
-| Data-plane security | The data plane currently has no required auth boundary and allows permissive CORS behavior. | Require data-plane auth for production use and replace broad CORS with an explicit allowlist. |
-| Server credential forwarding | `force_server` can cause server-held provider credentials to be injected into upstream requests. | Make the behavior explicit, gated, auditable, and safe by default. |
-| Protocol fidelity | Public protocol claims are broader than the implemented fidelity for several provider-specific semantics. | Narrow the claim or implement/reject high-risk fields explicitly. |
-| Provider semantics | Some provider-specific fields are dropped, weakened, or approximated in ways that can change meaning. | Preserve semantics on same-provider paths and fail closed when loss is high risk. |
-| Memory and streaming bounds | SSE and response-body handling lack clear size and time boundaries. | Add hard request, response, stream, hook, and debug-trace limits. |
-| Real-provider validation | The protected real provider smoke gate now blocks release artifacts, but real upstream validation is not yet broad enough to support a GA compatibility claim. | Broaden the real provider matrix while keeping the protected smoke gate mandatory for releases. |
+| Release environment secrets | Configure `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and `MINIMAX_API_KEY` in the protected `release-real-providers` GitHub environment. `GLM_APIKEY` may remain for compatibility, but it is not the P0 matrix gate. | Do not treat a GLM-only smoke as the real-provider GA gate. |
+| Real provider run | Execute the protected real provider smoke matrix and retain the uploaded `real-provider-smoke.json` artifact with the release evidence. | Do not call the release provider-certified or fully cross-provider certified from local mocks alone. |
+| External credential rotation | Rotate any credential that may have existed outside the secret manager and record the operator-side rotation evidence. | Do not claim external credential rotation has already been completed by repository changes. |
 
-## Protocol Gaps
+## Compatibility Boundaries
 
 ### OpenAI Responses
 
-OpenAI Responses support is not yet complete enough for a full lifecycle
-compatibility claim. The GA line should account for create, retrieve, cancel,
-delete, compact, input-item listing, streaming, conversation continuity, and
-state-related behavior. Unsupported lifecycle or state features should be
-documented as explicit boundaries and should fail clearly when they cannot be
-routed or preserved.
-
-High-risk Responses fields and behaviors should not be silently dropped. When
-the proxy cannot safely preserve a field, it should reject the request or emit a
-clear compatibility warning only for low-risk degradation.
+OpenAI Responses lifecycle and state resource endpoints are same-provider native
+passthrough only. Cross-provider reconstruction of provider-managed state,
+conversation continuity, encrypted reasoning, or opaque lifecycle resources
+must fail closed unless a future mapping is explicitly designed and tested.
 
 ### Anthropic Messages
 
-Anthropic extended thinking, redacted thinking, and richer content-block
-semantics are not fully preserved across provider mappings. These are not just
-decorative fields: they can affect model-visible reasoning continuity, audit
-behavior, and client expectations.
-
-GA should require either faithful same-provider pass-through or explicit
-fail-closed behavior for fields whose loss would change semantics.
+Anthropic extended thinking, redacted thinking, and provider-signature behavior
+are native semantics. They are preserved on same-provider routes and rejected on
+cross-provider routes when the target cannot faithfully carry them.
 
 ### Gemini GenerateContent
 
-Gemini-specific behavior such as `thoughtSignature`, `cachedContent`,
-`safetySettings`, function-calling details, and related typed content semantics
-are not yet fully round-tripped or preserved. These fields should be treated as
-high risk unless the target provider path has a documented, tested equivalent.
+Gemini `thoughtSignature`, `cachedContent`, `safetySettings`, and similar
+provider-managed fields remain high-risk semantics. Same-provider Gemini paths
+preserve native fields; cross-provider paths fail closed when the proxy cannot
+replay them safely.
 
-For GA, Gemini fields that affect safety, cache state, tool replay, or thought
-continuity should either be preserved or rejected before the upstream request is
-made.
+### MiniMax Lane
 
-## Documentation And Contract Gaps
+MiniMax is an OpenAI-compatible lane, not an OpenAI Responses certified clone.
+It is included in the P0 real-provider matrix as an OpenAI-compatible provider
+surface with documented portability boundaries.
 
-- The dashboard/admin boundary is documented as one admin-token boundary, including dashboard shell/admin actions.
-- CLI wrapper documentation now describes safe defaults and requires `--dangerous-harness` for high-risk bypass or `yolo` style parameters.
-- Performance targets are not backed by benchmark gates.
-- Release workflow now makes public release artifacts depend on Rust tests,
-  Python contract tests, governance and local secret scan, mock endpoint matrix,
-  CLI wrapper matrix, perf gate, protected real provider smoke, container smoke,
-  and supply-chain gates.
-- Compatibility docs should distinguish broad OpenAI-compatible forwarding from
-  provider-certified behavior.
+## GA Release Gates
 
-## Recommended GA Gates
+The GA release gates are split between deterministic local checks and protected
+release-environment checks. The mock endpoint matrix and perf gate run against
+local mock upstreams. The real provider smoke gate runs only from the
+`release-real-providers` GitHub environment, requires the four P0 provider
+secrets, and emits the `real-provider-smoke.json` artifact.
 
-The current GA release gates are intentionally split between deterministic
-local checks and protected release-environment checks. The mock endpoint matrix
-and perf gate run only against a local mock upstream. The real provider smoke
-gate runs only from the `release-real-providers` GitHub environment and fails
-closed when the protected `GLM_APIKEY` secret is absent.
-
-### Security
-
-- Rotate any potentially exposed provider credential.
-- Keep secret scanning in CI and pre-release checks.
-- Require production data-plane auth.
-- Replace permissive CORS with a configured allowlist.
-- Audit and gate any `force_server` path that injects server-held credentials.
-
-### Resource Boundaries
-
-- Add request body size limits.
-- Add response body size limits.
-- Add SSE frame, event, stream duration, and idle timeout limits.
-- Add hook execution size and time limits.
-- Add debug trace retention and payload size limits.
-- Ensure all limit failures produce predictable client errors and telemetry.
-
-### Protocol Safety
-
-- Reject high-risk unsupported fields instead of silently dropping them.
-- Preserve provider-native fields on same-provider routes.
-- Emit compatibility warnings only for low-risk, documented degradation.
-- Maintain a high-risk field matrix for OpenAI Responses, Anthropic Messages,
-  and Gemini GenerateContent.
-
-### Provider Validation
-
-- Add a real-provider matrix for OpenAI, Anthropic, Gemini, and MiniMax routes.
-- Cover non-streaming and streaming paths.
-- Cover tool/function calling where supported.
-- Cover state, cache, reasoning, safety, and content-block edge cases where the
-  provider exposes them.
-- Keep fixture credentials out of source control and inject them only through
-  secret-managed CI/runtime configuration.
-
-### Release Workflow
-
-GA release gating should include:
+GA release gating includes:
 
 - Rust unit, integration, and contract tests.
 - Python SDK/contract tests.
 - Deterministic mock endpoint matrix over OpenAI Chat, OpenAI Responses,
   Anthropic Messages, and Gemini GenerateContent unary, stream, tool, and error
   paths.
-- Real provider smoke tests from the protected `release-real-providers`
-  environment.
 - CLI wrapper matrix structure check.
 - Deterministic local perf gate with machine-readable JSON output and threshold
   checks.
+- Real provider smoke tests from the protected `release-real-providers`
+  environment.
 - Container image smoke tests.
 - Security, secret, and supply-chain scans.
-- Documentation consistency check for admin/data-plane boundaries and protocol
+- Documentation consistency checks for admin/data-plane boundaries and protocol
   compatibility claims.
 
 ## Baseline GA Definition
 
-GA should mean that a production operator can safely deploy the proxy with
-documented defaults, predictable failure modes, bounded resource usage, and
-release artifacts that have been validated against both local contracts and real
-provider behavior.
+GA means a production operator can deploy the portable core with documented
+defaults, predictable failure modes, bounded resource usage, secret-managed
+provider credentials, and release artifacts validated by both local contracts
+and the protected real-provider matrix.
 
-Until those gates are met, the recommended label is Beta or RC, with the
-current findings tracked as release blockers.
+It does not mean every provider-specific feature is equivalent across every
+target. The promises are same-provider native passthrough and cross-provider
+documented compatibility/fail-closed.
 
 ## Official References
 

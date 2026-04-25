@@ -23,6 +23,19 @@ from typing import Iterator
 PERF_DEFAULT_ITERATIONS = 30
 PERF_DEFAULT_P95_MS = 750.0
 PERF_DEFAULT_TOTAL_MS = 15_000.0
+REAL_PROVIDER_REQUIRED_ENVS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "MINIMAX_API_KEY",
+)
+REAL_PROVIDER_GATE = "real-provider-smoke"
+REAL_OPENAI_DEFAULT_MODEL = "gpt-5-mini"
+REAL_ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
+REAL_GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+REAL_MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7"
+SECRET_REDACTION_PLACEHOLDER_PREFIX = "[REDACTED:"
+MIN_SECRET_REDACTION_LENGTH = 4
 
 
 @dataclass(frozen=True)
@@ -30,6 +43,25 @@ class MockMatrixCase:
     case_id: str
     surface: str
     mode: str
+    path: str
+    payload: dict[str, object]
+    expected_status: int
+    expected_content_type: str
+    expected_markers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RealProviderMatrixCase:
+    case_id: str
+    provider: str
+    surface: str
+    mode: str
+    feature: str
+    env_var: str
+    required: bool
+    default_model: str
+    model_alias: str
+    upstream_format: str
     path: str
     payload: dict[str, object]
     expected_status: int
@@ -78,43 +110,6 @@ def wait_for_health(base_url: str, timeout_secs: int = 15) -> None:
     raise RuntimeError("proxy did not become healthy in time")
 
 
-def expect_json_case(
-    base_url: str,
-    path: str,
-    payload: dict[str, object],
-    expected_markers,
-    label: str,
-) -> None:
-    status, headers, body = http_json(f"{base_url}{path}", payload)
-    assert status == 200, f"{label}: unexpected status {status}, body={body}"
-    assert "application/json" in headers.get("content-type", ""), (
-        f"{label}: unexpected content-type {headers.get('content-type')}"
-    )
-    parsed = json.loads(body)
-    markers = expected_markers if isinstance(expected_markers, list) else [expected_markers]
-    rendered = json.dumps(parsed, ensure_ascii=False)
-    for marker in markers:
-        assert marker in rendered, f"{label}: missing marker {marker!r}, body={body}"
-    print(f"[ok] {label}")
-
-
-def expect_sse_case(
-    base_url: str,
-    path: str,
-    payload: dict[str, object],
-    expected_markers: list[str],
-    label: str,
-) -> None:
-    status, headers, body = http_json(f"{base_url}{path}", payload)
-    assert status == 200, f"{label}: unexpected status {status}, body={body}"
-    assert "text/event-stream" in headers.get("content-type", ""), (
-        f"{label}: unexpected content-type {headers.get('content-type')}"
-    )
-    for marker in expected_markers:
-        assert marker in body, f"{label}: missing marker {marker!r}, body={body}"
-    print(f"[ok] {label}")
-
-
 def _body_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
@@ -130,6 +125,54 @@ def _body_has_tool_request(value: object) -> bool:
 
 def _json_bytes(payload: object) -> bytes:
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def _secret_redaction_patterns() -> list[tuple[str, str]]:
+    patterns: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for env_name in REAL_PROVIDER_REQUIRED_ENVS:
+        secret = os.environ.get(env_name)
+        if not secret or len(secret) < MIN_SECRET_REDACTION_LENGTH:
+            continue
+        placeholder = f"{SECRET_REDACTION_PLACEHOLDER_PREFIX}{env_name}]"
+        for pattern in (secret, json.dumps(secret)[1:-1]):
+            if pattern and pattern not in seen:
+                patterns.append((pattern, placeholder))
+                seen.add(pattern)
+    patterns.sort(key=lambda item: len(item[0]), reverse=True)
+    return patterns
+
+
+def redact_real_provider_secrets(value: object) -> object:
+    if isinstance(value, str):
+        redacted = value
+        for secret, placeholder in _secret_redaction_patterns():
+            redacted = redacted.replace(secret, placeholder)
+        return redacted
+    if isinstance(value, dict):
+        return {
+            redact_real_provider_secrets(key): redact_real_provider_secrets(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_real_provider_secrets(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_real_provider_secrets(item) for item in value)
+    return value
+
+
+def redact_real_provider_report(report: dict[str, object]) -> dict[str, object]:
+    redacted = redact_real_provider_secrets(report)
+    if not isinstance(redacted, dict):
+        raise TypeError("redacted report must remain a dict")
+    return redacted
+
+
+def redact_real_provider_text(value: str) -> str:
+    redacted = redact_real_provider_secrets(value)
+    if not isinstance(redacted, str):
+        raise TypeError("redacted text must remain a string")
+    return redacted
 
 
 def _openai_chat_payload(model: str, *, stream: bool = False, tool: bool = False, error: bool = False) -> dict[str, object]:
@@ -152,6 +195,10 @@ def _openai_chat_payload(model: str, *, stream: bool = False, tool: bool = False
                 },
             }
         ]
+        payload["tool_choice"] = {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        }
     if error:
         payload["messages"] = [{"role": "user", "content": "force_error"}]
     return payload
@@ -175,6 +222,10 @@ def _openai_responses_payload(model: str, *, stream: bool = False, tool: bool = 
                 },
             }
         ]
+        payload["tool_choice"] = {
+            "type": "function",
+            "name": "get_weather",
+        }
     if error:
         payload["input"] = "force_error"
     return payload
@@ -198,6 +249,7 @@ def _anthropic_payload(model: str, *, stream: bool = False, tool: bool = False, 
                 },
             }
         ]
+        payload["tool_choice"] = {"type": "tool", "name": "get_weather"}
     if error:
         payload["messages"] = [{"role": "user", "content": "force_error"}]
     return payload
@@ -232,6 +284,12 @@ def _gemini_payload(*, tool: bool = False, error: bool = False) -> dict[str, obj
                 ]
             }
         ]
+        payload["toolConfig"] = {
+            "functionCallingConfig": {
+                "mode": "ANY",
+                "allowedFunctionNames": ["get_weather"],
+            }
+        }
     if error:
         payload["contents"] = [
             {
@@ -407,6 +465,309 @@ def build_mock_matrix_cases() -> list[MockMatrixCase]:
         _gemini_payload(error=True),
         status=503,
         markers=("forced mock error",),
+    )
+
+    return cases
+
+
+def build_perf_matrix_cases() -> list[MockMatrixCase]:
+    case_by_id = {case.case_id: case for case in build_mock_matrix_cases()}
+    perf_case_ids = (
+        "openai_chat_unary",
+        "openai_chat_stream",
+        "openai_responses_unary",
+        "openai_responses_tool",
+        "anthropic_messages_unary",
+        "gemini_generate_content_unary",
+    )
+    return [case_by_id[case_id] for case_id in perf_case_ids]
+
+
+def _responses_high_risk_state_payload(model: str) -> dict[str, object]:
+    return {
+        "model": model,
+        "input": "Hello",
+        "previous_response_id": "resp_cross_provider_state_should_fail_closed",
+    }
+
+
+def build_real_provider_matrix_cases(
+    *,
+    openai_model: str = REAL_OPENAI_DEFAULT_MODEL,
+    anthropic_model: str = REAL_ANTHROPIC_DEFAULT_MODEL,
+    gemini_model: str = REAL_GEMINI_DEFAULT_MODEL,
+    minimax_model: str = REAL_MINIMAX_DEFAULT_MODEL,
+) -> list[RealProviderMatrixCase]:
+    cases: list[RealProviderMatrixCase] = []
+
+    def add(
+        case_id: str,
+        provider: str,
+        surface: str,
+        mode: str,
+        feature: str,
+        env_var: str,
+        default_model: str,
+        model_alias: str,
+        upstream_format: str,
+        path: str,
+        payload: dict[str, object],
+        *,
+        required: bool = True,
+        status: int = 200,
+        content_type: str = "application/json",
+        markers: tuple[str, ...] = ("OK",),
+    ) -> None:
+        cases.append(
+            RealProviderMatrixCase(
+                case_id=case_id,
+                provider=provider,
+                surface=surface,
+                mode=mode,
+                feature=feature,
+                env_var=env_var,
+                required=required,
+                default_model=default_model,
+                model_alias=model_alias,
+                upstream_format=upstream_format,
+                path=path,
+                payload=payload,
+                expected_status=status,
+                expected_content_type=content_type,
+                expected_markers=markers,
+            )
+        )
+
+    add(
+        "openai_responses_unary",
+        "openai",
+        "responses",
+        "unary",
+        "responses_unary",
+        "OPENAI_API_KEY",
+        openai_model,
+        "real-openai-responses",
+        "openai-responses",
+        "/openai/v1/responses",
+        _openai_responses_payload("real-openai-responses"),
+    )
+    add(
+        "openai_responses_stream",
+        "openai",
+        "responses",
+        "stream",
+        "responses_stream",
+        "OPENAI_API_KEY",
+        openai_model,
+        "real-openai-responses",
+        "openai-responses",
+        "/openai/v1/responses",
+        _openai_responses_payload("real-openai-responses", stream=True),
+        content_type="text/event-stream",
+        markers=("response.completed", "OK"),
+    )
+    add(
+        "openai_chat_tool",
+        "openai",
+        "chat",
+        "tool",
+        "chat_tool",
+        "OPENAI_API_KEY",
+        openai_model,
+        "real-openai-chat",
+        "openai-completion",
+        "/openai/v1/chat/completions",
+        _openai_chat_payload("real-openai-chat", tool=True),
+        markers=("tool_calls", "get_weather"),
+    )
+    add(
+        "openai_responses_high_risk_state_fail_closed",
+        "openai",
+        "responses",
+        "fail_closed",
+        "high_risk_state",
+        "OPENAI_API_KEY",
+        openai_model,
+        "real-openai-chat",
+        "openai-completion",
+        "/openai/v1/responses",
+        _responses_high_risk_state_payload("real-openai-chat"),
+        status=400,
+        markers=("previous_response_id",),
+    )
+
+    add(
+        "anthropic_messages_unary",
+        "anthropic",
+        "messages",
+        "unary",
+        "messages_unary",
+        "ANTHROPIC_API_KEY",
+        anthropic_model,
+        "real-anthropic-messages",
+        "anthropic",
+        "/anthropic/v1/messages",
+        _anthropic_payload("real-anthropic-messages"),
+    )
+    add(
+        "anthropic_messages_stream",
+        "anthropic",
+        "messages",
+        "stream",
+        "messages_stream",
+        "ANTHROPIC_API_KEY",
+        anthropic_model,
+        "real-anthropic-messages",
+        "anthropic",
+        "/anthropic/v1/messages",
+        _anthropic_payload("real-anthropic-messages", stream=True),
+        content_type="text/event-stream",
+        markers=("message_start", "message_stop"),
+    )
+    add(
+        "anthropic_messages_client_tool",
+        "anthropic",
+        "messages",
+        "tool",
+        "client_tool",
+        "ANTHROPIC_API_KEY",
+        anthropic_model,
+        "real-anthropic-messages",
+        "anthropic",
+        "/anthropic/v1/messages",
+        _anthropic_payload("real-anthropic-messages", tool=True),
+        markers=("tool_use", "get_weather"),
+    )
+    add(
+        "anthropic_responses_high_risk_state_fail_closed",
+        "anthropic",
+        "messages",
+        "fail_closed",
+        "high_risk_state",
+        "ANTHROPIC_API_KEY",
+        anthropic_model,
+        "real-anthropic-messages",
+        "anthropic",
+        "/openai/v1/responses",
+        _responses_high_risk_state_payload("real-anthropic-messages"),
+        status=400,
+        markers=("previous_response_id",),
+    )
+
+    add(
+        "gemini_generate_content_unary",
+        "gemini",
+        "generateContent",
+        "unary",
+        "generate_content_unary",
+        "GEMINI_API_KEY",
+        gemini_model,
+        "real-gemini-generate-content",
+        "google",
+        "/google/v1beta/models/real-gemini-generate-content:generateContent",
+        _gemini_payload(),
+    )
+    add(
+        "gemini_stream_generate_content",
+        "gemini",
+        "streamGenerateContent",
+        "stream",
+        "stream_generate_content",
+        "GEMINI_API_KEY",
+        gemini_model,
+        "real-gemini-generate-content",
+        "google",
+        "/google/v1beta/models/real-gemini-generate-content:streamGenerateContent",
+        _gemini_payload(),
+        content_type="text/event-stream",
+        markers=("data:", "OK"),
+    )
+    add(
+        "gemini_function_declarations_tool",
+        "gemini",
+        "generateContent",
+        "tool",
+        "function_declarations",
+        "GEMINI_API_KEY",
+        gemini_model,
+        "real-gemini-generate-content",
+        "google",
+        "/google/v1beta/models/real-gemini-generate-content:generateContent",
+        _gemini_payload(tool=True),
+        markers=("functionCall", "get_weather"),
+    )
+    add(
+        "gemini_responses_high_risk_state_fail_closed",
+        "gemini",
+        "generateContent",
+        "fail_closed",
+        "high_risk_state",
+        "GEMINI_API_KEY",
+        gemini_model,
+        "real-gemini-generate-content",
+        "google",
+        "/openai/v1/responses",
+        _responses_high_risk_state_payload("real-gemini-generate-content"),
+        status=400,
+        markers=("previous_response_id",),
+    )
+
+    add(
+        "minimax_openai_chat_unary",
+        "minimax",
+        "openai_chat",
+        "unary",
+        "chat_unary",
+        "MINIMAX_API_KEY",
+        minimax_model,
+        "real-minimax-chat",
+        "openai-completion",
+        "/openai/v1/chat/completions",
+        _openai_chat_payload("real-minimax-chat"),
+    )
+    add(
+        "minimax_openai_chat_stream",
+        "minimax",
+        "openai_chat",
+        "stream",
+        "chat_stream",
+        "MINIMAX_API_KEY",
+        minimax_model,
+        "real-minimax-chat",
+        "openai-completion",
+        "/openai/v1/chat/completions",
+        _openai_chat_payload("real-minimax-chat", stream=True),
+        content_type="text/event-stream",
+        markers=("data:", "[DONE]"),
+    )
+    add(
+        "minimax_openai_chat_tool",
+        "minimax",
+        "openai_chat",
+        "tool",
+        "chat_tool",
+        "MINIMAX_API_KEY",
+        minimax_model,
+        "real-minimax-chat",
+        "openai-completion",
+        "/openai/v1/chat/completions",
+        _openai_chat_payload("real-minimax-chat", tool=True),
+        markers=("tool_calls", "get_weather"),
+    )
+    add(
+        "minimax_unsupported_lifecycle_state_fail_closed",
+        "minimax",
+        "openai_chat",
+        "fail_closed",
+        "unsupported_lifecycle_state",
+        "MINIMAX_API_KEY",
+        minimax_model,
+        "real-minimax-chat",
+        "openai-completion",
+        "/openai/v1/responses",
+        _responses_high_risk_state_payload("real-minimax-chat"),
+        status=400,
+        markers=("previous_response_id",),
     )
 
     return cases
@@ -848,13 +1209,12 @@ def run_perf_gate(
     if iterations <= 0:
         raise RuntimeError("--perf-iterations must be greater than zero")
 
-    case = next(
-        case for case in build_mock_matrix_cases() if case.case_id == "openai_chat_unary"
-    )
+    cases = build_perf_matrix_cases()
     durations_ms: list[float] = []
+    durations_by_case: dict[str, list[float]] = {case.case_id: [] for case in cases}
 
     with running_mock_proxy(binary) as base_url:
-        for _ in range(3):
+        for case in cases:
             warmup = run_mock_case(base_url, case)
             if warmup["status"] != "passed":
                 return {
@@ -866,15 +1226,18 @@ def run_perf_gate(
 
         total_started = time.perf_counter()
         for _ in range(iterations):
-            result = run_mock_case(base_url, case)
-            if result["status"] != "passed":
-                return {
-                    "status": "failed",
-                    "gate": "perf",
-                    "reason": "measured request failed",
-                    "result": result,
-                }
-            durations_ms.append(float(result["duration_ms"]))
+            for case in cases:
+                result = run_mock_case(base_url, case)
+                if result["status"] != "passed":
+                    return {
+                        "status": "failed",
+                        "gate": "perf",
+                        "reason": "measured request failed",
+                        "result": result,
+                    }
+                duration_ms = float(result["duration_ms"])
+                durations_ms.append(duration_ms)
+                durations_by_case[case.case_id].append(duration_ms)
         total_ms = round((time.perf_counter() - total_started) * 1000, 3)
 
     p95_ms = round(percentile(durations_ms, 95), 3)
@@ -890,10 +1253,22 @@ def run_perf_gate(
         "status": "passed" if not failures else "failed",
         "gate": "perf",
         "iterations": iterations,
+        "case_count": len(cases),
+        "request_count": len(durations_ms),
+        "cases": [case.case_id for case in cases],
+        "surfaces": sorted({case.surface for case in cases}),
         "p95_ms": p95_ms,
         "max_ms": max_ms,
         "mean_ms": mean_ms,
         "total_ms": total_ms,
+        "per_case": {
+            case_id: {
+                "p95_ms": round(percentile(values, 95), 3),
+                "max_ms": round(max(values), 3),
+                "mean_ms": round(sum(values) / len(values), 3),
+            }
+            for case_id, values in durations_by_case.items()
+        },
         "thresholds": {
             "p95_ms": p95_threshold_ms,
             "total_ms": total_threshold_ms,
@@ -903,6 +1278,7 @@ def run_perf_gate(
 
 
 def emit_machine_report(report: dict[str, object], json_out: str | None) -> None:
+    report = redact_real_provider_report(report)
     if json_out:
         output_path = Path(json_out)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -910,127 +1286,240 @@ def emit_machine_report(report: dict[str, object], json_out: str | None) -> None
     print(json.dumps(report, sort_keys=True))
 
 
-def build_config(
-    path: Path,
-    listen_port: int,
-    anthropic_key: str,
-    openai_key: str,
-    anthropic_base: str,
-    openai_base: str,
-    anthropic_model: str,
-    openai_model: str,
-) -> None:
+def write_real_provider_config(path: Path, listen_port: int, args: argparse.Namespace) -> None:
     config = f"""
 listen: 127.0.0.1:{listen_port}
 upstream_timeout_secs: 120
 upstreams:
-  GLM-ANTHROPIC:
-    api_root: {json.dumps(anthropic_base)}
-    format: anthropic
-    credential_actual: {json.dumps(anthropic_key)}
-    auth_policy: force_server
-  GLM-OPENAI:
-    api_root: {json.dumps(openai_base)}
+  REAL_OPENAI_CHAT:
+    api_root: {json.dumps(args.openai_base_url)}
     format: openai-completion
-    credential_actual: {json.dumps(openai_key)}
+    credential_env: OPENAI_API_KEY
+    auth_policy: force_server
+  REAL_OPENAI_RESPONSES:
+    api_root: {json.dumps(args.openai_base_url)}
+    format: openai-responses
+    credential_env: OPENAI_API_KEY
+    auth_policy: force_server
+  REAL_ANTHROPIC:
+    api_root: {json.dumps(args.anthropic_base_url)}
+    format: anthropic
+    credential_env: ANTHROPIC_API_KEY
+    auth_policy: force_server
+  REAL_GEMINI:
+    api_root: {json.dumps(args.gemini_base_url)}
+    format: google
+    credential_env: GEMINI_API_KEY
+    auth_policy: force_server
+  REAL_MINIMAX_CHAT:
+    api_root: {json.dumps(args.minimax_base_url)}
+    format: openai-completion
+    credential_env: MINIMAX_API_KEY
     auth_policy: force_server
 model_aliases:
-  glm-anthropic: {json.dumps(f"GLM-ANTHROPIC:{anthropic_model}")}
-  glm-openai: {json.dumps(f"GLM-OPENAI:{openai_model}")}
+  real-openai-chat: {json.dumps(f"REAL_OPENAI_CHAT:{args.openai_model}")}
+  real-openai-responses: {json.dumps(f"REAL_OPENAI_RESPONSES:{args.openai_model}")}
+  real-anthropic-messages: {json.dumps(f"REAL_ANTHROPIC:{args.anthropic_model}")}
+  real-gemini-generate-content: {json.dumps(f"REAL_GEMINI:{args.gemini_model}")}
+  real-minimax-chat: {json.dumps(f"REAL_MINIMAX_CHAT:{args.minimax_model}")}
 """
     path.write_text(config.strip() + "\n", encoding="utf-8")
 
 
-def run_matrix(base_url: str) -> None:
-    expect_json_case(
-        base_url,
-        "/openai/v1/chat/completions",
-        {"model": "glm-anthropic", "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": False},
-        '"content": "OK',
-        "anthropic upstream via chat completions",
+def _real_case_report_base(case: RealProviderMatrixCase) -> dict[str, object]:
+    return {
+        "case_id": case.case_id,
+        "provider": case.provider,
+        "surface": case.surface,
+        "mode": case.mode,
+        "feature": case.feature,
+        "env_var": case.env_var,
+        "required": case.required,
+        "default_model": case.default_model,
+        "model_alias": case.model_alias,
+        "path": case.path,
+    }
+
+
+def _real_case_preflight_result(
+    case: RealProviderMatrixCase,
+    *,
+    status: str,
+    error: str,
+) -> dict[str, object]:
+    error = redact_real_provider_text(error)
+    result = _real_case_report_base(case)
+    result.update(
+        {
+            "status": status,
+            "duration_ms": 0.0,
+            "http_status": None,
+            "content_type": None,
+            "error": error,
+            "failures": [error] if error else [],
+        }
     )
-    expect_json_case(
-        base_url,
-        "/openai/v1/responses",
-        {"model": "glm-anthropic", "input": "Reply with exactly OK", "stream": False},
-        '"text": "OK',
-        "anthropic upstream via responses",
-    )
-    expect_json_case(
-        base_url,
-        "/anthropic/v1/messages",
-        {"model": "glm-anthropic", "max_tokens": 32, "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": False},
-        '"text": "OK',
-        "anthropic upstream via messages",
-    )
-    expect_sse_case(
-        base_url,
-        "/openai/v1/responses",
-        {"model": "glm-anthropic", "input": "Reply with exactly OK", "stream": True},
-        ["response.completed", "OK"],
-        "anthropic upstream via responses stream",
-    )
-    expect_sse_case(
-        base_url,
-        "/anthropic/v1/messages",
-        {"model": "glm-anthropic", "max_tokens": 32, "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": True},
-        ["message_start", "message_stop"],
-        "anthropic upstream via messages stream",
+    return result
+
+
+def summarize_real_provider_results(
+    results: list[dict[str, object]],
+    *,
+    missing_env: list[str] | None = None,
+    reason: str | None = None,
+) -> dict[str, object]:
+    results = [
+        redact_real_provider_report(result)
+        for result in results
+    ]
+    passed = sum(1 for result in results if result["status"] == "passed")
+    failed = sum(1 for result in results if result["status"] == "failed")
+    skipped = sum(1 for result in results if result["status"] == "skipped")
+    report: dict[str, object] = {
+        "status": "passed" if failed == 0 and skipped == 0 else "failed",
+        "gate": REAL_PROVIDER_GATE,
+        "case_count": len(results),
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "results": results,
+    }
+    if missing_env is not None:
+        report["missing_env"] = missing_env
+    if reason:
+        report["reason"] = redact_real_provider_text(reason)
+    return redact_real_provider_report(report)
+
+
+def build_real_provider_missing_secret_report(
+    cases: list[RealProviderMatrixCase],
+    missing_env: list[str],
+) -> dict[str, object]:
+    missing = set(missing_env)
+    all_missing = all(case.env_var in missing for case in cases if case.required)
+    results: list[dict[str, object]] = []
+    missing_text = ", ".join(missing_env)
+
+    for case in cases:
+        if case.required and case.env_var in missing:
+            results.append(
+                _real_case_preflight_result(
+                    case,
+                    status="failed",
+                    error=f"{case.env_var} is required for {case.provider.upper()} provider",
+                )
+            )
+        elif case.required and not all_missing:
+            results.append(
+                _real_case_preflight_result(
+                    case,
+                    status="skipped",
+                    error=f"not run because required real provider secrets are missing: {missing_text}",
+                )
+            )
+        else:
+            results.append(
+                _real_case_preflight_result(
+                    case,
+                    status="skipped",
+                    error=f"not run because optional provider secret is missing: {case.env_var}",
+                )
+            )
+
+    return summarize_real_provider_results(
+        results,
+        missing_env=missing_env,
+        reason=f"missing required real provider secrets: {missing_text}",
     )
 
-    expect_json_case(
-        base_url,
-        "/openai/v1/chat/completions",
-        {"model": "glm-openai", "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": False},
-        '"content": "OK',
-        "openai upstream via chat completions",
+
+def build_real_provider_startup_failure_report(
+    cases: list[RealProviderMatrixCase],
+    error: str,
+) -> dict[str, object]:
+    error = redact_real_provider_text(error)
+    results = [
+        _real_case_preflight_result(case, status="failed", error=error)
+        for case in cases
+    ]
+    return summarize_real_provider_results(results, reason=error)
+
+
+def run_real_provider_case(base_url: str, case: RealProviderMatrixCase) -> dict[str, object]:
+    started = time.perf_counter()
+    result = _real_case_report_base(case)
+    try:
+        status, headers, body = http_json(f"{base_url}{case.path}", case.payload, timeout=120)
+    except Exception as error:
+        duration_ms = round((time.perf_counter() - started) * 1000, 3)
+        message = redact_real_provider_text(str(error))
+        result.update(
+            {
+                "status": "failed",
+                "http_status": None,
+                "content_type": None,
+                "duration_ms": duration_ms,
+                "error": message,
+                "failures": [message],
+            }
+        )
+        return result
+
+    duration_ms = round((time.perf_counter() - started) * 1000, 3)
+    content_type = headers.get("content-type", "")
+    failures = []
+    if status != case.expected_status:
+        failures.append(f"expected status {case.expected_status}, got {status}")
+    if case.expected_content_type not in content_type:
+        failures.append(
+            f"expected content-type containing {case.expected_content_type!r}, got {content_type!r}"
+        )
+    for marker in case.expected_markers:
+        if marker not in body:
+            failures.append(f"missing marker {marker!r}")
+
+    result.update(
+        {
+            "status": "passed" if not failures else "failed",
+            "http_status": status,
+            "content_type": content_type,
+            "duration_ms": duration_ms,
+            "error": "; ".join(failures),
+            "failures": failures,
+        }
     )
-    expect_json_case(
-        base_url,
-        "/openai/v1/responses",
-        {"model": "glm-openai", "input": "Reply with exactly OK", "stream": False},
-        '"text": "OK',
-        "openai upstream via responses",
-    )
-    expect_json_case(
-        base_url,
-        "/anthropic/v1/messages",
-        {"model": "glm-openai", "max_tokens": 32, "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": False},
-        ['"type": "message"', '"role": "assistant"'],
-        "openai upstream via messages",
-    )
-    expect_sse_case(
-        base_url,
-        "/openai/v1/chat/completions",
-        {"model": "glm-openai", "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": True},
-        ["data:", "[DONE]"],
-        "openai upstream via chat completions stream",
-    )
-    expect_sse_case(
-        base_url,
-        "/openai/v1/responses",
-        {"model": "glm-openai", "input": "Reply with exactly OK", "stream": True},
-        ["response.completed", "OK"],
-        "openai upstream via responses stream",
-    )
-    expect_sse_case(
-        base_url,
-        "/anthropic/v1/messages",
-        {"model": "glm-openai", "max_tokens": 32, "messages": [{"role": "user", "content": "Reply with exactly OK"}], "stream": True},
-        ["message_start", "message_stop"],
-        "openai upstream via messages stream",
-    )
+    return redact_real_provider_report(result)
 
 
 def run_real_provider_smoke(args: argparse.Namespace) -> int:
-    api_key = os.environ.get("GLM_APIKEY")
-    if not api_key:
-        print("GLM_APIKEY is required", file=sys.stderr)
+    cases = build_real_provider_matrix_cases(
+        openai_model=args.openai_model,
+        anthropic_model=args.anthropic_model,
+        gemini_model=args.gemini_model,
+        minimax_model=args.minimax_model,
+    )
+    missing_env = sorted(
+        {
+            case.env_var
+            for case in cases
+            if case.required and not os.environ.get(case.env_var)
+        }
+    )
+    if missing_env:
+        report = build_real_provider_missing_secret_report(cases, missing_env)
+        emit_machine_report(report, args.json_out)
+        print(
+            redact_real_provider_text("Missing required real provider secrets: " + ", ".join(missing_env)),
+            file=sys.stderr,
+        )
         return 2
 
     binary = Path(args.binary)
     if not binary.exists():
-        print(f"proxy binary not found: {binary}", file=sys.stderr)
+        message = f"proxy binary not found: {binary}"
+        report = build_real_provider_startup_failure_report(cases, message)
+        emit_machine_report(report, args.json_out)
+        print(redact_real_provider_text(message), file=sys.stderr)
         return 2
 
     port = free_port()
@@ -1038,26 +1527,24 @@ def run_real_provider_smoke(args: argparse.Namespace) -> int:
 
     with tempfile.TemporaryDirectory(prefix="proxy-real-matrix-") as tempdir:
         config_path = Path(tempdir) / "proxy.yaml"
-        build_config(
-            config_path,
-            port,
-            api_key,
-            api_key,
-            args.anthropic_base_url,
-            args.openai_base_url,
-            args.anthropic_model,
-            args.openai_model,
-        )
-
+        stdout_path = Path(tempdir) / "proxy.stdout.log"
+        stderr_path = Path(tempdir) / "proxy.stderr.log"
+        write_real_provider_config(config_path, port, args)
+        stdout_handle = stdout_path.open("w", encoding="utf-8")
+        stderr_handle = stderr_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
             [str(binary), "--config", str(config_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
             text=True,
         )
         try:
-            wait_for_health(base_url)
-            run_matrix(base_url)
+            try:
+                wait_for_health(base_url)
+                results = [run_real_provider_case(base_url, case) for case in cases]
+                report = summarize_real_provider_results(results)
+            except Exception as error:
+                report = build_real_provider_startup_failure_report(cases, str(error))
         finally:
             proc.terminate()
             try:
@@ -1065,49 +1552,111 @@ def run_real_provider_smoke(args: argparse.Namespace) -> int:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
-        if proc.returncode not in (0, -15):
-            stderr = proc.stderr.read() if proc.stderr else ""
-            print(stderr, file=sys.stderr)
-            return 1
-    return 0
+            stdout_handle.close()
+            stderr_handle.close()
+
+        if proc.returncode not in (0, -15) and report.get("status") == "passed":
+            stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+            message = stderr.strip() or f"proxy exited with {proc.returncode}"
+            report = build_real_provider_startup_failure_report(cases, message)
+
+    emit_machine_report(report, args.json_out)
+    return 0 if report.get("status") == "passed" else 1
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=("mock", "perf", "real-provider-smoke"),
+        help="explicit gate mode; legacy --mock/--perf/--real-provider-smoke flags are still supported",
+    )
     parser.add_argument("--mock", action="store_true", help="run deterministic local mock endpoint matrix")
-    parser.add_argument("--perf", action="store_true", help="run local deterministic perf gate; requires --mock")
+    parser.add_argument("--perf", action="store_true", help="run local deterministic perf gate; requires --mock or --mode perf")
     parser.add_argument("--json-out", help="write machine-readable gate result JSON")
     parser.add_argument("--real-provider-smoke", action="store_true", help="run protected real-provider smoke matrix")
     parser.add_argument("--binary", default="./target/debug/llm-universal-proxy")
     parser.add_argument("--perf-iterations", type=int, default=PERF_DEFAULT_ITERATIONS)
     parser.add_argument("--perf-p95-ms", type=float, default=PERF_DEFAULT_P95_MS)
     parser.add_argument("--perf-total-ms", type=float, default=PERF_DEFAULT_TOTAL_MS)
-    parser.add_argument("--anthropic-base-url", default=os.environ.get("ANTHROPIC_UPSTREAM_BASE_URL", "https://open.bigmodel.cn/api/anthropic/v1"))
-    parser.add_argument("--openai-base-url", default=os.environ.get("OPENAI_UPSTREAM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"))
-    parser.add_argument("--anthropic-model", default=os.environ.get("ANTHROPIC_UPSTREAM_MODEL", "GLM-5"))
-    parser.add_argument("--openai-model", default=os.environ.get("OPENAI_UPSTREAM_MODEL", "glm-4.7-flash"))
+    parser.add_argument(
+        "--anthropic-base-url",
+        default=os.environ.get("ANTHROPIC_UPSTREAM_BASE_URL", "https://api.anthropic.com/v1"),
+    )
+    parser.add_argument(
+        "--openai-base-url",
+        default=os.environ.get("OPENAI_UPSTREAM_BASE_URL", "https://api.openai.com/v1"),
+    )
+    parser.add_argument(
+        "--gemini-base-url",
+        default=os.environ.get("GEMINI_UPSTREAM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
+    )
+    parser.add_argument(
+        "--minimax-base-url",
+        default=os.environ.get("MINIMAX_UPSTREAM_BASE_URL", os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.io/v1")),
+    )
+    parser.add_argument(
+        "--anthropic-model",
+        default=os.environ.get("ANTHROPIC_UPSTREAM_MODEL", os.environ.get("ANTHROPIC_MODEL", REAL_ANTHROPIC_DEFAULT_MODEL)),
+    )
+    parser.add_argument(
+        "--openai-model",
+        default=os.environ.get("OPENAI_UPSTREAM_MODEL", os.environ.get("OPENAI_MODEL", REAL_OPENAI_DEFAULT_MODEL)),
+    )
+    parser.add_argument(
+        "--gemini-model",
+        default=os.environ.get("GEMINI_UPSTREAM_MODEL", os.environ.get("GEMINI_MODEL", REAL_GEMINI_DEFAULT_MODEL)),
+    )
+    parser.add_argument(
+        "--minimax-model",
+        default=os.environ.get("MINIMAX_UPSTREAM_MODEL", os.environ.get("MINIMAX_MODEL", REAL_MINIMAX_DEFAULT_MODEL)),
+    )
     args = parser.parse_args(argv)
-    if args.perf and not args.mock:
-        parser.error("--perf requires --mock")
+    mode_sources = []
+    if args.mode:
+        mode_sources.append(args.mode)
+    if args.real_provider_smoke:
+        mode_sources.append("real-provider-smoke")
+    if args.mock:
+        mode_sources.append("perf" if args.perf else "mock")
+    elif args.perf:
+        if args.mode != "perf":
+            parser.error("--perf requires --mock or --mode perf")
+        mode_sources.append("perf")
+
+    if not mode_sources:
+        parser.error(
+            "explicit mode required; use --mode mock|perf|real-provider-smoke "
+            "or legacy --mock/--mock --perf/--real-provider-smoke"
+        )
+    resolved_modes = set(mode_sources)
+    if len(resolved_modes) != 1:
+        parser.error(f"conflicting modes requested: {', '.join(mode_sources)}")
+    args.mode = mode_sources[0]
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.mock:
-        if args.perf:
-            report = run_perf_gate(
-                Path(args.binary),
-                iterations=args.perf_iterations,
-                p95_threshold_ms=args.perf_p95_ms,
-                total_threshold_ms=args.perf_total_ms,
-            )
-        else:
-            report = run_mock_matrix(Path(args.binary))
+    if args.mode == "mock":
+        report = run_mock_matrix(Path(args.binary))
         emit_machine_report(report, args.json_out)
         return 0 if report.get("status") == "passed" else 1
 
-    return run_real_provider_smoke(args)
+    if args.mode == "perf":
+        report = run_perf_gate(
+            Path(args.binary),
+            iterations=args.perf_iterations,
+            p95_threshold_ms=args.perf_p95_ms,
+            total_threshold_ms=args.perf_total_ms,
+        )
+        emit_machine_report(report, args.json_out)
+        return 0 if report.get("status") == "passed" else 1
+
+    if args.mode == "real-provider-smoke":
+        return run_real_provider_smoke(args)
+
+    raise AssertionError(f"unhandled mode: {args.mode}")
 
 
 if __name__ == "__main__":
