@@ -202,7 +202,9 @@ Supported `surface.modalities.input` values:
 
 These values describe the proxy's protocol compatibility layer and the configured client-visible alias surface. They do not prove that a real upstream provider or model accepts that media; configure only what the selected upstream model actually supports. The live MiniMax quickstart/provider profile should remain text-only unless a future MiniMax integration is explicitly validated for multimodal input; current multimodal e2e coverage uses first-party mock upstreams rather than the live MiniMax provider.
 
-Unsupported media must fail closed. The proxy should reject unsupported or unknown typed media parts instead of silently dropping them, flattening them into text, or forwarding them to an upstream surface that cannot represent them.
+`surface.modalities.input` gates media types, not every possible source transport for that media. For example, an enabled `image` or `pdf` surface can still reject a source form when the target translator cannot represent it safely. HTTP(S) URLs are explicit remote URLs; provider-native or local URIs such as `gs://`, `s3://`, and `file://`, and provider-owned identifiers such as `file_id`, are different source identities and are not portable unless a documented adapter supports them.
+
+Unsupported media and unsupported source transports must fail closed. The proxy should reject unsupported or unknown typed media parts instead of silently dropping them, flattening them into text, or forwarding them to an upstream surface that cannot represent them.
 
 Media metadata must also be self-consistent. For OpenAI Chat `file` parts and OpenAI Responses `input_file` parts, the proxy compares explicit `mime_type` / `mimeType`, MIME-bearing `file_data` data URIs, and filename-derived hints. If those sources disagree, the request is rejected before any upstream call. This keeps the effective `surface.modalities.input` gate aligned with the media bytes or URI that would actually be translated.
 

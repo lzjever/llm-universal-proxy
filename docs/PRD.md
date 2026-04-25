@@ -107,7 +107,9 @@ The proxy MUST translate the following request fields across protocols:
 | Tool choice (auto/none/required) | Must | Map between format-specific tool choice objects |
 | `max_output_tokens` / `max_tokens` | Must | Normalize field names |
 | `temperature`, `top_p` | Should | Pass through generation config where applicable |
-| Image content | Should | Map between `image_url` (OpenAI), `source.base64` (Anthropic), `inlineData` (Gemini) |
+| Image content | Should | Map portable image parts between OpenAI, Anthropic, and Gemini when the effective surface allows `image`; OpenAI HTTP(S) image URLs can map to Anthropic URL image sources, but Anthropic remote image URLs to Gemini fail closed without an explicit fetch/upload adapter |
+| PDF content | Should | Map PDF data URIs and PDF HTTP(S) file references when PDF MIME or filename provenance is available and the effective surface allows `pdf` or `file` |
+| Typed media source boundary | Must | Treat `surface.modalities.input` as a media-type gate, not a source transport promise; provider `file_id` and provider-native or local URIs such as `gs://`, `s3://`, and `file://` fail closed unless a documented adapter supports them |
 | Typed media MIME provenance | Must | Reject conflicting MIME hints before routing so surface gates and translators cannot disagree about the actual media kind |
 | Thinking/reasoning config | May | Preserve where upstream supports it |
 | Built-in / non-function tools | Won't | Dropped during cross-protocol translation with compat warning unless a documented bridge can preserve the original visible tool identity |

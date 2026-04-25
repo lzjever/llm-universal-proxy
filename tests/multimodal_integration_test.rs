@@ -18,6 +18,8 @@ const AUDIO_WAV_B64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF
 const PDF_B64: &str = "JVBERi0x";
 const PDF_DATA_URI: &str = "data:application/pdf;base64,JVBERi0x";
 const GEMINI_FILE_URI: &str = "gs://llmup-test/doc.pdf";
+const REMOTE_IMAGE_URL: &str = "https://example.com/cat.png";
+const TEXT_DATA_URI: &str = "data:text/plain;base64,SGVsbG8=";
 
 #[tokio::test]
 async fn multimodal_openai_chat_to_gemini_maps_inline_and_file_data() {
@@ -142,21 +144,25 @@ async fn multimodal_openai_remote_image_to_gemini_fails_closed_before_upstream()
 }
 
 #[tokio::test]
-async fn multimodal_openai_remote_image_to_anthropic_fails_closed_before_upstream() {
-    let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(|_| {
-        Err("remote image reached Anthropic upstream".to_string())
-    })
-    .await;
+async fn multimodal_openai_remote_image_to_anthropic_maps_to_url_source() {
+    let (mock_base, _mock, captured) =
+        spawn_asserting_anthropic_mock(assert_anthropic_image_url_source).await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let response = send_remote_image_chat_request(&proxy_base).await;
-    assert_failure_response(response).await;
-    assert_no_upstream_request(&captured).await;
+    assert_success_response(response).await;
+    assert_eq!(
+        captured
+            .wait_for_count(1, Duration::from_secs(1))
+            .await
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
-async fn multimodal_openai_audio_and_file_to_anthropic_fail_closed_before_upstream() {
+async fn multimodal_openai_audio_and_non_pdf_file_to_anthropic_fail_closed_before_upstream() {
     for (label, content) in [
         (
             "audio",
@@ -166,10 +172,14 @@ async fn multimodal_openai_audio_and_file_to_anthropic_fail_closed_before_upstre
             ]),
         ),
         (
-            "file",
+            "non-PDF file",
             json!([
-                { "type": "text", "text": "Summarize this file" },
-                { "type": "file", "file": { "file_data": PDF_DATA_URI, "filename": "fixture.pdf" } }
+                { "type": "text", "text": "Summarize this text file" },
+                { "type": "file", "file": {
+                    "file_data": TEXT_DATA_URI,
+                    "filename": "notes.txt",
+                    "mime_type": "text/plain"
+                } }
             ]),
         ),
     ] {
@@ -205,7 +215,7 @@ async fn send_remote_image_chat_request(proxy_base: &str) -> reqwest::Response {
                 "role": "user",
                 "content": [
                     { "type": "text", "text": "Describe this remote image" },
-                    { "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } }
+                    { "type": "image_url", "image_url": { "url": REMOTE_IMAGE_URL } }
                 ]
             }],
             "stream": false
@@ -317,6 +327,27 @@ fn assert_anthropic_image_base64_source(request: &CapturedMockRequest) -> Result
         &request.body,
         "/messages/0/content/1/source/data",
         json!(PNG_B64),
+    )
+}
+
+fn assert_anthropic_image_url_source(request: &CapturedMockRequest) -> Result<(), String> {
+    expect_pointer(&request.body, "/messages/0/role", json!("user"))?;
+    expect_pointer(&request.body, "/messages/0/content/0/type", json!("text"))?;
+    expect_pointer(
+        &request.body,
+        "/messages/0/content/0/text",
+        json!("Describe this remote image"),
+    )?;
+    expect_pointer(&request.body, "/messages/0/content/1/type", json!("image"))?;
+    expect_pointer(
+        &request.body,
+        "/messages/0/content/1/source/type",
+        json!("url"),
+    )?;
+    expect_pointer(
+        &request.body,
+        "/messages/0/content/1/source/url",
+        json!(REMOTE_IMAGE_URL),
     )
 }
 

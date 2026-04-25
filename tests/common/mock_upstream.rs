@@ -1059,6 +1059,117 @@ async fn asserting_google_handler(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
+/// Spawns an OpenAI Chat Completions mock that captures and asserts request shape.
+pub async fn spawn_asserting_openai_completion_mock(
+    assertion: impl Fn(&CapturedMockRequest) -> Result<(), String> + Send + Sync + 'static,
+) -> (String, tokio::task::JoinHandle<()>, CapturedMockRequests) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let captured = CapturedMockRequests::default();
+    let state = AssertingMockState {
+        captured: captured.clone(),
+        assertion: Arc::new(assertion),
+    };
+
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(asserting_openai_completion_handler),
+        )
+        .route(
+            "/chat/completions",
+            post(asserting_openai_completion_handler),
+        );
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.with_state(state)).await.ok();
+    });
+    (base, handle, captured)
+}
+
+async fn asserting_openai_completion_handler(
+    State(state): State<AssertingMockState>,
+    method: Method,
+    uri: Uri,
+    Json(body): Json<Value>,
+) -> Response {
+    let request = CapturedMockRequest {
+        method: method.to_string(),
+        path: uri.path().to_string(),
+        body,
+    };
+    state.captured.push(request.clone());
+
+    if let Err(message) = (state.assertion)(&request) {
+        return assertion_failure_response(message);
+    }
+
+    let resp = serde_json::json!({
+        "id": "chatcmpl-asserting-mock",
+        "object": "chat.completion",
+        "created": 1,
+        "model": request.body.get("model").unwrap_or(&serde_json::json!("mock")),
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "OK" }, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Spawns an OpenAI Responses mock that captures and asserts request shape.
+pub async fn spawn_asserting_openai_responses_mock(
+    assertion: impl Fn(&CapturedMockRequest) -> Result<(), String> + Send + Sync + 'static,
+) -> (String, tokio::task::JoinHandle<()>, CapturedMockRequests) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let captured = CapturedMockRequests::default();
+    let state = AssertingMockState {
+        captured: captured.clone(),
+        assertion: Arc::new(assertion),
+    };
+
+    let app = Router::new()
+        .route("/v1/responses", post(asserting_openai_responses_handler))
+        .route("/responses", post(asserting_openai_responses_handler));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app.with_state(state)).await.ok();
+    });
+    (base, handle, captured)
+}
+
+async fn asserting_openai_responses_handler(
+    State(state): State<AssertingMockState>,
+    method: Method,
+    uri: Uri,
+    Json(body): Json<Value>,
+) -> Response {
+    let request = CapturedMockRequest {
+        method: method.to_string(),
+        path: uri.path().to_string(),
+        body,
+    };
+    state.captured.push(request.clone());
+
+    if let Err(message) = (state.assertion)(&request) {
+        return assertion_failure_response(message);
+    }
+
+    let resp = serde_json::json!({
+        "id": "resp_asserting_mock",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "model": request.body.get("model").unwrap_or(&serde_json::json!("mock")),
+        "output": [
+            { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "OK" }] }
+        ],
+        "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
 /// Spawns an Anthropic Messages mock that captures and asserts request shape.
 ///
 /// Assertion failures are returned as 400 JSON so e2e tests see the mock-side

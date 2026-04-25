@@ -32,7 +32,7 @@ When translating between protocols, the proxy must preserve as much semantic fid
 - **Text content** — preserve portable user-visible text content; warn or reject when a field cannot be represented safely
 - **Tool calls / function calling** — preserve portable function definitions, arguments, and results across supported protocols
 - **Tool identity** — preserve the stable visible tool name supplied by the client; internal bridge names must never become the live model-visible or client-visible contract
-- **Media identity** — typed media hints must be self-consistent; conflicting MIME provenance must fail closed instead of being normalized by guesswork
+- **Media identity** — typed media hints and source identities must be self-consistent; conflicting MIME provenance or unsupported provider/local URI sources must fail closed instead of being normalized by guesswork
 - **Thinking / reasoning** — preserve reasoning output in whatever form the upstream provides
 - **Usage / token counting** — map token metrics to the client's expected format
 - **Stop reasons / finish reasons** — map between protocol-specific stop reason semantics

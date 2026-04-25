@@ -5,6 +5,10 @@ use serde_json::Value;
 use crate::config::{CompatibilityMode, ModelModality, ModelSurface};
 use crate::formats::UpstreamFormat;
 
+use super::media::{
+    mime_type_from_filename, openai_file_part_mime_conflict_message,
+    openai_file_part_resolved_mime_type,
+};
 use super::messages::{
     anthropic_thinking_provenance_dropped_message, custom_tool_format_downgraded_message,
     custom_tools_not_portable_message, openai_assistant_audio_history_not_portable_message,
@@ -19,10 +23,7 @@ use super::models::{
 use super::openai_responses::{
     decode_anthropic_reasoning_carrier, responses_input_item_is_message, responses_input_item_type,
 };
-use super::request_gemini::{
-    gemini_generation_config_field, gemini_part_field, mime_type_from_filename,
-    openai_file_part_mime_conflict_message, openai_file_part_resolved_mime_type,
-};
+use super::request_gemini::{gemini_generation_config_field, gemini_part_field};
 use super::tools::{
     normalized_responses_tool_definition, openai_custom_tool_format_is_plain_text,
     openai_custom_tool_format_supports_anthropic_bridge, openai_tool_arguments_to_structured_value,

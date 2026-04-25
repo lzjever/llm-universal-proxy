@@ -238,6 +238,15 @@ pub(super) fn gemini_response_to_openai(body: &Value) -> Result<Value, String> {
 pub(super) fn gemini_candidate_to_openai_assistant_message(
     content: Option<&Value>,
 ) -> Result<Value, String> {
+    if content
+        .map(gemini_content_has_media_output_parts)
+        .unwrap_or(false)
+    {
+        return Err(
+            "Gemini assistant multimodal output cannot be faithfully translated to OpenAI Chat Completions assistant content."
+                .to_string(),
+        );
+    }
     let translated = match content {
         Some(content) => convert_gemini_content_to_openai(content)?,
         None => Vec::new(),
@@ -263,6 +272,22 @@ pub(super) fn gemini_candidate_to_openai_assistant_message(
         "Gemini response content cannot be faithfully translated to a single OpenAI Chat Completions assistant message."
             .to_string(),
     )
+}
+
+fn gemini_content_has_media_output_parts(content: &Value) -> bool {
+    content
+        .get("parts")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts.iter().any(|part| {
+                part.get("inlineData")
+                    .or_else(|| part.get("inline_data"))
+                    .or_else(|| part.get("fileData"))
+                    .or_else(|| part.get("file_data"))
+                    .is_some()
+            })
+        })
+        .unwrap_or(false)
 }
 
 pub(super) fn gemini_assistant_message_has_non_text_content_parts(message: &Value) -> bool {

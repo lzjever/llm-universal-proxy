@@ -120,6 +120,8 @@ Reasoning effort such as `xhigh` is a client/request-side setting, not part of t
 - translated paths target a portable core and may warn or reject non-portable provider-native features
 - native extensions and provider-owned lifecycle state stay on same-provider paths unless a documented shim says otherwise
 - the quickstart includes conservative text-only `surface_defaults`; turn on search, image, or parallel-tool flags only when that model surface really supports them
+- multimodal `surface.modalities.input` gates media types, not every source transport; HTTP(S) image/PDF URLs are distinct from provider or local URIs such as `gs://`, `s3://`, and `file://`
+- Gemini `inlineData` can be preserved when translating to OpenAI Chat/Responses, but all Gemini `fileData.fileUri` sources currently fail closed until an explicit fetch/upload adapter exists
 - typed media metadata must be internally consistent; conflicting MIME hints such as `mime_type` versus a `file_data` data URI are rejected before the upstream call
 
 ## Codex / Claude Code / Gemini Basic Setup

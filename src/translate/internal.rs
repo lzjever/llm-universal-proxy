@@ -646,7 +646,7 @@ fn client_to_openai_completion(
             claude_to_openai(body, target_format == UpstreamFormat::OpenAiResponses)?;
         }
         UpstreamFormat::Google => {
-            gemini_to_openai(body)?;
+            gemini_to_openai(body, target_format)?;
         }
     }
     Ok(())
@@ -671,6 +671,7 @@ fn openai_completion_to_upstream(
     }
     Ok(())
 }
+mod media;
 mod openai_family;
 mod openai_responses;
 #[cfg(test)]
@@ -680,6 +681,11 @@ mod response_logprobs;
 pub(crate) mod response_protocols;
 pub(crate) mod tools;
 
+use media::{
+    classify_media_source_reference, is_pdf_mime, openai_file_data_reference_from_part,
+    openai_file_part_field, openai_file_part_resolved_mime_type, openai_file_reference_payload,
+    MediaSourceReference, OpenAiFileDataReference,
+};
 use messages::{
     anthropic_request_tool_definition_not_portable_message,
     anthropic_tool_result_order_not_portable_message, custom_tools_not_portable_message,
@@ -704,7 +710,7 @@ use openai_responses::{
 #[cfg(test)]
 use request_gemini::convert_gemini_content_to_openai;
 use request_gemini::{
-    base64_data_uri_parts, gemini_function_declaration_output_schema_field,
+    gemini_function_declaration_output_schema_field,
     gemini_function_output_schema_not_portable_message,
     gemini_function_response_has_nonportable_parts, gemini_openai_function_tools_from_request,
     gemini_part_field, gemini_request_function_calling_config_from_object,
@@ -2026,22 +2032,7 @@ fn convert_claude_message_to_openai_impl(
                 parts.push(semantic_text_part_to_openai_value(&text_part));
             }
             "image" => {
-                if block
-                    .get("source")
-                    .and_then(|s| s.get("type").and_then(Value::as_str))
-                    == Some("base64")
-                {
-                    let src = block.get("source").unwrap();
-                    let media = src
-                        .get("media_type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("image/png");
-                    let data = src.get("data").and_then(Value::as_str).unwrap_or("");
-                    parts.push(serde_json::json!({
-                        "type": "image_url",
-                        "image_url": { "url": format!("data:{};base64,{}", media, data) }
-                    }));
-                }
+                parts.push(anthropic_image_block_to_openai_part(block)?);
             }
             "tool_use" => {
                 let name = block.get("name").and_then(Value::as_str).unwrap_or("");
@@ -2154,6 +2145,42 @@ fn convert_claude_message_to_openai_impl(
         m["reasoning_content"] = Value::String(reasoning_text);
     }
     Ok(Some(vec![m]))
+}
+
+fn anthropic_image_block_to_openai_part(block: &Value) -> Result<Value, String> {
+    let source = block
+        .get("source")
+        .ok_or_else(|| anthropic_block_not_portable_message("image", "OpenAI Chat Completions"))?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(Value::as_str).unwrap_or("");
+            Ok(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{};base64,{}", media, data) }
+            }))
+        }
+        Some("url") => {
+            let url = source.get("url").and_then(Value::as_str).ok_or_else(|| {
+                "Anthropic image source.type=url requires a string `url` to translate to OpenAI Chat Completions."
+                    .to_string()
+            })?;
+            Ok(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": url }
+            }))
+        }
+        Some(other) => Err(format!(
+            "Anthropic image source type `{other}` cannot be faithfully translated to OpenAI Chat Completions."
+        )),
+        None => Err(
+            "Anthropic image blocks require a source.type to translate to OpenAI Chat Completions."
+                .to_string(),
+        ),
+    }
 }
 
 fn collapse_claude_text_parts_for_openai(parts: &[Value]) -> Value {
@@ -2360,27 +2387,109 @@ fn openai_image_url_part_to_claude_block(part: &Value) -> Result<Value, String> 
             "missing image URL; Anthropic image blocks require inline base64 image data.",
         ));
     };
-    let Some((media, data)) = base64_data_uri_parts(url) else {
-        let reason = if url.starts_with("data:") {
-            "image URLs must be base64 data URIs; non-base64 data URIs are not portable."
-        } else {
-            "remote image URLs require explicit upload/provenance and must not be silently dropped."
-        };
+    match classify_media_source_reference(url) {
+        MediaSourceReference::MimeDataUri { mime_type, data } => {
+            if !mime_type.starts_with("image/") {
+                return Err(openai_content_part_not_portable_to_anthropic_message(
+                    "image_url",
+                    &format!("data URI MIME `{mime_type}` is not an image MIME type."),
+                ));
+            }
+            Ok(serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": mime_type, "data": data }
+            }))
+        }
+        MediaSourceReference::HttpRemoteUrl { url } => Ok(serde_json::json!({
+            "type": "image",
+            "source": { "type": "url", "url": url }
+        })),
+        MediaSourceReference::ProviderOrLocalUri { uri } => Err(
+            openai_content_part_not_portable_to_anthropic_message(
+                "image_url",
+                &format!(
+                    "Anthropic image URL sources only support http:// or https:// remote URLs; provider/local URI `{uri}` is not portable."
+                ),
+            ),
+        ),
+        MediaSourceReference::BareBase64 { .. } | MediaSourceReference::Unsupported { .. } => {
+            Err(openai_content_part_not_portable_to_anthropic_message(
+                "image_url",
+                "image_url must be a base64 data URI or an http:// or https:// remote URL.",
+            ))
+        }
+    }
+}
+
+fn openai_file_part_error_to_anthropic(part_type: &str, reason: &str) -> String {
+    openai_content_part_not_portable_to_anthropic_message(part_type, reason)
+}
+
+fn openai_file_part_to_claude_document_block(part: &Value) -> Result<Value, String> {
+    openai_file_reference_payload(part)
+        .map_err(|err| openai_file_part_error_to_anthropic("file/input_file", &err))?;
+    if openai_file_part_field(part, "file_data")
+        .or_else(|| openai_file_part_field(part, "file_url"))
+        .is_none()
+    {
         return Err(openai_content_part_not_portable_to_anthropic_message(
-            "image_url",
-            reason,
-        ));
-    };
-    if !media.starts_with("image/") {
-        return Err(openai_content_part_not_portable_to_anthropic_message(
-            "image_url",
-            &format!("data URI MIME `{media}` is not an image MIME type."),
+            "file/input_file",
+            "file parts require file_data or file_url with PDF MIME/filename provenance; provider file_id references are not portable.",
         ));
     }
-    Ok(serde_json::json!({
-        "type": "image",
-        "source": { "type": "base64", "media_type": media, "data": data }
-    }))
+
+    let resolved_mime = openai_file_part_resolved_mime_type(part)
+        .map_err(|err| openai_file_part_error_to_anthropic("file/input_file", &err))?;
+    let reference = openai_file_data_reference_from_part(part)
+        .map_err(|err| openai_file_part_error_to_anthropic("file/input_file", &err))?;
+    match reference {
+        OpenAiFileDataReference::InlineData { mime_type, data } => {
+            if !is_pdf_mime(&mime_type) {
+                return Err(openai_file_part_error_to_anthropic(
+                    "file/input_file",
+                    &format!("only application/pdf files can map to Anthropic document blocks; got MIME `{mime_type}`."),
+                ));
+            }
+            Ok(serde_json::json!({
+                "type": "document",
+                "source": { "type": "base64", "media_type": "application/pdf", "data": data }
+            }))
+        }
+        OpenAiFileDataReference::HttpRemoteUrl {
+            mime_type,
+            url,
+        } => {
+            if !is_pdf_mime(&mime_type) {
+                return Err(openai_file_part_error_to_anthropic(
+                    "file/input_file",
+                    &format!("only application/pdf HTTP(S) URLs can map to Anthropic document URL blocks; got MIME `{mime_type}`."),
+                ));
+            }
+            Ok(serde_json::json!({
+                "type": "document",
+                "source": { "type": "url", "url": url }
+            }))
+        }
+        OpenAiFileDataReference::ProviderOrLocalUri { uri, .. } => Err(
+            openai_file_part_error_to_anthropic(
+                "file/input_file",
+                &format!(
+                    "Anthropic document URL sources only support http:// or https:// PDF URLs; provider/local URI `{uri}` is not portable."
+                ),
+            ),
+        ),
+        OpenAiFileDataReference::BareBase64 { mime_type, .. } => {
+            let mime = resolved_mime.or(mime_type);
+            let detail = mime
+                .as_deref()
+                .map(|mime| format!(" with MIME `{mime}`"))
+                .unwrap_or_default();
+            Err(openai_file_part_error_to_anthropic(
+                "file/input_file",
+                &format!("bare base64 file_data{detail} must not be coerced into Anthropic document bytes; use a MIME-bearing PDF data URI."),
+            ))
+        }
+    }
 }
 
 fn openai_audio_part_not_portable_to_anthropic_message(part: &Value) -> String {
@@ -2394,31 +2503,6 @@ fn openai_audio_part_not_portable_to_anthropic_message(part: &Value) -> String {
     openai_content_part_not_portable_to_anthropic_message(
         "input_audio",
         &format!("audio input{format} has no native Anthropic request mapping in this translator."),
-    )
-}
-
-fn openai_file_part_not_portable_to_anthropic_message(part: &Value) -> String {
-    let file = part.get("file").and_then(Value::as_object);
-    let mime = file
-        .and_then(|file| file.get("file_data"))
-        .and_then(Value::as_str)
-        .and_then(|file_data| base64_data_uri_parts(file_data).map(|(mime, _)| mime))
-        .map(|mime| format!(" with MIME `{mime}`"))
-        .unwrap_or_default();
-    let reference = if file
-        .and_then(|file| file.get("file_id"))
-        .and_then(Value::as_str)
-        .is_some()
-    {
-        " file_id references"
-    } else {
-        ""
-    };
-    openai_content_part_not_portable_to_anthropic_message(
-        "file/input_file",
-        &format!(
-            "file{mime}{reference} cannot be coerced into Anthropic document semantics; document/fileData mapping is not implemented yet."
-        ),
     )
 }
 
@@ -2565,7 +2649,7 @@ fn openai_message_to_claude_blocks(msg: &Value) -> Result<Option<Vec<Value>>, St
                         return Err(openai_audio_part_not_portable_to_anthropic_message(c));
                     }
                     "file" | "input_file" => {
-                        return Err(openai_file_part_not_portable_to_anthropic_message(c));
+                        blocks.push(openai_file_part_to_claude_document_block(c)?);
                     }
                     other => {
                         return Err(openai_content_part_not_portable_to_anthropic_message(

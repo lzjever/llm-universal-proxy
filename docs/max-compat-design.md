@@ -90,7 +90,7 @@ Native extensions:
 
 ## Multimodal Phase 1 Boundary
 
-Multimodal support is currently a protocol compatibility layer feature, not a blanket provider capability promise. The request policy gate recognizes typed media across OpenAI Chat/Responses, Anthropic Messages, and Gemini request shapes, then checks the effective `surface.modalities.input` for the routed alias.
+Multimodal support is currently a `max_compat` / request-policy protocol compatibility feature, not a blanket provider capability promise. The request policy gate recognizes typed media across OpenAI Chat/Responses, Anthropic Messages, and Gemini request shapes, then checks the effective `surface.modalities.input` for the routed alias. That surface value is a media-type gate only; source transport support is checked separately.
 
 Current input modality meanings:
 
@@ -104,13 +104,17 @@ Current translator boundaries:
 
 | Path | First-phase behavior |
 | --- | --- |
-| OpenAI Chat/Responses to Anthropic | Data URI images can become Anthropic image blocks. Remote images, `input_audio`, `file`/`input_file`, and unknown typed parts fail closed. |
-| OpenAI/Gemini | Existing image, audio, PDF, and Gemini `fileData` mappings remain supported when the effective surface allows them. |
+| OpenAI Chat/Responses images to Anthropic | Data URI images can become Anthropic base64 image blocks. HTTP(S) remote image URLs can become Anthropic `image.source.type=url`. |
+| OpenAI Chat/Responses PDFs to Anthropic | PDF `file` / `input_file` data URIs can become Anthropic `document.source.type=base64`. PDF `file_data` / `file_url` HTTP(S) URLs can become Anthropic `document.source.type=url` when PDF MIME or filename provenance is available and self-consistent. |
+| OpenAI Chat/Responses unsupported media to Anthropic | `input_audio`, non-PDF or generic files, unknown typed parts, provider `file_id`, and provider-native or local URIs such as `gs://`, `file://`, or `s3://` fail closed before contacting upstream. |
+| Anthropic remote images to Gemini | Anthropic image blocks using remote URL sources fail closed unless a future explicit fetch/upload adapter is documented. |
+| Gemini to OpenAI Chat/Responses | Gemini `inlineData` image, audio, and PDF content remains supported when the effective surface allows it. All Gemini `fileData.fileUri` sources, including HTTP(S), currently fail closed until an explicit fetch/upload adapter exists. |
+| OpenAI Chat/Responses to Gemini | OpenAI-supplied file URI or HTTP(S) file references can map to Gemini `fileData` when MIME provenance is available and self-consistent. |
 | Gemini video to non-Gemini | Fail closed before contacting upstream. |
 
 Provider/model availability still comes from configuration. Do not mark a live upstream as multimodal unless that provider integration and selected model are validated for the media shape. In particular, the live MiniMax test provider should remain text-only in first-party docs; current multimodal e2e coverage uses first-party mock upstreams rather than real MiniMax.
 
-Unsupported media is a hard boundary. Unknown typed parts, remote media forms that the target translator cannot represent, and media missing from the effective surface must be rejected before the upstream call instead of being silently dropped.
+Unsupported media and unsupported source transports are hard boundaries. HTTP(S) URLs are distinct from provider-native or local URIs: an HTTP(S) image or PDF URL may pass only on a path with an explicit target representation, while provider-owned identifiers and URIs such as `file_id`, `gs://`, `file://`, and `s3://` are not portable unless a documented adapter says otherwise. Unknown typed parts, media source forms that the target translator cannot represent, and media missing from the effective surface must be rejected before the upstream call instead of being silently dropped.
 
 MIME provenance is part of that boundary. OpenAI Chat `file` and OpenAI Responses `input_file` parts may carry explicit `mime_type` / `mimeType`, MIME-bearing `file_data` data URIs, and filename-derived hints. The proxy treats disagreement between those sources as unsafe and rejects the request before translation, including same-format Responses passthrough. That prevents a request from passing a PDF-only surface gate while the translator later emits video, audio, image, or another concrete media type from the actual data URI.
 

@@ -1196,7 +1196,14 @@ fn map_responses_content_to_openai(content: Option<Value>) -> Value {
             if ty == Some("input_file") {
                 has_non_text_part = true;
                 let mut file = serde_json::Map::new();
-                for key in ["file_id", "file_data", "filename", "mime_type", "mimeType"] {
+                for key in [
+                    "file_id",
+                    "file_data",
+                    "file_url",
+                    "filename",
+                    "mime_type",
+                    "mimeType",
+                ] {
                     if let Some(value) = c.get(key).cloned() {
                         file.insert(key.to_string(), value);
                     }
@@ -1815,7 +1822,14 @@ fn map_openai_content_to_responses(content: Option<Value>, content_type: &str) -
                 let mut out = serde_json::Map::new();
                 out.insert("type".to_string(), Value::String("input_file".to_string()));
                 if let Some(file_obj) = file.as_object() {
-                    for key in ["file_id", "file_data", "filename", "mime_type", "mimeType"] {
+                    for key in [
+                        "file_id",
+                        "file_data",
+                        "file_url",
+                        "filename",
+                        "mime_type",
+                        "mimeType",
+                    ] {
                         if let Some(value) = file_obj.get(key).cloned() {
                             out.insert(key.to_string(), value);
                         }

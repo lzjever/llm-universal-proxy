@@ -2034,17 +2034,16 @@ fn translate_request_responses_to_openai_maps_refusal_to_top_level_message_field
 }
 
 #[test]
-fn translate_request_gemini_to_openai_maps_audio_inline_data_and_file_parts_without_image_spoofing()
-{
+fn translate_request_gemini_to_openai_maps_inline_media_without_image_spoofing() {
     let mut body = json!({
         "model": "gemini-2.5-flash",
         "contents": [{
             "role": "user",
             "parts": [
                 { "text": "Inspect these" },
+                { "inlineData": { "mimeType": "image/png", "data": "iVBORw0KGgo=" } },
                 { "inlineData": { "mimeType": "audio/wav", "data": "AAAA" } },
-                { "inlineData": { "mimeType": "application/pdf", "data": "JVBERi0x" } },
-                { "fileData": { "mimeType": "application/pdf", "fileUri": "gs://bucket/doc.pdf" } }
+                { "inlineData": { "mimeType": "application/pdf", "data": "JVBERi0x" } }
             ]
         }]
     });
@@ -2061,17 +2060,78 @@ fn translate_request_gemini_to_openai_maps_audio_inline_data_and_file_parts_with
     let messages = body["messages"].as_array().expect("messages");
     let content = messages[0]["content"].as_array().expect("content");
     assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[1]["type"], "input_audio");
-    assert_eq!(content[1]["input_audio"]["data"], "AAAA");
-    assert_eq!(content[1]["input_audio"]["format"], "wav");
-    assert_eq!(content[2]["type"], "file");
+    assert_eq!(content[1]["type"], "image_url");
     assert_eq!(
-        content[2]["file"]["file_data"],
+        content[1]["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgo="
+    );
+    assert_eq!(content[2]["type"], "input_audio");
+    assert_eq!(content[2]["input_audio"]["data"], "AAAA");
+    assert_eq!(content[2]["input_audio"]["format"], "wav");
+    assert_eq!(content[3]["type"], "file");
+    assert_eq!(
+        content[3]["file"]["file_data"],
         "data:application/pdf;base64,JVBERi0x"
     );
-    assert_eq!(content[3]["type"], "file");
-    assert_eq!(content[3]["file"]["file_data"], "gs://bucket/doc.pdf");
-    assert!(content.iter().all(|part| part["type"] != "image_url"));
+    assert_eq!(content[3]["file"]["mime_type"], "application/pdf");
+}
+
+#[test]
+fn translate_request_gemini_file_data_gs_uri_to_openai_rejects() {
+    let mut body = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{
+            "role": "user",
+            "parts": [{
+                "fileData": {
+                    "mimeType": "application/pdf",
+                    "fileUri": "gs://bucket/doc.pdf",
+                    "displayName": "doc.pdf"
+                }
+            }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::Google,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        false,
+    )
+    .expect_err("Gemini provider-native fileData URI should fail closed for OpenAI Chat");
+
+    assert!(err.contains("fileData.fileUri"), "err = {err}");
+    assert!(err.contains("fetch/upload adapter"), "err = {err}");
+}
+
+#[test]
+fn translate_request_gemini_file_data_gs_uri_to_responses_rejects() {
+    let mut body = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{
+            "role": "user",
+            "parts": [{
+                "fileData": {
+                    "mimeType": "application/pdf",
+                    "fileUri": "gs://bucket/doc.pdf",
+                    "displayName": "doc.pdf"
+                }
+            }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::Google,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        &mut body,
+        false,
+    )
+    .expect_err("Gemini provider-native fileData URI should fail closed for OpenAI Responses");
+
+    assert!(err.contains("fileData.fileUri"), "err = {err}");
+    assert!(err.contains("fetch/upload adapter"), "err = {err}");
 }
 
 #[test]
@@ -2383,7 +2443,7 @@ fn translate_request_openai_to_anthropic_maps_data_uri_image() {
 }
 
 #[test]
-fn translate_request_openai_to_anthropic_rejects_remote_image_url_without_upload() {
+fn translate_request_openai_to_anthropic_maps_remote_image_url() {
     let mut body = json!({
         "model": "claude-3",
         "messages": [{
@@ -2395,18 +2455,21 @@ fn translate_request_openai_to_anthropic_rejects_remote_image_url_without_upload
         }]
     });
 
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect_err("remote image URLs should fail closed for Anthropic");
+    .expect("remote image URLs should map to Anthropic url image sources");
 
-    assert!(err.contains("remote"), "err = {err}");
-    assert!(err.contains("image"), "err = {err}");
-    assert!(err.contains("Anthropic"), "err = {err}");
+    let content = body["messages"][0]["content"]
+        .as_array()
+        .expect("anthropic content");
+    assert_eq!(content[0]["type"], "image");
+    assert_eq!(content[0]["source"]["type"], "url");
+    assert_eq!(content[0]["source"]["url"], "https://example.com/cat.png");
 }
 
 #[test]
@@ -2436,7 +2499,7 @@ fn translate_request_openai_to_anthropic_rejects_input_audio_without_native_mapp
 }
 
 #[test]
-fn translate_request_openai_to_anthropic_rejects_file_without_document_mapping() {
+fn translate_request_openai_to_anthropic_maps_pdf_data_uri_file_to_document() {
     let mut body = json!({
         "model": "claude-3",
         "messages": [{
@@ -2451,18 +2514,96 @@ fn translate_request_openai_to_anthropic_rejects_file_without_document_mapping()
         }]
     });
 
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect_err("file parts should fail closed for Anthropic until document mapping exists");
+    .expect("PDF data URI file parts should map to Anthropic document blocks");
 
-    assert!(err.contains("file"), "err = {err}");
-    assert!(err.contains("document"), "err = {err}");
-    assert!(err.contains("Anthropic"), "err = {err}");
+    let content = body["messages"][0]["content"]
+        .as_array()
+        .expect("anthropic content");
+    assert_eq!(content[0]["type"], "document");
+    assert_eq!(content[0]["source"]["type"], "base64");
+    assert_eq!(content[0]["source"]["media_type"], "application/pdf");
+    assert_eq!(content[0]["source"]["data"], "JVBERi0x");
+}
+
+#[test]
+fn translate_request_openai_to_anthropic_maps_pdf_url_file_to_document() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "file",
+                "file": {
+                    "file_data": "https://example.com/doc.pdf",
+                    "mime_type": "application/pdf",
+                    "filename": "doc.pdf"
+                }
+            }]
+        }]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("PDF URL file parts with MIME provenance should map to Anthropic document URL blocks");
+
+    let content = body["messages"][0]["content"]
+        .as_array()
+        .expect("anthropic content");
+    assert_eq!(content[0]["type"], "document");
+    assert_eq!(content[0]["source"]["type"], "url");
+    assert_eq!(content[0]["source"]["url"], "https://example.com/doc.pdf");
+}
+
+#[test]
+fn translate_request_openai_to_anthropic_rejects_file_id_and_bare_base64_file_data() {
+    let cases = [
+        (
+            "file_id",
+            json!({
+                "model": "claude-3",
+                "messages": [{
+                    "role": "user",
+                    "content": [{ "type": "file", "file": { "file_id": "file_123" } }]
+                }]
+            }),
+        ),
+        (
+            "file_data",
+            json!({
+                "model": "claude-3",
+                "messages": [{
+                    "role": "user",
+                    "content": [{ "type": "file", "file": { "file_data": "JVBERi0x" } }]
+                }]
+            }),
+        ),
+    ];
+
+    for (label, mut body) in cases {
+        let err = translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            "claude-3",
+            &mut body,
+            false,
+        )
+        .expect_err("unprovenanced OpenAI file references should fail closed for Anthropic");
+
+        assert!(err.contains(label), "err = {err}");
+        assert!(err.contains("Anthropic"), "err = {err}");
+    }
 }
 
 #[test]
@@ -2564,7 +2705,58 @@ fn translate_request_openai_to_anthropic_rejects_typed_system_media() {
 }
 
 #[test]
-fn translate_request_responses_to_anthropic_rejects_input_audio_and_input_file() {
+fn translate_request_responses_to_anthropic_maps_input_image_and_pdf_input_file() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": "https://example.com/cat.png"
+                },
+                {
+                    "type": "input_file",
+                    "file_data": "data:application/pdf;base64,JVBERi0x",
+                    "filename": "inline.pdf"
+                },
+                {
+                    "type": "input_file",
+                    "file_url": "https://example.com/doc.pdf",
+                    "mime_type": "application/pdf",
+                    "filename": "doc.pdf"
+                }
+            ]
+        }]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("Responses remote image/PDF URL should map to Anthropic URL sources");
+
+    let content = body["messages"][0]["content"]
+        .as_array()
+        .expect("anthropic content");
+    assert_eq!(content[0]["type"], "image");
+    assert_eq!(content[0]["source"]["type"], "url");
+    assert_eq!(content[0]["source"]["url"], "https://example.com/cat.png");
+    assert_eq!(content[1]["type"], "document");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "application/pdf");
+    assert_eq!(content[1]["source"]["data"], "JVBERi0x");
+    assert_eq!(content[2]["type"], "document");
+    assert_eq!(content[2]["source"]["type"], "url");
+    assert_eq!(content[2]["source"]["url"], "https://example.com/doc.pdf");
+}
+
+#[test]
+fn translate_request_responses_to_anthropic_rejects_input_audio_and_provider_file_id() {
     let cases = [
         (
             "input_audio",
@@ -2581,17 +2773,13 @@ fn translate_request_responses_to_anthropic_rejects_input_audio_and_input_file()
             }),
         ),
         (
-            "input_file",
+            "file_id",
             json!({
                 "model": "gpt-4o",
                 "input": [{
                     "type": "message",
                     "role": "user",
-                    "content": [{
-                        "type": "input_file",
-                        "file_data": "data:application/pdf;base64,JVBERi0x",
-                        "filename": "doc.pdf"
-                    }]
+                    "content": [{ "type": "input_file", "file_id": "file_123" }]
                 }]
             }),
         ),
@@ -2605,7 +2793,7 @@ fn translate_request_responses_to_anthropic_rejects_input_audio_and_input_file()
             &mut body,
             false,
         )
-        .expect_err("Responses media should fail closed for Anthropic");
+        .expect_err("Responses audio/provider file IDs should fail closed for Anthropic");
 
         assert!(err.contains(label), "err = {err}");
         assert!(err.contains("Anthropic"), "err = {err}");
@@ -2613,59 +2801,66 @@ fn translate_request_responses_to_anthropic_rejects_input_audio_and_input_file()
 }
 
 #[test]
-fn translate_request_gemini_to_anthropic_rejects_audio_pdf_filedata_until_document_mapping() {
-    let cases = [
-        (
-            "audio",
-            json!({
-                "model": "gemini-2.5-flash",
-                "contents": [{
-                    "role": "user",
-                    "parts": [{ "inlineData": { "mimeType": "audio/wav", "data": "BBBB" } }]
-                }]
-            }),
-        ),
-        (
-            "application/pdf",
-            json!({
-                "model": "gemini-2.5-flash",
-                "contents": [{
-                    "role": "user",
-                    "parts": [{ "inlineData": { "mimeType": "application/pdf", "data": "JVBERi0x" } }]
-                }]
-            }),
-        ),
-        (
-            "fileData",
-            json!({
-                "model": "gemini-2.5-flash",
-                "contents": [{
-                    "role": "user",
-                    "parts": [{
-                        "fileData": {
-                            "mimeType": "application/pdf",
-                            "fileUri": "gs://bucket/doc.pdf",
-                            "displayName": "doc.pdf"
-                        }
-                    }]
-                }]
-            }),
-        ),
-    ];
+fn translate_request_gemini_to_anthropic_maps_pdf_inline_and_file_data_documents() {
+    let mut body = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{
+            "role": "user",
+            "parts": [
+                { "inlineData": { "mimeType": "application/pdf", "data": "JVBERi0x" } },
+                {
+                    "fileData": {
+                        "mimeType": "application/pdf",
+                        "fileUri": "https://example.com/doc.pdf",
+                        "displayName": "doc.pdf"
+                    }
+                }
+            ]
+        }]
+    });
 
-    for (label, mut body) in cases {
-        let err = translate_request(
-            UpstreamFormat::Google,
-            UpstreamFormat::Anthropic,
-            "claude-3",
-            &mut body,
-            false,
-        )
-        .expect_err("Gemini non-image media should fail closed for Anthropic");
+    translate_request(
+        UpstreamFormat::Google,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("Gemini PDF inlineData/fileData should map to Anthropic documents");
 
-        assert!(err.contains(label), "err = {err}");
-        assert!(err.contains("Anthropic"), "err = {err}");
-    }
+    let content = body["messages"][0]["content"]
+        .as_array()
+        .expect("anthropic content");
+    assert_eq!(content[0]["type"], "document");
+    assert_eq!(content[0]["source"]["type"], "base64");
+    assert_eq!(content[0]["source"]["media_type"], "application/pdf");
+    assert_eq!(content[0]["source"]["data"], "JVBERi0x");
+    assert_eq!(content[1]["type"], "document");
+    assert_eq!(content[1]["source"]["type"], "url");
+    assert_eq!(content[1]["source"]["url"], "https://example.com/doc.pdf");
+}
+
+#[test]
+fn translate_request_gemini_to_anthropic_rejects_audio() {
+    let mut body = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{
+            "role": "user",
+            "parts": [{ "inlineData": { "mimeType": "audio/wav", "data": "BBBB" } }]
+        }]
+    });
+
+    let err = translate_request(
+        UpstreamFormat::Google,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect_err("Gemini audio should fail closed for Anthropic");
+
+    assert!(err.contains("audio"), "err = {err}");
+    assert!(err.contains("Anthropic"), "err = {err}");
 }
 
 #[test]
@@ -9715,6 +9910,73 @@ fn translate_request_claude_to_openai_maps_tool_choice_and_parallel_calls() {
     assert_eq!(body["tool_choice"]["type"], "function");
     assert_eq!(body["tool_choice"]["function"]["name"], "lookup");
     assert_eq!(body["parallel_tool_calls"], false);
+}
+
+#[test]
+fn translate_request_claude_to_openai_preserves_url_image_source() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Describe this" },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": "https://example.com/cat.png"
+                    }
+                }
+            ]
+        }]
+    });
+
+    translate_request(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        false,
+    )
+    .expect("Anthropic URL image sources should map to OpenAI Chat image_url parts");
+
+    let content = body["messages"][0]["content"].as_array().expect("content");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "https://example.com/cat.png"
+    );
+}
+
+#[test]
+fn translate_request_claude_to_responses_preserves_url_image_source() {
+    let mut body = json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "url",
+                    "url": "https://example.com/cat.png"
+                }
+            }]
+        }]
+    });
+
+    translate_request(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        &mut body,
+        false,
+    )
+    .expect("Anthropic URL image sources should map to Responses input_image parts");
+
+    let content = body["input"][0]["content"].as_array().expect("content");
+    assert_eq!(content[0]["type"], "input_image");
+    assert_eq!(content[0]["image_url"], "https://example.com/cat.png");
 }
 
 #[test]
