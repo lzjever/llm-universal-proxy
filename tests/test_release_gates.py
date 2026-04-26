@@ -409,6 +409,66 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("not mandatory", ga_review)
         self.assertNotIn("not mandatory", container)
 
+    def test_docs_record_opaque_reasoning_and_compaction_degrade_contract(self):
+        docs = {
+            "compatibility": self.read_text("docs/protocol-compatibility-matrix.md"),
+            "reasoning": self.read_text("docs/protocol-baselines/capabilities/reasoning.md"),
+            "state": self.read_text("docs/protocol-baselines/capabilities/state-continuity.md"),
+            "field_mapping": self.read_text(
+                "docs/protocol-baselines/matrices/field-mapping-matrix.md"
+            ),
+            "responses": self.read_text("docs/protocol-baselines/openai-responses.md"),
+            "ga_review": self.read_text("docs/ga-readiness-review.md"),
+        }
+
+        required_by_doc = {
+            "compatibility": (
+                "default/max_compat",
+                "visible summary",
+                "opaque-only",
+                "same-provider/native passthrough",
+            ),
+            "reasoning": (
+                "reasoning.encrypted_content",
+                "default/max_compat",
+                "visible summary",
+                "strict and balanced",
+            ),
+            "state": (
+                "context_management",
+                "request-side compaction input",
+                "default/max_compat",
+                "opaque-only",
+                "native Responses passthrough",
+            ),
+            "field_mapping": (
+                "Reasoning opaque state",
+                "default/max_compat",
+                "Compaction",
+                "opaque-only compaction",
+            ),
+            "responses": (
+                "context_management",
+                "request-side compaction",
+                "visible portable transcript",
+                "Opaque-only compaction input",
+                "Native OpenAI Responses passthrough",
+            ),
+            "ga_review": (
+                "default/max_compat",
+                "visible summary",
+                "strict/balanced",
+                "opaque-only",
+                "same-provider/native passthrough",
+            ),
+        }
+
+        for doc_name, snippets in required_by_doc.items():
+            text = docs[doc_name].casefold()
+            for snippet in snippets:
+                with self.subTest(doc=doc_name, snippet=snippet):
+                    self.assertIn(snippet.casefold(), text)
+
 
 if __name__ == "__main__":
     unittest.main()

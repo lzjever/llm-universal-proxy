@@ -141,7 +141,7 @@ In the captured create reference, `context_management` currently supports compac
 
 The captured compact endpoint returns a compacted response object. This is part of the formal surface, not just a guide-only idea.
 
-Proxy posture: `context_management` and compact resources are native OpenAI Responses state surfaces. Same-provider passthrough preserves them; cross-provider request translation fails closed instead of dropping or approximating compaction state.
+Proxy posture: `context_management` and compact resources are native OpenAI Responses state surfaces. Native OpenAI Responses passthrough preserves them. Cross-provider request translation in strict and balanced modes fails closed for compaction input items. In the default/max_compat lane, request-side compaction input items degrade only when visible portable transcript or explicit summary text remains: the proxy drops provider-owned opaque fields such as `encrypted_content` without parsing, decrypting, forwarding, or synthesizing them, and preserves any explicit summary text as ordinary visible context. Opaque-only compaction input still fails closed.
 
 ### Tool surface
 

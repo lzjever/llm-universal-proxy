@@ -19,7 +19,10 @@ use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
     SemanticToolKind, SharedControlProfile, TranslationAssessment,
 };
-use super::openai_responses::{responses_input_item_is_message, responses_input_item_type};
+use super::openai_responses::{
+    responses_compaction_summary_text, responses_input_item_is_compaction,
+    responses_input_item_is_message, responses_input_item_type, responses_reasoning_summary_text,
+};
 use super::request_gemini::{gemini_generation_config_field, gemini_part_field};
 use super::tools::{
     normalized_responses_tool_definition, openai_custom_tool_format_is_plain_text,
@@ -474,6 +477,11 @@ pub(super) fn responses_warning_only_request_controls_for_translate(
     {
         controls.push("input[].reasoning.encrypted_content".to_string());
     }
+    if compatibility_mode == CompatibilityMode::MaxCompat
+        && responses_input_compaction_carrier_present(body)
+    {
+        controls.push("input[].compaction".to_string());
+    }
 
     if body.get("reasoning").is_some()
         && (!profile.reasoning_effort || responses_reasoning_has_nonportable_fields(body, profile))
@@ -806,12 +814,105 @@ pub(super) fn responses_portable_input_item_type(item_type: &str) -> bool {
     )
 }
 
+fn responses_input_compaction_carrier_present(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().any(responses_input_item_is_compaction))
+        .unwrap_or(false)
+}
+
+fn responses_request_has_visible_portable_context(body: &Value) -> bool {
+    match body.get("input") {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .any(responses_input_item_has_visible_portable_context),
+        _ => false,
+    }
+}
+
+fn responses_request_has_non_compaction_visible_portable_context(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().any(|item| {
+                !responses_input_item_is_compaction(item)
+                    && responses_input_item_has_visible_portable_context(item)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn responses_compaction_item_can_drop_opaque_state(
+    item: &Value,
+    request_has_non_compaction_visible_context: bool,
+) -> bool {
+    !responses_compaction_summary_text(item).trim().is_empty()
+        || request_has_non_compaction_visible_context
+}
+
+fn responses_reasoning_item_can_drop_opaque_state(
+    item: &Value,
+    request_has_visible_context: bool,
+) -> bool {
+    !responses_reasoning_summary_text(item).trim().is_empty() || request_has_visible_context
+}
+
+fn responses_input_item_has_visible_portable_context(item: &Value) -> bool {
+    match responses_input_item_type(item) {
+        Some("message") => responses_content_has_visible_portable_context(item.get("content")),
+        Some("reasoning") => !responses_reasoning_summary_text(item).trim().is_empty(),
+        Some("compaction" | "compaction_summary") => {
+            !responses_compaction_summary_text(item).trim().is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn responses_content_has_visible_portable_context(content: Option<&Value>) -> bool {
+    match content {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .any(responses_content_part_has_visible_portable_context),
+        Some(Value::Object(_)) => {
+            content.is_some_and(responses_content_part_has_visible_portable_context)
+        }
+        _ => false,
+    }
+}
+
+fn responses_content_part_has_visible_portable_context(part: &Value) -> bool {
+    match part.get("type").and_then(Value::as_str) {
+        Some("input_text" | "output_text" | "refusal") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty()),
+        Some("input_image" | "image_url") => part.get("image_url").is_some(),
+        Some("input_audio") => part.get("input_audio").is_some(),
+        Some("input_file" | "file") => [
+            "file_id",
+            "file_data",
+            "file_url",
+            "filename",
+            "mime_type",
+            "mimeType",
+        ]
+        .iter()
+        .any(|field| part.get(*field).is_some()),
+        _ => false,
+    }
+}
+
 pub(super) fn responses_nonportable_input_item_message(
     body: &Value,
     target_format: UpstreamFormat,
+    compatibility_mode: CompatibilityMode,
 ) -> Option<String> {
     let target_label = translation_target_label(target_format);
     let items = body.get("input").and_then(Value::as_array)?;
+    let has_non_compaction_visible_portable_context =
+        responses_request_has_non_compaction_visible_portable_context(body);
     items.iter().find_map(|item| {
         let item_type = responses_input_item_type(item)?;
         if matches!(item_type, "function_call" | "custom_tool_call")
@@ -822,6 +923,24 @@ pub(super) fn responses_nonportable_input_item_message(
                 item.get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
+            ));
+        }
+        if responses_input_item_is_compaction(item) {
+            if compatibility_mode == CompatibilityMode::MaxCompat
+                && responses_compaction_item_can_drop_opaque_state(
+                    item,
+                    has_non_compaction_visible_portable_context,
+                )
+            {
+                return None;
+            }
+            if compatibility_mode == CompatibilityMode::MaxCompat {
+                return Some(format!(
+                    "OpenAI Responses compaction input item contains provider-owned opaque state and cannot be safely dropped when translating to {target_label} because no visible portable transcript or summary remains"
+                ));
+            }
+            return Some(format!(
+                "OpenAI Responses compaction input item requires native Responses continuity semantics and cannot be faithfully translated to {target_label}"
             ));
         }
         if responses_portable_input_item_type(item_type) {
@@ -850,12 +969,36 @@ fn responses_input_reasoning_encrypted_content_present(body: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn responses_input_reasoning_encrypted_content_requires_native_continuity(body: &Value) -> bool {
+    let has_visible_portable_context = responses_request_has_visible_portable_context(body);
+    body.get("input")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().any(|item| {
+                responses_input_item_type(item) == Some("reasoning")
+                    && item.get("encrypted_content").is_some()
+                    && !responses_reasoning_item_can_drop_opaque_state(
+                        item,
+                        has_visible_portable_context,
+                    )
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub(super) fn responses_reasoning_continuity_request_message(
     body: &Value,
     target_format: UpstreamFormat,
     compatibility_mode: CompatibilityMode,
 ) -> Option<String> {
     if compatibility_mode == CompatibilityMode::MaxCompat {
+        if responses_input_reasoning_encrypted_content_requires_native_continuity(body) {
+            let target_label = translation_target_label(target_format);
+            return Some(responses_reasoning_continuity_not_portable_message(
+                "input[].reasoning.encrypted_content",
+                target_label,
+            ));
+        }
         return None;
     }
     let target_label = translation_target_label(target_format);
@@ -1620,7 +1763,9 @@ pub(crate) fn assess_request_translation(
         if let Some(message) = responses_nonportable_tool_choice_message(body, upstream_format) {
             assessment.reject(message);
         }
-        if let Some(message) = responses_nonportable_input_item_message(body, upstream_format) {
+        if let Some(message) =
+            responses_nonportable_input_item_message(body, upstream_format, compatibility_mode)
+        {
             assessment.reject(message);
         }
         if let Some(message) = responses_nonportable_tool_definition_message(

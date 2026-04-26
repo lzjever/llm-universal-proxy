@@ -97,7 +97,7 @@ pub(super) fn openai_message_anthropic_reasoning_replay_blocks(
         .cloned()
 }
 
-pub(super) fn responses_reasoning_summary_text(item: &Value) -> String {
+fn responses_summary_array_text(item: &Value) -> String {
     item.get("summary")
         .and_then(Value::as_array)
         .map(|parts| {
@@ -111,6 +111,10 @@ pub(super) fn responses_reasoning_summary_text(item: &Value) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+pub(super) fn responses_reasoning_summary_text(item: &Value) -> String {
+    responses_summary_array_text(item)
 }
 
 pub(super) fn responses_reasoning_replay_blocks_for_anthropic(item: &Value) -> Option<Vec<Value>> {
@@ -170,6 +174,30 @@ pub(super) fn responses_input_item_type(item: &Value) -> Option<&str> {
 
 pub(super) fn responses_input_item_is_message(item: &Value) -> bool {
     responses_input_item_type(item) == Some("message")
+}
+
+pub(super) fn responses_input_item_is_compaction(item: &Value) -> bool {
+    matches!(
+        responses_input_item_type(item),
+        Some("compaction" | "compaction_summary")
+    )
+}
+
+pub(super) fn responses_compaction_summary_text(item: &Value) -> String {
+    if !responses_input_item_is_compaction(item) {
+        return String::new();
+    }
+    let summary = responses_summary_array_text(item);
+    if !summary.is_empty() {
+        return summary;
+    }
+    if let Some(summary) = item.get("summary").and_then(Value::as_str) {
+        return summary.to_string();
+    }
+    item.get("summary_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn responses_output_audio_item_to_openai_audio(item: &Value) -> Option<Value> {
@@ -923,6 +951,20 @@ pub(super) fn responses_to_messages(
                             a["reasoning_content"] = Value::String(format!("{existing}{summary}"));
                         }
                     }
+                }
+            }
+            "compaction" | "compaction_summary" => {
+                let summary = responses_compaction_summary_text(&item);
+                if !summary.is_empty() {
+                    flush_assistant(&mut messages, &mut current_assistant);
+                    flush_deferred_user_after_tool_results(
+                        &mut messages,
+                        &mut deferred_user_after_tool_results,
+                    );
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": summary
+                    }));
                 }
             }
             _ => {}

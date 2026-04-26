@@ -47,10 +47,17 @@ upstream calls, and low-risk degradation must be visible rather than silent.
 
 ### OpenAI Responses
 
-OpenAI Responses lifecycle and state resource endpoints are same-provider native
-passthrough only. Cross-provider reconstruction of provider-managed state,
-conversation continuity, encrypted reasoning, or opaque lifecycle resources
-must fail closed unless a future mapping is explicitly designed and tested.
+OpenAI Responses lifecycle and state resource endpoints remain
+same-provider/native passthrough only. Cross-provider reconstruction of
+provider-managed state, conversation continuity, `context_management`, compact
+resources, or opaque lifecycle resources must fail closed unless a future
+mapping is explicitly designed and tested.
+
+Request-side opaque reasoning and compaction input items are mode-specific:
+strict/balanced fail closed, while default/max_compat may drop opaque carriers
+such as `encrypted_content` only when visible summary text or visible transcript
+history remains. Opaque-only reasoning or compaction state still fails closed,
+and native Responses passthrough preserves the native item unchanged.
 
 ### Anthropic Messages
 

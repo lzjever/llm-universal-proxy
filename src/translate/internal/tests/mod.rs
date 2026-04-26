@@ -4304,6 +4304,277 @@ fn translate_request_responses_to_non_responses_rejects_item_reference_items() {
 }
 
 #[test]
+fn translate_request_responses_to_non_responses_drops_compaction_when_visible_history_exists() {
+    let original = json!({
+        "model": "gpt-4o",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Summary visible to every provider." }]
+            },
+            {
+                "type": "compaction",
+                "id": "cmp_123",
+                "encrypted_content": "opaque_compaction_state",
+                "created_by": "openai"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Continue from the summary." }]
+            }
+        ]
+    });
+
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Google,
+    ] {
+        let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+            UpstreamFormat::OpenAiResponses,
+            upstream_format,
+            &original,
+            crate::config::CompatibilityMode::MaxCompat,
+        );
+        let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
+            panic!("expected max_compat warning path, got {assessment:?}");
+        };
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("compaction")),
+            "upstream = {upstream_format:?}, warnings = {warnings:?}"
+        );
+
+        let mut body = original.clone();
+        translate_request_with_policy(
+            UpstreamFormat::OpenAiResponses,
+            upstream_format,
+            "target-model",
+            &mut body,
+            request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+            false,
+        )
+        .expect("max_compat should drop opaque compaction state when visible history remains");
+
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(serialized.contains("Summary visible to every provider."));
+        assert!(serialized.contains("Continue from the summary."));
+        assert!(!serialized.contains("encrypted_content"), "body = {body:?}");
+        assert!(
+            !serialized.contains("opaque_compaction_state"),
+            "body = {body:?}"
+        );
+        assert!(!serialized.contains("created_by"), "body = {body:?}");
+    }
+}
+
+#[test]
+fn translate_request_responses_compaction_summary_text_survives_max_compat() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "compaction",
+            "summary": [{ "type": "summary_text", "text": "Condensed visible context." }],
+            "encrypted_content": "opaque_compaction_state"
+        }]
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        "target-model",
+        &mut body,
+        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        false,
+    )
+    .expect("max_compat should preserve explicit compaction summary text");
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1, "body = {body:?}");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "Condensed visible context.");
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains("encrypted_content"), "body = {body:?}");
+    assert!(
+        !serialized.contains("opaque_compaction_state"),
+        "body = {body:?}"
+    );
+}
+
+#[test]
+fn translate_request_responses_multi_compaction_summary_does_not_allow_opaque_only_compaction() {
+    let original = json!({
+        "model": "gpt-4o",
+        "input": [
+            {
+                "type": "compaction_summary",
+                "summary": [{ "type": "summary_text", "text": "Visible compacted context." }],
+                "encrypted_content": "opaque_compaction_state_with_summary"
+            },
+            {
+                "type": "compaction",
+                "encrypted_content": "only_opaque_compaction_state"
+            }
+        ]
+    });
+
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Google,
+    ] {
+        let mut body = original.clone();
+        let err = translate_request_with_policy(
+            UpstreamFormat::OpenAiResponses,
+            upstream_format,
+            "target-model",
+            &mut body,
+            request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+            false,
+        )
+        .expect_err("one compaction summary must not allow another opaque-only compaction item");
+
+        assert!(err.contains("compaction"), "err = {err}");
+        assert_eq!(body, original);
+    }
+}
+
+#[test]
+fn translate_request_responses_compaction_only_fails_closed_even_in_max_compat() {
+    let original = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "compaction_summary",
+            "encrypted_content": "only_opaque_context"
+        }]
+    });
+
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Google,
+    ] {
+        let mut body = original.clone();
+        let err = translate_request_with_policy(
+            UpstreamFormat::OpenAiResponses,
+            upstream_format,
+            "target-model",
+            &mut body,
+            request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+            false,
+        )
+        .expect_err("opaque-only compaction must not be silently dropped");
+
+        assert!(err.contains("compaction"), "err = {err}");
+        assert_eq!(body, original);
+    }
+}
+
+#[test]
+fn translate_request_responses_compaction_balanced_still_fails_closed() {
+    let original = json!({
+        "model": "gpt-4o",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Visible summary." }]
+            },
+            {
+                "type": "compaction",
+                "encrypted_content": "opaque_compaction_state"
+            }
+        ]
+    });
+
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Google,
+    ] {
+        let mut body = original.clone();
+        let err = translate_request_with_policy(
+            UpstreamFormat::OpenAiResponses,
+            upstream_format,
+            "target-model",
+            &mut body,
+            request_translation_policy(crate::config::CompatibilityMode::Balanced, None),
+            false,
+        )
+        .expect_err("balanced mode should fail closed for Responses compaction carriers");
+
+        assert!(err.contains("compaction"), "err = {err}");
+        assert_eq!(body, original);
+    }
+}
+
+#[test]
+fn translate_request_responses_passthrough_preserves_compaction_fields() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "compaction",
+            "id": "cmp_123",
+            "encrypted_content": "opaque_compaction_state",
+            "created_by": "openai"
+        }]
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        &mut body,
+        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        false,
+    )
+    .expect("native Responses passthrough should preserve compaction fields");
+
+    assert_eq!(body["input"][0]["type"], "compaction");
+    assert_eq!(body["input"][0]["id"], "cmp_123");
+    assert_eq!(
+        body["input"][0]["encrypted_content"],
+        "opaque_compaction_state"
+    );
+    assert_eq!(body["input"][0]["created_by"], "openai");
+}
+
+#[test]
+fn translate_request_responses_reasoning_opaque_only_fails_closed_even_in_max_compat() {
+    let original = json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "reasoning",
+            "encrypted_content": "only_opaque_reasoning_state"
+        }]
+    });
+
+    for upstream_format in [
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::Google,
+    ] {
+        let mut body = original.clone();
+        let err = translate_request_with_policy(
+            UpstreamFormat::OpenAiResponses,
+            upstream_format,
+            "target-model",
+            &mut body,
+            request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+            false,
+        )
+        .expect_err("opaque-only reasoning state must fail closed in max_compat");
+
+        assert!(err.contains("reasoning"), "err = {err}");
+        assert!(err.contains("encrypted_content"), "err = {err}");
+        assert_eq!(body, original);
+    }
+}
+
+#[test]
 fn translate_request_responses_to_openai_drops_reasoning_encrypted_content_and_uses_summary() {
     let mut body = json!({
         "model": "gpt-4o",
