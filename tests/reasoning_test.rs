@@ -13,6 +13,7 @@ mod common;
 use common::mock_upstream::*;
 use common::proxy_helpers::proxy_config;
 use common::runtime_proxy::start_proxy;
+use llm_universal_proxy::config::CompatibilityMode;
 use llm_universal_proxy::formats::UpstreamFormat;
 use reqwest::Client;
 use serde_json::json;
@@ -223,7 +224,7 @@ async fn anthropic_signed_thinking_to_responses_non_streaming_returns_carrier() 
 }
 
 #[tokio::test]
-async fn anthropic_signed_thinking_responses_round_trip_non_streaming_rejects_carrier_before_upstream(
+async fn anthropic_signed_thinking_responses_round_trip_non_streaming_degrades_carrier_before_upstream(
 ) {
     let (source_base, _source_mock) = spawn_anthropic_signed_thinking_mock().await;
     let source_config = proxy_config(&source_base, UpstreamFormat::Anthropic);
@@ -246,8 +247,9 @@ async fn anthropic_signed_thinking_responses_round_trip_non_streaming_rejects_ca
     let reasoning_item = output[0].clone();
     let message_item = output[1].clone();
 
-    let (capture_base, _capture_mock, captured) = spawn_capture_anthropic_mock().await;
-    let capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
+    let (capture_base, _capture_mock, mut captured) = spawn_capture_anthropic_mock().await;
+    let mut capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
+    capture_config.compatibility_mode = CompatibilityMode::MaxCompat;
     let (capture_proxy_base, _capture_proxy) = start_proxy(capture_config).await;
 
     let second_response = client
@@ -273,22 +275,37 @@ async fn anthropic_signed_thinking_responses_round_trip_non_streaming_rejects_ca
         .send()
         .await
         .unwrap();
-    assert_eq!(second_response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let status = second_response.status();
     let body: Value = second_response.json().await.unwrap();
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("encrypted_content"), "body = {body:?}");
+    assert_eq!(status, reqwest::StatusCode::OK, "body = {body:?}");
+
+    captured.changed().await.unwrap();
+    let request = captured
+        .borrow()
+        .clone()
+        .expect("captured anthropic request");
+    let messages = request["messages"].as_array().expect("anthropic messages");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "internal reasoning");
+    assert!(assistant_content[0].get("signature").is_none());
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "Visible answer");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["text"], "Continue");
+    let serialized = serde_json::to_string(&request).unwrap();
     assert!(
-        message.contains("native OpenAI Responses"),
-        "body = {body:?}"
+        !serialized.contains("encrypted_content"),
+        "request = {request:?}"
     );
-    assert!(
-        captured.borrow().is_none(),
-        "signed thinking carrier fail-closed path must not reach Anthropic upstream"
-    );
+    assert!(!serialized.contains("signature"), "request = {request:?}");
+    assert!(!serialized.contains("sig_123"), "request = {request:?}");
 }
 
 #[tokio::test]
-async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_rejects_carrier_before_upstream(
+async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_drops_carrier_before_upstream(
 ) {
     let (source_base, _source_mock) = spawn_anthropic_omitted_thinking_mock().await;
     let source_config = proxy_config(&source_base, UpstreamFormat::Anthropic);
@@ -317,8 +334,9 @@ async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_rejects_c
     let reasoning_item = output[0].clone();
     let message_item = output[1].clone();
 
-    let (capture_base, _capture_mock, captured) = spawn_capture_anthropic_mock().await;
-    let capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
+    let (capture_base, _capture_mock, mut captured) = spawn_capture_anthropic_mock().await;
+    let mut capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
+    capture_config.compatibility_mode = CompatibilityMode::MaxCompat;
     let (capture_proxy_base, _capture_proxy) = start_proxy(capture_config).await;
 
     let second_response = client
@@ -344,18 +362,31 @@ async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_rejects_c
         .send()
         .await
         .unwrap();
-    assert_eq!(second_response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let status = second_response.status();
     let body: Value = second_response.json().await.unwrap();
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("encrypted_content"), "body = {body:?}");
+    assert_eq!(status, reqwest::StatusCode::OK, "body = {body:?}");
+
+    captured.changed().await.unwrap();
+    let request = captured
+        .borrow()
+        .clone()
+        .expect("captured anthropic request");
+    let messages = request["messages"].as_array().expect("anthropic messages");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content.len(), 1, "request = {request:?}");
+    assert_eq!(assistant_content[0]["type"], "text");
+    assert_eq!(assistant_content[0]["text"], "Visible answer");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["text"], "Continue");
+    let serialized = serde_json::to_string(&request).unwrap();
     assert!(
-        message.contains("native OpenAI Responses"),
-        "body = {body:?}"
+        !serialized.contains("encrypted_content"),
+        "request = {request:?}"
     );
-    assert!(
-        captured.borrow().is_none(),
-        "omitted thinking carrier fail-closed path must not reach Anthropic upstream"
-    );
+    assert!(!serialized.contains("signature"), "request = {request:?}");
+    assert!(!serialized.contains("sig_omitted"), "request = {request:?}");
 }
 
 #[tokio::test]

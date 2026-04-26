@@ -4304,7 +4304,7 @@ fn translate_request_responses_to_non_responses_rejects_item_reference_items() {
 }
 
 #[test]
-fn translate_request_responses_to_openai_rejects_reasoning_encrypted_content_items() {
+fn translate_request_responses_to_openai_drops_reasoning_encrypted_content_and_uses_summary() {
     let mut body = json!({
         "model": "gpt-4o",
         "input": [{
@@ -4313,74 +4313,205 @@ fn translate_request_responses_to_openai_rejects_reasoning_encrypted_content_ite
             "encrypted_content": "opaque_state"
         }]
     });
-    let original = body.clone();
 
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::OpenAiCompletion,
         "target-model",
         &mut body,
         false,
     )
-    .expect_err(
-        "Responses reasoning encrypted_content should fail closed on Chat-compatible upstreams",
-    );
+    .expect("default max_compat should drop opaque reasoning state and use summary");
 
-    assert!(err.contains("encrypted_content"), "err = {err}");
-    assert!(err.contains("native OpenAI Responses"), "err = {err}");
-    assert_eq!(body, original);
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages[0]["reasoning_content"], "thinking");
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains("encrypted_content"), "body = {body:?}");
+    assert!(!serialized.contains("opaque_state"), "body = {body:?}");
+    assert!(!serialized.contains("signature"), "body = {body:?}");
 }
 
 #[test]
-fn translate_request_responses_to_google_rejects_reasoning_encrypted_content_items() {
+fn translate_request_responses_to_google_drops_reasoning_encrypted_content_and_uses_summary() {
     let mut body = json!({
         "model": "gpt-4o",
-        "input": [{
-            "type": "reasoning",
-            "summary": [{ "type": "summary_text", "text": "thinking" }],
-            "encrypted_content": "enc_123"
-        }]
+        "input": [
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Hi" }] },
+            {
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "thinking" }],
+                "encrypted_content": "enc_123"
+            },
+            { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Visible answer" }] }
+        ]
     });
 
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Google,
-        "target-model",
+        "gemini-3-pro",
         &mut body,
         false,
     )
-    .expect_err("Responses reasoning encrypted_content should still fail closed for Gemini");
+    .expect("default max_compat should drop opaque reasoning state and use summary");
 
-    assert!(err.contains("encrypted_content"), "err = {err}");
+    let assistant_parts = body["contents"][1]["parts"]
+        .as_array()
+        .expect("assistant parts");
+    assert_eq!(assistant_parts[0]["thought"], true);
+    assert_eq!(assistant_parts[0]["text"], "thinking");
+    assert_eq!(assistant_parts[1]["text"], "Visible answer");
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains("encrypted_content"), "body = {body:?}");
+    assert!(!serialized.contains("enc_123"), "body = {body:?}");
+    assert!(!serialized.contains("signature"), "body = {body:?}");
 }
 
 #[test]
-fn translate_request_responses_to_claude_rejects_malformed_reasoning_carrier() {
+fn translate_request_responses_to_claude_drops_non_string_reasoning_encrypted_content_and_uses_summary(
+) {
     let mut body = json!({
         "model": "claude-3",
-        "input": [{
-            "type": "reasoning",
-            "summary": [{ "type": "summary_text", "text": "thinking" }],
-            "encrypted_content": { "opaque": "state" }
-        }, {
-            "type": "message",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "text": "Visible answer" }]
-        }]
+        "input": [
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Hi" }] },
+            {
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "thinking" }],
+                "encrypted_content": { "opaque": "state" }
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Visible answer" }]
+            }
+        ]
     });
-    let original = body.clone();
 
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect_err("malformed Responses reasoning carrier should fail closed for Anthropic");
+    .expect("default max_compat should ignore malformed opaque state and use summary");
 
-    assert!(err.contains("encrypted_content"), "err = {err}");
-    assert_eq!(body, original);
+    let assistant_content = body["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "thinking");
+    assert!(assistant_content[0].get("signature").is_none());
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "Visible answer");
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains("encrypted_content"), "body = {body:?}");
+    assert!(!serialized.contains("opaque"), "body = {body:?}");
+    assert!(!serialized.contains("signature"), "body = {body:?}");
+}
+
+#[test]
+fn translate_request_responses_to_claude_drops_valid_reasoning_carrier_and_uses_unsigned_summary() {
+    let valid_carrier = super::openai_responses::encode_anthropic_reasoning_carrier(&[json!({
+        "type": "thinking",
+        "thinking": "provider-owned thinking",
+        "signature": "sig_123"
+    })])
+    .expect("carrier should encode");
+    let mut body = json!({
+        "model": "claude-3",
+        "input": [
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Hi" }] },
+            {
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "portable summary" }],
+                "encrypted_content": valid_carrier
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Visible answer" }]
+            }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("default max_compat should not replay provider-owned carrier state");
+
+    let assistant_content = body["messages"][1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "portable summary");
+    assert!(assistant_content[0].get("signature").is_none());
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "Visible answer");
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains("encrypted_content"), "body = {body:?}");
+    assert!(
+        !serialized.contains("provider-owned thinking"),
+        "body = {body:?}"
+    );
+    assert!(!serialized.contains("sig_123"), "body = {body:?}");
+}
+
+#[test]
+fn translate_request_responses_to_claude_drops_empty_reasoning_carrier_and_preserves_visible_history(
+) {
+    let valid_carrier = super::openai_responses::encode_anthropic_reasoning_carrier(&[json!({
+        "type": "thinking",
+        "thinking": { "display": "omitted" },
+        "signature": "sig_omitted"
+    })])
+    .expect("carrier should encode");
+    let mut body = json!({
+        "model": "claude-3",
+        "input": [
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Think about it" }] },
+            {
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": valid_carrier
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Visible answer" }]
+            },
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Continue" }] }
+        ]
+    });
+
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut body,
+        false,
+    )
+    .expect("empty reasoning items should be dropped while visible history remains");
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 3, "body = {body:?}");
+    assert_eq!(messages[1]["role"], "assistant");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content.len(), 1, "body = {body:?}");
+    assert_eq!(assistant_content[0]["type"], "text");
+    assert_eq!(assistant_content[0]["text"], "Visible answer");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["text"], "Continue");
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains("encrypted_content"), "body = {body:?}");
+    assert!(!serialized.contains("sig_omitted"), "body = {body:?}");
+    assert!(!serialized.contains("signature"), "body = {body:?}");
 }
 
 #[test]
@@ -10201,22 +10332,49 @@ fn translate_request_responses_passthrough_preserves_native_state_and_reasoning_
 #[test]
 fn translate_request_responses_high_risk_state_and_reasoning_continuity_fail_closed_cross_provider()
 {
+    let cases = [(
+        "context_management",
+        json!({
+            "model": "gpt-4o",
+            "context_management": { "type": "auto" },
+            "input": "Hi"
+        }),
+    )];
+
+    for (expected, original) in cases {
+        for upstream_format in [
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Anthropic,
+            UpstreamFormat::Google,
+        ] {
+            let mut body = original.clone();
+            let err = translate_request(
+                UpstreamFormat::OpenAiResponses,
+                upstream_format,
+                "gpt-4o",
+                &mut body,
+                false,
+            )
+            .expect_err("high-risk Responses fields should fail closed cross-provider");
+
+            assert!(
+                err.contains(expected),
+                "expected = {expected}, upstream = {upstream_format:?}, err = {err}"
+            );
+            assert_eq!(body, original);
+        }
+    }
+}
+
+#[test]
+fn translate_request_responses_reasoning_continuity_fail_closed_in_balanced_mode() {
     let valid_carrier = super::openai_responses::encode_anthropic_reasoning_carrier(&[json!({
         "type": "thinking",
         "thinking": "internal reasoning",
         "signature": "sig_123"
     })])
     .expect("carrier should encode");
-
     let cases = [
-        (
-            "context_management",
-            json!({
-                "model": "gpt-4o",
-                "context_management": { "type": "auto" },
-                "input": "Hi"
-            }),
-        ),
         (
             "reasoning.encrypted_content",
             json!({
@@ -10262,14 +10420,15 @@ fn translate_request_responses_high_risk_state_and_reasoning_continuity_fail_clo
             UpstreamFormat::Google,
         ] {
             let mut body = original.clone();
-            let err = translate_request(
+            let err = translate_request_with_policy(
                 UpstreamFormat::OpenAiResponses,
                 upstream_format,
                 "gpt-4o",
                 &mut body,
+                request_translation_policy(crate::config::CompatibilityMode::Balanced, None),
                 false,
             )
-            .expect_err("high-risk Responses fields should fail closed cross-provider");
+            .expect_err("Balanced mode should still fail closed for Responses reasoning carriers");
 
             assert!(
                 err.contains(expected),
@@ -10281,7 +10440,46 @@ fn translate_request_responses_high_risk_state_and_reasoning_continuity_fail_clo
 }
 
 #[test]
-fn translate_request_responses_to_claude_rejects_anthropic_reasoning_carrier() {
+fn translate_request_responses_reasoning_encrypted_content_include_warns_and_drops_in_max_compat() {
+    let body = json!({
+        "model": "gpt-4o",
+        "include": ["reasoning.encrypted_content"],
+        "input": "Hi"
+    });
+
+    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        &body,
+        crate::config::CompatibilityMode::MaxCompat,
+    );
+    let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
+        panic!("expected max_compat warning path, got {assessment:?}");
+    };
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("reasoning.encrypted_content")),
+        "warnings = {warnings:?}"
+    );
+
+    let mut translated = body.clone();
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        "claude-3",
+        &mut translated,
+        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        false,
+    )
+    .expect("max_compat should warn and drop Responses reasoning encrypted_content include");
+
+    assert!(translated.get("include").is_none(), "body = {translated:?}");
+}
+
+#[test]
+fn translate_request_responses_to_claude_degrades_anthropic_reasoning_carrier_to_unsigned_summary()
+{
     let signed_response = json!({
         "id": "msg_sig",
         "content": [
@@ -10332,23 +10530,37 @@ fn translate_request_responses_to_claude_rejects_anthropic_reasoning_carrier() {
             }
         ]
     });
-    let original = body.clone();
-
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect_err("Responses reasoning carrier should fail closed cross-provider");
+    .expect("Responses reasoning carrier should degrade through summary by default");
 
-    assert!(err.contains("encrypted_content"), "err = {err}");
-    assert_eq!(body, original);
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 3, "body = {body:?}");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[1]["role"], "assistant");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content[0]["type"], "thinking");
+    assert_eq!(assistant_content[0]["thinking"], "internal reasoning");
+    assert!(assistant_content[0].get("signature").is_none());
+    assert_eq!(assistant_content[1]["type"], "text");
+    assert_eq!(assistant_content[1]["text"], "Visible answer");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["text"], "Continue");
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains("encrypted_content"), "body = {body:?}");
+    assert!(!serialized.contains("sig_123"), "body = {body:?}");
+    assert!(!serialized.contains("signature"), "body = {body:?}");
 }
 
 #[test]
-fn translate_request_responses_to_claude_rejects_anthropic_omitted_reasoning_carrier() {
+fn translate_request_responses_to_claude_drops_anthropic_omitted_reasoning_carrier() {
     let omitted_response = json!({
         "id": "msg_omitted",
         "content": [
@@ -10399,19 +10611,30 @@ fn translate_request_responses_to_claude_rejects_anthropic_omitted_reasoning_car
             }
         ]
     });
-    let original = body.clone();
-
-    let err = translate_request(
+    translate_request(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
         false,
     )
-    .expect_err("Responses omitted carrier should fail closed cross-provider");
+    .expect("Responses omitted thinking carrier should drop by default");
 
-    assert!(err.contains("encrypted_content"), "err = {err}");
-    assert_eq!(body, original);
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 3, "body = {body:?}");
+    assert_eq!(messages[1]["role"], "assistant");
+    let assistant_content = messages[1]["content"]
+        .as_array()
+        .expect("assistant content");
+    assert_eq!(assistant_content.len(), 1, "body = {body:?}");
+    assert_eq!(assistant_content[0]["type"], "text");
+    assert_eq!(assistant_content[0]["text"], "Visible answer");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["text"], "Continue");
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(!serialized.contains("encrypted_content"), "body = {body:?}");
+    assert!(!serialized.contains("sig_omitted"), "body = {body:?}");
+    assert!(!serialized.contains("signature"), "body = {body:?}");
 }
 
 #[test]

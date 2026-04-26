@@ -217,7 +217,7 @@ The captured `include` surface is especially important because it gates extra fi
 - `computer_call_output.output.image_url`
 - `code_interpreter_call.outputs`
 
-Proxy posture: `reasoning.encrypted_content` is opaque reasoning-continuity state. `include: ["reasoning.encrypted_content"]` and request input reasoning items with `encrypted_content` are preserved only on native OpenAI Responses passthrough; cross-provider request translation rejects them. This includes proxy-local carrier strings that encode Anthropic signed or omitted thinking provenance: they are never replayed into another provider's request history, and the proxy returns 400 before contacting the selected upstream.
+Proxy posture: `reasoning.encrypted_content` is opaque reasoning-continuity state. Native OpenAI Responses passthrough preserves `include: ["reasoning.encrypted_content"]` and request input reasoning items with `encrypted_content` exactly. Cross-provider request translation in the default/max_compat lane degrades by dropping the opaque field without parsing, decoding, or replaying it; if the reasoning item has `summary`, only that summary is reused as unsigned reasoning/thinking, and empty-summary reasoning items are dropped while visible message/tool history is preserved. Cross-provider `include: ["reasoning.encrypted_content"]` is warned and dropped in max_compat. Strict and balanced modes still fail closed for these request-side reasoning-continuity fields. Proxy-local carrier strings that encode Anthropic signed or omitted thinking provenance are never replayed into another provider's request history.
 
 ## Response baseline
 

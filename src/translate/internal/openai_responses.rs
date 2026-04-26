@@ -131,6 +131,19 @@ pub(super) fn responses_reasoning_replay_blocks_for_anthropic(item: &Value) -> O
     None
 }
 
+pub(super) fn responses_reasoning_unsigned_summary_blocks_for_anthropic_request(
+    item: &Value,
+) -> Option<Vec<Value>> {
+    let summary = responses_reasoning_summary_text(item);
+    if summary.is_empty() {
+        return None;
+    }
+    Some(vec![serde_json::json!({
+        "type": "thinking",
+        "thinking": summary
+    })])
+}
+
 pub(super) fn append_openai_message_anthropic_reasoning_replay_blocks(
     message: &mut Value,
     blocks: Vec<Value>,
@@ -880,7 +893,9 @@ pub(super) fn responses_to_messages(
             }
             "reasoning" => {
                 if target_format == UpstreamFormat::Anthropic {
-                    if let Some(blocks) = responses_reasoning_replay_blocks_for_anthropic(&item) {
+                    if let Some(blocks) =
+                        responses_reasoning_unsigned_summary_blocks_for_anthropic_request(&item)
+                    {
                         if current_assistant.is_none() {
                             current_assistant = Some(serde_json::json!({
                                 "role": "assistant",

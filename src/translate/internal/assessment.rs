@@ -445,6 +445,7 @@ pub(super) fn gemini_warning_only_request_controls_for_translate(
 pub(super) fn responses_warning_only_request_controls_for_translate(
     body: &Value,
     target_format: UpstreamFormat,
+    compatibility_mode: CompatibilityMode,
 ) -> Vec<String> {
     let profile = shared_control_profile_for_target(target_format);
     let mut controls = Vec::new();
@@ -462,6 +463,16 @@ pub(super) fn responses_warning_only_request_controls_for_translate(
     }
     if responses_include_has_nonportable_items(body, target_format) {
         controls.push("include".to_string());
+    }
+    if compatibility_mode == CompatibilityMode::MaxCompat
+        && responses_include_items(body).contains(&"reasoning.encrypted_content")
+    {
+        controls.push("reasoning.encrypted_content".to_string());
+    }
+    if compatibility_mode == CompatibilityMode::MaxCompat
+        && responses_input_reasoning_encrypted_content_present(body)
+    {
+        controls.push("input[].reasoning.encrypted_content".to_string());
     }
 
     if body.get("reasoning").is_some()
@@ -803,12 +814,6 @@ pub(super) fn responses_nonportable_input_item_message(
     let items = body.get("input").and_then(Value::as_array)?;
     items.iter().find_map(|item| {
         let item_type = responses_input_item_type(item)?;
-        if item_type == "reasoning" && item.get("encrypted_content").is_some() {
-            return Some(responses_reasoning_continuity_not_portable_message(
-                "input[].reasoning.encrypted_content",
-                target_label,
-            ));
-        }
         if matches!(item_type, "function_call" | "custom_tool_call")
             && item.get("namespace").is_some()
         {
@@ -833,10 +838,26 @@ pub(super) fn responses_nonportable_input_item_message(
     })
 }
 
+fn responses_input_reasoning_encrypted_content_present(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().any(|item| {
+                responses_input_item_type(item) == Some("reasoning")
+                    && item.get("encrypted_content").is_some()
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub(super) fn responses_reasoning_continuity_request_message(
     body: &Value,
     target_format: UpstreamFormat,
+    compatibility_mode: CompatibilityMode,
 ) -> Option<String> {
+    if compatibility_mode == CompatibilityMode::MaxCompat {
+        return None;
+    }
     let target_label = translation_target_label(target_format);
     if responses_include_items(body).contains(&"reasoning.encrypted_content") {
         return Some(responses_reasoning_continuity_not_portable_message(
@@ -844,8 +865,13 @@ pub(super) fn responses_reasoning_continuity_request_message(
             target_label,
         ));
     }
-    responses_nonportable_input_item_message(body, target_format)
-        .filter(|message| message.contains("encrypted_content"))
+    if responses_input_reasoning_encrypted_content_present(body) {
+        return Some(responses_reasoning_continuity_not_portable_message(
+            "input[].reasoning.encrypted_content",
+            target_label,
+        ));
+    }
+    None
 }
 
 pub(super) fn cross_protocol_requested_choice_count(
@@ -1568,12 +1594,18 @@ pub(crate) fn assess_request_translation(
                 "Responses request controls {quoted} require a native OpenAI Responses upstream and cannot be translated to {upstream_format}; the proxy does not reconstruct provider state"
             ));
         }
-        if let Some(message) = responses_reasoning_continuity_request_message(body, upstream_format)
-        {
+        if let Some(message) = responses_reasoning_continuity_request_message(
+            body,
+            upstream_format,
+            compatibility_mode,
+        ) {
             assessment.reject(message);
         }
-        let dropped_controls =
-            responses_warning_only_request_controls_for_translate(body, upstream_format);
+        let dropped_controls = responses_warning_only_request_controls_for_translate(
+            body,
+            upstream_format,
+            compatibility_mode,
+        );
         if !dropped_controls.is_empty() {
             let quoted = dropped_controls
                 .iter()
