@@ -1,5 +1,10 @@
+import os
 import pathlib
 import re
+import shutil
+import stat
+import subprocess
+import tempfile
 import unittest
 
 
@@ -156,6 +161,90 @@ def workflow_step_block(text: str, step_name: str) -> str:
 
 
 class GovernanceTests(unittest.TestCase):
+    def test_governance_fails_when_current_version_tag_is_occupied_by_another_head(self):
+        version_match = re.search(
+            r'^version = "([^"]+)"',
+            (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(version_match, "Cargo.toml must declare package version")
+        version = version_match.group(1)
+
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git, "git must be available for governance tests")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_bin = pathlib.Path(temp_dir)
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                """#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+tag_ref = os.environ["FAKE_GIT_OCCUPIED_TAG_REF"]
+head_sha = os.environ["FAKE_GIT_HEAD_SHA"]
+tag_sha = os.environ["FAKE_GIT_TAG_SHA"]
+
+
+def is_occupied_tag(value):
+    return value == tag_ref or value == f"{tag_ref}^{{commit}}"
+
+
+if args[:1] == ["rev-parse"]:
+    if args[-1] in ("HEAD", "HEAD^{commit}"):
+        print(head_sha)
+        sys.exit(0)
+    if any(is_occupied_tag(arg) for arg in args):
+        print(tag_sha)
+        sys.exit(0)
+
+if args[:1] == ["show-ref"] and any(is_occupied_tag(arg) for arg in args):
+    sys.exit(0)
+
+if args[:1] == ["rev-list"] and any(is_occupied_tag(arg) for arg in args):
+    print(tag_sha)
+    sys.exit(0)
+
+real_git = os.environ["REAL_GIT"]
+os.execv(real_git, [real_git, *args])
+""",
+                encoding="utf-8",
+            )
+            fake_git.chmod(fake_git.stat().st_mode | stat.S_IXUSR)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "FAKE_GIT_OCCUPIED_TAG_REF": f"refs/tags/v{version}",
+                    "FAKE_GIT_HEAD_SHA": "1" * 40,
+                    "FAKE_GIT_TAG_SHA": "2" * 40,
+                    "GITHUB_REF": f"refs/tags/v{version}",
+                    "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', '')}",
+                    "REAL_GIT": real_git,
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(GOVERNANCE_SCRIPT)],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+        output = result.stdout + result.stderr
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            "governance must fail when the current version tag already points "
+            "at a different commit",
+        )
+        self.assertIn(f"refs/tags/v{version}", output)
+        self.assertIn("current HEAD", output)
+
     def test_default_test_entries_run_python_contract_tests_without_bytecode(self):
         entrypoints = {
             ".github/workflows/ci.yml": REPO_ROOT / ".github" / "workflows" / "ci.yml",

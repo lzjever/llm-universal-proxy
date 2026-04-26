@@ -319,6 +319,9 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "if-no-files-found: error",
             "REQUIRED_RELEASE_GATE_NEEDS",
             "check_release_publish_jobs_need_ga_gates",
+            "check_release_tag_identity",
+            "refs/tags/v${VERSION}",
+            "git rev-parse --verify --quiet",
             "cargo audit",
             "anchore/sbom-action",
         ):

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.2.19 - 2026-04-25
+
+- Changed the repo-side release workflow to require the provider-neutral compatible GA smoke gate before publishing, using the protected `release-compatible-provider` environment while leaving the four official provider live smoke as optional extended evidence rather than a protected release blocker.
+- Locked the `compatible-provider-smoke` invocation, JSON artifact upload, and release publish dependencies under `scripts/check-governance.sh` and Python release-gate contract tests.
+- Added release identity governance that fails when `refs/tags/v$VERSION` already exists at a commit other than current `HEAD`, preventing continued development on an occupied tag/version pair.
+
 ## v0.2.18 - 2026-04-25
 
 - Hardened the release workflow so Docker Buildx diagnostic records do not get uploaded as release artifacts.

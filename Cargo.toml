@@ -1,6 +1,6 @@
 [package]
 name = "llm-universal-proxy"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2021"
 description = "Universal LLM endpoint proxy: single URL, 4 formats (Google, Anthropic, OpenAI completion, OpenAI responses), streaming, format conversion with passthrough when same."
 license = "MIT"

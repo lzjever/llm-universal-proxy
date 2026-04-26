@@ -62,6 +62,23 @@ check_absent() {
     fi
 }
 
+check_release_tag_identity() {
+    local release_tag="refs/tags/v${VERSION}"
+    local current_head
+    local tag_head
+
+    if ! current_head="$(git rev-parse HEAD 2>/dev/null)"; then
+        FAILURES+=("unable to resolve current HEAD for release tag identity check")
+        return
+    fi
+
+    if tag_head="$(git rev-parse --verify --quiet "${release_tag}^{commit}" 2>/dev/null)"; then
+        if [[ "$tag_head" != "$current_head" ]]; then
+            FAILURES+=("${release_tag} already points to ${tag_head}, not current HEAD ${current_head}; bump the package version instead of reusing or moving an existing tag")
+        fi
+    fi
+}
+
 scan_tracked_secret_risks() {
     python3 - <<'PY'
 import pathlib
@@ -389,6 +406,7 @@ check_compatible_provider_smoke_invocation
 
 check_eq "Cargo.lock package version" "$LOCK_VERSION" "$VERSION"
 check_eq "CHANGELOG latest version" "$CHANGELOG_VERSION" "$VERSION"
+check_release_tag_identity
 
 if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
     check_eq "Git tag" "${GITHUB_REF}" "refs/tags/v${VERSION}"
