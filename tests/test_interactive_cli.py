@@ -22,6 +22,10 @@ FORBIDDEN_DANGEROUS_ARGS = (
     "--sandbox=false",
     "--yolo",
 )
+CODEX_PROXY_CONFIG_PREFIXES = (
+    "model_provider=",
+    "model_providers.proxy.",
+)
 
 
 def load_module():
@@ -31,6 +35,16 @@ def load_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def codex_proxy_configs(command):
+    return [
+        value
+        for index, arg in enumerate(command[:-1])
+        if arg == "-c"
+        for value in (command[index + 1],)
+        if value.startswith(CODEX_PROXY_CONFIG_PREFIXES)
+    ]
 
 
 class InteractiveCliTests(unittest.TestCase):
@@ -54,6 +68,22 @@ class InteractiveCliTests(unittest.TestCase):
 
         self.assertFalse(safe_args.dangerous_harness)
         self.assertTrue(dangerous_args.dangerous_harness)
+
+    def test_parse_args_uses_provider_neutral_preset_default_models(self):
+        module = load_module()
+
+        self.assertEqual(
+            module.parse_args(["--client", "codex"]).model,
+            "preset-openai-compatible",
+        )
+        self.assertEqual(
+            module.parse_args(["--client", "claude"]).model,
+            "preset-anthropic-compatible",
+        )
+        self.assertEqual(
+            module.parse_args(["--client", "gemini"]).model,
+            "preset-openai-compatible",
+        )
 
     def test_wrapper_scripts_resolve_interactive_cli_relative_to_script_dir(self):
         for wrapper_path in WRAPPER_PATHS:
@@ -83,7 +113,7 @@ class InteractiveCliTests(unittest.TestCase):
             module.build_interactive_command(
                 "codex",
                 workspace,
-                "minimax-openai",
+                "preset-openai-compatible",
                 proxy_base,
                 client_home=pathlib.Path("/tmp/codex-home"),
                 model_limits=None,
@@ -93,7 +123,7 @@ class InteractiveCliTests(unittest.TestCase):
                 "-C",
                 str(workspace),
                 "-m",
-                "minimax-openai",
+                "preset-openai-compatible",
                 "--sandbox",
                 "workspace-write",
                 "-c",
@@ -104,13 +134,15 @@ class InteractiveCliTests(unittest.TestCase):
                 f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
                 "-c",
                 'model_providers.proxy.wire_api="responses"',
+                "-c",
+                "model_providers.proxy.supports_websockets=false",
             ],
         )
         self.assertEqual(
             module.build_interactive_command(
                 "claude",
                 workspace,
-                "claude-haiku-4-5",
+                "preset-anthropic-compatible",
                 proxy_base,
                 client_home=None,
                 model_limits=None,
@@ -121,7 +153,7 @@ class InteractiveCliTests(unittest.TestCase):
                 "--setting-sources",
                 "user",
                 "--model",
-                "claude-haiku-4-5",
+                "preset-anthropic-compatible",
                 "--add-dir",
                 str(workspace),
             ],
@@ -130,7 +162,7 @@ class InteractiveCliTests(unittest.TestCase):
             module.build_interactive_command(
                 "gemini",
                 workspace,
-                "minimax-openai",
+                "preset-openai-compatible",
                 proxy_base,
                 client_home=None,
                 model_limits=None,
@@ -138,7 +170,7 @@ class InteractiveCliTests(unittest.TestCase):
             [
                 "gemini",
                 "--model",
-                "minimax-openai",
+                "preset-openai-compatible",
                 "--include-directories",
                 str(workspace),
             ],
@@ -149,9 +181,9 @@ class InteractiveCliTests(unittest.TestCase):
         workspace = pathlib.Path("/tmp/workspace").resolve()
 
         for client_name, model in (
-            ("codex", "minimax-openai"),
-            ("claude", "claude-haiku-4-5"),
-            ("gemini", "minimax-openai"),
+            ("codex", "preset-openai-compatible"),
+            ("claude", "preset-anthropic-compatible"),
+            ("gemini", "preset-openai-compatible"),
         ):
             with self.subTest(client=client_name):
                 command = module.build_interactive_command(
@@ -172,7 +204,7 @@ class InteractiveCliTests(unittest.TestCase):
         codex = module.build_interactive_command(
             "codex",
             workspace,
-            "minimax-openai",
+            "preset-openai-compatible",
             "http://127.0.0.1:18888",
             client_home=pathlib.Path("/tmp/codex-home"),
             model_limits=None,
@@ -181,7 +213,7 @@ class InteractiveCliTests(unittest.TestCase):
         claude = module.build_interactive_command(
             "claude",
             workspace,
-            "claude-haiku-4-5",
+            "preset-anthropic-compatible",
             "http://127.0.0.1:18888",
             client_home=None,
             model_limits=None,
@@ -190,7 +222,7 @@ class InteractiveCliTests(unittest.TestCase):
         gemini = module.build_interactive_command(
             "gemini",
             workspace,
-            "minimax-openai",
+            "preset-openai-compatible",
             "http://127.0.0.1:18888",
             client_home=None,
             model_limits=None,
@@ -211,7 +243,7 @@ class InteractiveCliTests(unittest.TestCase):
             command = module.build_interactive_command(
                 "codex",
                 workspace,
-                "minimax-openai",
+                "preset-openai-compatible",
                 "http://127.0.0.1:18888",
                 client_home=client_home,
                 model_limits=module.ModelLimits(
@@ -229,6 +261,7 @@ class InteractiveCliTests(unittest.TestCase):
             )
 
         joined = " ".join(command)
+        self.assertIn("model_providers.proxy.supports_websockets=false", command)
         self.assertIn("model_catalog_json", joined)
         self.assertIn(str(client_home / ".codex" / "catalog.json"), joined)
         self.assertIn('web_search="disabled"', joined)
@@ -236,6 +269,52 @@ class InteractiveCliTests(unittest.TestCase):
         self.assertEqual(
             catalog["models"][0]["apply_patch_tool_type"],
             "freeform",
+        )
+
+    def test_codex_proxy_configs_match_real_matrix_command(self):
+        module = load_module()
+        real_matrix = sys.modules["real_cli_matrix"]
+        workspace = pathlib.Path("/tmp/workspace").resolve()
+        proxy_base = "http://127.0.0.1:18888"
+
+        interactive_command = module.build_interactive_command(
+            "codex",
+            workspace,
+            "preset-chat",
+            proxy_base,
+            client_home=pathlib.Path("/tmp/codex-home"),
+            model_limits=None,
+        )
+        matrix_command = real_matrix.build_client_command(
+            "codex",
+            proxy_base,
+            real_matrix.Lane(
+                name="preset-chat",
+                required=True,
+                enabled=True,
+                proxy_model="preset-chat",
+                upstream_name="PRESET-COMPAT",
+                skip_reason=None,
+            ),
+            real_matrix.TaskFixture(
+                fixture_id="smoke",
+                kind="smoke",
+                prompt="Reply with OK",
+                verifier={},
+                timeout_secs=30,
+                workspace_template=None,
+            ),
+            workspace,
+            client_home=pathlib.Path("/tmp/matrix-codex-home"),
+        )
+
+        self.assertEqual(
+            codex_proxy_configs(interactive_command),
+            codex_proxy_configs(matrix_command),
+        )
+        self.assertIn(
+            "model_providers.proxy.supports_websockets=false",
+            codex_proxy_configs(interactive_command),
         )
 
     def test_build_interactive_command_skips_view_image_disable_for_image_capable_models(self):
@@ -279,7 +358,7 @@ class InteractiveCliTests(unittest.TestCase):
                     module.build_interactive_command(
                         "codex",
                         workspace,
-                        "minimax-openai",
+                        "preset-openai-compatible",
                         "http://127.0.0.1:18888",
                         client_home=client_home,
                         model_limits=None,
@@ -335,7 +414,7 @@ class InteractiveCliTests(unittest.TestCase):
         wait_for_health.assert_called_once_with("http://127.0.0.1:18888", timeout_secs=55)
         fetch_live_model_profile.assert_called_once_with(
             "http://127.0.0.1:18888",
-            "minimax-openai",
+            "preset-openai-compatible",
         )
         stop_proxy.assert_called_once_with(None, terminate_grace_secs=15)
         launch_args = launch_client.call_args.args
@@ -344,7 +423,7 @@ class InteractiveCliTests(unittest.TestCase):
             module.build_interactive_command(
                 "codex",
                 pathlib.Path(temp_dir).resolve(),
-                "minimax-openai",
+                "preset-openai-compatible",
                 "http://127.0.0.1:18888",
                 client_home=pathlib.Path(launch_args[2]["HOME"]),
                 model_limits=live_profile.limits,
@@ -399,7 +478,7 @@ class InteractiveCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         fetch_live_model_profile.assert_called_once_with(
             "http://127.0.0.1:18888",
-            "minimax-openai",
+            "preset-openai-compatible",
         )
         launch_args = launch_client.call_args.args
         self.assertEqual(
@@ -407,7 +486,7 @@ class InteractiveCliTests(unittest.TestCase):
             module.build_interactive_command(
                 "codex",
                 pathlib.Path(temp_dir).resolve(),
-                "minimax-openai",
+                "preset-openai-compatible",
                 "http://127.0.0.1:18888",
                 client_home=pathlib.Path(launch_args[2]["HOME"]),
                 model_limits=live_profile.limits,
@@ -464,10 +543,16 @@ class InteractiveCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         start_proxy.assert_called_once()
-        wait_for_health.assert_called_once_with("http://127.0.0.1:18888", timeout_secs=65)
+        wait_for_health.assert_called_once_with(
+            "http://127.0.0.1:18888",
+            timeout_secs=65,
+            process=fake_process,
+            stdout_path=pathlib.Path(temp_dir) / "proxy.stdout.log",
+            stderr_path=pathlib.Path(temp_dir) / "proxy.stderr.log",
+        )
         fetch_live_model_profile.assert_called_once_with(
             "http://127.0.0.1:18888",
-            "claude-haiku-4-5",
+            "preset-anthropic-compatible",
         )
         stop_proxy.assert_called_once_with(fake_process, terminate_grace_secs=15)
 
@@ -540,7 +625,12 @@ model_aliases:
                     root / "proxy.stderr.log",
                 ),
             ) as start_proxy:
-                proxy_base, process = module.start_managed_proxy(
+                (
+                    proxy_base,
+                    process,
+                    stdout_path,
+                    stderr_path,
+                ) = module.start_managed_proxy(
                     args,
                     {"PATH": os.environ.get("PATH", "")},
                     root / "runtime-root",
@@ -548,6 +638,8 @@ model_aliases:
 
         self.assertEqual(proxy_base, "http://127.0.0.1:18888")
         self.assertIs(process, fake_process)
+        self.assertEqual(stdout_path, root / "proxy.stdout.log")
+        self.assertEqual(stderr_path, root / "proxy.stderr.log")
         runtime_config_text = start_proxy.call_args.args[1]
         self.assertIn("surface_defaults:", runtime_config_text)
         self.assertIn('input: ["text"]', runtime_config_text)
@@ -563,6 +655,239 @@ model_aliases:
         self.assertIn("supports_view_image: true", runtime_config_text)
         self.assertIn("apply_patch_transport: freeform", runtime_config_text)
         self.assertIn("supports_parallel_calls: false", runtime_config_text)
+
+    def test_start_managed_proxy_preserves_provider_neutral_credential_env(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            config_source = root / "proxy.yaml"
+            config_source.write_text(
+                """
+listen: 127.0.0.1:18888
+upstreams:
+  PRESET-COMPAT:
+    api_root: "https://preset.example/v1"
+    format: openai-completion
+    credential_env: PRESET_ENDPOINT_API_KEY
+    auth_policy: force_server
+model_aliases:
+  preset-chat: "PRESET-COMPAT:preset-model"
+""".lstrip(),
+                encoding="utf-8",
+            )
+            env_file = root / ".env.test"
+            env_file.write_text(
+                'export PRESET_ENDPOINT_API_KEY="proxy-only-secret"\n',
+                encoding="utf-8",
+            )
+            args = module.parse_args(
+                [
+                    "--client",
+                    "codex",
+                    "--model",
+                    "preset-chat",
+                    "--config-source",
+                    str(config_source),
+                    "--env-file",
+                    str(env_file),
+                    "--binary",
+                    str(root / "llm-universal-proxy"),
+                ]
+            )
+
+            fake_process = object()
+            base_env = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": "/home/real-user",
+                "PRESET_ENDPOINT_API_KEY": "host-secret",
+            }
+            with mock.patch.object(
+                module, "ensure_proxy_binary"
+            ), mock.patch.object(
+                module,
+                "start_proxy",
+                return_value=(
+                    fake_process,
+                    root / "runtime-config.yaml",
+                    root / "proxy.stdout.log",
+                    root / "proxy.stderr.log",
+                ),
+            ) as start_proxy:
+                proxy_base, process, _stdout_path, _stderr_path = module.start_managed_proxy(
+                    args,
+                    base_env,
+                    root / "runtime-root",
+                )
+
+            client_env = module.build_client_env(
+                "codex",
+                base_env,
+                proxy_base,
+                root / "codex-home",
+            )
+
+        runtime_config_text = start_proxy.call_args.args[1]
+        proxy_env = start_proxy.call_args.args[3]
+        self.assertIs(process, fake_process)
+        self.assertIn("credential_env: PRESET_ENDPOINT_API_KEY", runtime_config_text)
+        self.assertNotIn("credential_actual", runtime_config_text)
+        self.assertNotIn("proxy-only-secret", runtime_config_text)
+        self.assertNotIn("MINIMAX", runtime_config_text.upper())
+        self.assertEqual(proxy_env["PRESET_ENDPOINT_API_KEY"], "proxy-only-secret")
+        self.assertNotIn("PRESET_ENDPOINT_API_KEY", client_env)
+
+    def test_start_managed_proxy_hydrates_default_preset_from_base_env_without_env_file(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            args = module.parse_args(
+                [
+                    "--client",
+                    "codex",
+                    "--config-source",
+                    str(module.DEFAULT_CONFIG_SOURCE),
+                    "--env-file",
+                    str(root / "missing.env"),
+                    "--binary",
+                    str(root / "llm-universal-proxy"),
+                ]
+            )
+
+            fake_process = object()
+            base_env = {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": "/home/real-user",
+                "PRESET_ENDPOINT_API_KEY": "shell-only-secret",
+                "PRESET_OPENAI_ENDPOINT_BASE_URL": "https://openai-compatible.example/v1",
+                "PRESET_ANTHROPIC_ENDPOINT_BASE_URL": "https://anthropic-compatible.example/v1",
+                "PRESET_ENDPOINT_MODEL": "provider-configured-model",
+            }
+            with mock.patch.object(
+                module, "ensure_proxy_binary"
+            ), mock.patch.object(
+                module,
+                "start_proxy",
+                return_value=(
+                    fake_process,
+                    root / "runtime-config.yaml",
+                    root / "proxy.stdout.log",
+                    root / "proxy.stderr.log",
+                ),
+            ) as start_proxy:
+                proxy_base, process, _stdout_path, _stderr_path = module.start_managed_proxy(
+                    args,
+                    base_env,
+                    root / "runtime-root",
+                )
+
+        runtime_config_text = start_proxy.call_args.args[1]
+        proxy_env = start_proxy.call_args.args[3]
+        self.assertEqual(proxy_base, "http://127.0.0.1:18888")
+        self.assertIs(process, fake_process)
+        self.assertIn("api_root: https://openai-compatible.example/v1", runtime_config_text)
+        self.assertIn(
+            "api_root: https://anthropic-compatible.example/v1",
+            runtime_config_text,
+        )
+        self.assertIn(
+            'preset-openai-compatible: "PRESET-OPENAI-COMPATIBLE:provider-configured-model"',
+            runtime_config_text,
+        )
+        self.assertIn(
+            'preset-anthropic-compatible: "PRESET-ANTHROPIC-COMPATIBLE:provider-configured-model"',
+            runtime_config_text,
+        )
+        self.assertNotIn("api_root: PRESET_", runtime_config_text)
+        self.assertNotIn("PRESET_ENDPOINT_MODEL", runtime_config_text)
+        self.assertNotIn("shell-only-secret", runtime_config_text)
+        self.assertEqual(proxy_env["PRESET_ENDPOINT_API_KEY"], "shell-only-secret")
+
+    def test_run_missing_provider_credential_fails_with_proxy_stderr_tail(self):
+        module = load_module()
+
+        class ExitedProcess:
+            def poll(self):
+                return 2
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            config_source = root / "proxy.yaml"
+            config_source.write_text(
+                """
+listen: 127.0.0.1:18888
+upstreams:
+  PRESET-COMPAT:
+    api_root: "https://preset.example/v1"
+    format: openai-completion
+    auth_policy: force_server
+model_aliases:
+  preset-chat: "PRESET-COMPAT:preset-model"
+""".lstrip(),
+                encoding="utf-8",
+            )
+            env_file = root / ".env.test"
+            env_file.write_text("", encoding="utf-8")
+            captured_runtime_config = {}
+
+            def fake_start_proxy(_proxy_binary, runtime_config_text, _report_dir, _proxy_env):
+                stdout_path = root / "proxy.stdout.log"
+                stderr_path = root / "proxy.stderr.log"
+                stdout_path.write_text("", encoding="utf-8")
+                stderr_path.write_text(
+                    "configuration error: upstream PRESET-COMPAT missing credential\n",
+                    encoding="utf-8",
+                )
+                captured_runtime_config["text"] = runtime_config_text
+                return (
+                    ExitedProcess(),
+                    root / "runtime-config.yaml",
+                    stdout_path,
+                    stderr_path,
+                )
+
+            with mock.patch.object(
+                module, "ensure_client_binary"
+            ), mock.patch.object(
+                module, "ensure_proxy_binary"
+            ), mock.patch.object(
+                module, "start_proxy", side_effect=fake_start_proxy
+            ) as start_proxy, mock.patch.object(
+                module, "fetch_live_model_profile"
+            ) as fetch_live_model_profile, mock.patch.object(
+                module, "launch_interactive_client"
+            ) as launch_interactive_client:
+                with self.assertRaises(RuntimeError) as raised:
+                    module.run(
+                        [
+                            "--client",
+                            "codex",
+                            "--model",
+                            "preset-chat",
+                            "--workspace",
+                            temp_dir,
+                            "--config-source",
+                            str(config_source),
+                            "--env-file",
+                            str(env_file),
+                            "--binary",
+                            str(root / "llm-universal-proxy"),
+                        ]
+                    )
+
+        message = str(raised.exception)
+        self.assertIn("proxy process exited before becoming healthy", message)
+        self.assertIn("exit code 2", message)
+        self.assertIn(
+            "stderr tail: configuration error: upstream PRESET-COMPAT missing credential",
+            message,
+        )
+        start_proxy.assert_called_once()
+        fetch_live_model_profile.assert_not_called()
+        launch_interactive_client.assert_not_called()
+        self.assertNotIn("credential_env:", captured_runtime_config["text"])
+        self.assertNotIn("MINIMAX", captured_runtime_config["text"].upper())
 
     def test_start_managed_proxy_round_trips_namespace_and_upstream_proxy_objects(self):
         module = load_module()

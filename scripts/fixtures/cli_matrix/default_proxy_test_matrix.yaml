@@ -1,16 +1,16 @@
 # ============================================================
 # LLM Universal Proxy — Default tracked test configuration
-# Upstreams: MiniMax (Anthropic + OpenAI) + optional local qwen3.5-9b-awq
+# Upstreams: provider-neutral preset endpoints + optional local qwen3.5-9b-awq
 # ============================================================
 
 listen: 127.0.0.1:18888
 upstream_timeout_secs: 120
 
 upstreams:
-  MINIMAX-ANTHROPIC:
-    api_root: "https://api.minimaxi.com/anthropic/v1"
+  PRESET-ANTHROPIC-COMPATIBLE:
+    api_root: PRESET_ANTHROPIC_ENDPOINT_BASE_URL
     format: anthropic
-    credential_env: MINIMAX_API_KEY
+    credential_env: PRESET_ENDPOINT_API_KEY
     auth_policy: force_server
     limits:
       context_window: 200000
@@ -25,10 +25,10 @@ upstreams:
         apply_patch_transport: freeform
         supports_parallel_calls: false
 
-  MINIMAX-OPENAI:
-    api_root: "https://api.minimaxi.com/v1"
+  PRESET-OPENAI-COMPATIBLE:
+    api_root: PRESET_OPENAI_ENDPOINT_BASE_URL
     format: openai-completion
-    credential_env: MINIMAX_API_KEY
+    credential_env: PRESET_ENDPOINT_API_KEY
     auth_policy: force_server
     limits:
       context_window: 200000
@@ -44,12 +44,8 @@ upstreams:
         supports_parallel_calls: false
 
 model_aliases:
-  minimax-anth: "MINIMAX-ANTHROPIC:MiniMax-M2.7-highspeed"
-  minimax-openai: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
-
-  claude-sonnet-4-6: "MINIMAX-ANTHROPIC:MiniMax-M2.7-highspeed"
-  claude-haiku-4-5: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
-  claude-opus-4-6: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
+  preset-anthropic-compatible: "PRESET-ANTHROPIC-COMPATIBLE:PRESET_ENDPOINT_MODEL"
+  preset-openai-compatible: "PRESET-OPENAI-COMPATIBLE:PRESET_ENDPOINT_MODEL"
 
 debug_trace:
   path: /tmp/llm-proxy-test-debug.jsonl

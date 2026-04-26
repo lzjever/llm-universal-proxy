@@ -769,6 +769,7 @@ async fn handle_request_core_with_downstream_cancellation(
         &upstream_request_body,
         stream,
         &auth_headers,
+        stream.then_some(namespace_state.config.upstream_timeout),
         &downstream_cancellation,
     )
     .await
@@ -845,6 +846,14 @@ async fn handle_request_core_with_downstream_cancellation(
                 );
             }
             return response;
+        }
+        if !response_is_event_stream(&upstream_response_headers) {
+            tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+            return streaming_error_response(
+                client_format,
+                StatusCode::BAD_GATEWAY,
+                "upstream returned non-SSE response for streaming request",
+            );
         }
         let upstream_stream = res.bytes_stream();
         let mut body_stream: Pin<
@@ -1031,6 +1040,15 @@ async fn handle_request_core_with_downstream_cancellation(
     }
     append_compatibility_warning_headers(&mut response, &compatibility_warnings);
     response
+}
+
+fn response_is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

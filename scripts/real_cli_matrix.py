@@ -96,6 +96,14 @@ INTERNAL_TOOL_ARTIFACT_PATTERN = re.compile(r"__llmup_custom__[A-Za-z0-9_:-]*")
 PUBLIC_APPLY_PATCH_TOOL_NAME = "apply_patch"
 PUBLIC_APPLY_PATCH_TOOL_TYPE = "freeform"
 DEFAULT_CODEX_APPLY_PATCH_TOOL_TYPE = PUBLIC_APPLY_PATCH_TOOL_TYPE
+PRESET_ENDPOINT_MODEL_ENV = "PRESET_ENDPOINT_MODEL"
+PRESET_ENDPOINT_API_KEY_ENV = "PRESET_ENDPOINT_API_KEY"
+PRESET_OPENAI_ENDPOINT_BASE_URL_ENV = "PRESET_OPENAI_ENDPOINT_BASE_URL"
+PRESET_ANTHROPIC_ENDPOINT_BASE_URL_ENV = "PRESET_ANTHROPIC_ENDPOINT_BASE_URL"
+PRESET_OPENAI_COMPATIBLE_LANE = "preset-openai-compatible"
+PRESET_ANTHROPIC_COMPATIBLE_LANE = "preset-anthropic-compatible"
+PRESET_OPENAI_COMPATIBLE_UPSTREAM = "PRESET-OPENAI-COMPATIBLE"
+PRESET_ANTHROPIC_COMPATIBLE_UPSTREAM = "PRESET-ANTHROPIC-COMPATIBLE"
 SUPPORTED_PROMPT_TEMPLATE_FIELDS = frozenset({"client_name"})
 REPLAY_MARKER_KEY_ENV = "LLMUP_INTERNAL_REPLAY_MARKER_KEY"
 REPLAY_MARKER_KEY_FILENAME = ".llmup-internal-replay-marker-key"
@@ -936,12 +944,117 @@ def has_local_qwen(dotenv_env: dict[str, str]) -> bool:
     )
 
 
+def _primary_lane_specs() -> tuple[tuple[str, bool, str], ...]:
+    return (
+        (
+            PRESET_ANTHROPIC_COMPATIBLE_LANE,
+            True,
+            PRESET_ANTHROPIC_COMPATIBLE_UPSTREAM,
+        ),
+        (
+            PRESET_OPENAI_COMPATIBLE_LANE,
+            True,
+            PRESET_OPENAI_COMPATIBLE_UPSTREAM,
+        ),
+    )
+
+
+def _preset_upstream_base_url_envs() -> tuple[tuple[str, str], ...]:
+    return (
+        (
+            PRESET_OPENAI_COMPATIBLE_UPSTREAM,
+            PRESET_OPENAI_ENDPOINT_BASE_URL_ENV,
+        ),
+        (
+            PRESET_ANTHROPIC_COMPATIBLE_UPSTREAM,
+            PRESET_ANTHROPIC_ENDPOINT_BASE_URL_ENV,
+        ),
+    )
+
+
+def _preset_upstream_names() -> set[str]:
+    return {upstream_name for upstream_name, _env_key in _preset_upstream_base_url_envs()}
+
+
+def _append_unique(values: list[str], value: str) -> None:
+    if value not in values:
+        values.append(value)
+
+
+def required_preset_endpoint_env_keys(config: ProxySourceConfig) -> tuple[str, ...]:
+    required: list[str] = []
+    for upstream_name, base_url_env in _preset_upstream_base_url_envs():
+        upstream = config.upstreams.get(upstream_name)
+        if upstream is None:
+            continue
+        if upstream.get("api_root") == base_url_env:
+            _append_unique(required, base_url_env)
+        if upstream.get("credential_env") == PRESET_ENDPOINT_API_KEY_ENV:
+            _append_unique(required, PRESET_ENDPOINT_API_KEY_ENV)
+
+    preset_upstreams = _preset_upstream_names()
+    for alias_config in config.model_alias_configs.values():
+        target = alias_config.target
+        if ":" not in target:
+            continue
+        upstream_name, upstream_model = target.split(":", 1)
+        if (
+            upstream_name in preset_upstreams
+            and upstream_model == PRESET_ENDPOINT_MODEL_ENV
+        ):
+            _append_unique(required, PRESET_ENDPOINT_MODEL_ENV)
+
+    return tuple(required)
+
+
+def validate_preset_endpoint_env(
+    config: ProxySourceConfig, dotenv_env: dict[str, str]
+) -> None:
+    missing = [
+        key
+        for key in required_preset_endpoint_env_keys(config)
+        if not dotenv_env.get(key, "").strip()
+    ]
+    if missing:
+        raise ValueError(
+            "missing required provider-neutral preset environment variables: "
+            + ", ".join(missing)
+        )
+
+
+def merge_preset_endpoint_env(
+    config: ProxySourceConfig,
+    dotenv_env: dict[str, str],
+    base_env: dict[str, str],
+) -> dict[str, str]:
+    merged = dict(dotenv_env)
+    for key in required_preset_endpoint_env_keys(config):
+        if base_env.get(key):
+            merged[key] = base_env[key]
+    return merged
+
+
+def _hydrate_preset_endpoint_model_target(
+    target: str, dotenv_env: dict[str, str]
+) -> str:
+    if ":" not in target:
+        return target
+    upstream_name, upstream_model = target.split(":", 1)
+    if (
+        upstream_name in _preset_upstream_names()
+        and upstream_model == PRESET_ENDPOINT_MODEL_ENV
+    ):
+        preset_model = dotenv_env.get(PRESET_ENDPOINT_MODEL_ENV, "")
+        if preset_model:
+            return f"{upstream_name}:{preset_model}"
+    return target
+
+
 def resolve_lanes(
     config: ProxySourceConfig, dotenv_env: dict[str, str]
 ) -> list[Lane]:
-    lane_specs = (
-        ("minimax-anth", True, "MINIMAX-ANTHROPIC"),
-        ("minimax-openai", True, "MINIMAX-OPENAI"),
+    validate_preset_endpoint_env(config, dotenv_env)
+    lane_specs = _primary_lane_specs() + (
         ("qwen-local", False, "LOCAL-QWEN"),
     )
     lanes: list[Lane] = []
@@ -949,6 +1062,8 @@ def resolve_lanes(
         alias_value = config.model_aliases.get(lane_name)
         if alias_value is None and lane_name == "qwen-local" and has_local_qwen(dotenv_env):
             alias_value = f"LOCAL-QWEN:{dotenv_env['LOCAL_QWEN_MODEL']}"
+        if alias_value is not None:
+            alias_value = _hydrate_preset_endpoint_model_target(alias_value, dotenv_env)
         upstream_name = default_upstream
         upstream_model = None
         if alias_value and ":" in alias_value:
@@ -1000,6 +1115,10 @@ def _runtime_upstreams(
         (name, collections.OrderedDict(values))
         for name, values in config.upstreams.items()
     )
+    for upstream_name, base_url_env in _preset_upstream_base_url_envs():
+        base_url = dotenv_env.get(base_url_env)
+        if base_url and upstream_name in upstreams:
+            upstreams[upstream_name]["api_root"] = base_url
     if has_local_qwen(dotenv_env):
         qwen_upstream = collections.OrderedDict(
             [
@@ -1239,7 +1358,7 @@ def _runtime_alias_configs(
     qwen_model = dotenv_env.get("LOCAL_QWEN_MODEL", "")
 
     for alias_name, alias_config in config.model_alias_configs.items():
-        target = alias_config.target
+        target = _hydrate_preset_endpoint_model_target(alias_config.target, dotenv_env)
         if target.startswith("LOCAL-QWEN:"):
             if not qwen_enabled:
                 continue
@@ -1383,6 +1502,7 @@ def build_runtime_config_text(
     listen_port: int,
     trace_path: pathlib.Path,
 ) -> str:
+    validate_preset_endpoint_env(config, dotenv_env)
     section_renderers = collections.OrderedDict(
         [
             ("listen", lambda: _render_runtime_listen_section(listen_host, listen_port)),
@@ -5414,6 +5534,7 @@ def run(argv: list[str] | None = None) -> int:
     config_source = pathlib.Path(args.config_source)
     dotenv_env = load_dotenv_file(pathlib.Path(args.env_file))
     parsed_source = parse_proxy_source(config_source.read_text(encoding="utf-8"))
+    dotenv_env = merge_preset_endpoint_env(parsed_source, dotenv_env, base_env)
     lanes = resolve_lanes(parsed_source, dotenv_env)
     fixtures = load_fixtures(pathlib.Path(args.fixtures_root))
     cases = expand_matrix(

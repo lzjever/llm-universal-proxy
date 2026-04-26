@@ -510,7 +510,10 @@ os.execv(real_git, [real_git, *args])
             with self.subTest(key_pattern=key_pattern):
                 self.assertIn(key_pattern, script)
                 self.assertNotIn(key_pattern, default_config)
-        self.assertIn("credential_env: MINIMAX_API_KEY", default_config)
+        self.assertIn("credential_env: PRESET_ENDPOINT_API_KEY", default_config)
+        self.assertIn("PRESET-OPENAI-COMPATIBLE", default_config)
+        self.assertIn("PRESET-ANTHROPIC-COMPATIBLE", default_config)
+        self.assertNotIn("MINIMAX", default_config.upper())
         self.assertNotIn("credential_actual", default_config)
 
     def test_container_examples_and_docs_do_not_bake_secrets(self):

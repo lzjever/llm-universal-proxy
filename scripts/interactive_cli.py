@@ -30,6 +30,7 @@ from real_cli_matrix import (  # noqa: E402
     ensure_no_public_internal_tool_artifacts,
     fetch_live_model_profile,
     load_dotenv_file,
+    merge_preset_endpoint_env,
     parse_proxy_source,
     prepare_proxy_env,
     start_proxy,
@@ -40,9 +41,9 @@ from real_cli_matrix import (  # noqa: E402
 
 
 DEFAULT_MODEL_BY_CLIENT = {
-    "codex": "minimax-openai",
-    "claude": "claude-haiku-4-5",
-    "gemini": "minimax-openai",
+    "codex": "preset-openai-compatible",
+    "claude": "preset-anthropic-compatible",
+    "gemini": "preset-openai-compatible",
 }
 
 
@@ -132,6 +133,8 @@ def build_interactive_command(
                 f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
                 "-c",
                 'model_providers.proxy.wire_api="responses"',
+                "-c",
+                "model_providers.proxy.supports_websockets=false",
             ]
         )
         command.extend(
@@ -195,13 +198,19 @@ def start_managed_proxy(
     args: argparse.Namespace,
     base_env: dict[str, str],
     runtime_root: pathlib.Path,
-) -> tuple[str, subprocess.Popen[str] | None]:
+) -> tuple[
+    str,
+    subprocess.Popen[str] | None,
+    pathlib.Path | None,
+    pathlib.Path | None,
+]:
     config_source = pathlib.Path(args.config_source)
     dotenv_env = load_dotenv_file(pathlib.Path(args.env_file))
     proxy_binary = pathlib.Path(args.binary)
     ensure_proxy_binary(proxy_binary)
 
     parsed_source = parse_proxy_source(config_source.read_text(encoding="utf-8"))
+    dotenv_env = merge_preset_endpoint_env(parsed_source, dotenv_env, base_env)
     report_dir = runtime_root / "proxy"
     report_dir.mkdir(parents=True, exist_ok=True)
     trace_path = report_dir / "debug-trace.jsonl"
@@ -213,13 +222,18 @@ def start_managed_proxy(
         trace_path=trace_path,
     )
     proxy_env = prepare_proxy_env(base_env, dotenv_env, runtime_root)
-    process, _config_path, _stdout_path, _stderr_path = start_proxy(
+    process, _config_path, stdout_path, stderr_path = start_proxy(
         proxy_binary,
         runtime_config_text,
         report_dir,
         proxy_env,
     )
-    return f"http://{args.proxy_host}:{args.proxy_port}", process
+    return (
+        f"http://{args.proxy_host}:{args.proxy_port}",
+        process,
+        stdout_path,
+        stderr_path,
+    )
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -234,20 +248,37 @@ def run(argv: list[str] | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix=f"interactive-cli-{args.client}-") as temp_dir:
         runtime_root = pathlib.Path(temp_dir)
         proxy_process: subprocess.Popen[str] | None = None
+        proxy_stdout_path: pathlib.Path | None = None
+        proxy_stderr_path: pathlib.Path | None = None
 
         try:
             if args.proxy_base:
                 proxy_base = normalize_proxy_base(args.proxy_base)
             else:
-                proxy_base, proxy_process = start_managed_proxy(
+                (
+                    proxy_base,
+                    proxy_process,
+                    proxy_stdout_path,
+                    proxy_stderr_path,
+                ) = start_managed_proxy(
                     args,
                     base_env,
                     runtime_root,
                 )
 
-            wait_for_health(
-                proxy_base, timeout_secs=timeout_policy.proxy_health_timeout_secs
-            )
+            if proxy_process is None:
+                wait_for_health(
+                    proxy_base,
+                    timeout_secs=timeout_policy.proxy_health_timeout_secs,
+                )
+            else:
+                wait_for_health(
+                    proxy_base,
+                    timeout_secs=timeout_policy.proxy_health_timeout_secs,
+                    process=proxy_process,
+                    stdout_path=proxy_stdout_path,
+                    stderr_path=proxy_stderr_path,
+                )
             live_profile = fetch_live_model_profile(proxy_base, args.model)
 
             client_home = runtime_root / "homes" / args.client

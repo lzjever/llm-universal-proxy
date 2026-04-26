@@ -159,6 +159,52 @@ async fn spawn_openai_completion_raw_mock(
     (format!("http://{addr}"), requests, server)
 }
 
+async fn spawn_header_delayed_openai_completion_stream_mock(
+    header_delay: std::time::Duration,
+    sentinel_body: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    #[derive(Clone)]
+    struct SlowHeaderState {
+        header_delay: std::time::Duration,
+        sentinel_body: &'static str,
+    }
+
+    async fn handle_chat_completions(
+        State(state): State<SlowHeaderState>,
+        Json(body): Json<Value>,
+    ) -> Response<Body> {
+        assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
+        tokio::time::sleep(state.header_delay).await;
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(format!(
+                "data: {{\"sentinel\":\"{}\"}}\n\n",
+                state.sentinel_body
+            )))
+            .expect("delayed header streaming response")
+    }
+
+    let app = Router::new()
+        .route("/chat/completions", post(handle_chat_completions))
+        .with_state(SlowHeaderState {
+            header_delay,
+            sentinel_body,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind header-delayed mock upstream");
+    let addr = listener.local_addr().expect("header-delayed local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("header-delayed mock server");
+    });
+
+    (format!("http://{addr}"), server)
+}
+
 async fn set_resource_limits(state: &Arc<AppState>, limits: crate::config::ResourceLimits) {
     let mut runtime = state.runtime.write().await;
     runtime
@@ -2477,6 +2523,152 @@ async fn openai_responses_non_stream_transport_error_uses_json_error_shape() {
         .expect("json body bytes");
     let body: Value = serde_json::from_slice(&body).expect("json body");
     assert_eq!(body["error"]["type"], "server_error");
+}
+
+#[tokio::test]
+async fn openai_chat_streaming_first_response_timeout_fails_closed_without_body_leak() {
+    const SENTINEL: &str = "STREAM_HEADER_TIMEOUT_SENTINEL_SHOULD_NOT_LEAK";
+    let (mock_base, server) = spawn_header_delayed_openai_completion_stream_mock(
+        std::time::Duration::from_secs(2),
+        SENTINEL,
+    )
+    .await;
+    let state = app_state_for_single_upstream_with_timeout(
+        mock_base,
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        std::time::Duration::from_millis(50),
+    );
+
+    let started = std::time::Instant::now();
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        handle_request_core(
+            state,
+            DEFAULT_NAMESPACE.to_string(),
+            HeaderMap::new(),
+            "/openai/v1/chat/completions".to_string(),
+            serde_json::json!({
+                "model": "gpt-4o-mini",
+                "messages": [{ "role": "user", "content": "Hi" }],
+                "stream": true
+            }),
+            "gpt-4o-mini".to_string(),
+            crate::formats::UpstreamFormat::OpenAiCompletion,
+            None,
+        ),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            server.abort();
+            panic!("streaming request did not fail within the first-response timeout budget");
+        }
+    };
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "streaming first-response timeout should fire before the mock returns headers"
+    );
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("error body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("error body utf8");
+    assert!(body_text.contains("timed out"), "body = {body_text}");
+    assert!(!body_text.contains(SENTINEL), "body = {body_text}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn same_format_openai_chat_streaming_fails_closed_on_non_sse_success() {
+    const SENTINEL: &str = "NON_SSE_STREAM_SENTINEL_SHOULD_NOT_LEAK";
+    let (mock_base, _requests, server) = spawn_openai_completion_raw_mock(
+        StatusCode::OK,
+        format!(r#"{{"id":"chatcmpl_json","object":"chat.completion","sentinel":"{SENTINEL}"}}"#),
+    )
+    .await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/chat/completions".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("error body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("error body utf8");
+    assert!(
+        body_text.contains("upstream returned non-SSE response for streaming request"),
+        "body = {body_text}"
+    );
+    assert!(!body_text.contains(SENTINEL), "body = {body_text}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn translated_responses_streaming_fails_closed_on_non_sse_success() {
+    const SENTINEL: &str = "TRANSLATED_NON_SSE_STREAM_SENTINEL_SHOULD_NOT_LEAK";
+    let (mock_base, _requests, server) = spawn_openai_completion_raw_mock(
+        StatusCode::OK,
+        format!(r#"{{"id":"chatcmpl_json","object":"chat.completion","sentinel":"{SENTINEL}"}}"#),
+    )
+    .await;
+    let state =
+        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
+
+    let response = handle_request_core(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        "/openai/v1/responses".to_string(),
+        serde_json::json!({
+            "model": "gpt-4o-mini",
+            "input": "Hi",
+            "stream": true
+        }),
+        "gpt-4o-mini".to_string(),
+        crate::formats::UpstreamFormat::OpenAiResponses,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("stream error body bytes");
+    let body_text = String::from_utf8(body.to_vec()).expect("stream error body utf8");
+    assert!(body_text.contains("response.failed"), "body = {body_text}");
+    assert!(
+        body_text.contains("upstream returned non-SSE response for streaming request"),
+        "body = {body_text}"
+    );
+    assert!(!body_text.contains(SENTINEL), "body = {body_text}");
+
+    server.abort();
 }
 
 #[tokio::test]

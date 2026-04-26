@@ -1,6 +1,7 @@
 //! Upstream HTTP client: build request URLs and call upstream resources.
 
 use std::error::Error;
+use std::fmt;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -183,6 +184,33 @@ pub(crate) enum DownstreamAwareError<E> {
     DownstreamCancelled,
 }
 
+#[derive(Debug)]
+pub(crate) enum UpstreamSendError {
+    Transport(reqwest::Error),
+    FirstResponseTimeout { timeout: Duration },
+}
+
+impl fmt::Display for UpstreamSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::FirstResponseTimeout { timeout } => write!(
+                f,
+                "upstream streaming response headers timed out after {timeout:?}"
+            ),
+        }
+    }
+}
+
+impl Error for UpstreamSendError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::FirstResponseTimeout { .. } => None,
+        }
+    }
+}
+
 type BoxError = Box<dyn Error + Send + Sync>;
 
 pub(crate) struct UpstreamResourceTarget {
@@ -252,14 +280,29 @@ where
     }
 }
 
+async fn send_with_optional_first_response_timeout(
+    request: reqwest::RequestBuilder,
+    first_response_timeout: Option<Duration>,
+) -> Result<reqwest::Response, UpstreamSendError> {
+    let send = request.send();
+    match first_response_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, send)
+            .await
+            .map_err(|_| UpstreamSendError::FirstResponseTimeout { timeout })?
+            .map_err(UpstreamSendError::Transport),
+        None => send.await.map_err(UpstreamSendError::Transport),
+    }
+}
+
 pub(crate) async fn call_upstream_with_cancellation(
     client: &Client,
     url: &str,
     body: &Value,
     stream: bool,
     headers: &[(String, String)],
+    first_response_timeout: Option<Duration>,
     downstream_cancellation: &DownstreamCancellation,
-) -> Result<reqwest::Response, DownstreamAwareError<reqwest::Error>> {
+) -> Result<reqwest::Response, DownstreamAwareError<UpstreamSendError>> {
     let mut req = client.post(url).json(body);
     if stream {
         req = req.header("Accept", "text/event-stream");
@@ -267,7 +310,11 @@ pub(crate) async fn call_upstream_with_cancellation(
     for (name, value) in headers {
         req = req.header(name, value);
     }
-    await_with_downstream_cancellation(req.send(), downstream_cancellation).await
+    await_with_downstream_cancellation(
+        send_with_optional_first_response_timeout(req, first_response_timeout),
+        downstream_cancellation,
+    )
+    .await
 }
 
 pub(crate) fn build_upstream_resource_target(

@@ -3,6 +3,8 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
+import textwrap
 import unittest
 
 
@@ -76,10 +78,125 @@ class DefaultMatrixConfigSourceContractTests(unittest.TestCase):
         )
         self.assertNotIn("CONFIG=\"${CONFIG:-proxy-test-minimax-and-local.yaml}\"", script_text)
 
+    def test_test_compatibility_auto_start_renders_runtime_config_from_env_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = pathlib.Path(temp_dir) / ".env.test"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        'export PRESET_ENDPOINT_API_KEY="proxy-only-secret"',
+                        'export PRESET_OPENAI_ENDPOINT_BASE_URL="https://openai-compatible.example/v1"',
+                        'export PRESET_ANTHROPIC_ENDPOINT_BASE_URL="https://anthropic-compatible.example/v1"',
+                        'export PRESET_ENDPOINT_MODEL="provider-configured-model"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            command = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                source scripts/test_compatibility.sh
+                BASE_URL="http://127.0.0.1:19991"
+                render_auto_start_config "{TRACKED_CONFIG_PATH}" "{env_file}"
+                runtime_config="$AUTO_START_RUNTIME_CONFIG"
+                runtime_dir="$AUTO_START_RUNTIME_DIR"
+                test -n "$runtime_config"
+                test -n "$runtime_dir"
+                test -d "$runtime_dir"
+                test -f "$runtime_config"
+                grep -Fq "listen: 127.0.0.1:19991" "$runtime_config"
+                grep -Fq "api_root: https://openai-compatible.example/v1" "$runtime_config"
+                grep -Fq "api_root: https://anthropic-compatible.example/v1" "$runtime_config"
+                grep -Fq '"PRESET-OPENAI-COMPATIBLE:provider-configured-model"' "$runtime_config"
+                grep -Fq '"PRESET-ANTHROPIC-COMPATIBLE:provider-configured-model"' "$runtime_config"
+                ! grep -Fq "api_root: PRESET_" "$runtime_config"
+                ! grep -Fq "PRESET_ENDPOINT_MODEL" "$runtime_config"
+                cleanup_auto_start_runtime_config
+                test ! -e "$runtime_dir"
+                """
+            )
+
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
+    def test_test_compatibility_auto_start_cleans_runtime_dir_on_start_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            runtime_tmp = root / "tmp"
+            runtime_tmp.mkdir()
+            env_file = root / ".env.test"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        'export PRESET_ENDPOINT_API_KEY="proxy-only-secret"',
+                        'export PRESET_OPENAI_ENDPOINT_BASE_URL="https://openai-compatible.example/v1"',
+                        'export PRESET_ANTHROPIC_ENDPOINT_BASE_URL="https://anthropic-compatible.example/v1"',
+                        'export PRESET_ENDPOINT_MODEL="provider-configured-model"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_binary = root / "fake-proxy"
+            fake_binary.write_text(
+                "#!/usr/bin/env bash\n"
+                "trap 'exit 0' TERM\n"
+                "while :; do sleep 1; done\n",
+                encoding="utf-8",
+            )
+            fake_binary.chmod(0o755)
+            command = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                source scripts/test_compatibility.sh
+                wait_for_proxy() {{ return 1; }}
+                BINARY="{fake_binary}"
+                CONFIG="{TRACKED_CONFIG_PATH}"
+                ENV_FILE="{env_file}"
+                TMPDIR="{runtime_tmp}"
+                BASE_URL="http://127.0.0.1:19992"
+                main --auto-start
+                """
+            )
+
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            leftovers = list(runtime_tmp.glob("llmup-compat-runtime.*"))
+
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertEqual(leftovers, [], completed.stdout + completed.stderr)
+
     def test_tracked_default_config_uses_env_credentials_without_provider_keys(self):
         config_text = TRACKED_CONFIG_PATH.read_text(encoding="utf-8")
 
-        self.assertIn("credential_env: MINIMAX_API_KEY", config_text)
+        self.assertIn("credential_env: PRESET_ENDPOINT_API_KEY", config_text)
+        self.assertIn("PRESET-OPENAI-COMPATIBLE", config_text)
+        self.assertIn("PRESET-ANTHROPIC-COMPATIBLE", config_text)
+        self.assertIn("preset-openai-compatible", config_text)
+        self.assertIn("preset-anthropic-compatible", config_text)
+        self.assertNotIn("MINIMAX", config_text.upper())
+        self.assertNotIn("minimax-openai", config_text)
+        self.assertNotIn("minimax-anth", config_text)
         self.assertNotIn("credential_actual", config_text)
         self.assertIsNone(PROVIDER_KEY_RE.search(config_text))
 

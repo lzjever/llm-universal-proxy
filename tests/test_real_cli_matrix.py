@@ -191,6 +191,26 @@ def make_context(module, client_name: str):
     return module.VerifierContext(client_name=client_name)
 
 
+def preset_endpoint_env(**overrides):
+    values = {
+        "PRESET_ENDPOINT_API_KEY": "proxy-only-secret",
+        "PRESET_OPENAI_ENDPOINT_BASE_URL": "https://openai-compatible.example/v1",
+        "PRESET_ANTHROPIC_ENDPOINT_BASE_URL": "https://anthropic-compatible.example/v1",
+        "PRESET_ENDPOINT_MODEL": "provider-configured-model",
+    }
+    values.update(overrides)
+    return values
+
+
+def write_preset_endpoint_env_file(path: pathlib.Path, **overrides) -> pathlib.Path:
+    values = preset_endpoint_env(**overrides)
+    path.write_text(
+        "".join(f'export {key}="{value}"\n' for key, value in values.items()),
+        encoding="utf-8",
+    )
+    return path
+
+
 def make_case(module, *, client_name, lane=None, fixture=None, case_id=None):
     lane = lane or make_lane(module)
     fixture = fixture or make_fixture(module)
@@ -516,20 +536,118 @@ class RealCliMatrixTests(unittest.TestCase):
             DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
 
-        lanes = {lane.name: lane for lane in module.resolve_lanes(parsed, {})}
+        lanes = {
+            lane.name: lane
+            for lane in module.resolve_lanes(parsed, preset_endpoint_env())
+        }
 
-        self.assertTrue(lanes["minimax-anth"].required)
-        self.assertTrue(lanes["minimax-openai"].required)
+        self.assertNotIn("minimax-anth", lanes)
+        self.assertNotIn("minimax-openai", lanes)
+        self.assertTrue(lanes["preset-anthropic-compatible"].required)
+        self.assertTrue(lanes["preset-openai-compatible"].required)
         self.assertFalse(lanes["qwen-local"].required)
         self.assertFalse(lanes["qwen-local"].enabled)
         self.assertIn("LOCAL_QWEN", lanes["qwen-local"].skip_reason)
-        self.assertEqual(lanes["minimax-openai"].limits.context_window, 200000)
-        self.assertEqual(lanes["minimax-openai"].limits.max_output_tokens, 128000)
         self.assertEqual(
-            lanes["minimax-openai"].codex_metadata.input_modalities,
+            lanes["preset-openai-compatible"].limits.context_window,
+            200000,
+        )
+        self.assertEqual(
+            lanes["preset-openai-compatible"].limits.max_output_tokens,
+            128000,
+        )
+        self.assertEqual(
+            lanes["preset-openai-compatible"].codex_metadata.input_modalities,
             ("text",),
         )
-        self.assertFalse(lanes["minimax-openai"].codex_metadata.supports_search_tool)
+        self.assertFalse(
+            lanes["preset-openai-compatible"].codex_metadata.supports_search_tool
+        )
+
+    def test_resolve_lanes_hydrates_preset_upstream_model_from_dotenv(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+
+        lanes = {
+            lane.name: lane
+            for lane in module.resolve_lanes(
+                parsed,
+                preset_endpoint_env(PRESET_ENDPOINT_MODEL="provider-live-model"),
+            )
+        }
+
+        self.assertEqual(
+            lanes["preset-openai-compatible"].upstream_model,
+            "provider-live-model",
+        )
+        self.assertEqual(
+            lanes["preset-anthropic-compatible"].upstream_model,
+            "provider-live-model",
+        )
+
+    def test_preset_trace_filter_keeps_real_provider_model_after_lane_resolution(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+        lanes = {
+            lane.name: lane
+            for lane in module.resolve_lanes(
+                parsed,
+                preset_endpoint_env(PRESET_ENDPOINT_MODEL="provider-live-model"),
+            )
+        }
+        case = make_case(
+            module,
+            client_name="codex",
+            lane=lanes["preset-openai-compatible"],
+            fixture=make_fixture(module),
+        )
+
+        filtered = module.filter_trace_entries_for_case(
+            [
+                {
+                    "timestamp_ms": 1000,
+                    "request_id": "req_case",
+                    "phase": "request",
+                    "path": "/openai/v1/responses",
+                    "client_format": "openai-responses",
+                    "client_model": "preset-openai-compatible",
+                    "upstream_name": "PRESET-OPENAI-COMPATIBLE",
+                    "upstream_model": "provider-live-model",
+                },
+                {
+                    "timestamp_ms": 1000,
+                    "request_id": "req_case",
+                    "phase": "response",
+                    "path": "/openai/v1/responses",
+                    "upstream_name": "PRESET-OPENAI-COMPATIBLE",
+                    "upstream_model": "provider-live-model",
+                },
+            ],
+            case,
+            started_ms=950,
+            finished_ms=1050,
+        )
+
+        self.assertEqual([entry["request_id"] for entry in filtered], ["req_case", "req_case"])
+
+    def test_resolve_lanes_fails_fast_when_preset_endpoint_env_is_missing(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            module.resolve_lanes(parsed, {})
+
+        message = str(raised.exception)
+        self.assertIn("PRESET_OPENAI_ENDPOINT_BASE_URL", message)
+        self.assertIn("PRESET_ANTHROPIC_ENDPOINT_BASE_URL", message)
+        self.assertIn("PRESET_ENDPOINT_MODEL", message)
+        self.assertIn("PRESET_ENDPOINT_API_KEY", message)
 
     def test_resolve_lanes_enables_qwen_when_env_present(self):
         module = load_module()
@@ -541,11 +659,11 @@ class RealCliMatrixTests(unittest.TestCase):
             lane.name: lane
             for lane in module.resolve_lanes(
                 parsed,
-                {
-                    "LOCAL_QWEN_BASE_URL": "http://127.0.0.1:9997/v1",
-                    "LOCAL_QWEN_MODEL": "qwen3.5-9b-awq",
-                    "LOCAL_QWEN_API_KEY": "not-needed",
-                },
+                preset_endpoint_env(
+                    LOCAL_QWEN_BASE_URL="http://127.0.0.1:9997/v1",
+                    LOCAL_QWEN_MODEL="qwen3.5-9b-awq",
+                    LOCAL_QWEN_API_KEY="not-needed",
+                ),
             )
         }
 
@@ -561,11 +679,11 @@ class RealCliMatrixTests(unittest.TestCase):
 
         rendered = module.build_runtime_config_text(
             parsed,
-            {
-                "LOCAL_QWEN_BASE_URL": "http://127.0.0.1:9997/v1",
-                "LOCAL_QWEN_MODEL": "qwen3.5-9b-awq",
-                "LOCAL_QWEN_API_KEY": "not-needed",
-            },
+            preset_endpoint_env(
+                LOCAL_QWEN_BASE_URL="http://127.0.0.1:9997/v1",
+                LOCAL_QWEN_MODEL="qwen3.5-9b-awq",
+                LOCAL_QWEN_API_KEY="not-needed",
+            ),
             listen_host="127.0.0.1",
             listen_port=19999,
             trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
@@ -576,7 +694,7 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertIn('qwen-local: "LOCAL-QWEN:qwen3.5-9b-awq"', rendered)
         self.assertIn("path: /tmp/cli-matrix-trace.jsonl", rendered)
 
-    def test_build_runtime_config_injects_qwen_surface_defaults_for_live_profile_truth_chain(self):
+    def test_build_runtime_config_hydrates_provider_neutral_preset_endpoint_from_dotenv(self):
         module = load_module()
         parsed = module.parse_proxy_source(
             DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
@@ -585,10 +703,45 @@ class RealCliMatrixTests(unittest.TestCase):
         rendered = module.build_runtime_config_text(
             parsed,
             {
-                "LOCAL_QWEN_BASE_URL": "http://127.0.0.1:9997/v1",
-                "LOCAL_QWEN_MODEL": "qwen3.5-9b-awq",
-                "LOCAL_QWEN_API_KEY": "not-needed",
+                "PRESET_ENDPOINT_API_KEY": "proxy-only-secret",
+                "PRESET_OPENAI_ENDPOINT_BASE_URL": "https://openai-compatible.example/v1",
+                "PRESET_ANTHROPIC_ENDPOINT_BASE_URL": "https://anthropic-compatible.example/v1",
+                "PRESET_ENDPOINT_MODEL": "provider-configured-model",
             },
+            listen_host="127.0.0.1",
+            listen_port=19999,
+            trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
+        )
+
+        self.assertIn("PRESET-OPENAI-COMPATIBLE:", rendered)
+        self.assertIn("api_root: https://openai-compatible.example/v1", rendered)
+        self.assertIn("PRESET-ANTHROPIC-COMPATIBLE:", rendered)
+        self.assertIn("api_root: https://anthropic-compatible.example/v1", rendered)
+        self.assertEqual(rendered.count("credential_env: PRESET_ENDPOINT_API_KEY"), 2)
+        self.assertIn(
+            'preset-openai-compatible: "PRESET-OPENAI-COMPATIBLE:provider-configured-model"',
+            rendered,
+        )
+        self.assertIn(
+            'preset-anthropic-compatible: "PRESET-ANTHROPIC-COMPATIBLE:provider-configured-model"',
+            rendered,
+        )
+        self.assertNotIn("proxy-only-secret", rendered)
+        self.assertNotIn("MINIMAX", rendered.upper())
+
+    def test_build_runtime_config_injects_qwen_surface_defaults_for_live_profile_truth_chain(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+
+        rendered = module.build_runtime_config_text(
+            parsed,
+            preset_endpoint_env(
+                LOCAL_QWEN_BASE_URL="http://127.0.0.1:9997/v1",
+                LOCAL_QWEN_MODEL="qwen3.5-9b-awq",
+                LOCAL_QWEN_API_KEY="not-needed",
+            ),
             listen_host="127.0.0.1",
             listen_port=19999,
             trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
@@ -667,7 +820,7 @@ class RealCliMatrixTests(unittest.TestCase):
 
         rendered = module.build_runtime_config_text(
             parsed,
-            {},
+            preset_endpoint_env(),
             listen_host="127.0.0.1",
             listen_port=19999,
             trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
@@ -718,7 +871,7 @@ class RealCliMatrixTests(unittest.TestCase):
 
         rendered = module.build_runtime_config_text(
             parsed,
-            {},
+            preset_endpoint_env(),
             listen_host="127.0.0.1",
             listen_port=19999,
             trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
@@ -951,7 +1104,7 @@ class RealCliMatrixTests(unittest.TestCase):
 
         rendered = module.build_runtime_config_text(
             parsed,
-            {},
+            preset_endpoint_env(),
             listen_host="127.0.0.1",
             listen_port=19999,
             trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
@@ -1494,14 +1647,17 @@ class RealCliMatrixTests(unittest.TestCase):
         parsed = module.parse_proxy_source(
             DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
-        model_limits = module.resolve_model_limits(parsed, "minimax-openai")
-        codex_metadata = module.resolve_codex_model_metadata(parsed, "minimax-openai")
+        model_limits = module.resolve_model_limits(parsed, "preset-openai-compatible")
+        codex_metadata = module.resolve_codex_model_metadata(
+            parsed,
+            "preset-openai-compatible",
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             home_dir = pathlib.Path(temp_dir)
             args = module.build_codex_catalog_args(
                 home_dir,
-                "minimax-openai",
+                "preset-openai-compatible",
                 model_limits,
                 codex_metadata,
             )
@@ -1528,11 +1684,14 @@ class RealCliMatrixTests(unittest.TestCase):
         parsed = module.parse_proxy_source(
             DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
         )
-        model_limits = module.resolve_model_limits(parsed, "minimax-openai")
-        codex_metadata = module.resolve_codex_model_metadata(parsed, "minimax-openai")
+        model_limits = module.resolve_model_limits(parsed, "preset-openai-compatible")
+        codex_metadata = module.resolve_codex_model_metadata(
+            parsed,
+            "preset-openai-compatible",
+        )
 
         payload = module.build_codex_model_catalog(
-            "minimax-openai",
+            "preset-openai-compatible",
             model_limits,
             codex_metadata,
         )
@@ -3644,9 +3803,11 @@ class RealCliMatrixTests(unittest.TestCase):
                 return False
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            reports_root = pathlib.Path(temp_dir) / "reports"
-            binary_path = pathlib.Path(temp_dir) / "fake-proxy"
-            proxy_stderr_path = pathlib.Path(temp_dir) / "proxy.stderr.log"
+            temp_root = pathlib.Path(temp_dir)
+            reports_root = temp_root / "reports"
+            binary_path = temp_root / "fake-proxy"
+            env_file = write_preset_endpoint_env_file(temp_root / ".env.test")
+            proxy_stderr_path = temp_root / "proxy.stderr.log"
             proxy_stderr_path.write_text(
                 "error: failed to bind 127.0.0.1:18888: Address already in use\n",
                 encoding="utf-8",
@@ -3691,7 +3852,7 @@ class RealCliMatrixTests(unittest.TestCase):
                             "--config-source",
                             str(DEFAULT_CONFIG_PATH),
                             "--env-file",
-                            str(pathlib.Path(temp_dir) / "missing.env"),
+                            str(env_file),
                             "--fixtures-root",
                             str(REPO_ROOT / "scripts" / "fixtures" / "cli_matrix"),
                             "--reports-root",
@@ -3745,12 +3906,13 @@ class RealCliMatrixTests(unittest.TestCase):
             temp_root = pathlib.Path(temp_dir)
             reports_root = temp_root / "reports"
             binary_path = temp_root / "fake-proxy"
+            env_file = write_preset_endpoint_env_file(temp_root / ".env.test")
             common_args = [
                 "--proxy-only",
                 "--config-source",
                 str(DEFAULT_CONFIG_PATH),
                 "--env-file",
-                str(temp_root / "missing.env"),
+                str(env_file),
                 "--fixtures-root",
                 str(REPO_ROOT / "scripts" / "fixtures" / "cli_matrix"),
                 "--reports-root",
@@ -3824,11 +3986,13 @@ class RealCliMatrixTests(unittest.TestCase):
             observed["proxy_binary"] = proxy_binary
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            reports_root = pathlib.Path(temp_dir) / "reports"
-            binary_path = pathlib.Path(temp_dir) / "fake-proxy"
-            runtime_config_path = pathlib.Path(temp_dir) / "runtime-config.yaml"
-            proxy_stdout_path = pathlib.Path(temp_dir) / "proxy.stdout.log"
-            proxy_stderr_path = pathlib.Path(temp_dir) / "proxy.stderr.log"
+            temp_root = pathlib.Path(temp_dir)
+            reports_root = temp_root / "reports"
+            binary_path = temp_root / "fake-proxy"
+            env_file = write_preset_endpoint_env_file(temp_root / ".env.test")
+            runtime_config_path = temp_root / "runtime-config.yaml"
+            proxy_stdout_path = temp_root / "proxy.stdout.log"
+            proxy_stderr_path = temp_root / "proxy.stderr.log"
             stdout = io.StringIO()
             with mock.patch.object(
                 module, "ensure_required_binaries", side_effect=fake_ensure_required_binaries
@@ -3860,7 +4024,7 @@ class RealCliMatrixTests(unittest.TestCase):
                         "--config-source",
                         str(DEFAULT_CONFIG_PATH),
                         "--env-file",
-                        str(pathlib.Path(temp_dir) / "missing.env"),
+                        str(env_file),
                         "--fixtures-root",
                         str(REPO_ROOT / "scripts" / "fixtures" / "cli_matrix"),
                         "--reports-root",

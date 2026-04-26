@@ -14,6 +14,12 @@ CONFIG_PATH = (
     / "cli_matrix"
     / "default_proxy_test_matrix.yaml"
 )
+PRESET_ENV = {
+    "PRESET_ENDPOINT_API_KEY": "proxy-only-secret",
+    "PRESET_OPENAI_ENDPOINT_BASE_URL": "https://openai-compatible.example/v1",
+    "PRESET_ANTHROPIC_ENDPOINT_BASE_URL": "https://anthropic-compatible.example/v1",
+    "PRESET_ENDPOINT_MODEL": "provider-configured-model",
+}
 
 
 def load_module():
@@ -48,12 +54,15 @@ class DefaultMatrixSurfaceContractTests(unittest.TestCase):
         module = load_module()
         parsed = module.parse_proxy_source(CONFIG_PATH.read_text(encoding="utf-8"))
 
-        self.assertIn("MINIMAX-ANTHROPIC", parsed.upstream_surface_defaults)
-        self.assertIn("MINIMAX-OPENAI", parsed.upstream_surface_defaults)
-        self.assertNotIn("MINIMAX-ANTHROPIC", parsed.upstream_codex_metadata)
-        self.assertNotIn("MINIMAX-OPENAI", parsed.upstream_codex_metadata)
+        self.assertIn("PRESET-ANTHROPIC-COMPATIBLE", parsed.upstream_surface_defaults)
+        self.assertIn("PRESET-OPENAI-COMPATIBLE", parsed.upstream_surface_defaults)
+        self.assertNotIn("PRESET-ANTHROPIC-COMPATIBLE", parsed.upstream_codex_metadata)
+        self.assertNotIn("PRESET-OPENAI-COMPATIBLE", parsed.upstream_codex_metadata)
 
-        for model_name in ("minimax-anth", "minimax-openai", "claude-haiku-4-5"):
+        for model_name in (
+            "preset-anthropic-compatible",
+            "preset-openai-compatible",
+        ):
             with self.subTest(model_name=model_name):
                 surface = effective_surface_for_model(module, parsed, model_name)
                 module._validate_live_surface_codex_requirements(
@@ -72,7 +81,7 @@ class DefaultMatrixSurfaceContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime_text = module.build_runtime_config_text(
                 parsed,
-                {},
+                PRESET_ENV,
                 listen_host="127.0.0.1",
                 listen_port=19999,
                 trace_path=pathlib.Path(temp_dir) / "trace.jsonl",
@@ -80,7 +89,10 @@ class DefaultMatrixSurfaceContractTests(unittest.TestCase):
         self.assertIn("supports_parallel_calls: false", runtime_text)
 
         runtime_parsed = module.parse_proxy_source(runtime_text)
-        for model_name in ("minimax-anth", "minimax-openai", "claude-haiku-4-5"):
+        for model_name in (
+            "preset-anthropic-compatible",
+            "preset-openai-compatible",
+        ):
             with self.subTest(model_name=model_name):
                 surface = effective_surface_for_model(module, runtime_parsed, model_name)
                 module._validate_live_surface_codex_requirements(

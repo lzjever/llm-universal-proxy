@@ -6,9 +6,11 @@
 #
 # Prerequisites:
 #   1. Build the proxy: cargo build --release
-#   2. Start the proxy:
-#        ./target/release/llm-universal-proxy --config scripts/fixtures/cli_matrix/default_proxy_test_matrix.yaml
-#   3. Run this script: bash scripts/test_compatibility.sh
+#   2. Configure provider-neutral preset vars in .env.test:
+#        PRESET_OPENAI_ENDPOINT_BASE_URL, PRESET_ANTHROPIC_ENDPOINT_BASE_URL,
+#        PRESET_ENDPOINT_MODEL, PRESET_ENDPOINT_API_KEY
+#   3. Start the proxy with a rendered runtime config, or use auto-start below.
+#   4. Run this script: bash scripts/test_compatibility.sh
 #
 # Or run with auto-start (script starts/stops proxy for you):
 #   bash scripts/test_compatibility.sh --auto-start
@@ -18,10 +20,13 @@ set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:18888}"
 DEFAULT_CONFIG="scripts/fixtures/cli_matrix/default_proxy_test_matrix.yaml"
+DEFAULT_ENV_FILE=".env.test"
 PASS=0
 FAIL=0
 SKIP=0
 RESULTS=()
+AUTO_START_RUNTIME_DIR=""
+AUTO_START_RUNTIME_CONFIG=""
 
 # Colors
 RED='\033[0;31m'
@@ -67,6 +72,89 @@ wait_for_proxy() {
     done
     echo "Proxy did not become healthy within ${max_wait}s" >&2
     return 1
+}
+
+load_auto_start_env_file() {
+    local env_file="$1"
+    if [ ! -f "$env_file" ]; then
+        return 0
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    source "$env_file"
+    set +a
+}
+
+cleanup_auto_start_runtime_config() {
+    if [ -n "${AUTO_START_RUNTIME_DIR:-}" ] && [ -d "$AUTO_START_RUNTIME_DIR" ]; then
+        rm -rf "$AUTO_START_RUNTIME_DIR"
+    fi
+    AUTO_START_RUNTIME_DIR=""
+    AUTO_START_RUNTIME_CONFIG=""
+}
+
+render_auto_start_config() {
+    local config_source="${1:-$DEFAULT_CONFIG}"
+    local env_file="${2:-$DEFAULT_ENV_FILE}"
+    local runtime_dir
+    runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/llmup-compat-runtime.XXXXXX")
+    AUTO_START_RUNTIME_DIR="$runtime_dir"
+    AUTO_START_RUNTIME_CONFIG="$runtime_dir/runtime-config.yaml"
+    local trace_path="$runtime_dir/debug-trace.jsonl"
+
+    if ! python3 - "$config_source" "$env_file" "$AUTO_START_RUNTIME_CONFIG" "$trace_path" "$BASE_URL" <<'PY'
+import importlib.util
+import os
+import pathlib
+import sys
+import urllib.parse
+
+config_source = pathlib.Path(sys.argv[1])
+env_file = pathlib.Path(sys.argv[2])
+runtime_config = pathlib.Path(sys.argv[3])
+trace_path = pathlib.Path(sys.argv[4])
+base_url = sys.argv[5]
+repo_root = pathlib.Path.cwd()
+script_path = repo_root / "scripts" / "real_cli_matrix.py"
+
+spec = importlib.util.spec_from_file_location("real_cli_matrix_for_compat", script_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+parsed = module.parse_proxy_source(config_source.read_text(encoding="utf-8"))
+dotenv_env = module.load_dotenv_file(env_file)
+for key in module.required_preset_endpoint_env_keys(parsed):
+    if os.environ.get(key):
+        dotenv_env[key] = os.environ[key]
+module.validate_preset_endpoint_env(parsed, dotenv_env)
+
+parsed_url = urllib.parse.urlparse(base_url)
+listen_host = parsed_url.hostname or "127.0.0.1"
+if parsed_url.port is not None:
+    listen_port = parsed_url.port
+elif parsed_url.scheme == "https":
+    listen_port = 443
+else:
+    listen_port = 80
+
+runtime_config.write_text(
+    module.build_runtime_config_text(
+        parsed,
+        dotenv_env,
+        listen_host=listen_host,
+        listen_port=listen_port,
+        trace_path=trace_path,
+    ),
+    encoding="utf-8",
+)
+PY
+    then
+        cleanup_auto_start_runtime_config
+        return 1
+    fi
+
+    return 0
 }
 
 # ============================================================
@@ -132,96 +220,96 @@ test_health() {
 }
 
 # ============================================================
-# MiniMax via Anthropic-compatible upstream
+# Preset Anthropic-compatible upstream
 # ============================================================
-test_minimax_anthropic() {
-    log_header "MiniMax Anthropic Upstream — OpenAI Chat Completions Client"
+test_preset_anthropic_compatible() {
+    log_header "Preset Anthropic-compatible Upstream — OpenAI Chat Completions Client"
 
     test_json \
-        "Non-stream: OpenAI Chat → MiniMax Anthropic" \
+        "Non-stream: OpenAI Chat → preset Anthropic-compatible" \
         "$BASE_URL/openai/v1/chat/completions" \
-        '{"model":"minimax-anth","messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":false}' \
+        '{"model":"preset-anthropic-compatible","messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":false}' \
         '"content"' '"OK"'
 
     test_sse \
-        "Stream: OpenAI Chat → MiniMax Anthropic" \
+        "Stream: OpenAI Chat → preset Anthropic-compatible" \
         "$BASE_URL/openai/v1/chat/completions" \
-        '{"model":"minimax-anth","messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":true}' \
+        '{"model":"preset-anthropic-compatible","messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":true}' \
         "data:" "[DONE]"
 
-    log_header "MiniMax Anthropic Upstream — OpenAI Responses Client"
+    log_header "Preset Anthropic-compatible Upstream — OpenAI Responses Client"
 
     test_json \
-        "Non-stream: OpenAI Responses → MiniMax Anthropic" \
+        "Non-stream: OpenAI Responses → preset Anthropic-compatible" \
         "$BASE_URL/openai/v1/responses" \
-        '{"model":"minimax-anth","input":"Reply with exactly: OK","stream":false}' \
+        '{"model":"preset-anthropic-compatible","input":"Reply with exactly: OK","stream":false}' \
         '"text"'
 
     test_sse \
-        "Stream: OpenAI Responses → MiniMax Anthropic" \
+        "Stream: OpenAI Responses → preset Anthropic-compatible" \
         "$BASE_URL/openai/v1/responses" \
-        '{"model":"minimax-anth","input":"Reply with exactly: OK","stream":true}' \
+        '{"model":"preset-anthropic-compatible","input":"Reply with exactly: OK","stream":true}' \
         "response.completed"
 
-    log_header "MiniMax Anthropic Upstream — Anthropic Messages Client"
+    log_header "Preset Anthropic-compatible Upstream — Anthropic Messages Client"
 
     test_json \
-        "Non-stream: Anthropic Messages → MiniMax Anthropic (passthrough)" \
+        "Non-stream: Anthropic Messages → preset Anthropic-compatible (passthrough)" \
         "$BASE_URL/anthropic/v1/messages" \
-        '{"model":"minimax-anth","max_tokens":256,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":false}' \
+        '{"model":"preset-anthropic-compatible","max_tokens":256,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":false}' \
         '"text"'
 
     test_sse \
-        "Stream: Anthropic Messages → MiniMax Anthropic (passthrough)" \
+        "Stream: Anthropic Messages → preset Anthropic-compatible (passthrough)" \
         "$BASE_URL/anthropic/v1/messages" \
-        '{"model":"minimax-anth","max_tokens":64,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":true}' \
+        '{"model":"preset-anthropic-compatible","max_tokens":64,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":true}' \
         "message_start" "message_stop"
 }
 
 # ============================================================
-# MiniMax via OpenAI-compatible upstream
+# Preset OpenAI-compatible upstream
 # ============================================================
-test_minimax_openai() {
-    log_header "MiniMax OpenAI Upstream — OpenAI Chat Completions Client"
+test_preset_openai_compatible() {
+    log_header "Preset OpenAI-compatible Upstream — OpenAI Chat Completions Client"
 
     test_json \
-        "Non-stream: OpenAI Chat → MiniMax OpenAI (passthrough)" \
+        "Non-stream: OpenAI Chat → preset OpenAI-compatible (passthrough)" \
         "$BASE_URL/openai/v1/chat/completions" \
-        '{"model":"minimax-openai","messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":false}' \
+        '{"model":"preset-openai-compatible","messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":false}' \
         '"content"'
 
     test_sse \
-        "Stream: OpenAI Chat → MiniMax OpenAI (passthrough)" \
+        "Stream: OpenAI Chat → preset OpenAI-compatible (passthrough)" \
         "$BASE_URL/openai/v1/chat/completions" \
-        '{"model":"minimax-openai","messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":true}' \
+        '{"model":"preset-openai-compatible","messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":true}' \
         "data:" "[DONE]"
 
-    log_header "MiniMax OpenAI Upstream — OpenAI Responses Client"
+    log_header "Preset OpenAI-compatible Upstream — OpenAI Responses Client"
 
     test_json \
-        "Non-stream: OpenAI Responses → MiniMax OpenAI" \
+        "Non-stream: OpenAI Responses → preset OpenAI-compatible" \
         "$BASE_URL/openai/v1/responses" \
-        '{"model":"minimax-openai","input":"Reply with exactly: OK","stream":false}' \
+        '{"model":"preset-openai-compatible","input":"Reply with exactly: OK","stream":false}' \
         '"text"'
 
     test_sse \
-        "Stream: OpenAI Responses → MiniMax OpenAI" \
+        "Stream: OpenAI Responses → preset OpenAI-compatible" \
         "$BASE_URL/openai/v1/responses" \
-        '{"model":"minimax-openai","input":"Reply with exactly: OK","stream":true}' \
+        '{"model":"preset-openai-compatible","input":"Reply with exactly: OK","stream":true}' \
         "response.completed"
 
-    log_header "MiniMax OpenAI Upstream — Anthropic Messages Client"
+    log_header "Preset OpenAI-compatible Upstream — Anthropic Messages Client"
 
     test_json \
-        "Non-stream: Anthropic Messages → MiniMax OpenAI" \
+        "Non-stream: Anthropic Messages → preset OpenAI-compatible" \
         "$BASE_URL/anthropic/v1/messages" \
-        '{"model":"minimax-openai","max_tokens":64,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":false}' \
+        '{"model":"preset-openai-compatible","max_tokens":64,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":false}' \
         '"type":"message"'
 
     test_sse \
-        "Stream: Anthropic Messages → MiniMax OpenAI" \
+        "Stream: Anthropic Messages → preset OpenAI-compatible" \
         "$BASE_URL/anthropic/v1/messages" \
-        '{"model":"minimax-openai","max_tokens":64,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":true}' \
+        '{"model":"preset-openai-compatible","max_tokens":64,"messages":[{"role":"user","content":"Reply with exactly: OK"}],"stream":true}' \
         "message_start" "message_stop"
 }
 
@@ -278,18 +366,18 @@ test_local_qwen() {
 test_tool_calls() {
     log_header "Tool Call Translation"
 
-    # OpenAI Chat → MiniMax Anthropic (tool call)
+    # OpenAI Chat → preset Anthropic-compatible (tool call)
     test_json \
-        "Tool call: OpenAI Chat → MiniMax Anthropic" \
+        "Tool call: OpenAI Chat → preset Anthropic-compatible" \
         "$BASE_URL/openai/v1/chat/completions" \
-        '{"model":"minimax-anth","messages":[{"role":"user","content":"What is the weather in Tokyo?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"stream":false}' \
+        '{"model":"preset-anthropic-compatible","messages":[{"role":"user","content":"What is the weather in Tokyo?"}],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"stream":false}' \
         '"tool_calls"' '"get_weather"'
 
-    # Anthropic Messages → MiniMax OpenAI (tool call)
+    # Anthropic Messages → preset OpenAI-compatible (tool call)
     test_json \
-        "Tool call: Anthropic Messages → MiniMax OpenAI" \
+        "Tool call: Anthropic Messages → preset OpenAI-compatible" \
         "$BASE_URL/anthropic/v1/messages" \
-        '{"model":"minimax-openai","max_tokens":256,"messages":[{"role":"user","content":"What is the weather in Tokyo?"}],"tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"stream":false}' \
+        '{"model":"preset-openai-compatible","max_tokens":256,"messages":[{"role":"user","content":"What is the weather in Tokyo?"}],"tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"stream":false}' \
         '"tool_use"' '"get_weather"'
 }
 
@@ -333,14 +421,18 @@ main() {
         echo "Auto-starting proxy..."
         BINARY="${BINARY:-./target/release/llm-universal-proxy}"
         CONFIG="${CONFIG:-$DEFAULT_CONFIG}"
+        ENV_FILE="${ENV_FILE:-$DEFAULT_ENV_FILE}"
         if [ ! -f "$BINARY" ]; then
             echo "Building proxy..."
             cargo build --locked --release
         fi
-        $BINARY --config "$CONFIG" &
+        load_auto_start_env_file "$ENV_FILE"
+        render_auto_start_config "$CONFIG" "$ENV_FILE"
+        RUNTIME_CONFIG="$AUTO_START_RUNTIME_CONFIG"
+        $BINARY --config "$RUNTIME_CONFIG" &
         PROXY_PID=$!
         echo "Proxy PID: $PROXY_PID"
-        trap "kill $PROXY_PID 2>/dev/null; echo 'Proxy stopped.'; exit" EXIT
+        trap 'status=$?; kill "$PROXY_PID" 2>/dev/null; cleanup_auto_start_runtime_config; echo "Proxy stopped."; exit "$status"' EXIT
         if ! wait_for_proxy; then
             echo "Failed to start proxy." >&2
             exit 1
@@ -348,12 +440,14 @@ main() {
     fi
 
     test_health
-    test_minimax_anthropic
-    test_minimax_openai
+    test_preset_anthropic_compatible
+    test_preset_openai_compatible
     test_local_qwen
     test_tool_calls
 
     print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
