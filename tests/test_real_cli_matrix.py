@@ -729,6 +729,27 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertNotIn("proxy-only-secret", rendered)
         self.assertNotIn("MINIMAX", rendered.upper())
 
+    def test_build_runtime_config_fails_fast_when_preset_endpoint_env_is_missing(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            module.build_runtime_config_text(
+                parsed,
+                {},
+                listen_host="127.0.0.1",
+                listen_port=19999,
+                trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
+            )
+
+        message = str(raised.exception)
+        self.assertIn("PRESET_OPENAI_ENDPOINT_BASE_URL", message)
+        self.assertIn("PRESET_ANTHROPIC_ENDPOINT_BASE_URL", message)
+        self.assertIn("PRESET_ENDPOINT_MODEL", message)
+        self.assertIn("PRESET_ENDPOINT_API_KEY", message)
+
     def test_build_runtime_config_injects_qwen_surface_defaults_for_live_profile_truth_chain(self):
         module = load_module()
         parsed = module.parse_proxy_source(
@@ -4038,6 +4059,44 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(observed["clients"], [])
         self.assertEqual(observed["proxy_binary"], binary_path)
         self.assertIn("Proxy healthy at http://127.0.0.1:23456", stdout.getvalue())
+
+    def test_run_list_matrix_succeeds_without_preset_env(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_env_file = pathlib.Path(temp_dir) / "missing.env"
+            stdout = io.StringIO()
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": os.environ.get("PATH", "")},
+                clear=True,
+            ), mock.patch("sys.stdout", stdout):
+                exit_code = module.run(
+                    [
+                        "--test",
+                        "basic",
+                        "--skip-slow",
+                        "--list-matrix",
+                        "--config-source",
+                        str(DEFAULT_CONFIG_PATH),
+                        "--env-file",
+                        str(missing_env_file),
+                        "--fixtures-root",
+                        str(REPO_ROOT / "scripts" / "fixtures" / "cli_matrix"),
+                    ]
+                )
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn(
+            "codex__preset-anthropic-compatible__smoke_pong",
+            output,
+        )
+        self.assertIn(
+            "gemini__preset-openai-compatible__smoke_pong",
+            output,
+        )
+        self.assertNotIn("minimax", output.lower())
 
     def test_resolve_cli_args_supports_list_matrix_and_case_filters(self):
         module = load_module()

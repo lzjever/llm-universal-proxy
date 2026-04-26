@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import pathlib
 import re
 import subprocess
@@ -185,6 +186,96 @@ class DefaultMatrixConfigSourceContractTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
         self.assertEqual(leftovers, [], completed.stdout + completed.stderr)
+
+    def test_test_compatibility_skips_local_qwen_without_local_qwen_env(self):
+        command = textwrap.dedent(
+            """
+            set -euo pipefail
+            source scripts/test_compatibility.sh
+            test_json() {
+                echo "unexpected test_json call: $1" >&2
+                return 99
+            }
+            test_sse() {
+                echo "unexpected test_sse call: $1" >&2
+                return 99
+            }
+            output_file="$(mktemp)"
+            test_local_qwen >"$output_file"
+            test "$SKIP" -eq 1
+            test "$PASS" -eq 0
+            test "$FAIL" -eq 0
+            grep -Fq "[SKIP]" "$output_file"
+            grep -Fq "LOCAL_QWEN_BASE_URL" "$output_file"
+            grep -Fq "LOCAL_QWEN_MODEL" "$output_file"
+            """
+        )
+
+        completed = subprocess.run(
+            ["bash", "-c", command],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PRESET_ENDPOINT_API_KEY": "proxy-only-secret",
+                "PRESET_OPENAI_ENDPOINT_BASE_URL": "https://openai-compatible.example/v1",
+                "PRESET_ANTHROPIC_ENDPOINT_BASE_URL": "https://anthropic-compatible.example/v1",
+                "PRESET_ENDPOINT_MODEL": "provider-configured-model",
+            },
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
+    def test_test_compatibility_runs_local_qwen_when_local_qwen_env_exists(self):
+        command = textwrap.dedent(
+            """
+            set -euo pipefail
+            source scripts/test_compatibility.sh
+            JSON_CALLS=0
+            SSE_CALLS=0
+            test_json() {
+                JSON_CALLS=$((JSON_CALLS + 1))
+            }
+            test_sse() {
+                SSE_CALLS=$((SSE_CALLS + 1))
+            }
+            test_local_qwen
+            test "$JSON_CALLS" -eq 3
+            test "$SSE_CALLS" -eq 3
+            test "$SKIP" -eq 0
+            """
+        )
+
+        completed = subprocess.run(
+            ["bash", "-c", command],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PRESET_ENDPOINT_API_KEY": "proxy-only-secret",
+                "PRESET_OPENAI_ENDPOINT_BASE_URL": "https://openai-compatible.example/v1",
+                "PRESET_ANTHROPIC_ENDPOINT_BASE_URL": "https://anthropic-compatible.example/v1",
+                "PRESET_ENDPOINT_MODEL": "provider-configured-model",
+                "LOCAL_QWEN_BASE_URL": "http://127.0.0.1:9997/v1",
+                "LOCAL_QWEN_MODEL": "qwen3.5-9b-awq",
+            },
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
 
     def test_tracked_default_config_uses_env_credentials_without_provider_keys(self):
         config_text = TRACKED_CONFIG_PATH.read_text(encoding="utf-8")

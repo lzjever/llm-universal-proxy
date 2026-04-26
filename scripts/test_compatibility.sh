@@ -317,6 +317,12 @@ test_preset_openai_compatible() {
 # Local qwen3.5-9b-awq via OpenAI-compatible upstream
 # ============================================================
 test_local_qwen() {
+    if [ -z "${LOCAL_QWEN_BASE_URL:-}" ] || [ -z "${LOCAL_QWEN_MODEL:-}" ]; then
+        log_header "Local qwen3.5 Upstream"
+        log_skip "Local qwen tests require LOCAL_QWEN_BASE_URL and LOCAL_QWEN_MODEL"
+        return 0
+    fi
+
     log_header "Local qwen3.5 Upstream — OpenAI Chat Completions Client"
 
     test_json \

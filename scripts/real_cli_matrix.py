@@ -1051,9 +1051,13 @@ def _hydrate_preset_endpoint_model_target(
 
 
 def resolve_lanes(
-    config: ProxySourceConfig, dotenv_env: dict[str, str]
+    config: ProxySourceConfig,
+    dotenv_env: dict[str, str],
+    *,
+    require_preset_endpoint_env: bool = True,
 ) -> list[Lane]:
-    validate_preset_endpoint_env(config, dotenv_env)
+    if require_preset_endpoint_env:
+        validate_preset_endpoint_env(config, dotenv_env)
     lane_specs = _primary_lane_specs() + (
         ("qwen-local", False, "LOCAL-QWEN"),
     )
@@ -5535,7 +5539,11 @@ def run(argv: list[str] | None = None) -> int:
     dotenv_env = load_dotenv_file(pathlib.Path(args.env_file))
     parsed_source = parse_proxy_source(config_source.read_text(encoding="utf-8"))
     dotenv_env = merge_preset_endpoint_env(parsed_source, dotenv_env, base_env)
-    lanes = resolve_lanes(parsed_source, dotenv_env)
+    lanes = resolve_lanes(
+        parsed_source,
+        dotenv_env,
+        require_preset_endpoint_env=not args.list_matrix,
+    )
     fixtures = load_fixtures(pathlib.Path(args.fixtures_root))
     cases = expand_matrix(
         clients=CLIENT_NAMES,
