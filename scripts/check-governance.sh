@@ -62,6 +62,93 @@ check_absent() {
     fi
 }
 
+check_checkout_tag_visibility() {
+    local is_shallow
+
+    if ! is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null)"; then
+        FAILURES+=("unable to determine checkout depth for release tag visibility; configure actions/checkout with fetch-depth: 0 so governance can see occupied tags")
+        return
+    fi
+
+    case "$is_shallow" in
+        false)
+            ;;
+        true)
+            FAILURES+=("shallow checkout cannot safely enforce release tag visibility; configure actions/checkout with fetch-depth: 0 so governance can see occupied tags")
+            ;;
+        *)
+            FAILURES+=("unexpected shallow checkout state '$is_shallow'; configure actions/checkout with fetch-depth: 0 so governance can see occupied tags")
+            ;;
+    esac
+}
+
+check_governance_checkout_fetch_depth() {
+    local workflow="$1"
+    local checkout_output
+
+    if ! checkout_output="$(WORKFLOW_PATH="$workflow" python3 - <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+
+def workflow_jobs(text):
+    matches = list(re.finditer(r"^  ([A-Za-z0-9_-]+):\n", text, re.MULTILINE))
+    jobs = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        jobs[match.group(1)] = text[match.start() : end]
+    return jobs
+
+
+def workflow_step_block(text, step_name):
+    marker = f"      - name: {step_name}"
+    start = text.find(marker)
+    if start == -1:
+        return ""
+    next_step = text.find("\n      - name: ", start + len(marker))
+    if next_step == -1:
+        return text[start:]
+    return text[start:next_step]
+
+
+workflow_path = pathlib.Path(os.environ["WORKFLOW_PATH"])
+workflow = workflow_path.read_text(encoding="utf-8")
+job = workflow_jobs(workflow).get("governance", "")
+failures = []
+
+if not job:
+    failures.append(f"{workflow_path} is missing the governance job")
+else:
+    checkout_step = workflow_step_block(job, "Checkout code")
+    if not checkout_step:
+        failures.append(f"{workflow_path} governance job is missing Checkout code step")
+    else:
+        if "uses: actions/checkout@v5" not in checkout_step:
+            failures.append(
+                f"{workflow_path} governance checkout must use actions/checkout@v5"
+            )
+        if not re.search(r"(?m)^        with:\s*$", checkout_step):
+            failures.append(
+                f"{workflow_path} governance checkout must define a with block"
+            )
+        if not re.search(r"(?m)^          fetch-depth:\s*0\s*$", checkout_step):
+            failures.append(
+                f"{workflow_path} governance checkout must set fetch-depth: 0 for tag visibility"
+            )
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+PY
+    )"; then
+        while IFS= read -r failure; do
+            [[ -n "$failure" ]] && FAILURES+=("$failure")
+        done <<< "$checkout_output"
+    fi
+}
+
 check_release_tag_identity() {
     local release_tag="refs/tags/v${VERSION}"
     local current_head
@@ -403,6 +490,10 @@ if ! RELEASE_PUBLISH_GATE_OUTPUT="$(check_release_publish_jobs_need_ga_gates)"; 
 fi
 
 check_compatible_provider_smoke_invocation
+
+check_checkout_tag_visibility
+check_governance_checkout_fetch_depth ".github/workflows/ci.yml"
+check_governance_checkout_fetch_depth ".github/workflows/release.yml"
 
 check_eq "Cargo.lock package version" "$LOCK_VERSION" "$VERSION"
 check_eq "CHANGELOG latest version" "$CHANGELOG_VERSION" "$VERSION"

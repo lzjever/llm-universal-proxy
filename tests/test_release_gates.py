@@ -174,6 +174,20 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             r"supply-chain[^\]]*\]",
         )
 
+    def test_governance_checkout_fetches_full_history_for_release_tag_visibility(self):
+        for workflow_path in (CI_WORKFLOW, RELEASE_WORKFLOW):
+            with self.subTest(workflow=workflow_path.name):
+                job = workflow_jobs(workflow_path).get("governance", "")
+                self.assertTrue(job, "workflow must define a governance job")
+                checkout_step = workflow_step_block(job, "Checkout code")
+                self.assertTrue(
+                    checkout_step,
+                    "governance job must checkout repository code",
+                )
+                self.assertIn("uses: actions/checkout@v5", checkout_step)
+                self.assertIn("        with:", checkout_step)
+                self.assertRegex(checkout_step, r"(?m)^          fetch-depth: 0$")
+
     def test_release_compatible_provider_smoke_delegates_missing_secret_json_to_script(self):
         jobs = release_workflow_jobs()
         job = jobs.get("compatible-provider-smoke", "")
@@ -354,6 +368,10 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "check_release_tag_identity",
             "refs/tags/v${VERSION}",
             "git rev-parse --verify --quiet",
+            "check_governance_checkout_fetch_depth",
+            "git rev-parse --is-shallow-repository",
+            "fetch-depth: 0",
+            "tag visibility",
             SUPPLY_CHAIN_AUDIT_COMMAND,
             LOCKFILE_INTEGRITY_COMMAND,
             "cargo audit --locked",

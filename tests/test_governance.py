@@ -9,6 +9,8 @@ import unittest
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 GOVERNANCE_SCRIPT = REPO_ROOT / "scripts" / "check-governance.sh"
 SUPPLY_CHAIN_AUDIT_SCRIPT = REPO_ROOT / "scripts" / "supply_chain_audit.sh"
 SUPPLY_CHAIN_AUDIT_COMMAND = "bash scripts/supply_chain_audit.sh"
@@ -152,6 +154,17 @@ def has_compatible_provider_smoke_invocation(text: str) -> bool:
     )
 
 
+def workflow_jobs(workflow_path: pathlib.Path):
+    text = workflow_path.read_text(encoding="utf-8")
+    matches = list(re.finditer(r"^  ([A-Za-z0-9_-]+):\n", text, re.MULTILINE))
+    jobs = {}
+    for index, match in enumerate(matches):
+        job_name = match.group(1)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        jobs[job_name] = text[match.start() : end]
+    return jobs
+
+
 def workflow_step_block(text: str, step_name: str) -> str:
     marker = f"      - name: {step_name}"
     start = text.find(marker)
@@ -164,6 +177,73 @@ def workflow_step_block(text: str, step_name: str) -> str:
 
 
 class GovernanceTests(unittest.TestCase):
+    def test_governance_checkout_fetches_full_history_for_tag_visibility(self):
+        for workflow_path in (CI_WORKFLOW, RELEASE_WORKFLOW):
+            with self.subTest(workflow=workflow_path.name):
+                job = workflow_jobs(workflow_path).get("governance", "")
+                self.assertTrue(job, "workflow must define a governance job")
+                checkout_step = workflow_step_block(job, "Checkout code")
+                self.assertTrue(
+                    checkout_step,
+                    "governance job must checkout repository code",
+                )
+                self.assertIn("uses: actions/checkout@v5", checkout_step)
+                self.assertIn("        with:", checkout_step)
+                self.assertRegex(checkout_step, r"(?m)^          fetch-depth: 0$")
+
+    def test_governance_fails_closed_in_github_actions_shallow_checkout(self):
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git, "git must be available for governance tests")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_bin = pathlib.Path(temp_dir)
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                """#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+if args[:1] == ["rev-parse"] and "--is-shallow-repository" in args:
+    print("true")
+    sys.exit(0)
+
+real_git = os.environ["REAL_GIT"]
+os.execv(real_git, [real_git, *args])
+""",
+                encoding="utf-8",
+            )
+            fake_git.chmod(fake_git.stat().st_mode | stat.S_IXUSR)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "GITHUB_ACTIONS": "true",
+                    "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', '')}",
+                    "REAL_GIT": real_git,
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(GOVERNANCE_SCRIPT)],
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
+        output = result.stdout + result.stderr
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            "governance must fail closed in GitHub Actions shallow checkouts",
+        )
+        self.assertIn("shallow", output.lower())
+        self.assertIn("fetch-depth: 0", output)
+        self.assertIn("tag visibility", output)
+
     def test_governance_fails_when_current_version_tag_is_occupied_by_another_head(self):
         version_match = re.search(
             r'^version = "([^"]+)"',

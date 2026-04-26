@@ -504,7 +504,25 @@ class InteractiveCliTests(unittest.TestCase):
         fake_process = FakeProcess()
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            with mock.patch.object(
+            root = pathlib.Path(temp_dir)
+            env_file = root / "preset.env"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        "PRESET_ENDPOINT_API_KEY=proxy-only-secret",
+                        "PRESET_OPENAI_ENDPOINT_BASE_URL=https://openai-compatible.example/v1",
+                        "PRESET_ANTHROPIC_ENDPOINT_BASE_URL=https://anthropic-compatible.example/v1",
+                        "PRESET_ENDPOINT_MODEL=provider-configured-model",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": os.environ.get("PATH", "")},
+                clear=True,
+            ), mock.patch.object(
                 module, "ensure_client_binary"
             ), mock.patch.object(
                 module, "ensure_proxy_binary"
@@ -512,9 +530,9 @@ class InteractiveCliTests(unittest.TestCase):
                 module, "start_proxy",
                 return_value=(
                     fake_process,
-                    pathlib.Path(temp_dir) / "runtime-config.yaml",
-                    pathlib.Path(temp_dir) / "proxy.stdout.log",
-                    pathlib.Path(temp_dir) / "proxy.stderr.log",
+                    root / "runtime-config.yaml",
+                    root / "proxy.stdout.log",
+                    root / "proxy.stderr.log",
                 ),
             ) as start_proxy, mock.patch.object(
                 module, "wait_for_health"
@@ -538,23 +556,95 @@ class InteractiveCliTests(unittest.TestCase):
                         temp_dir,
                         "--proxy-health-timeout-secs",
                         "65",
+                        "--env-file",
+                        str(env_file),
                     ]
                 )
 
         self.assertEqual(exit_code, 0)
         start_proxy.assert_called_once()
+        runtime_config_text = start_proxy.call_args.args[1]
+        proxy_env = start_proxy.call_args.args[3]
+        self.assertIn("api_root: https://openai-compatible.example/v1", runtime_config_text)
+        self.assertIn(
+            "api_root: https://anthropic-compatible.example/v1",
+            runtime_config_text,
+        )
+        self.assertIn(
+            'preset-openai-compatible: "PRESET-OPENAI-COMPATIBLE:provider-configured-model"',
+            runtime_config_text,
+        )
+        self.assertIn(
+            'preset-anthropic-compatible: "PRESET-ANTHROPIC-COMPATIBLE:provider-configured-model"',
+            runtime_config_text,
+        )
+        self.assertNotIn("api_root: PRESET_", runtime_config_text)
+        self.assertNotIn("PRESET_ENDPOINT_MODEL", runtime_config_text)
+        self.assertNotIn("proxy-only-secret", runtime_config_text)
+        self.assertEqual(proxy_env["PRESET_ENDPOINT_API_KEY"], "proxy-only-secret")
         wait_for_health.assert_called_once_with(
             "http://127.0.0.1:18888",
             timeout_secs=65,
             process=fake_process,
-            stdout_path=pathlib.Path(temp_dir) / "proxy.stdout.log",
-            stderr_path=pathlib.Path(temp_dir) / "proxy.stderr.log",
+            stdout_path=root / "proxy.stdout.log",
+            stderr_path=root / "proxy.stderr.log",
         )
         fetch_live_model_profile.assert_called_once_with(
             "http://127.0.0.1:18888",
             "preset-anthropic-compatible",
         )
         stop_proxy.assert_called_once_with(fake_process, terminate_grace_secs=15)
+
+    def test_run_without_proxy_base_missing_preset_env_fails_before_starting_proxy(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            missing_env_file = root / "missing.env"
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": os.environ.get("PATH", "")},
+                clear=True,
+            ), mock.patch.object(
+                module, "ensure_client_binary"
+            ), mock.patch.object(
+                module, "ensure_proxy_binary"
+            ), mock.patch.object(
+                module, "start_proxy"
+            ) as start_proxy, mock.patch.object(
+                module, "wait_for_health"
+            ) as wait_for_health, mock.patch.object(
+                module, "stop_proxy"
+            ) as stop_proxy, mock.patch.object(
+                module, "fetch_live_model_profile"
+            ) as fetch_live_model_profile, mock.patch.object(
+                module, "launch_interactive_client"
+            ) as launch_interactive_client:
+                with self.assertRaises(ValueError) as raised:
+                    module.run(
+                        [
+                            "--client",
+                            "claude",
+                            "--workspace",
+                            temp_dir,
+                            "--env-file",
+                            str(missing_env_file),
+                        ]
+                    )
+
+        message = str(raised.exception)
+        for required_key in (
+            "PRESET_OPENAI_ENDPOINT_BASE_URL",
+            "PRESET_ANTHROPIC_ENDPOINT_BASE_URL",
+            "PRESET_ENDPOINT_MODEL",
+            "PRESET_ENDPOINT_API_KEY",
+        ):
+            self.assertIn(required_key, message)
+        start_proxy.assert_not_called()
+        wait_for_health.assert_not_called()
+        fetch_live_model_profile.assert_not_called()
+        launch_interactive_client.assert_not_called()
+        stop_proxy.assert_called_once_with(None, terminate_grace_secs=15)
 
     def test_start_managed_proxy_serializes_surface_fields_into_runtime_config(self):
         module = load_module()

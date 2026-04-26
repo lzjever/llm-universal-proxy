@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.2.21 - 2026-04-26
+
+- Bumped the release identity past the occupied `v0.2.20` tag without moving, deleting, or reusing the existing tag.
+- Hardened governance so CI and release fetch full tag history before checking release identity, and fail closed when a shallow checkout makes tag visibility unsafe.
+- Collected the recent provider-neutral CLI matrix, compatible-provider smoke, streaming translation, and release-governance fixes under the forward-bumped release line.
+
 ## v0.2.20 - 2026-04-25
 
 - Split the supply-chain gate into a Cargo-supported lockfile integrity check via `cargo metadata --locked --format-version 1 --no-deps` and a cargo-audit execution that no longer passes unsupported audit flags.

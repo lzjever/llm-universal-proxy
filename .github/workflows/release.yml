@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Check version, toolchain, and Secret Scan governance
         run: bash scripts/check-governance.sh
