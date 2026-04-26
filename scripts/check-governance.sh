@@ -464,7 +464,8 @@ check_contains ".github/workflows/ci.yml" "python3 scripts/real_endpoint_matrix.
 check_contains ".github/workflows/ci.yml" "Perf Gate"
 check_contains ".github/workflows/ci.yml" "python3 scripts/real_endpoint_matrix.py --mock --perf"
 check_contains ".github/workflows/ci.yml" "Supply Chain"
-check_contains ".github/workflows/ci.yml" "cargo audit"
+check_contains ".github/workflows/ci.yml" "bash scripts/supply_chain_audit.sh"
+check_absent ".github/workflows/ci.yml" "cargo audit --locked"
 check_contains ".github/workflows/ci.yml" "Container Image Smoke"
 check_contains ".github/workflows/ci.yml" "push: false"
 check_contains ".github/workflows/ci.yml" "IMAGE=llm-universal-proxy:ci bash scripts/test_container_smoke.sh"
@@ -490,7 +491,8 @@ check_contains ".github/workflows/release.yml" "python3 scripts/real_cli_matrix.
 check_contains ".github/workflows/release.yml" "Perf Gate"
 check_contains ".github/workflows/release.yml" "python3 scripts/real_endpoint_matrix.py --mock --perf"
 check_contains ".github/workflows/release.yml" "Supply Chain"
-check_contains ".github/workflows/release.yml" "cargo audit"
+check_contains ".github/workflows/release.yml" "bash scripts/supply_chain_audit.sh"
+check_absent ".github/workflows/release.yml" "cargo audit --locked"
 check_contains ".github/workflows/release.yml" "anchore/sbom-action"
 check_contains ".github/workflows/release.yml" "Compatible Provider Smoke"
 check_contains ".github/workflows/release.yml" "environment: release-compatible-provider"
@@ -536,6 +538,10 @@ check_contains "examples/container-config.yaml" "credential_env: OPENAI_API_KEY"
 check_contains "examples/docker-compose.yaml" 'OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}'
 check_contains "examples/docker-compose.yaml" 'LLM_UNIVERSAL_PROXY_ADMIN_TOKEN: ${LLM_UNIVERSAL_PROXY_ADMIN_TOKEN:?set LLM_UNIVERSAL_PROXY_ADMIN_TOKEN}'
 check_absent "examples/container-config.yaml" "credential_actual"
+
+check_contains "scripts/supply_chain_audit.sh" "cargo metadata --locked --format-version 1 --no-deps"
+check_contains "scripts/supply_chain_audit.sh" "cargo audit"
+check_absent "scripts/supply_chain_audit.sh" "cargo audit --locked"
 
 if [[ ${#FAILURES[@]} -gt 0 ]]; then
     printf 'governance check failed:\n' >&2

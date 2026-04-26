@@ -10,6 +10,9 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 GOVERNANCE_SCRIPT = REPO_ROOT / "scripts" / "check-governance.sh"
+SUPPLY_CHAIN_AUDIT_SCRIPT = REPO_ROOT / "scripts" / "supply_chain_audit.sh"
+SUPPLY_CHAIN_AUDIT_COMMAND = "bash scripts/supply_chain_audit.sh"
+LOCKFILE_INTEGRITY_COMMAND = "cargo metadata --locked --format-version 1 --no-deps"
 PYTHON_CONTRACT_TEST_COMMAND = (
     "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
 )
@@ -451,6 +454,42 @@ os.execv(real_git, [real_git, *args])
         self.assertIn(PYTHON_CONTRACT_TEST_COMMAND, release)
         self.assertRegex(ci, r"(?i)secret scan")
         self.assertRegex(release, r"(?i)secret scan")
+
+    def test_supply_chain_audit_contract_is_governed(self):
+        ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        release = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        governance = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertTrue(
+            SUPPLY_CHAIN_AUDIT_SCRIPT.exists(),
+            "supply-chain gate must use a shared script entrypoint",
+        )
+        audit_script = SUPPLY_CHAIN_AUDIT_SCRIPT.read_text(encoding="utf-8")
+
+        for label, workflow in (("ci", ci), ("release", release)):
+            with self.subTest(workflow=label):
+                self.assertIn(SUPPLY_CHAIN_AUDIT_COMMAND, workflow)
+                self.assertNotIn("cargo audit --locked", workflow)
+
+        self.assertIn(LOCKFILE_INTEGRITY_COMMAND, audit_script)
+        self.assertIn("cargo audit", audit_script)
+        self.assertNotIn("cargo audit --locked", audit_script)
+
+        for snippet in (
+            f'check_contains ".github/workflows/ci.yml" "{SUPPLY_CHAIN_AUDIT_COMMAND}"',
+            f'check_contains ".github/workflows/release.yml" "{SUPPLY_CHAIN_AUDIT_COMMAND}"',
+            'check_absent ".github/workflows/ci.yml" "cargo audit --locked"',
+            'check_absent ".github/workflows/release.yml" "cargo audit --locked"',
+            f'check_contains "scripts/supply_chain_audit.sh" "{LOCKFILE_INTEGRITY_COMMAND}"',
+            'check_contains "scripts/supply_chain_audit.sh" "cargo audit"',
+            'check_absent "scripts/supply_chain_audit.sh" "cargo audit --locked"',
+        ):
+            with self.subTest(governance_snippet=snippet):
+                self.assertIn(snippet, governance)
 
     def test_governance_secret_scan_covers_tracked_fixtures_docs_examples_scripts(self):
         script = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")

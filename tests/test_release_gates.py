@@ -9,6 +9,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 GOVERNANCE_SCRIPT = REPO_ROOT / "scripts" / "check-governance.sh"
+SUPPLY_CHAIN_AUDIT_SCRIPT = REPO_ROOT / "scripts" / "supply_chain_audit.sh"
+SUPPLY_CHAIN_AUDIT_COMMAND = "bash scripts/supply_chain_audit.sh"
+LOCKFILE_INTEGRITY_COMMAND = "cargo metadata --locked --format-version 1 --no-deps"
 ENDPOINT_MATRIX_SCRIPT = REPO_ROOT / "scripts" / "real_endpoint_matrix.py"
 PYTHON_CONTRACT_TEST_COMMAND = (
     "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
@@ -57,8 +60,8 @@ def load_endpoint_matrix_module():
     return module
 
 
-def release_workflow_jobs():
-    text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+def workflow_jobs(workflow_path: pathlib.Path):
+    text = workflow_path.read_text(encoding="utf-8")
     matches = list(re.finditer(r"^  ([A-Za-z0-9_-]+):\n", text, re.MULTILINE))
     jobs = {}
     for index, match in enumerate(matches):
@@ -66,6 +69,10 @@ def release_workflow_jobs():
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         jobs[job_name] = text[match.start() : end]
     return jobs
+
+
+def release_workflow_jobs():
+    return workflow_jobs(RELEASE_WORKFLOW)
 
 
 def job_needs(job_block: str):
@@ -148,7 +155,7 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "Perf Gate",
             "python3 scripts/real_endpoint_matrix.py --mock --perf",
             "Supply Chain",
-            "cargo audit",
+            SUPPLY_CHAIN_AUDIT_COMMAND,
             "anchore/sbom-action",
             "Compatible Provider Smoke",
             "environment: release-compatible-provider",
@@ -251,10 +258,35 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "Perf Gate",
             "python3 scripts/real_endpoint_matrix.py --mock --perf",
             "Supply Chain",
-            "cargo audit",
+            SUPPLY_CHAIN_AUDIT_COMMAND,
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, ci)
+
+    def test_supply_chain_audit_gate_has_central_contract(self):
+        self.assertTrue(
+            SUPPLY_CHAIN_AUDIT_SCRIPT.exists(),
+            "supply-chain audit must have one repo-local entrypoint shared by CI and release",
+        )
+        audit_script = SUPPLY_CHAIN_AUDIT_SCRIPT.read_text(encoding="utf-8")
+
+        for workflow_path in (CI_WORKFLOW, RELEASE_WORKFLOW):
+            workflow = workflow_path.read_text(encoding="utf-8")
+            jobs = workflow_jobs(workflow_path)
+            job = jobs.get("supply-chain", "")
+            with self.subTest(workflow=workflow_path.name):
+                self.assertTrue(job, "workflow must define a supply-chain job")
+                self.assertIn("Install cargo-audit", job)
+                self.assertIn(SUPPLY_CHAIN_AUDIT_COMMAND, job)
+                self.assertNotIn("cargo audit --locked", workflow)
+
+        release_supply_chain = workflow_jobs(RELEASE_WORKFLOW).get("supply-chain", "")
+        self.assertIn("anchore/sbom-action", release_supply_chain)
+        self.assertIn("Upload SBOM", release_supply_chain)
+
+        self.assertIn(LOCKFILE_INTEGRITY_COMMAND, audit_script)
+        self.assertIn("cargo audit", audit_script)
+        self.assertNotIn("cargo audit --locked", audit_script)
 
     def test_endpoint_mock_matrix_covers_public_surface_minimal_paths(self):
         module = load_endpoint_matrix_module()
@@ -322,7 +354,9 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "check_release_tag_identity",
             "refs/tags/v${VERSION}",
             "git rev-parse --verify --quiet",
-            "cargo audit",
+            SUPPLY_CHAIN_AUDIT_COMMAND,
+            LOCKFILE_INTEGRITY_COMMAND,
+            "cargo audit --locked",
             "anchore/sbom-action",
         ):
             with self.subTest(snippet=snippet):

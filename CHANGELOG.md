@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.2.20 - 2026-04-25
+
+- Split the supply-chain gate into a Cargo-supported lockfile integrity check via `cargo metadata --locked --format-version 1 --no-deps` and a cargo-audit execution that no longer passes unsupported audit flags.
+- Routed both CI and release through the shared `scripts/supply_chain_audit.sh` contract while keeping release SBOM generation and upload in place.
+- Bumped the release identity after the failed occupied `v0.2.19` run.
+
 ## v0.2.19 - 2026-04-25
 
 - Changed the repo-side release workflow to require the provider-neutral compatible GA smoke gate before publishing, using the protected `release-compatible-provider` environment while leaving the four official provider live smoke as optional extended evidence rather than a protected release blocker.

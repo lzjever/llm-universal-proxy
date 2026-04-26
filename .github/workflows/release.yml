@@ -275,8 +275,8 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      - name: Run cargo audit
-        run: cargo audit --locked
+      - name: Run supply-chain audit
+        run: bash scripts/supply_chain_audit.sh
 
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
