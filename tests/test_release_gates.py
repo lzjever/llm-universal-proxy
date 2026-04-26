@@ -17,16 +17,28 @@ REQUIRED_RELEASE_GATE_NEEDS = (
     "mock-endpoint-matrix",
     "cli-wrapper-matrix",
     "perf-gate",
-    "real-provider-smoke",
+    "compatible-provider-smoke",
     "supply-chain",
 )
-REAL_PROVIDER_REQUIRED_SECRETS = (
+OFFICIAL_PROVIDER_SECRET_ENVS = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "MINIMAX_API_KEY",
 )
-REAL_PROVIDER_SMOKE_JSON = "artifacts/real-provider-smoke.json"
+COMPAT_PROVIDER_SECRET_ENVS = (
+    "COMPAT_PROVIDER_API_KEY",
+    "COMPAT_OPENAI_API_KEY",
+    "COMPAT_ANTHROPIC_API_KEY",
+)
+COMPAT_PROVIDER_VAR_ENVS = (
+    "COMPAT_OPENAI_BASE_URL",
+    "COMPAT_OPENAI_MODEL",
+    "COMPAT_ANTHROPIC_BASE_URL",
+    "COMPAT_ANTHROPIC_MODEL",
+    "COMPAT_PROVIDER_LABEL",
+)
+COMPAT_PROVIDER_SMOKE_JSON = "artifacts/compatible-provider-smoke.json"
 RELEASE_PUBLISH_JOB_MARKERS = (
     "push: true",
     "packages: write",
@@ -81,15 +93,12 @@ def job_needs(job_block: str):
     return needs
 
 
-def real_provider_smoke_invocation_lines(text: str):
+def compatible_provider_smoke_invocation_lines(text: str):
     return [
         line.strip()
         for line in text.splitlines()
         if "python3 scripts/real_endpoint_matrix.py" in line
-        and (
-            "--real-provider-smoke" in line
-            or "--mode real-provider-smoke" in line
-        )
+        and "--mode compatible-provider-smoke" in line
     ]
 
 
@@ -108,16 +117,16 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
     def read_text(self, relative_path: str) -> str:
         return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
 
-    def assert_has_real_provider_smoke_invocation(self, text: str):
-        invocation_lines = real_provider_smoke_invocation_lines(text)
+    def assert_has_compatible_provider_smoke_invocation(self, text: str):
+        invocation_lines = compatible_provider_smoke_invocation_lines(text)
         self.assertTrue(
             invocation_lines,
-            "real provider smoke must invoke real_endpoint_matrix.py with "
-            "--real-provider-smoke or --mode real-provider-smoke",
+            "compatible provider smoke must invoke real_endpoint_matrix.py with "
+            "--mode compatible-provider-smoke",
         )
         self.assertTrue(
-            any("--json-out" in line and REAL_PROVIDER_SMOKE_JSON in line for line in invocation_lines),
-            "real provider smoke must emit the machine-readable JSON artifact",
+            any("--json-out" in line and COMPAT_PROVIDER_SMOKE_JSON in line for line in invocation_lines),
+            "compatible provider smoke must emit the machine-readable JSON artifact",
         )
 
     def test_release_workflow_contains_ga_release_gates(self):
@@ -141,63 +150,69 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "Supply Chain",
             "cargo audit",
             "anchore/sbom-action",
-            "Real Provider Smoke",
-            "environment: release-real-providers",
-            REAL_PROVIDER_SMOKE_JSON,
+            "Compatible Provider Smoke",
+            "environment: release-compatible-provider",
+            COMPAT_PROVIDER_SMOKE_JSON,
         )
 
         for snippet in required_snippets:
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, release)
-        self.assert_has_real_provider_smoke_invocation(release)
+        self.assert_has_compatible_provider_smoke_invocation(release)
 
         self.assertRegex(
             release,
             r"release:\n(?:.|\n)*needs: \[[^\]]*mock-endpoint-matrix[^\]]*"
-            r"cli-wrapper-matrix[^\]]*perf-gate[^\]]*real-provider-smoke[^\]]*"
+            r"cli-wrapper-matrix[^\]]*perf-gate[^\]]*compatible-provider-smoke[^\]]*"
             r"supply-chain[^\]]*\]",
         )
 
-    def test_release_real_provider_smoke_delegates_missing_secret_json_to_script(self):
+    def test_release_compatible_provider_smoke_delegates_missing_secret_json_to_script(self):
         jobs = release_workflow_jobs()
-        job = jobs.get("real-provider-smoke", "")
-        self.assertTrue(job, "release workflow must define real-provider-smoke")
+        job = jobs.get("compatible-provider-smoke", "")
+        self.assertTrue(job, "release workflow must define compatible-provider-smoke")
 
-        run_step = workflow_step_block(job, "Run real provider smoke")
-        self.assertTrue(run_step, "real provider smoke must have a script run step")
-        for secret_name in REAL_PROVIDER_REQUIRED_SECRETS:
+        run_step = workflow_step_block(job, "Run compatible provider smoke")
+        self.assertTrue(run_step, "compatible provider smoke must have a script run step")
+        for secret_name in COMPAT_PROVIDER_SECRET_ENVS:
             with self.subTest(secret=secret_name):
                 self.assertIn(f"{secret_name}: ${{{{ secrets.{secret_name} }}}}", run_step)
+        for var_name in COMPAT_PROVIDER_VAR_ENVS:
+            with self.subTest(var=var_name):
+                self.assertIn(f"{var_name}: ${{{{ vars.{var_name} }}}}", run_step)
+        for secret_name in OFFICIAL_PROVIDER_SECRET_ENVS:
+            with self.subTest(no_official_secret=secret_name):
+                self.assertNotIn(f"{secret_name}: ${{{{ secrets.{secret_name} }}}}", job)
         self.assertNotIn("GLM_APIKEY", run_step)
         self.assertNotIn("secrets.GLM_APIKEY", job)
 
-        invocation_lines = real_provider_smoke_invocation_lines(job)
+        invocation_lines = compatible_provider_smoke_invocation_lines(job)
         self.assertTrue(invocation_lines)
         invocation_index = job.find(invocation_lines[0])
         self.assertGreaterEqual(invocation_index, 0)
         before_invocation = job[:invocation_index]
 
         self.assertNotIn("Validate protected real provider secrets", before_invocation)
-        self.assertNotIn("is required in the release-real-providers environment", before_invocation)
+        self.assertNotIn("is required in the release-compatible-provider environment", before_invocation)
         self.assertNotIn("exit 1", before_invocation)
-        for secret_name in REAL_PROVIDER_REQUIRED_SECRETS:
-            with self.subTest(no_preflight=secret_name):
-                self.assertNotIn(f'test -n "${{{secret_name}:-}}"', before_invocation)
+        for env_name in (*COMPAT_PROVIDER_SECRET_ENVS, *COMPAT_PROVIDER_VAR_ENVS):
+            with self.subTest(no_preflight=env_name):
+                self.assertNotIn(f'test -n "${{{env_name}:-}}"', before_invocation)
 
-        self.assert_has_real_provider_smoke_invocation(job)
+        self.assert_has_compatible_provider_smoke_invocation(job)
 
-    def test_release_real_provider_smoke_uploads_json_artifact_always(self):
+    def test_release_compatible_provider_smoke_uploads_json_artifact_always(self):
         jobs = release_workflow_jobs()
-        job = jobs.get("real-provider-smoke", "")
-        self.assertTrue(job, "release workflow must define real-provider-smoke")
+        job = jobs.get("compatible-provider-smoke", "")
+        self.assertTrue(job, "release workflow must define compatible-provider-smoke")
 
-        upload_step = workflow_step_block(job, "Upload real provider smoke result")
-        self.assertTrue(upload_step, "real provider smoke JSON artifact must be uploaded")
-        self.assertIn("Upload real provider smoke result", job)
+        upload_step = workflow_step_block(job, "Upload compatible provider smoke result")
+        self.assertTrue(upload_step, "compatible provider smoke JSON artifact must be uploaded")
+        self.assertIn("Upload compatible provider smoke result", job)
         self.assertIn('if: ${{ always() }}', upload_step)
         self.assertIn("uses: actions/upload-artifact@v4", upload_step)
-        self.assertIn("name: real-provider-smoke", upload_step)
-        self.assertIn(f"path: {REAL_PROVIDER_SMOKE_JSON}", upload_step)
+        self.assertIn("name: compatible-provider-smoke", upload_step)
+        self.assertIn(f"path: {COMPAT_PROVIDER_SMOKE_JSON}", upload_step)
         self.assertIn("if-no-files-found: error", upload_step)
 
     def test_release_publish_jobs_need_ga_gates_before_publishing(self):
@@ -214,11 +229,17 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
 
         for job_name, job_block in publish_jobs.items():
             with self.subTest(job=job_name):
-                missing = set(REQUIRED_RELEASE_GATE_NEEDS) - job_needs(job_block)
+                needs = job_needs(job_block)
+                missing = set(REQUIRED_RELEASE_GATE_NEEDS) - needs
                 self.assertFalse(
                     missing,
                     f"{job_name} publishes release artifacts before GA gates: "
                     f"{', '.join(sorted(missing))}",
+                )
+                self.assertNotIn(
+                    "real-provider-smoke",
+                    needs,
+                    f"{job_name} must not block GA release on the legacy four-provider smoke",
                 )
 
     def test_ci_workflow_contains_local_mock_perf_and_supply_chain_gates(self):
@@ -265,7 +286,7 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "--mock",
             "--perf",
             "--json-out",
-            "--real-provider-smoke",
+            "--mode",
             "PERF_DEFAULT_P95_MS",
             "PERF_DEFAULT_TOTAL_MS",
             "build_mock_matrix_cases",
@@ -275,8 +296,8 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
                 self.assertIn(snippet, script)
 
         self.assertTrue(
-            "--real-provider-smoke" in script or "--mode" in script,
-            "real endpoint matrix must expose a real-provider smoke CLI mode",
+            "--mode" in script,
+            "real endpoint matrix must expose explicit CLI modes",
         )
 
         self.assertNotIn("sk-proj-", script)
@@ -290,10 +311,11 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "python3 scripts/real_endpoint_matrix.py --mock",
             "python3 scripts/real_cli_matrix.py --test basic --skip-slow --list-matrix",
             "python3 scripts/real_endpoint_matrix.py --mock --perf",
-            "environment: release-real-providers",
-            "REAL_PROVIDER_REQUIRED_SECRETS",
-            "REAL_PROVIDER_SMOKE_JSON",
-            "check_real_provider_smoke_invocation",
+            "environment: release-compatible-provider",
+            "COMPAT_PROVIDER_SECRET_ENVS",
+            "COMPAT_PROVIDER_VAR_ENVS",
+            "COMPAT_PROVIDER_SMOKE_JSON",
+            "check_compatible_provider_smoke_invocation",
             "if-no-files-found: error",
             "REQUIRED_RELEASE_GATE_NEEDS",
             "check_release_publish_jobs_need_ga_gates",
@@ -302,7 +324,7 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, governance)
-        self.assert_has_real_provider_smoke_invocation(governance)
+        self.assert_has_compatible_provider_smoke_invocation(governance)
 
     def test_docs_record_local_and_protected_release_gates(self):
         ga_review = self.read_text("docs/ga-readiness-review.md")
@@ -313,8 +335,8 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "GA release gates",
             "mock endpoint matrix",
             "perf gate",
-            "real provider smoke",
-            "release-real-providers",
+            "compatible provider smoke",
+            "release-compatible-provider",
             "portable-core production GA",
             "same-provider native passthrough",
             "cross-provider documented compatibility/fail-closed",
@@ -327,7 +349,7 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
         self.assertIn("CLI wrapper matrix", container)
         self.assertIn("mock endpoint matrix", container)
         self.assertIn("perf gate", container)
-        self.assertIn("real-provider-smoke.json", container)
+        self.assertIn("compatible-provider-smoke.json", container)
         self.assertNotIn("not yet mandatory release gates", ga_review)
         self.assertNotIn("not mandatory", ga_review)
         self.assertNotIn("not mandatory", container)

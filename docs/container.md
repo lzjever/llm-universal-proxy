@@ -38,6 +38,10 @@ CORS response headers are not emitted by default. Set `LLM_UNIVERSAL_PROXY_CORS_
 
 Use a container-oriented config whose `listen` value is `0.0.0.0:8080`, such as [examples/container-config.yaml](../examples/container-config.yaml). Do not mount the local quickstart config unchanged for container service mode: `listen: 127.0.0.1:8080` binds inside the container's own loopback namespace and will not serve traffic through the Docker port mapping.
 
+The sample below follows the OpenAI/MiniMax example config. MiniMax is only an
+example provider choice here, not a GA release-gate requirement; use the runtime
+secret variables required by the config you actually mount.
+
 ```bash
 export OPENAI_API_KEY="set-at-runtime"
 export MINIMAX_API_KEY="set-at-runtime"
@@ -84,11 +88,12 @@ make docker-smoke
 CI uses the same shape as local smoke:
 
 - `ci.yml`: build a local image, load it into Docker, and run `scripts/test_container_smoke.sh`; `push: false` is required.
-- `release.yml`: run the same Rust and Python contract test gates as CI, then require the mock endpoint matrix, CLI wrapper matrix, perf gate, protected real provider smoke, and supply-chain gates before the GHCR publishing job can run. The job builds a local `linux/amd64` image for smoke first, then pushes the multi-arch GHCR image only when the ref is a release tag.
+- `release.yml`: run the same Rust and Python contract test gates as CI, then require the mock endpoint matrix, CLI wrapper matrix, perf gate, protected compatible provider smoke, and supply-chain gates before the GHCR publishing job can run. The job builds a local `linux/amd64` image for smoke first, then pushes the multi-arch GHCR image only when the ref is a release tag.
 - The mock endpoint matrix runs `scripts/real_endpoint_matrix.py --mock` against a local mock upstream and covers unary, stream, tool, and error paths before release publication.
 - The CLI wrapper matrix expands the supported wrapper surface before release publication.
 - The perf gate runs `scripts/real_endpoint_matrix.py --mock --perf` against the same local mock path and emits threshold-checked JSON.
-- The real provider smoke gate is separate from container smoke and runs only in the protected `release-real-providers` environment. It requires `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and `MINIMAX_API_KEY`, then uploads `real-provider-smoke.json` as release evidence.
+- The compatible provider smoke gate is separate from container smoke and runs only in the protected `release-compatible-provider` environment. It should run as provider-neutral compatible live evidence over the OpenAI-compatible completions/chat-completions surface and the Anthropic-compatible messages surface. Configure either `COMPAT_PROVIDER_API_KEY` for one compatible provider that exposes both surfaces, or `COMPAT_OPENAI_API_KEY` plus `COMPAT_ANTHROPIC_API_KEY` when the surfaces use separate credentials; also set `COMPAT_OPENAI_BASE_URL`, `COMPAT_OPENAI_MODEL`, `COMPAT_ANTHROPIC_BASE_URL`, and `COMPAT_ANTHROPIC_MODEL`, with optional `COMPAT_PROVIDER_LABEL`. The job uploads `artifacts/compatible-provider-smoke.json` as the `compatible-provider-smoke` release evidence artifact.
+- Official OpenAI Responses, Gemini, and broader four-provider live smoke can be kept as optional extended evidence, but they do not block portable-core GA once the provider-neutral compatible smoke and deterministic gates pass.
 - The GHCR image tags, including `latest`, are published only after those release gates pass.
 - Governance runs a local secret scan over tracked fixtures, docs, examples, and scripts before CI or release jobs proceed.
 - Release metadata is passed through Docker build args for OCI labels: `VERSION` and `VCS_REF`.

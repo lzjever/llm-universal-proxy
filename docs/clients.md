@@ -13,6 +13,9 @@ If you want the MiniMax lane, swap `--model gpt-5-4` for `--model gpt-5-4-mini`.
 MiniMax is an OpenAI-compatible lane, not an OpenAI Responses certified clone;
 use the same documented portability and fail-closed boundaries as other
 cross-provider routes.
+This quickstart lane is an example only. Release/GA live evidence should use
+provider-neutral `COMPAT_*` configuration and should not treat MiniMax as a
+required provider.
 
 ## Recommended Path: Start With the Wrapper Scripts
 

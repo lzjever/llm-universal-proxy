@@ -30,6 +30,21 @@ REAL_PROVIDER_REQUIRED_ENVS = (
     "MINIMAX_API_KEY",
 )
 REAL_PROVIDER_GATE = "real-provider-smoke"
+COMPATIBLE_PROVIDER_GATE = "compatible-provider-smoke"
+COMPATIBLE_PROVIDER_CLAIM_SCOPE = "compatible_provider_openai_completion_and_anthropic_messages"
+COMPATIBLE_PROVIDER_DEFAULT_LABEL = "compatible-provider"
+COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV = "COMPAT_PROVIDER_API_KEY"
+COMPAT_OPENAI_CREDENTIAL_ENV = "COMPAT_OPENAI_API_KEY"
+COMPAT_ANTHROPIC_CREDENTIAL_ENV = "COMPAT_ANTHROPIC_API_KEY"
+COMPAT_PROVIDER_SECRET_ENVS = (
+    COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV,
+    COMPAT_OPENAI_CREDENTIAL_ENV,
+    COMPAT_ANTHROPIC_CREDENTIAL_ENV,
+)
+COMPAT_OPENAI_BASE_URL_ENV = "COMPAT_OPENAI_BASE_URL"
+COMPAT_OPENAI_MODEL_ENV = "COMPAT_OPENAI_MODEL"
+COMPAT_ANTHROPIC_BASE_URL_ENV = "COMPAT_ANTHROPIC_BASE_URL"
+COMPAT_ANTHROPIC_MODEL_ENV = "COMPAT_ANTHROPIC_MODEL"
 REAL_OPENAI_DEFAULT_MODEL = "gpt-5-mini"
 REAL_ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
 REAL_GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
@@ -67,6 +82,18 @@ class RealProviderMatrixCase:
     expected_status: int
     expected_content_type: str
     expected_markers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CompatibleProviderConfig:
+    provider_label: str
+    openai_base_url: str | None
+    openai_model: str | None
+    openai_credential_env: str | None
+    anthropic_base_url: str | None
+    anthropic_model: str | None
+    anthropic_credential_env: str | None
+    missing_config: tuple[str, ...]
 
 
 def free_port() -> int:
@@ -130,7 +157,7 @@ def _json_bytes(payload: object) -> bytes:
 def _secret_redaction_patterns() -> list[tuple[str, str]]:
     patterns: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for env_name in REAL_PROVIDER_REQUIRED_ENVS:
+    for env_name in REAL_PROVIDER_REQUIRED_ENVS + COMPAT_PROVIDER_SECRET_ENVS:
         secret = os.environ.get(env_name)
         if not secret or len(secret) < MIN_SECRET_REDACTION_LENGTH:
             continue
@@ -773,6 +800,121 @@ def build_real_provider_matrix_cases(
     return cases
 
 
+def build_compatible_provider_matrix_cases(
+    *,
+    openai_model: str,
+    anthropic_model: str,
+    openai_credential_env: str,
+    anthropic_credential_env: str,
+) -> list[RealProviderMatrixCase]:
+    cases: list[RealProviderMatrixCase] = []
+
+    def add(
+        case_id: str,
+        surface: str,
+        mode: str,
+        feature: str,
+        env_var: str,
+        default_model: str,
+        model_alias: str,
+        upstream_format: str,
+        path: str,
+        payload: dict[str, object],
+        *,
+        status: int = 200,
+        content_type: str = "application/json",
+        markers: tuple[str, ...] = ("OK",),
+    ) -> None:
+        cases.append(
+            RealProviderMatrixCase(
+                case_id=case_id,
+                provider="compatible",
+                surface=surface,
+                mode=mode,
+                feature=feature,
+                env_var=env_var,
+                required=True,
+                default_model=default_model,
+                model_alias=model_alias,
+                upstream_format=upstream_format,
+                path=path,
+                payload=payload,
+                expected_status=status,
+                expected_content_type=content_type,
+                expected_markers=markers,
+            )
+        )
+
+    add(
+        "compatible_openai_chat_completions_unary",
+        "openai_chat_completions",
+        "unary",
+        "chat_completions_unary",
+        openai_credential_env,
+        openai_model,
+        "compat-openai-chat",
+        "openai-completion",
+        "/openai/v1/chat/completions",
+        _openai_chat_payload("compat-openai-chat"),
+    )
+    add(
+        "compatible_openai_chat_completions_stream",
+        "openai_chat_completions",
+        "stream",
+        "chat_completions_stream",
+        openai_credential_env,
+        openai_model,
+        "compat-openai-chat",
+        "openai-completion",
+        "/openai/v1/chat/completions",
+        _openai_chat_payload("compat-openai-chat", stream=True),
+        content_type="text/event-stream",
+        markers=("data:",),
+    )
+    add(
+        "compatible_anthropic_messages_unary",
+        "anthropic_messages",
+        "unary",
+        "messages_unary",
+        anthropic_credential_env,
+        anthropic_model,
+        "compat-anthropic-messages",
+        "anthropic",
+        "/anthropic/v1/messages",
+        _anthropic_payload("compat-anthropic-messages"),
+    )
+    add(
+        "compatible_anthropic_messages_stream",
+        "anthropic_messages",
+        "stream",
+        "messages_stream",
+        anthropic_credential_env,
+        anthropic_model,
+        "compat-anthropic-messages",
+        "anthropic",
+        "/anthropic/v1/messages",
+        _anthropic_payload("compat-anthropic-messages", stream=True),
+        content_type="text/event-stream",
+        markers=("message_start", "message_stop"),
+    )
+    add(
+        "compatible_openai_responses_state_fail_closed",
+        "openai_chat_completions",
+        "fail_closed",
+        "responses_stateful_controls_rejected",
+        openai_credential_env,
+        openai_model,
+        "compat-openai-chat",
+        "openai-completion",
+        "/openai/v1/responses",
+        _responses_high_risk_state_payload("compat-openai-chat"),
+        status=400,
+        markers=("previous_response_id",),
+    )
+
+    return cases
+
+
 class MockProviderHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1286,6 +1428,132 @@ def emit_machine_report(report: dict[str, object], json_out: str | None) -> None
     print(json.dumps(report, sort_keys=True))
 
 
+def _nonempty(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value if value else None
+
+
+def _resolve_compatible_credential_env(surface_env: str) -> str | None:
+    if _nonempty(os.environ.get(COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV)):
+        return COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV
+    if _nonempty(os.environ.get(surface_env)):
+        return surface_env
+    return None
+
+
+def resolve_compatible_provider_config(args: argparse.Namespace) -> CompatibleProviderConfig:
+    openai_base_url = _nonempty(args.compat_openai_base_url)
+    openai_model = _nonempty(args.compat_openai_model)
+    anthropic_base_url = _nonempty(args.compat_anthropic_base_url)
+    anthropic_model = _nonempty(args.compat_anthropic_model)
+    provider_label = _nonempty(args.compat_provider_label) or COMPATIBLE_PROVIDER_DEFAULT_LABEL
+    openai_credential_env = _resolve_compatible_credential_env(COMPAT_OPENAI_CREDENTIAL_ENV)
+    anthropic_credential_env = _resolve_compatible_credential_env(COMPAT_ANTHROPIC_CREDENTIAL_ENV)
+
+    missing_config: list[str] = []
+    if not openai_base_url:
+        missing_config.append(COMPAT_OPENAI_BASE_URL_ENV)
+    if not openai_model:
+        missing_config.append(COMPAT_OPENAI_MODEL_ENV)
+    if not anthropic_base_url:
+        missing_config.append(COMPAT_ANTHROPIC_BASE_URL_ENV)
+    if not anthropic_model:
+        missing_config.append(COMPAT_ANTHROPIC_MODEL_ENV)
+    if not openai_credential_env:
+        missing_config.append(f"{COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV} or {COMPAT_OPENAI_CREDENTIAL_ENV}")
+    if not anthropic_credential_env:
+        missing_config.append(f"{COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV} or {COMPAT_ANTHROPIC_CREDENTIAL_ENV}")
+
+    return CompatibleProviderConfig(
+        provider_label=provider_label,
+        openai_base_url=openai_base_url,
+        openai_model=openai_model,
+        openai_credential_env=openai_credential_env,
+        anthropic_base_url=anthropic_base_url,
+        anthropic_model=anthropic_model,
+        anthropic_credential_env=anthropic_credential_env,
+        missing_config=tuple(missing_config),
+    )
+
+
+def compatible_provider_surfaces(config: CompatibleProviderConfig) -> list[dict[str, object]]:
+    return [
+        {
+            "name": "openai_chat_completions",
+            "format": "openai-completion",
+            "base_url_env": COMPAT_OPENAI_BASE_URL_ENV,
+            "model_env": COMPAT_OPENAI_MODEL_ENV,
+            "credential_env": config.openai_credential_env,
+            "credential_env_alternatives": [
+                COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV,
+                COMPAT_OPENAI_CREDENTIAL_ENV,
+            ],
+            "configured": bool(
+                config.openai_base_url
+                and config.openai_model
+                and config.openai_credential_env
+            ),
+        },
+        {
+            "name": "anthropic_messages",
+            "format": "anthropic",
+            "base_url_env": COMPAT_ANTHROPIC_BASE_URL_ENV,
+            "model_env": COMPAT_ANTHROPIC_MODEL_ENV,
+            "credential_env": config.anthropic_credential_env,
+            "credential_env_alternatives": [
+                COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV,
+                COMPAT_ANTHROPIC_CREDENTIAL_ENV,
+            ],
+            "configured": bool(
+                config.anthropic_base_url
+                and config.anthropic_model
+                and config.anthropic_credential_env
+            ),
+        },
+    ]
+
+
+def write_compatible_provider_config(
+    path: Path,
+    listen_port: int,
+    config: CompatibleProviderConfig,
+) -> None:
+    if config.missing_config:
+        missing_text = ", ".join(config.missing_config)
+        raise RuntimeError(f"missing compatible provider configuration: {missing_text}")
+    if (
+        not config.openai_base_url
+        or not config.openai_model
+        or not config.openai_credential_env
+        or not config.anthropic_base_url
+        or not config.anthropic_model
+        or not config.anthropic_credential_env
+    ):
+        raise RuntimeError("missing compatible provider configuration")
+
+    rendered = f"""
+listen: 127.0.0.1:{listen_port}
+upstream_timeout_secs: 120
+upstreams:
+  COMPAT_OPENAI_CHAT:
+    api_root: {json.dumps(config.openai_base_url)}
+    format: openai-completion
+    credential_env: {config.openai_credential_env}
+    auth_policy: force_server
+  COMPAT_ANTHROPIC:
+    api_root: {json.dumps(config.anthropic_base_url)}
+    format: anthropic
+    credential_env: {config.anthropic_credential_env}
+    auth_policy: force_server
+model_aliases:
+  compat-openai-chat: {json.dumps(f"COMPAT_OPENAI_CHAT:{config.openai_model}")}
+  compat-anthropic-messages: {json.dumps(f"COMPAT_ANTHROPIC:{config.anthropic_model}")}
+"""
+    path.write_text(rendered.strip() + "\n", encoding="utf-8")
+
+
 def write_real_provider_config(path: Path, listen_port: int, args: argparse.Namespace) -> None:
     config = f"""
 listen: 127.0.0.1:{listen_port}
@@ -1367,6 +1635,8 @@ def summarize_real_provider_results(
     *,
     missing_env: list[str] | None = None,
     reason: str | None = None,
+    gate: str = REAL_PROVIDER_GATE,
+    extra_fields: dict[str, object] | None = None,
 ) -> dict[str, object]:
     results = [
         redact_real_provider_report(result)
@@ -1377,13 +1647,15 @@ def summarize_real_provider_results(
     skipped = sum(1 for result in results if result["status"] == "skipped")
     report: dict[str, object] = {
         "status": "passed" if failed == 0 and skipped == 0 else "failed",
-        "gate": REAL_PROVIDER_GATE,
+        "gate": gate,
         "case_count": len(results),
         "passed": passed,
         "failed": failed,
         "skipped": skipped,
         "results": results,
     }
+    if extra_fields:
+        report.update(redact_real_provider_report(extra_fields))
     if missing_env is not None:
         report["missing_env"] = missing_env
     if reason:
@@ -1445,6 +1717,68 @@ def build_real_provider_startup_failure_report(
     return summarize_real_provider_results(results, reason=error)
 
 
+def _compatible_provider_report_fields(config: CompatibleProviderConfig) -> dict[str, object]:
+    return {
+        "claim_scope": COMPATIBLE_PROVIDER_CLAIM_SCOPE,
+        "provider_label": config.provider_label,
+        "configured_surfaces": compatible_provider_surfaces(config),
+        "real_surfaces": [
+            "openai_chat_completions",
+            "anthropic_messages",
+        ],
+    }
+
+
+def summarize_compatible_provider_results(
+    results: list[dict[str, object]],
+    config: CompatibleProviderConfig,
+    *,
+    missing_config: list[str] | None = None,
+    reason: str | None = None,
+) -> dict[str, object]:
+    report = summarize_real_provider_results(
+        results,
+        reason=reason,
+        gate=COMPATIBLE_PROVIDER_GATE,
+        extra_fields=_compatible_provider_report_fields(config),
+    )
+    if missing_config is not None:
+        report["missing_config"] = missing_config
+    return redact_real_provider_report(report)
+
+
+def build_compatible_provider_missing_config_report(
+    cases: list[RealProviderMatrixCase],
+    config: CompatibleProviderConfig,
+) -> dict[str, object]:
+    missing_config = list(config.missing_config)
+    missing_text = ", ".join(missing_config)
+    error = f"missing compatible provider configuration: {missing_text}"
+    results = [
+        _real_case_preflight_result(case, status="failed", error=error)
+        for case in cases
+    ]
+    return summarize_compatible_provider_results(
+        results,
+        config,
+        missing_config=missing_config,
+        reason=error,
+    )
+
+
+def build_compatible_provider_startup_failure_report(
+    cases: list[RealProviderMatrixCase],
+    config: CompatibleProviderConfig,
+    error: str,
+) -> dict[str, object]:
+    error = redact_real_provider_text(error)
+    results = [
+        _real_case_preflight_result(case, status="failed", error=error)
+        for case in cases
+    ]
+    return summarize_compatible_provider_results(results, config, reason=error)
+
+
 def run_real_provider_case(base_url: str, case: RealProviderMatrixCase) -> dict[str, object]:
     started = time.perf_counter()
     result = _real_case_report_base(case)
@@ -1489,6 +1823,79 @@ def run_real_provider_case(base_url: str, case: RealProviderMatrixCase) -> dict[
         }
     )
     return redact_real_provider_report(result)
+
+
+def _compatible_cases_from_config(config: CompatibleProviderConfig) -> list[RealProviderMatrixCase]:
+    return build_compatible_provider_matrix_cases(
+        openai_model=config.openai_model or "missing-COMPAT_OPENAI_MODEL",
+        anthropic_model=config.anthropic_model or "missing-COMPAT_ANTHROPIC_MODEL",
+        openai_credential_env=config.openai_credential_env or f"{COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV} or {COMPAT_OPENAI_CREDENTIAL_ENV}",
+        anthropic_credential_env=config.anthropic_credential_env or f"{COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV} or {COMPAT_ANTHROPIC_CREDENTIAL_ENV}",
+    )
+
+
+def run_compatible_provider_smoke(args: argparse.Namespace) -> int:
+    config = resolve_compatible_provider_config(args)
+    cases = _compatible_cases_from_config(config)
+    if config.missing_config:
+        report = build_compatible_provider_missing_config_report(cases, config)
+        emit_machine_report(report, args.json_out)
+        print(
+            redact_real_provider_text(
+                "Missing compatible provider configuration: " + ", ".join(config.missing_config)
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    binary = Path(args.binary)
+    if not binary.exists():
+        message = f"proxy binary not found: {binary}"
+        report = build_compatible_provider_startup_failure_report(cases, config, message)
+        emit_machine_report(report, args.json_out)
+        print(redact_real_provider_text(message), file=sys.stderr)
+        return 2
+
+    port = free_port()
+    base_url = f"http://127.0.0.1:{port}"
+
+    with tempfile.TemporaryDirectory(prefix="proxy-compatible-matrix-") as tempdir:
+        config_path = Path(tempdir) / "proxy.yaml"
+        stdout_path = Path(tempdir) / "proxy.stdout.log"
+        stderr_path = Path(tempdir) / "proxy.stderr.log"
+        write_compatible_provider_config(config_path, port, config)
+        stdout_handle = stdout_path.open("w", encoding="utf-8")
+        stderr_handle = stderr_path.open("w", encoding="utf-8")
+        proc = subprocess.Popen(
+            [str(binary), "--config", str(config_path)],
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            text=True,
+        )
+        try:
+            try:
+                wait_for_health(base_url)
+                results = [run_real_provider_case(base_url, case) for case in cases]
+                report = summarize_compatible_provider_results(results, config)
+            except Exception as error:
+                report = build_compatible_provider_startup_failure_report(cases, config, str(error))
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            stdout_handle.close()
+            stderr_handle.close()
+
+        if proc.returncode not in (0, -15) and report.get("status") == "passed":
+            stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+            message = stderr.strip() or f"proxy exited with {proc.returncode}"
+            report = build_compatible_provider_startup_failure_report(cases, config, message)
+
+    emit_machine_report(report, args.json_out)
+    return 0 if report.get("status") == "passed" else 1
 
 
 def run_real_provider_smoke(args: argparse.Namespace) -> int:
@@ -1568,17 +1975,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=("mock", "perf", "real-provider-smoke"),
-        help="explicit gate mode; legacy --mock/--perf/--real-provider-smoke flags are still supported",
+        choices=("mock", "perf", "compatible-provider-smoke", "real-provider-smoke"),
+        help="explicit gate mode; legacy --mock/--perf/--compatible-provider-smoke/--real-provider-smoke flags are still supported",
     )
     parser.add_argument("--mock", action="store_true", help="run deterministic local mock endpoint matrix")
     parser.add_argument("--perf", action="store_true", help="run local deterministic perf gate; requires --mock or --mode perf")
     parser.add_argument("--json-out", help="write machine-readable gate result JSON")
+    parser.add_argument("--compatible-provider-smoke", action="store_true", help="run protected compatible-provider smoke matrix")
     parser.add_argument("--real-provider-smoke", action="store_true", help="run protected real-provider smoke matrix")
     parser.add_argument("--binary", default="./target/debug/llm-universal-proxy")
     parser.add_argument("--perf-iterations", type=int, default=PERF_DEFAULT_ITERATIONS)
     parser.add_argument("--perf-p95-ms", type=float, default=PERF_DEFAULT_P95_MS)
     parser.add_argument("--perf-total-ms", type=float, default=PERF_DEFAULT_TOTAL_MS)
+    parser.add_argument(
+        "--compat-openai-base-url",
+        default=os.environ.get(COMPAT_OPENAI_BASE_URL_ENV),
+    )
+    parser.add_argument(
+        "--compat-openai-model",
+        default=os.environ.get(COMPAT_OPENAI_MODEL_ENV),
+    )
+    parser.add_argument(
+        "--compat-anthropic-base-url",
+        default=os.environ.get(COMPAT_ANTHROPIC_BASE_URL_ENV),
+    )
+    parser.add_argument(
+        "--compat-anthropic-model",
+        default=os.environ.get(COMPAT_ANTHROPIC_MODEL_ENV),
+    )
+    parser.add_argument(
+        "--compat-provider-label",
+        default=os.environ.get("COMPAT_PROVIDER_LABEL", COMPATIBLE_PROVIDER_DEFAULT_LABEL),
+    )
     parser.add_argument(
         "--anthropic-base-url",
         default=os.environ.get("ANTHROPIC_UPSTREAM_BASE_URL", "https://api.anthropic.com/v1"),
@@ -1615,6 +2043,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode_sources = []
     if args.mode:
         mode_sources.append(args.mode)
+    if args.compatible_provider_smoke:
+        mode_sources.append("compatible-provider-smoke")
     if args.real_provider_smoke:
         mode_sources.append("real-provider-smoke")
     if args.mock:
@@ -1626,8 +2056,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     if not mode_sources:
         parser.error(
-            "explicit mode required; use --mode mock|perf|real-provider-smoke "
-            "or legacy --mock/--mock --perf/--real-provider-smoke"
+            "explicit mode required; use --mode mock|perf|compatible-provider-smoke|real-provider-smoke "
+            "or legacy --mock/--mock --perf/--compatible-provider-smoke/--real-provider-smoke"
         )
     resolved_modes = set(mode_sources)
     if len(resolved_modes) != 1:
@@ -1652,6 +2082,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         emit_machine_report(report, args.json_out)
         return 0 if report.get("status") == "passed" else 1
+
+    if args.mode == "compatible-provider-smoke":
+        return run_compatible_provider_smoke(args)
 
     if args.mode == "real-provider-smoke":
         return run_real_provider_smoke(args)

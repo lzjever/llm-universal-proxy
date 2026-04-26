@@ -13,13 +13,25 @@ PROVIDER_KEY_PATTERN_SNIPPETS = (
     "sk-ant-",
     "sk-proj-",
 )
-REAL_PROVIDER_REQUIRED_SECRETS = (
+OFFICIAL_PROVIDER_SECRET_ENVS = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "MINIMAX_API_KEY",
 )
-REAL_PROVIDER_SMOKE_JSON = "artifacts/real-provider-smoke.json"
+COMPAT_PROVIDER_SECRET_ENVS = (
+    "COMPAT_PROVIDER_API_KEY",
+    "COMPAT_OPENAI_API_KEY",
+    "COMPAT_ANTHROPIC_API_KEY",
+)
+COMPAT_PROVIDER_VAR_ENVS = (
+    "COMPAT_OPENAI_BASE_URL",
+    "COMPAT_OPENAI_MODEL",
+    "COMPAT_ANTHROPIC_BASE_URL",
+    "COMPAT_ANTHROPIC_MODEL",
+    "COMPAT_PROVIDER_LABEL",
+)
+COMPAT_PROVIDER_SMOKE_JSON = "artifacts/compatible-provider-smoke.json"
 ACTIVE_DOC_PATHS = (
     REPO_ROOT / "README.md",
     REPO_ROOT / "README_CN.md",
@@ -122,15 +134,12 @@ def curl_command_blocks(script: str):
         yield "\n".join(block)
 
 
-def has_real_provider_smoke_invocation(text: str) -> bool:
+def has_compatible_provider_smoke_invocation(text: str) -> bool:
     return any(
         "python3 scripts/real_endpoint_matrix.py" in line
-        and (
-            "--real-provider-smoke" in line
-            or "--mode real-provider-smoke" in line
-        )
+        and "--mode compatible-provider-smoke" in line
         and "--json-out" in line
-        and REAL_PROVIDER_SMOKE_JSON in line
+        and COMPAT_PROVIDER_SMOKE_JSON in line
         for line in text.splitlines()
     )
 
@@ -278,23 +287,32 @@ class GovernanceTests(unittest.TestCase):
         )
         self.assertNotIn(":edge", release)
 
-    def test_real_provider_release_gate_contract_is_governed(self):
+    def test_compatible_provider_release_gate_contract_is_governed(self):
         release = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
         )
         governance = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
 
-        self.assertIn("real-provider-smoke:", release)
-        self.assertIn("environment: release-real-providers", release)
+        self.assertIn("compatible-provider-smoke:", release)
+        self.assertIn("environment: release-compatible-provider", release)
         self.assertNotIn("Validate protected real provider secrets", release)
-        run_step = workflow_step_block(release, "Run real provider smoke")
+        run_step = workflow_step_block(release, "Run compatible provider smoke")
         self.assertTrue(run_step)
-        for secret_name in REAL_PROVIDER_REQUIRED_SECRETS:
+        for secret_name in COMPAT_PROVIDER_SECRET_ENVS:
             with self.subTest(secret=secret_name):
                 self.assertIn(f"{secret_name}: ${{{{ secrets.{secret_name} }}}}", run_step)
                 self.assertNotIn(f'test -n "${{{secret_name}:-}}"', release)
                 self.assertIn(f'check_contains ".github/workflows/release.yml" \'{secret_name}: ${{{{ secrets.{secret_name} }}}}\'', governance)
                 self.assertIn(f'check_absent ".github/workflows/release.yml" \'test -n "${{{secret_name}:-}}"\'', governance)
+        for var_name in COMPAT_PROVIDER_VAR_ENVS:
+            with self.subTest(var=var_name):
+                self.assertIn(f"{var_name}: ${{{{ vars.{var_name} }}}}", run_step)
+                self.assertNotIn(f'test -n "${{{var_name}:-}}"', release)
+                self.assertIn(f'check_contains ".github/workflows/release.yml" \'{var_name}: ${{{{ vars.{var_name} }}}}\'', governance)
+                self.assertIn(f'check_absent ".github/workflows/release.yml" \'test -n "${{{var_name}:-}}"\'', governance)
+        for secret_name in OFFICIAL_PROVIDER_SECRET_ENVS:
+            with self.subTest(no_official_secret=secret_name):
+                self.assertNotIn(f"{secret_name}: ${{{{ secrets.{secret_name} }}}}", run_step)
         self.assertNotIn("GLM_APIKEY", run_step)
         self.assertNotIn("secrets.GLM_APIKEY", release)
         self.assertIn(
@@ -302,23 +320,25 @@ class GovernanceTests(unittest.TestCase):
             governance,
         )
 
-        self.assertTrue(has_real_provider_smoke_invocation(release))
-        upload_step = workflow_step_block(release, "Upload real provider smoke result")
+        self.assertTrue(has_compatible_provider_smoke_invocation(release))
+        upload_step = workflow_step_block(release, "Upload compatible provider smoke result")
         self.assertTrue(upload_step)
         self.assertIn('if: ${{ always() }}', upload_step)
-        self.assertIn("name: real-provider-smoke", upload_step)
-        self.assertIn(f"path: {REAL_PROVIDER_SMOKE_JSON}", upload_step)
+        self.assertIn("name: compatible-provider-smoke", upload_step)
+        self.assertIn(f"path: {COMPAT_PROVIDER_SMOKE_JSON}", upload_step)
         self.assertIn("if-no-files-found: error", upload_step)
 
         for snippet in (
-            "REAL_PROVIDER_REQUIRED_SECRETS",
-            "REAL_PROVIDER_SMOKE_JSON",
-            "check_real_provider_smoke_invocation",
+            "COMPAT_PROVIDER_SECRET_ENVS",
+            "COMPAT_PROVIDER_VAR_ENVS",
+            "OFFICIAL_PROVIDER_SECRET_ENVS",
+            "COMPAT_PROVIDER_SMOKE_JSON",
+            "check_compatible_provider_smoke_invocation",
             'check_absent ".github/workflows/release.yml" "Validate protected real provider secrets"',
-            "Upload real provider smoke result",
+            "Upload compatible provider smoke result",
             'if: ${{ always() }}',
-            "name: real-provider-smoke",
-            f"path: {REAL_PROVIDER_SMOKE_JSON}",
+            "name: compatible-provider-smoke",
+            f"path: {COMPAT_PROVIDER_SMOKE_JSON}",
             "if-no-files-found: error",
         ):
             with self.subTest(governance_snippet=snippet):

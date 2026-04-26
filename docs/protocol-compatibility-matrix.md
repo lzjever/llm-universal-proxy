@@ -37,8 +37,10 @@ The GA claim is portable-core production GA. Same-provider native passthrough is
 the path for preserving provider-native fields and lifecycle resources.
 Cross-provider documented compatibility/fail-closed is the portability contract:
 the proxy documents supported mappings and rejects high-risk unsupported fields
-before contacting upstream. MiniMax is an OpenAI-compatible lane, not an OpenAI
-Responses certified clone.
+before contacting upstream. Compatible providers can satisfy live GA evidence by
+exposing the OpenAI-compatible completions/chat-completions surface and the
+Anthropic-compatible messages surface. MiniMax is only one example compatible
+lane, not an OpenAI Responses certified clone and not a GA-required provider.
 
 The proxy should treat function calling and explicit transcript replay as the common denominator. Hosted tools, provider-managed state, compaction, and cache-control semantics are increasingly vendor-specific and should be preserved only on same-provider paths or documented as intentional degradations.
 
