@@ -39,21 +39,22 @@ CORS response headers are not emitted by default. Set `LLM_UNIVERSAL_PROXY_CORS_
 
 Use a container-oriented config whose `listen` value is `0.0.0.0:8080`, such as [examples/container-config.yaml](../examples/container-config.yaml). Do not mount the local quickstart config unchanged for container service mode: `listen: 127.0.0.1:8080` binds inside the container's own loopback namespace and will not serve traffic through the Docker port mapping.
 
-The sample below follows the OpenAI/MiniMax example config. MiniMax is only an
-example provider choice here, not a GA release-gate requirement; use the runtime
-secret variables required by the config you actually mount.
+The sample below follows the provider-neutral compatible upstreams in the
+container config. Replace the placeholder base URLs and model aliases in that
+file with your chosen OpenAI-compatible and Anthropic-compatible providers, and
+set the runtime secret variables required by the config you actually mount.
 
 ```bash
-export OPENAI_API_KEY="set-at-runtime"
-export MINIMAX_API_KEY="set-at-runtime"
+export OPENAI_COMPATIBLE_API_KEY="set-at-runtime"
+export ANTHROPIC_COMPATIBLE_API_KEY="set-at-runtime"
 export LLM_UNIVERSAL_PROXY_ADMIN_TOKEN="set-a-random-admin-token"
 export LLM_UNIVERSAL_PROXY_DATA_TOKEN="set-a-random-data-token"
 
 docker run --rm --name llmup \
   -p 127.0.0.1:8080:8080 \
   -v "$PWD/examples/container-config.yaml:/etc/llmup/config.yaml:ro" \
-  -e OPENAI_API_KEY \
-  -e MINIMAX_API_KEY \
+  -e OPENAI_COMPATIBLE_API_KEY \
+  -e ANTHROPIC_COMPATIBLE_API_KEY \
   -e LLM_UNIVERSAL_PROXY_ADMIN_TOKEN \
   -e LLM_UNIVERSAL_PROXY_DATA_TOKEN \
   ghcr.io/agentsmith-project/llm-universal-proxy:latest
@@ -72,6 +73,11 @@ For Compose, start from [examples/docker-compose.yaml](../examples/docker-compos
 ```bash
 docker compose -f examples/docker-compose.yaml up
 ```
+
+The historical concrete OpenAI + MiniMax example remains available at
+[examples/quickstart-openai-minimax.yaml](../examples/quickstart-openai-minimax.yaml)
+for users who want a named-provider sample. It is optional example material, not
+the container main path or a GA release-gate requirement.
 
 ## Local Build and Smoke
 

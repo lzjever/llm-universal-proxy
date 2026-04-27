@@ -2,7 +2,7 @@
 
 **Version**: 1.0
 **Status**: Active
-**Last Updated**: 2026-04-23
+**Last Updated**: 2026-04-27
 
 ---
 
@@ -161,7 +161,7 @@ The proxy MUST support:
   - auto-discovered upstreams are available only when discovery returns at least one supported protocol
   - empty discovery results MUST be treated as unavailable, not silently downgraded to another protocol
 
-### 2.7 Observability
+### 2.8 Observability
 
 | Feature | Priority | Description |
 |---------|----------|-------------|
@@ -169,7 +169,7 @@ The proxy MUST support:
 | Health endpoint | Must | `GET /health` returns `{"status":"ok"}` |
 | Exchange hooks | Should | Async HTTP webhook for full request/response capture |
 | Usage hooks | Should | Async HTTP webhook for token usage metering |
-| Dashboard | May | Terminal UI showing live request stats and upstream health |
+| Dashboard | May | Web Admin Dashboard/static UI showing live request stats and upstream health |
 | Compatibility warnings | Must | `x-proxy-compat-warning` response headers for degraded translations |
 | Request ID tracking | Must | Every request gets a unique ID for correlation |
 
@@ -177,8 +177,10 @@ Dashboard requirements:
 
 - The dashboard MUST render from live runtime state rather than startup-time static config snapshots.
 - The dashboard's default namespace view MUST reflect the current runtime config, upstream availability, and hook state after admin writes are applied.
+- `/dashboard` shell and static assets are public UI resources.
+- Dashboard JavaScript sends `Authorization: Bearer <admin-token>` only when it calls existing `/admin/*` APIs.
 
-### 2.8 Namespace Support
+### 2.9 Namespace Support
 
 The proxy MUST support namespace-prefixed routes for multi-tenant deployments:
 
@@ -204,7 +206,7 @@ Selection rules:
 
 `GET /openai/v1/responses/:response_id?stream=true` MUST be treated as a native streaming resource request. The proxy MUST forward it only to the selected native OpenAI Responses upstream, send `Accept: text/event-stream`, stream the upstream SSE response through the public-boundary guard, and fail closed if a successful upstream response is not SSE.
 
-### 2.9 Admin Control Plane
+### 2.10 Admin Control Plane
 
 The proxy MUST expose a separate admin control plane with these properties:
 
@@ -224,7 +226,7 @@ The proxy MUST expose a separate admin control plane with these properties:
 - Admin state responses MUST NOT return sensitive static upstream header values in plaintext.
 - Header redaction MUST use a conservative rule set that covers at least `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, and header names containing `token`, `secret`, `credential`, `api-key`, or `apikey`.
 
-### 2.10 Admin Config CAS Semantics
+### 2.11 Admin Config CAS Semantics
 
 Admin namespace writes MUST use server-owned revisions with exact compare-and-swap semantics.
 
@@ -468,7 +470,7 @@ These are NOT in scope for the current version but inform architectural decision
 | Metric | Target |
 |--------|--------|
 | All 16 protocol combinations within documented portability boundaries | 16/16 assessed as pass, warn, or reject as specified |
-| Streaming works for all combinations | 16/16 pass |
+| Streaming behavior across all protocol combinations within documented portability boundaries | 16/16 assessed as pass, warn, or reject as specified |
 | Codex CLI works through configured proxy lanes | Required test upstreams pass within the wrapper surface contract |
 | Claude Code works through configured proxy lanes | Required test upstreams pass within the wrapper surface contract |
 | Passthrough adds < 1ms latency | Measured |

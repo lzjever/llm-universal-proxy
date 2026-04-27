@@ -639,8 +639,14 @@ check_contains "docs/container.md" "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN"
 check_contains "docs/container.md" "Do not mount the local quickstart config unchanged for container service mode"
 check_contains "docs/admin-dynamic-config.md" "do not introduce a separate service key"
 check_contains "examples/container-config.yaml" "listen: 0.0.0.0:8080"
-check_contains "examples/container-config.yaml" "credential_env: OPENAI_API_KEY"
-check_contains "examples/docker-compose.yaml" 'OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}'
+check_contains "examples/container-config.yaml" "credential_env: OPENAI_COMPATIBLE_API_KEY"
+check_contains "examples/container-config.yaml" "credential_env: ANTHROPIC_COMPATIBLE_API_KEY"
+check_absent "examples/container-config.yaml" "MINIMAX"
+check_absent "examples/container-config.yaml" "PRESET_"
+check_contains "examples/docker-compose.yaml" 'OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:?set OPENAI_COMPATIBLE_API_KEY}'
+check_contains "examples/docker-compose.yaml" 'ANTHROPIC_COMPATIBLE_API_KEY: ${ANTHROPIC_COMPATIBLE_API_KEY:?set ANTHROPIC_COMPATIBLE_API_KEY}'
+check_absent "examples/docker-compose.yaml" "MINIMAX"
+check_absent "examples/docker-compose.yaml" "PRESET_"
 check_contains "examples/docker-compose.yaml" 'LLM_UNIVERSAL_PROXY_ADMIN_TOKEN: ${LLM_UNIVERSAL_PROXY_ADMIN_TOKEN:?set LLM_UNIVERSAL_PROXY_ADMIN_TOKEN}'
 check_absent "examples/container-config.yaml" "credential_actual"
 

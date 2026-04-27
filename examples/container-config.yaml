@@ -2,11 +2,14 @@ listen: 0.0.0.0:8080
 upstream_timeout_secs: 120
 
 upstreams:
-  OPENAI:
-    api_root: https://api.openai.com/v1
-    format: openai-responses
-    credential_env: OPENAI_API_KEY
+  OPENAI_COMPATIBLE:
+    api_root: https://openai-compatible.example/v1
+    format: openai-completion
+    credential_env: OPENAI_COMPATIBLE_API_KEY
     auth_policy: force_server
+    limits:
+      context_window: 200000
+      max_output_tokens: 128000
     surface_defaults:
       modalities:
         input: ["text"]
@@ -17,11 +20,14 @@ upstreams:
         apply_patch_transport: freeform
         supports_parallel_calls: false
 
-  MINIMAX_OPENAI:
-    api_root: https://api.minimaxi.com/v1
-    format: openai-completion
-    credential_env: MINIMAX_API_KEY
+  ANTHROPIC_COMPATIBLE:
+    api_root: https://anthropic-compatible.example/v1
+    format: anthropic
+    credential_env: ANTHROPIC_COMPATIBLE_API_KEY
     auth_policy: force_server
+    limits:
+      context_window: 200000
+      max_output_tokens: 128000
     surface_defaults:
       modalities:
         input: ["text"]
@@ -33,5 +39,5 @@ upstreams:
         supports_parallel_calls: false
 
 model_aliases:
-  gpt-5-4: OPENAI:gpt-5.4
-  gpt-5-4-mini: MINIMAX_OPENAI:MiniMax-M2.7-highspeed
+  openai-compatible-chat: OPENAI_COMPATIBLE:example-openai-compatible-model
+  anthropic-compatible-messages: ANTHROPIC_COMPATIBLE:example-anthropic-compatible-model

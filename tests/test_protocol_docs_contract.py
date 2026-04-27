@@ -148,6 +148,42 @@ class ProtocolDocsContractTests(unittest.TestCase):
         self.assertIn("`snapshot_bucket`: `2026-04-16`", responses)
         self.assertIn("`proxy_posture_updated`: `2026-04-26`", responses)
 
+    def test_ga_source_spot_check_is_recorded_without_full_snapshot_refresh(self):
+        audit_path = (
+            REPO_ROOT
+            / "docs"
+            / "protocol-baselines"
+            / "audits"
+            / "2026-04-27-ga-source-spot-check.md"
+        )
+        self.assertTrue(audit_path.exists(), "GA source spot-check audit is missing")
+        audit = audit_path.read_text(encoding="utf-8")
+        readme = read_doc("docs/protocol-baselines/README.md")
+        overview = read_doc("docs/protocol-baselines/overview.md")
+
+        self.assertIn(
+            "audits/2026-04-27-ga-source-spot-check.md",
+            readme + overview,
+        )
+        for snippet in (
+            "not a full recertification",
+            "not a full snapshot refresh",
+            "2026-04-16 snapshot bucket",
+            "captured baseline",
+            "2026-04-27 spot-check",
+            "GA portability contract",
+            "OpenAI Responses",
+            "Conversations",
+            "compact",
+            "Gemini generateContent",
+            "Anthropic 2026-04-23/24 release notes",
+            "Rate Limits API",
+            "Managed Agents memory",
+            "portable-core contract",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, audit)
+
     def test_development_plan_records_interactive_codex_wrapper_gate(self):
         text = read_doc("docs/max-compat-development-plan.md")
 

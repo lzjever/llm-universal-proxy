@@ -646,9 +646,24 @@ os.execv(real_git, [real_git, *args])
         )
 
         self.assertIn("listen: 0.0.0.0:8080", container_config)
-        self.assertIn("credential_env: OPENAI_API_KEY", container_config)
+        self.assertIn("credential_env: OPENAI_COMPATIBLE_API_KEY", container_config)
+        self.assertIn(
+            "credential_env: ANTHROPIC_COMPATIBLE_API_KEY",
+            container_config,
+        )
         self.assertNotIn("credential_actual", container_config)
-        self.assertIn("${OPENAI_API_KEY:?set OPENAI_API_KEY}", compose)
+        self.assertNotIn("MINIMAX", container_config.upper())
+        self.assertNotIn("MINIMAX", compose.upper())
+        self.assertNotIn("PRESET_", container_config)
+        self.assertNotIn("PRESET_", compose)
+        self.assertIn(
+            "${OPENAI_COMPATIBLE_API_KEY:?set OPENAI_COMPATIBLE_API_KEY}",
+            compose,
+        )
+        self.assertIn(
+            "${ANTHROPIC_COMPATIBLE_API_KEY:?set ANTHROPIC_COMPATIBLE_API_KEY}",
+            compose,
+        )
         self.assertIn(
             "${LLM_UNIVERSAL_PROXY_ADMIN_TOKEN:?set LLM_UNIVERSAL_PROXY_ADMIN_TOKEN}",
             compose,

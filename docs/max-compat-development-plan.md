@@ -88,7 +88,7 @@ Current contract:
 
 ### Phase 5: Documentation Rollout
 
-Status: in progress.
+Status: delivered for current GA docs; ongoing maintenance.
 
 Current contract:
 

@@ -1,4 +1,5 @@
 import pathlib
+import re
 import unittest
 
 
@@ -24,7 +25,139 @@ def markdown_section(text: str, heading: str) -> str:
     return text[start:] if next_heading == -1 else text[start:next_heading]
 
 
+def markdown_subsection(text: str, heading: str) -> str:
+    marker = f"\n### {heading}\n"
+    start = text.find(marker)
+    if start == -1:
+        if text.startswith(f"### {heading}\n"):
+            start = 0
+        else:
+            raise AssertionError(f"missing subsection heading: {heading}")
+    else:
+        start += 1
+
+    next_heading = text.find("\n### ", start + len(f"### {heading}\n"))
+    return text[start:] if next_heading == -1 else text[start:next_heading]
+
+
 class GaDocsContractTests(unittest.TestCase):
+    def test_prd_metadata_and_section_numbers_are_current_for_ga(self):
+        prd = read_doc("docs/PRD.md")
+
+        self.assertIn("**Last Updated**: 2026-04-27", prd)
+
+        headings = re.findall(r"^### 2\.(\d+) ", prd, flags=re.MULTILINE)
+        numbers = [int(value) for value in headings]
+        self.assertEqual(
+            list(range(1, len(numbers) + 1)),
+            numbers,
+            "PRD functional requirement headings must be unique and sequential",
+        )
+
+        for heading in (
+            "### 2.7 Upstream Configuration",
+            "### 2.8 Observability",
+            "### 2.9 Namespace Support",
+            "### 2.10 Admin Control Plane",
+            "### 2.11 Admin Config CAS Semantics",
+        ):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, prd)
+
+    def test_prd_dashboard_scope_is_web_static_ui_with_admin_api_boundary(self):
+        prd = read_doc("docs/PRD.md")
+        observability = markdown_subsection(prd, "2.8 Observability")
+
+        self.assertNotIn("Terminal UI", observability)
+        for snippet in (
+            "Web Admin Dashboard",
+            "`/dashboard` shell and static assets are public UI resources",
+            "Dashboard JavaScript sends `Authorization: Bearer <admin-token>` only when it calls existing `/admin/*` APIs",
+            "live runtime state",
+            "current runtime config",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, observability)
+
+    def test_prd_success_metrics_keep_streaming_within_portability_boundaries(self):
+        prd = read_doc("docs/PRD.md")
+        success_metrics = markdown_section(prd, "9. Success Metrics")
+
+        self.assertNotIn(
+            "| Streaming works for all combinations | 16/16 pass |",
+            success_metrics,
+        )
+        self.assertIn("documented portability boundaries", success_metrics)
+        self.assertIn("pass, warn, or reject as specified", success_metrics)
+
+    def test_max_compat_phase_5_is_delivered_for_ga_docs_with_maintenance_open(self):
+        text = read_doc("docs/max-compat-development-plan.md")
+        phase_5 = text.split("### Phase 5: Documentation Rollout", 1)[1].split(
+            "\n### Phase 6:", 1
+        )[0]
+
+        self.assertNotIn("Status: in progress.", phase_5)
+        self.assertIn("delivered", phase_5.casefold())
+        self.assertIn("current GA docs", phase_5)
+        self.assertIn("ongoing maintenance", phase_5)
+
+    def test_container_main_path_is_provider_neutral(self):
+        container_config = read_doc("examples/container-config.yaml")
+        compose = read_doc("examples/docker-compose.yaml")
+        container_doc = read_doc("docs/container.md")
+        run_section = container_doc.split("## Run the Release Image", 1)[1].split(
+            "\n## Local Build and Smoke", 1
+        )[0]
+
+        for snippet in (
+            "OPENAI_COMPATIBLE",
+            "ANTHROPIC_COMPATIBLE",
+            "credential_env: OPENAI_COMPATIBLE_API_KEY",
+            "credential_env: ANTHROPIC_COMPATIBLE_API_KEY",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, container_config)
+
+        self.assertIn(
+            "OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:?set OPENAI_COMPATIBLE_API_KEY}",
+            compose,
+        )
+        self.assertIn(
+            "ANTHROPIC_COMPATIBLE_API_KEY: ${ANTHROPIC_COMPATIBLE_API_KEY:?set ANTHROPIC_COMPATIBLE_API_KEY}",
+            compose,
+        )
+        for forbidden in (
+            "MINIMAX",
+            "PRESET_",
+            "api.openai.com",
+            "api.minimaxi.com",
+            "OPENAI_API_KEY",
+            "MINIMAX_API_KEY",
+            "MiniMax-M2.7",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, container_config)
+
+        for forbidden in ("MINIMAX", "PRESET_", "OPENAI_API_KEY", "MINIMAX_API_KEY"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, compose)
+
+        for snippet in (
+            "OPENAI_COMPATIBLE_API_KEY",
+            "ANTHROPIC_COMPATIBLE_API_KEY",
+            "provider-neutral compatible upstreams",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, run_section)
+        for forbidden in (
+            "MINIMAX_API_KEY",
+            "OPENAI_API_KEY",
+            "OpenAI/MiniMax",
+            "MiniMax is only an example provider choice here",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, run_section)
+
     def test_prd_ga_evidence_is_provider_neutral_not_fixed_live_matrix(self):
         prd = read_doc("docs/PRD.md")
         test_config = markdown_section(prd, "6. Test Configuration")
