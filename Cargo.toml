@@ -4,7 +4,7 @@ version = "0.2.21"
 edition = "2021"
 description = "Universal LLM endpoint proxy: single URL, 4 formats (Google, Anthropic, OpenAI completion, OpenAI responses), streaming, format conversion with passthrough when same."
 license = "MIT"
-repository = "https://github.com/lzjever/llm-universal-proxy"
+repository = "https://github.com/agentsmith-project/llm-universal-proxy"
 
 [dependencies]
 axum = { version = "0.7", features = ["json"] }

@@ -3,12 +3,12 @@
 This page records the converged container plan for `llmup` and gives the product-facing runtime entrypoints. The release image is:
 
 ```text
-ghcr.io/lzjever/llm-universal-proxy
+ghcr.io/agentsmith-project/llm-universal-proxy
 ```
 
 ## Decisions
 
-- Container releases publish to GHCR at `ghcr.io/lzjever/llm-universal-proxy`.
+- Container releases publish to GHCR at `ghcr.io/agentsmith-project/llm-universal-proxy`.
 - Pull requests and `main` build an image and run container smoke, but never push.
 - Release tags matching `v*` build, smoke, and push multi-arch images for `linux/amd64` and `linux/arm64`.
 - Release images get `vX.Y.Z`, `X.Y.Z`, and `latest` tags. `latest` only moves on formal release tags.
@@ -56,7 +56,7 @@ docker run --rm --name llmup \
   -e MINIMAX_API_KEY \
   -e LLM_UNIVERSAL_PROXY_ADMIN_TOKEN \
   -e LLM_UNIVERSAL_PROXY_DATA_TOKEN \
-  ghcr.io/lzjever/llm-universal-proxy:latest
+  ghcr.io/agentsmith-project/llm-universal-proxy:latest
 ```
 
 Check health:

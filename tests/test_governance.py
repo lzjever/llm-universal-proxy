@@ -380,7 +380,7 @@ os.execv(real_git, [real_git, *args])
             "FROM ${RUST_BASE_IMAGE} AS builder",
             "FROM ${RUNTIME_BASE_IMAGE}",
             "cargo build --locked --release",
-            'org.opencontainers.image.source="https://github.com/lzjever/llm-universal-proxy"',
+            'org.opencontainers.image.source="https://github.com/agentsmith-project/llm-universal-proxy"',
             "USER llmup:llmup",
             "EXPOSE 8080",
             "HEALTHCHECK",
@@ -452,7 +452,7 @@ os.execv(real_git, [real_git, *args])
             "IMAGE=llm-universal-proxy:ci bash scripts/test_container_smoke.sh",
             ci,
         )
-        self.assertIn("GHCR_IMAGE: ghcr.io/lzjever/llm-universal-proxy", release)
+        self.assertIn("GHCR_IMAGE: ghcr.io/agentsmith-project/llm-universal-proxy", release)
         self.assertIn("platforms: linux/amd64,linux/arm64", release)
         self.assertIn("push: true", release)
         self.assertIn("${{ env.GHCR_IMAGE }}:latest", release)
@@ -658,7 +658,7 @@ os.execv(real_git, [real_git, *args])
             compose,
         )
         self.assertNotRegex(container_config + compose, r"sk-[A-Za-z0-9]")
-        self.assertIn("ghcr.io/lzjever/llm-universal-proxy", container_doc)
+        self.assertIn("ghcr.io/agentsmith-project/llm-universal-proxy", container_doc)
         self.assertIn("LLM_UNIVERSAL_PROXY_DATA_TOKEN", container_doc)
         self.assertIn("X-LLMUP-Data-Token", container_doc)
         self.assertIn(

@@ -17,8 +17,8 @@ ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="LLM Universal Proxy" \
   org.opencontainers.image.description="Single-binary LLM HTTP protocol proxy" \
-  org.opencontainers.image.source="https://github.com/lzjever/llm-universal-proxy" \
-  org.opencontainers.image.url="https://github.com/lzjever/llm-universal-proxy" \
+  org.opencontainers.image.source="https://github.com/agentsmith-project/llm-universal-proxy" \
+  org.opencontainers.image.url="https://github.com/agentsmith-project/llm-universal-proxy" \
   org.opencontainers.image.licenses="MIT" \
   org.opencontainers.image.version="${VERSION}" \
   org.opencontainers.image.revision="${VCS_REF}"

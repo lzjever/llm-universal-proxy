@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  GHCR_IMAGE: ghcr.io/lzjever/llm-universal-proxy
+  GHCR_IMAGE: ghcr.io/agentsmith-project/llm-universal-proxy
 
 jobs:
   governance:
@@ -397,7 +397,7 @@ jobs:
             VERSION=${{ steps.repo_meta.outputs.version }}
             VCS_REF=${{ github.sha }}
           labels: |
-            org.opencontainers.image.source=https://github.com/lzjever/llm-universal-proxy
+            org.opencontainers.image.source=https://github.com/agentsmith-project/llm-universal-proxy
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.repo_meta.outputs.version }}
           cache-from: type=gha

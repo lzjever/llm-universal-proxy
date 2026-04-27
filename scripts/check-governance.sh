@@ -520,7 +520,7 @@ fi
 check_contains "Dockerfile" "ARG RUST_TOOLCHAIN=${TOOLCHAIN}"
 check_contains "Dockerfile" "COPY rust-toolchain.toml"
 check_contains "Dockerfile" "cargo build --locked --release"
-check_contains "Dockerfile" 'org.opencontainers.image.source="https://github.com/lzjever/llm-universal-proxy"'
+check_contains "Dockerfile" 'org.opencontainers.image.source="https://github.com/agentsmith-project/llm-universal-proxy"'
 check_contains "Dockerfile" "USER llmup:llmup"
 check_contains "Dockerfile" 'CMD ["--config", "/etc/llmup/config.yaml"]'
 check_contains "Dockerfile" "HEALTHCHECK"
@@ -623,7 +623,7 @@ check_contains ".github/workflows/release.yml" "Upload compatible provider smoke
 check_contains ".github/workflows/release.yml" "path: ${COMPAT_PROVIDER_SMOKE_JSON}"
 check_contains ".github/workflows/release.yml" "path: artifacts/compatible-provider-smoke.json"
 check_contains ".github/workflows/release.yml" "if-no-files-found: error"
-check_contains ".github/workflows/release.yml" "ghcr.io/lzjever/llm-universal-proxy"
+check_contains ".github/workflows/release.yml" "ghcr.io/agentsmith-project/llm-universal-proxy"
 check_contains ".github/workflows/release.yml" "platforms: linux/amd64,linux/arm64"
 check_contains ".github/workflows/release.yml" "push: true"
 check_contains ".github/workflows/release.yml" '${{ env.GHCR_IMAGE }}:latest'
@@ -634,7 +634,7 @@ check_contains ".github/workflows/release.yml" "IMAGE=llm-universal-proxy:releas
 check_contains "docs/README.md" "container.md"
 check_contains "README.md" "docs/container.md"
 check_contains "README_CN.md" "docs/container.md"
-check_contains "docs/container.md" "ghcr.io/lzjever/llm-universal-proxy"
+check_contains "docs/container.md" "ghcr.io/agentsmith-project/llm-universal-proxy"
 check_contains "docs/container.md" "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN"
 check_contains "docs/container.md" "Do not mount the local quickstart config unchanged for container service mode"
 check_contains "docs/admin-dynamic-config.md" "do not introduce a separate service key"

@@ -77,7 +77,7 @@ model_aliases:
 Set the preset environment variables before starting a wrapper-managed session:
 
 ```bash
-git clone https://github.com/lzjever/llm-universal-proxy.git
+git clone https://github.com/agentsmith-project/llm-universal-proxy.git
 cd llm-universal-proxy
 cargo build --locked --release
 
@@ -194,7 +194,7 @@ For the full YAML reference and more examples, see [docs/configuration.md](./doc
 
 ## Container Image
 
-Release images are published at `ghcr.io/lzjever/llm-universal-proxy`. Container usage, Docker Compose, container smoke, Admin Dashboard auth boundaries, and GHCR release policy are documented in [docs/container.md](./docs/container.md).
+Release images are published at `ghcr.io/agentsmith-project/llm-universal-proxy`. Container usage, Docker Compose, container smoke, Admin Dashboard auth boundaries, and GHCR release policy are documented in [docs/container.md](./docs/container.md).
 
 ## Dynamic Configuration Overview
 

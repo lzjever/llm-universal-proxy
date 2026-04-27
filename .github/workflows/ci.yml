@@ -9,7 +9,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  GHCR_IMAGE: ghcr.io/lzjever/llm-universal-proxy
+  GHCR_IMAGE: ghcr.io/agentsmith-project/llm-universal-proxy
 
 jobs:
   governance:

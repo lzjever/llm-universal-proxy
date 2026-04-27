@@ -1,6 +1,6 @@
 services:
   llmup:
-    image: ghcr.io/lzjever/llm-universal-proxy:latest
+    image: ghcr.io/agentsmith-project/llm-universal-proxy:latest
     restart: unless-stopped
     ports:
       - "127.0.0.1:8080:8080"

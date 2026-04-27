@@ -35,7 +35,7 @@
 - Added an embedded Web Admin Dashboard at `/dashboard` as a single-binary static shell. `/dashboard` shell and static assets are public UI resources; admin work stays behind the existing `/admin/*` APIs, where `/admin/*` API calls require `Authorization: Bearer <admin-token>` using `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`. The data-plane token is separate, and the dashboard does not introduce service keys, multi-user auth, sessions, or a separate frontend runtime.
 - Added dashboard regression coverage for public shell loading, admin-token-protected API access, static asset content types, no inherited CORS, redacted-state read-only guidance, and responsive mobile layout boundaries.
 - Productionized container support with a non-root Docker image, `/etc/llmup/config.yaml` default config path, OCI labels, `/health` Docker `HEALTHCHECK`, Makefile Docker targets, and a container smoke test that verifies image metadata, admin-token gating, Docker health, and a streaming proxy path through a mock upstream.
-- Added GHCR release publishing for `ghcr.io/lzjever/llm-universal-proxy`, including CI image build/smoke without push, tag-only multi-arch release publishing, container examples, and container/admin dashboard documentation.
+- Added GHCR release publishing for `ghcr.io/agentsmith-project/llm-universal-proxy`, including CI image build/smoke without push, tag-only multi-arch release publishing, container examples, and container/admin dashboard documentation.
 
 ## v0.2.16 - 2026-04-25
 
