@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.2.22 - 2026-04-27
+
 - Documented provider-neutral preset naming as the portable GA path, keeping named official and compatible providers as operator examples rather than release-blocking dependencies.
 - Clarified Responses reasoning/compaction continuity degradation boundaries for opaque state: visible summaries or transcript context may degrade in compatible modes, while opaque-only continuity still fails closed outside native passthrough.
 - Recorded the hermetic Codex wrapper interaction gate as the deterministic release check for scripted two-turn wrapper behavior.

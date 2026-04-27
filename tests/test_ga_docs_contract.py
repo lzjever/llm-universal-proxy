@@ -307,9 +307,9 @@ class GaDocsContractTests(unittest.TestCase):
                 self.assertNotIn("OpenAI-compatible completions surface", text)
                 self.assertNotIn("OpenAI-compatible completions and", text)
 
-    def test_changelog_unreleased_records_recent_user_visible_changes(self):
+    def test_changelog_latest_release_records_recent_user_visible_changes(self):
         changelog = read_doc("CHANGELOG.md")
-        unreleased = markdown_section(changelog, "Unreleased")
+        latest_release = markdown_section(changelog, "v0.2.22 - 2026-04-27")
 
         for snippet in (
             "provider-neutral preset naming",
@@ -318,7 +318,7 @@ class GaDocsContractTests(unittest.TestCase):
             "GA docs alignment",
         ):
             with self.subTest(snippet=snippet):
-                self.assertIn(snippet, unreleased)
+                self.assertIn(snippet, latest_release)
 
 
 if __name__ == "__main__":
