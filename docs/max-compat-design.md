@@ -1,7 +1,7 @@
 # Maximum Compatibility Design
 
 Status: active  
-Last updated: 2026-04-25
+Last updated: 2026-04-26
 
 ## Summary
 
@@ -65,9 +65,10 @@ Client brand names can still exist in wrappers, real-client test matrix labels, 
 
 ## Product Direction
 
-The product promise is bounded: protocol coverage means native passthrough for same-protocol paths and portable-core translation for mismatched paths, not full-fidelity provider equivalence.
+The product promise is bounded: protocol coverage means same-provider/native passthrough for native paths and portable-core translation for mismatched paths, not full-fidelity provider equivalence. A compatible same-protocol lane can satisfy the portable fields for that protocol family, but it is not the same thing as native provider passthrough.
 
-- same-protocol paths: native passthrough within proxy routing, auth, and observability boundaries
+- same-provider/native passthrough: preserve provider-native fields within proxy routing, auth, and observability boundaries
+- compatible same-protocol lane: keep portable fields for the compatible protocol surface, but do not promise provider-owned state, lifecycle resources, or native-only extensions
 - translated paths: `portable core` plus explicit compatibility behavior
 - provider-native state and native extensions: same-provider only unless a documented shim exists
 
@@ -79,7 +80,7 @@ Portable core:
 - function tools
 - portable tool results
 - usage and basic terminal reasons
-- reasoning summaries and safe reasoning carriers
+- visible reasoning summaries; response-side proxy-local Anthropic carrier recovery remains a dedicated shim, not request-side cross-provider carrier replay
 
 Native extensions:
 
@@ -87,6 +88,33 @@ Native extensions:
 - Anthropic server tools and pause-turn semantics
 - Gemini built-in tools, caches, and interaction-specific state
 - provider-owned conversation or compaction resources
+
+## Request Translation And State Continuity
+
+Current implementation facts:
+
+- RequestTranslationPolicy::default() is `max_compat`.
+- `translate_request()` defaults to `max_compat` when the caller does not supply an explicit policy.
+- same-format request translation passthrough preserves native fields when the source and upstream are the same provider-native surface.
+- Native Responses passthrough preserves `context_management`, `include` values such as `reasoning.encrypted_content`, and input reasoning and compaction items with `encrypted_content` unchanged.
+- Responses lifecycle/resource endpoints require exactly one native OpenAI Responses upstream and the proxy does not reconstruct provider state.
+
+Request-side reasoning encrypted_content rules:
+
+- For request-side reasoning encrypted_content and include `reasoning.encrypted_content`, strict/balanced modes fail closed on cross-provider translation.
+- In default/max_compat, include `reasoning.encrypted_content` is warned and dropped on cross-provider translation because it only asks the source provider to emit an opaque carrier the target cannot use.
+- In default/max_compat, a reasoning item `encrypted_content` carrier may be dropped only when the item has visible summary text or the request still contains visible transcript/history that can be replayed as portable context.
+- The opaque-only reasoning case fails closed even in default/max_compat. The proxy must not silently discard the only continuity signal.
+
+Request-side compaction input rules:
+
+- For request-side compaction input, strict/balanced modes fail closed on cross-provider translation.
+- In default/max_compat, a compaction item may warn/drop opaque carrier fields only when that compaction item has an explicit visible summary, or when the request contains non-compaction visible portable transcript/history that can carry the context forward.
+- In the same request, one summarized compaction item does not permit another opaque-only compaction item to be silently dropped.
+- Opaque-only compaction fails closed even in default/max_compat.
+- The native Responses passthrough lane preserves compaction items unchanged.
+
+Response-side reasoning encrypted_content is a separate translation concern. There is a dedicated Anthropic carrier recovery path for response-side reasoning encrypted_content; the request-side continuity rules above must not be generalized into a blanket rule for all response translation.
 
 ## Multimodal Phase 1 Boundary
 

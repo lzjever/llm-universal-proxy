@@ -31,7 +31,7 @@ REAL_PROVIDER_REQUIRED_ENVS = (
 )
 REAL_PROVIDER_GATE = "real-provider-smoke"
 COMPATIBLE_PROVIDER_GATE = "compatible-provider-smoke"
-COMPATIBLE_PROVIDER_CLAIM_SCOPE = "compatible_provider_openai_completion_and_anthropic_messages"
+COMPATIBLE_PROVIDER_CLAIM_SCOPE = "compatible_provider_openai_chat_completions_and_anthropic_messages"
 COMPATIBLE_PROVIDER_DEFAULT_LABEL = "compatible-provider"
 COMPAT_PROVIDER_SHARED_CREDENTIAL_ENV = "COMPAT_PROVIDER_API_KEY"
 COMPAT_OPENAI_CREDENTIAL_ENV = "COMPAT_OPENAI_API_KEY"
@@ -1856,7 +1856,14 @@ def run_compatible_provider_smoke(args: argparse.Namespace) -> int:
         print(redact_real_provider_text(message), file=sys.stderr)
         return 2
 
-    port = free_port()
+    try:
+        port = free_port()
+    except Exception as error:
+        message = f"could not allocate local proxy port: {error}"
+        report = build_compatible_provider_startup_failure_report(cases, config, message)
+        emit_machine_report(report, args.json_out)
+        print(redact_real_provider_text(message), file=sys.stderr)
+        return 2
     base_url = f"http://127.0.0.1:{port}"
 
     with tempfile.TemporaryDirectory(prefix="proxy-compatible-matrix-") as tempdir:
@@ -1929,7 +1936,14 @@ def run_real_provider_smoke(args: argparse.Namespace) -> int:
         print(redact_real_provider_text(message), file=sys.stderr)
         return 2
 
-    port = free_port()
+    try:
+        port = free_port()
+    except Exception as error:
+        message = f"could not allocate local proxy port: {error}"
+        report = build_real_provider_startup_failure_report(cases, message)
+        emit_machine_report(report, args.json_out)
+        print(redact_real_provider_text(message), file=sys.stderr)
+        return 2
     base_url = f"http://127.0.0.1:{port}"
 
     with tempfile.TemporaryDirectory(prefix="proxy-real-matrix-") as tempdir:

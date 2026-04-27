@@ -10,6 +10,10 @@ Use admin-driven dynamic config when you need to:
 - update a namespace config in place
 
 For the basic YAML shape, start with [Configuration Guide](./configuration.md).
+For CLI-wrapper entrypoints, the provider-neutral preset names are
+`preset-openai-compatible` and `preset-anthropic-compatible`; dynamic admin
+writes should send the already-hydrated concrete URL/model values, not raw
+`PRESET_*` placeholders.
 
 ## Admin Access Rules
 
@@ -32,14 +36,15 @@ The data plane has its own token, `LLM_UNIVERSAL_PROXY_DATA_TOKEN`, and does not
 
 ## Admin Dashboard Boundary
 
-The Web Admin Dashboard uses the same admin plane and the same `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` boundary as the endpoints below.
+The dashboard boundary has two separate pieces:
 
 Current product boundary:
 
-- keep `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`
+- `/dashboard` shell and static assets are public UI resources. Loading the shell or assets does not grant admin API access.
+- Dashboard JavaScript sends `Authorization: Bearer <admin-token>` only when it calls existing `/admin/*` APIs.
+- Admin-plane routes use `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`; when the token is set to a non-empty value, admin API requests must provide a matching bearer token.
+- data-plane provider/model/resource routes use `LLM_UNIVERSAL_PROXY_DATA_TOKEN` separately and do not accept the admin token
 - do not introduce a separate service key
-- dashboard login is admin-token based
-- dashboard shell/admin actions are admin-plane operations, not a separate trust boundary
 - do not add multi-user accounts, readonly roles, or complex session behavior in this plan
 
 For container-specific runtime notes, see [Container Image and GHCR Release](./container.md).
@@ -150,6 +155,12 @@ The write flow supports revision checks so a client does not accidentally overwr
 
 Runtime writes use the same client-visible surface contract as static YAML. Raw HTTP tests can omit `surface_defaults`, but Codex, Claude Code, and Gemini wrapper/live-profile flows should provide at least the conservative text-only surface shown below, or an accurate alias-level `surface`.
 
+Responses reasoning/compaction continuity follows the same compatibility policy
+in dynamically written namespaces: default/max_compat may drop an opaque carrier
+only when visible summary text or visible transcript history remains;
+strict/balanced fail closed; opaque-only reasoning and opaque-only compaction
+fail closed; same-provider/native passthrough preserves provider-owned state.
+
 ### Recommended write pattern
 
 1. read the current namespace state
@@ -175,10 +186,10 @@ curl -fsS \
     },
     "upstreams": [
       {
-        "name": "OPENAI",
-        "api_root": "https://api.openai.com/v1",
-        "fixed_upstream_format": "openai-responses",
-        "fallback_credential_env": "OPENAI_API_KEY",
+        "name": "PRESET-OPENAI-COMPATIBLE",
+        "api_root": "https://openai-compatible.example/v1",
+        "fixed_upstream_format": "openai-completion",
+        "fallback_credential_env": "PRESET_ENDPOINT_API_KEY",
         "auth_policy": "force_server",
         "surface_defaults": {
           "modalities": {
@@ -195,9 +206,9 @@ curl -fsS \
       }
     ],
     "model_aliases": {
-      "coder-strong": {
-        "upstream_name": "OPENAI",
-        "upstream_model": "gpt-4o"
+      "preset-openai-compatible": {
+        "upstream_name": "PRESET-OPENAI-COMPATIBLE",
+        "upstream_model": "provider-model-id"
       }
     },
     "hooks": {},

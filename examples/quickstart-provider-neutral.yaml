@@ -1,0 +1,56 @@
+# Provider-neutral quickstart config source for CLI wrappers.
+#
+# The wrapper/real-CLI harness hydrates these preset variables before starting
+# the proxy:
+# - PRESET_OPENAI_ENDPOINT_BASE_URL: OpenAI-compatible API root, including /v1
+# - PRESET_ANTHROPIC_ENDPOINT_BASE_URL: Anthropic-compatible API root
+# - PRESET_ENDPOINT_MODEL: provider model ID used by both preset lanes
+# - PRESET_ENDPOINT_API_KEY: provider credential kept on the proxy side
+#
+# For direct `llm-universal-proxy --config` use, replace the PRESET_* placeholders
+# with concrete URLs/model names first, or use a concrete example such as
+# quickstart-openai-minimax.yaml.
+
+listen: 127.0.0.1:8080
+upstream_timeout_secs: 120
+
+upstreams:
+  PRESET-ANTHROPIC-COMPATIBLE:
+    api_root: PRESET_ANTHROPIC_ENDPOINT_BASE_URL
+    format: anthropic
+    credential_env: PRESET_ENDPOINT_API_KEY
+    auth_policy: force_server
+    limits:
+      context_window: 200000
+      max_output_tokens: 128000
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
+
+  PRESET-OPENAI-COMPATIBLE:
+    api_root: PRESET_OPENAI_ENDPOINT_BASE_URL
+    format: openai-completion
+    credential_env: PRESET_ENDPOINT_API_KEY
+    auth_policy: force_server
+    limits:
+      context_window: 200000
+      max_output_tokens: 128000
+    surface_defaults:
+      modalities:
+        input: ["text"]
+        output: ["text"]
+      tools:
+        supports_search: false
+        supports_view_image: false
+        apply_patch_transport: freeform
+        supports_parallel_calls: false
+
+model_aliases:
+  preset-anthropic-compatible: "PRESET-ANTHROPIC-COMPATIBLE:PRESET_ENDPOINT_MODEL"
+  preset-openai-compatible: "PRESET-OPENAI-COMPATIBLE:PRESET_ENDPOINT_MODEL"

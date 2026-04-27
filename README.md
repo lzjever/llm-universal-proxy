@@ -19,23 +19,28 @@ The optional local dashboard helps you inspect routing, streaming, cancellation,
 
 ## Quick Start
 
-This homepage path shows two upstreams directly:
+The GA user-entry path is provider-neutral and starts with the CLI wrappers. The recommended config source is [examples/quickstart-provider-neutral.yaml](./examples/quickstart-provider-neutral.yaml), using these stable local aliases:
 
-- official OpenAI API routing to `gpt-5.4`
-- MiniMax's OpenAI-compatible endpoint routing to `MiniMax-M2.7-highspeed`
+- `preset-openai-compatible` for the OpenAI-compatible lane
+- `preset-anthropic-compatible` for the Anthropic-compatible lane
 
-Start from [examples/quickstart-openai-minimax.yaml](./examples/quickstart-openai-minimax.yaml). The file contents are:
+MiniMax is only a replaceable OpenAI-compatible example, not a GA-required provider and not the mainline preset name. A concrete OpenAI + MiniMax sample remains in [examples/quickstart-openai-minimax.yaml](./examples/quickstart-openai-minimax.yaml) for users who want to replace the preset placeholders with named providers.
+
+The provider-neutral config source is:
 
 ```yaml
 listen: 127.0.0.1:8080
 upstream_timeout_secs: 120
 
 upstreams:
-  OPENAI:
-    api_root: https://api.openai.com/v1
-    format: openai-responses
-    credential_env: OPENAI_API_KEY
+  PRESET-ANTHROPIC-COMPATIBLE:
+    api_root: PRESET_ANTHROPIC_ENDPOINT_BASE_URL
+    format: anthropic
+    credential_env: PRESET_ENDPOINT_API_KEY
     auth_policy: force_server
+    limits:
+      context_window: 200000
+      max_output_tokens: 128000
     surface_defaults:
       modalities:
         input: ["text"]
@@ -46,11 +51,14 @@ upstreams:
         apply_patch_transport: freeform
         supports_parallel_calls: false
 
-  MINIMAX_OPENAI:
-    api_root: https://api.minimaxi.com/v1
+  PRESET-OPENAI-COMPATIBLE:
+    api_root: PRESET_OPENAI_ENDPOINT_BASE_URL
     format: openai-completion
-    credential_env: MINIMAX_API_KEY
+    credential_env: PRESET_ENDPOINT_API_KEY
     auth_policy: force_server
+    limits:
+      context_window: 200000
+      max_output_tokens: 128000
     surface_defaults:
       modalities:
         input: ["text"]
@@ -62,53 +70,33 @@ upstreams:
         supports_parallel_calls: false
 
 model_aliases:
-  gpt-5-4: OPENAI:gpt-5.4
-  gpt-5-4-mini: MINIMAX_OPENAI:MiniMax-M2.7-highspeed
+  preset-anthropic-compatible: "PRESET-ANTHROPIC-COMPATIBLE:PRESET_ENDPOINT_MODEL"
+  preset-openai-compatible: "PRESET-OPENAI-COMPATIBLE:PRESET_ENDPOINT_MODEL"
 ```
 
-What those aliases mean:
-
-- `gpt-5-4` is your stable local alias for OpenAI `gpt-5.4`
-- `gpt-5-4-mini` is also a local alias; in this example it routes to MiniMax `MiniMax-M2.7-highspeed`
-
-Build and start the proxy:
+Set the preset environment variables before starting a wrapper-managed session:
 
 ```bash
 git clone https://github.com/lzjever/llm-universal-proxy.git
 cd llm-universal-proxy
 cargo build --locked --release
 
-export OPENAI_API_KEY="your-openai-key"
-export MINIMAX_API_KEY="your-minimax-key"
-
-./target/release/llm-universal-proxy --config examples/quickstart-openai-minimax.yaml
+export PRESET_OPENAI_ENDPOINT_BASE_URL="https://openai-compatible.example/v1"
+export PRESET_ANTHROPIC_ENDPOINT_BASE_URL="https://anthropic-compatible.example/v1"
+export PRESET_ENDPOINT_MODEL="provider-model-id"
+export PRESET_ENDPOINT_API_KEY="provider-api-key"
 ```
 
-Check health:
+What those variables do:
 
-```bash
-curl -fsS http://127.0.0.1:8080/health && echo
-```
+| Variable | Used for |
+| --- | --- |
+| `PRESET_OPENAI_ENDPOINT_BASE_URL` | API root for the OpenAI-compatible upstream, including its version segment such as `/v1` |
+| `PRESET_ANTHROPIC_ENDPOINT_BASE_URL` | API root for the Anthropic-compatible upstream |
+| `PRESET_ENDPOINT_MODEL` | Provider model ID hydrated into both preset aliases |
+| `PRESET_ENDPOINT_API_KEY` | Server-side provider credential used by both preset upstreams |
 
-Try both aliases through the same local OpenAI-style client surface:
-
-```bash
-curl http://127.0.0.1:8080/openai/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-5-4",
-    "input": "Reply with pong."
-  }'
-```
-
-```bash
-curl http://127.0.0.1:8080/openai/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-5-4-mini",
-    "input": "Reply with pong."
-  }'
-```
+The `PRESET_*` values are a wrapper/config-source contract. The wrappers hydrate them into a concrete runtime config before starting the proxy. If you run `llm-universal-proxy --config` directly, replace the placeholders with concrete URLs and model names first.
 
 Reasoning effort such as `xhigh` is a client/request-side setting, not part of the model name. Keep the alias stable and set reasoning in the request or client config.
 
@@ -116,9 +104,11 @@ Reasoning effort such as `xhigh` is a client/request-side setting, not part of t
 
 `llmup` gives clients a stable local protocol surface, not unlimited provider equivalence.
 
-- same-protocol paths stay native when possible
+- same-provider/native passthrough preserves provider-native fields and lifecycle state
+- compatible same-protocol lanes promise portable core/portable fields only; they are not native provider passthrough
 - translated paths target a portable core and may warn or reject non-portable provider-native features
-- native extensions and provider-owned lifecycle state stay on same-provider paths unless a documented shim says otherwise
+- native extensions and provider-owned lifecycle state stay on same-provider/native paths unless a documented shim says otherwise
+- Responses reasoning/compaction continuity is mode-bound: default/max_compat may drop an opaque carrier only when visible summary text or visible transcript history remains; strict/balanced fail closed; opaque-only reasoning and opaque-only compaction fail closed; same-provider/native passthrough preserves provider-owned state
 - the quickstart includes conservative text-only `surface_defaults`; turn on search, image, or parallel-tool flags only when that model surface really supports them
 - multimodal `surface.modalities.input` gates media types, not every source transport; HTTP(S) image/PDF URLs are distinct from provider or local URIs such as `gs://`, `s3://`, and `file://`
 - Gemini `inlineData` can be preserved when translating to OpenAI Chat/Responses, but all Gemini `fileData.fileUri` sources currently fail closed until an explicit fetch/upload adapter exists
@@ -126,39 +116,44 @@ Reasoning effort such as `xhigh` is a client/request-side setting, not part of t
 
 ## Codex / Claude Code / Gemini Basic Setup
 
-For day-to-day usage, prefer the repo's wrapper scripts instead of hand-configuring each client. They handle local environment isolation, base URL injection, and client-specific metadata.
+For day-to-day usage, prefer the repo's wrapper scripts instead of hand-configuring each client. They handle local environment isolation, base URL injection, preset hydration, and client-specific metadata.
 
-With the quickstart config above, start with `--model gpt-5-4`. Swap to `--model gpt-5-4-mini` when you want the MiniMax lane instead.
+The defaults in `scripts/interactive_cli.py` match the provider-neutral preset names:
+
+| Client | Default wrapper model |
+| --- | --- |
+| Codex CLI | `preset-openai-compatible` |
+| Claude Code | `preset-anthropic-compatible` |
+| Gemini CLI | `preset-openai-compatible` |
 
 ### Codex CLI
 
 ```bash
 bash scripts/run_codex_proxy.sh \
-  --proxy-base http://127.0.0.1:8080 \
-  --config-source examples/quickstart-openai-minimax.yaml \
+  --config-source examples/quickstart-provider-neutral.yaml \
   --workspace "$PWD" \
-  --model gpt-5-4
+  --model preset-openai-compatible
 ```
 
 ### Claude Code
 
 ```bash
 bash scripts/run_claude_proxy.sh \
-  --proxy-base http://127.0.0.1:8080 \
-  --config-source examples/quickstart-openai-minimax.yaml \
+  --config-source examples/quickstart-provider-neutral.yaml \
   --workspace "$PWD" \
-  --model gpt-5-4
+  --model preset-anthropic-compatible
 ```
 
 ### Gemini CLI
 
 ```bash
 bash scripts/run_gemini_proxy.sh \
-  --proxy-base http://127.0.0.1:8080 \
-  --config-source examples/quickstart-openai-minimax.yaml \
+  --config-source examples/quickstart-provider-neutral.yaml \
   --workspace "$PWD" \
-  --model gpt-5-4
+  --model preset-openai-compatible
 ```
+
+Pass `--proxy-base http://127.0.0.1:8080` when you want to attach to a proxy you started separately. When `--proxy-base` is omitted, the wrapper renders the preset config, starts the proxy, waits for `/health`, launches the client, and stops the proxy when the session exits.
 
 Wrapper base URL and actual proxy endpoint are related but not identical.
 
@@ -191,8 +186,9 @@ Practical rules:
 
 - `api_root` should be the provider API root and include its version segment, such as `.../v1` or `.../v1beta`
 - `format` pins the upstream protocol: `openai-responses`, `openai-completion`, `anthropic`, or `google`
-- aliases such as `gpt-5-4` and `gpt-5-4-mini` are local names; they do not need to equal the upstream model ID
+- aliases such as `preset-openai-compatible` and `preset-anthropic-compatible` are local names; they do not need to equal the upstream model ID
 - use structured aliases only when you want extra `limits` or `surface` metadata on top of `target: UPSTREAM:MODEL`
+- the provider-neutral `PRESET_*` placeholders are for wrapper-rendered config sources; direct static YAML should contain concrete URLs and model IDs
 
 For the full YAML reference and more examples, see [docs/configuration.md](./docs/configuration.md).
 
@@ -218,6 +214,7 @@ That flow is documented in [docs/admin-dynamic-config.md](./docs/admin-dynamic-c
 - [docs/clients.md](./docs/clients.md): Codex / Claude Code / Gemini wrapper setup and base URL details
 - [docs/container.md](./docs/container.md): GHCR image usage, Docker Compose, container smoke, and release policy
 - [docs/admin-dynamic-config.md](./docs/admin-dynamic-config.md): admin API, live config, CAS updates
+- [docs/ga-readiness-review.md](./docs/ga-readiness-review.md): GA scope, release evidence, and compatibility boundaries
 - [docs/protocol-compatibility-matrix.md](./docs/protocol-compatibility-matrix.md): compatibility boundaries and portability summary
 - [docs/max-compat-design.md](./docs/max-compat-design.md): deeper translated-path compatibility notes
 - [docs/DESIGN.md](./docs/DESIGN.md): current architecture map

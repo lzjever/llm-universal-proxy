@@ -40,9 +40,9 @@ When translating between protocols, the proxy must preserve as much semantic fid
 
 When exact 1:1 mapping is impossible, the proxy must degrade gracefully and signal the degradation via `x-proxy-compat-warning` headers rather than silently losing information.
 
-### 3. Zero Overhead Passthrough
+### 3. Same-Provider Native Passthrough
 
-When the client and upstream share the same protocol, the proxy must forward requests and responses with **zero translation overhead**. Passthrough is the fast path; translation is only invoked when needed.
+When the route is same-provider/native, the proxy must forward requests and responses with **zero translation overhead** apart from explicit proxy behavior such as routing, authentication policy, headers, and observability. A compatible endpoint that speaks the same wire protocol is a same-format lane: it preserves portable core fields unless an explicit compatibility shim says otherwise, but it must not be treated as native provider passthrough.
 
 ### 4. Protocol-Agnostic Client Interface
 
@@ -72,7 +72,7 @@ The proxy does not favor any particular LLM provider. It works equally well with
 These are non-negotiable properties that all future development must preserve:
 
 1. **Supported protocol routing**: Every supported client protocol must be able to reach every supported upstream protocol within documented portability boundaries.
-2. **Passthrough preserves native semantics**: When client and upstream protocols match, the proxy should avoid translation while still allowing explicit proxy behavior such as routing, auth policy, headers, and observability.
+2. **Passthrough preserves native semantics**: Same-provider/native routes should avoid translation while still allowing explicit proxy behavior such as routing, auth policy, headers, and observability. Compatible same-protocol lanes preserve portable fields but are not native provider passthrough.
 3. **Translated responses keep the client protocol shape**: The response must conform to the client's expected protocol shape, and any non-portable degradation must remain visible through warnings or rejection.
 4. **Visible tool identity is preserved**: The proxy must never change the stable tool name supplied by the client on model-visible or client-visible surfaces.
 5. **Streaming is first-class**: Streaming (SSE) support is mandatory for supported protocol pairs within the same portability and reject rules as non-streaming translation.
@@ -99,6 +99,16 @@ Locked tool identity contract:
 - Reasoning/thinking output preservation
 - Usage/token metric normalization
 - Capability-surface projection for real agent clients and compatibility modes
+- Proxy authentication boundaries for health, data-plane, and admin-plane routes
+
+Proxy authentication is in scope:
+
+- `/health` remains unauthenticated so process and container health checks can run without secrets.
+- Data-plane provider/model/resource routes require `LLM_UNIVERSAL_PROXY_DATA_TOKEN` for shared or remote service use. Clients may send it as `X-LLMUP-Data-Token` or `Authorization: Bearer <data-token>`, and the proxy strips that token before upstream calls and hook payloads.
+- `/dashboard` shell and static assets are public UI resources. Dashboard JavaScript sends `Authorization: Bearer <admin-token>` only when it calls existing `/admin/*` APIs.
+- Admin-plane routes use `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` when it is configured, sent as `Authorization: Bearer <admin-token>`. Empty or whitespace-only admin tokens are misconfiguration and fail closed.
+- When an admin or data token is not configured, that plane defaults to loopback-only access and rejects proxy-forwarding headers in loopback-only mode.
+- A non-loopback listener with server-held provider credentials, sensitive upstream headers, or `auth_policy: force_server` must fail closed unless the data token boundary is configured.
 
 ### Out of Scope
 
@@ -106,7 +116,6 @@ Locked tool identity contract:
 - Prompt engineering or content modification
 - Persistent conversation state (the proxy is stateless per request)
 - Provider-owned lifecycle state reconstruction
-- Authentication to the proxy itself (delegated to upstream credential policy)
 - Rate limiting or quota management (delegated to upstream providers)
 - Training data collection
 

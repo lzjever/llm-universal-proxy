@@ -2,10 +2,13 @@
 
 - Layer: capability-diff matrix
 - Status: active
-- Last refreshed: 2026-04-16
+- Vendor snapshot/captured date: 2026-04-16
+- Proxy posture updated date: 2026-04-26
 - Scope: one-page comparison of the protocol surfaces the proxy has to reason about
 
 Legend: provider-status cells answer only whether the capability is officially documented on that provider surface. `Native` means documented on the surface covered by the vendor baseline. `Limited` means documented on that same surface but with narrower shape, model coverage, or lifecycle semantics. `Guide/Beta` means officially documented only in adjacent guides or beta-marked surfaces. `No official surface` means the baseline for that provider does not document it on this surface. Portability guidance lives in `Proxy note`.
+
+Provider columns are vendor contract snapshot/source facts. `Proxy note` is proxy policy/proxy posture and may be updated without claiming a new vendor refresh.
 
 | Capability | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Gemini `generateContent` | Proxy note |
 | --- | --- | --- | --- | --- | --- |
@@ -16,7 +19,7 @@ Legend: provider-status cells answer only whether the capability is officially d
 | Hosted / server tools | Native | No official surface | Native | Native | Treat as vendor-specific |
 | Remote MCP tools | Native | No official surface | Guide/Beta | Native | Same-provider passthrough only |
 | Tool parallelism control | Native | Native | Native | No official surface | Intent only can be preserved |
-| Reasoning request control | Native | Limited | Native | Native | Non-portable request syntax |
+| Reasoning request control | Native | Limited | Native | Native | Non-portable request syntax; request-side opaque reasoning carriers follow the default/max_compat vs strict/balanced downgrade rules in the reasoning note |
 | Reasoning output as typed structure | Native | Limited | Native | Native | Summary text is the practical common denominator |
 | Cached prompt reuse | Native | Native | Native | Native | Semantics differ sharply |
 | Named cache resource | No official surface | No official surface | No official surface | Native | Gemini-specific |
@@ -24,7 +27,7 @@ Legend: provider-status cells answer only whether the capability is officially d
 | Explicit incomplete / failed stream terminal | Native | Limited | Limited | Limited | Important for Responses-native clients |
 | Native response-chain handle | Native | No official surface | No official surface | No official surface | OpenAI-specific state model |
 | Native conversation resource | Native | No official surface | Guide/Beta | No official surface | Do not emulate across providers |
-| Native compaction surface | Native | No official surface | Guide/Beta | No official surface | Treat as provider-native state management |
+| Native compaction surface | Native | No official surface | Guide/Beta | No official surface | Treat as provider-native state management; request-side compaction input follows the visible summary/history downgrade rules in the state-continuity note |
 | Background / async run mode | Native | No official surface | No official surface | No official surface | Keep same-provider |
 | Service tier in request surface | Native | Native | Native | Native | Usually passthrough only |
 | Request-side persistence flag | Native (`store`) | Native (`store`) | No official surface | Native (`store`) | Not portable |

@@ -1,7 +1,7 @@
 # Maximum Compatibility Development Plan
 
 Status: active  
-Last updated: 2026-04-23
+Last updated: 2026-04-26
 
 ## Goal
 
@@ -112,6 +112,7 @@ Delivered coverage:
 - wrapper parsing/runtime-config tests for `surface_defaults` and alias `surface`
 - live surface fail-fast tests for critical `llmup.surface.tools` fields
 - CLI smoke verifier coverage that fails if public output omits the current client's public editing tool name, mentions another client's public editing tool name, or surfaces `__llmup_custom__*`
+- hermetic scripted interactive Codex wrapper gate
 
 ## Remaining Roadmap
 

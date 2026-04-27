@@ -1,15 +1,16 @@
-# Public quickstart example:
-# - official OpenAI API on gpt-5.4
-# - MiniMax OpenAI-compatible endpoint on MiniMax-M2.7-highspeed
-# - stable local aliases for clients: gpt-5-4 and gpt-5-4-mini
+# Historical concrete example.
 #
-# Reasoning effort such as xhigh belongs on the client request, not in the alias name.
+# MiniMax is a replaceable OpenAI-compatible example, not a GA-required provider
+# and not the main CLI-wrapper preset path. The recommended user-entry config
+# source is quickstart-provider-neutral.yaml; this file shows how to replace
+# provider-neutral PRESET_* placeholders with concrete upstreams when you want
+# an explicit OpenAI + MiniMax sample.
 
 listen: 127.0.0.1:8080
 upstream_timeout_secs: 120
 
 upstreams:
-  OPENAI:
+  OPENAI_RESPONSES_EXAMPLE:
     api_root: https://api.openai.com/v1
     format: openai-responses
     credential_env: OPENAI_API_KEY
@@ -24,7 +25,7 @@ upstreams:
         apply_patch_transport: freeform
         supports_parallel_calls: false
 
-  MINIMAX_OPENAI:
+  MINIMAX_OPENAI_COMPATIBLE_EXAMPLE:
     api_root: https://api.minimaxi.com/v1
     format: openai-completion
     credential_env: MINIMAX_API_KEY
@@ -40,5 +41,5 @@ upstreams:
         supports_parallel_calls: false
 
 model_aliases:
-  gpt-5-4: OPENAI:gpt-5.4
-  gpt-5-4-mini: MINIMAX_OPENAI:MiniMax-M2.7-highspeed
+  openai-responses-example: OPENAI_RESPONSES_EXAMPLE:gpt-5.4
+  minimax-openai-compatible-example: MINIMAX_OPENAI_COMPATIBLE_EXAMPLE:MiniMax-M2.7-highspeed

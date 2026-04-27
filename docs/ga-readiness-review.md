@@ -40,7 +40,7 @@ upstream calls, and low-risk degradation must be visible rather than silent.
 | Area | Required before final GA release | Non-claim until complete |
 | --- | --- | --- |
 | Release environment wiring | Configure the protected `release-compatible-provider` environment for a provider-neutral compatible smoke. If one compatible provider exposes both required surfaces, use `COMPAT_PROVIDER_API_KEY`; if the surfaces use separate credentials, use `COMPAT_OPENAI_API_KEY` and `COMPAT_ANTHROPIC_API_KEY`. In both cases set `COMPAT_OPENAI_BASE_URL`, `COMPAT_OPENAI_MODEL`, `COMPAT_ANTHROPIC_BASE_URL`, and `COMPAT_ANTHROPIC_MODEL`; `COMPAT_PROVIDER_LABEL` is optional. | Do not require MiniMax, GLM, or a fixed four-provider credential set for the GA gate. |
-| Compatible provider run | Execute the protected provider-neutral compatible live smoke and retain the uploaded `artifacts/compatible-provider-smoke.json` artifact with the release evidence. The required live coverage is the OpenAI-compatible completions/chat-completions surface plus the Anthropic-compatible messages surface. | Do not call the release provider-certified or fully cross-provider certified from local mocks alone. |
+| Compatible provider run | Execute the protected provider-neutral compatible live smoke from the protected `release-compatible-provider` environment and retain the uploaded `artifacts/compatible-provider-smoke.json` GitHub Actions artifact with the external release evidence. It is not a GitHub Release asset in the current workflow. The required live coverage is the OpenAI-compatible chat-completions route `/openai/v1/chat/completions` plus the Anthropic-compatible messages route `/anthropic/v1/messages`. | Do not call the release provider-certified or fully cross-provider certified from local mocks alone. |
 | External credential rotation | Rotate any credential that may have existed outside the secret manager and record the operator-side rotation evidence. | Do not claim external credential rotation has already been completed by repository changes. |
 
 ## Compatibility Boundaries
@@ -77,17 +77,20 @@ replay them safely.
 MiniMax is only an example of an OpenAI-compatible lane chosen by a user, not a
 GA-required provider and not an OpenAI Responses certified clone. Release smoke
 evidence should prefer provider-neutral `COMPAT_*` configuration and prove the
-compatible OpenAI completions/chat-completions and Anthropic messages surfaces
-without naming a specific provider as the GA requirement.
+OpenAI-compatible chat-completions route `/openai/v1/chat/completions` and the
+Anthropic-compatible messages route `/anthropic/v1/messages` without naming a
+specific provider as the GA requirement.
 
 ## GA Release Gates
 
 The GA release gates are split between deterministic local checks and protected
 release-environment checks. The mock endpoint matrix and perf gate run against
 local mock upstreams. The compatible provider smoke gate runs only from the
-`release-compatible-provider` GitHub environment, uses provider-neutral
-`COMPAT_*` configuration, and emits the
-`artifacts/compatible-provider-smoke.json` artifact.
+protected `release-compatible-provider` GitHub environment, uses provider-neutral
+`COMPAT_*` configuration, and uploads
+`artifacts/compatible-provider-smoke.json` as a GitHub Actions artifact for
+external release evidence. It is not a GitHub Release asset unless the workflow
+is changed to attach it to the release.
 
 GA release gating includes:
 
@@ -100,8 +103,9 @@ GA release gating includes:
 - Deterministic local perf gate with machine-readable JSON output and threshold
   checks.
 - Compatible provider smoke tests from the protected `release-compatible-provider`
-  environment, covering a compatible OpenAI completions/chat-completions surface
-  and a compatible Anthropic messages surface.
+  environment, covering the OpenAI-compatible chat-completions route
+  `/openai/v1/chat/completions` and the Anthropic-compatible messages route
+  `/anthropic/v1/messages`.
 - Container image smoke tests.
 - Security, secret, and supply-chain scans.
 - Documentation consistency checks for admin/data-plane boundaries and protocol

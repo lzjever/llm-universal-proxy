@@ -122,6 +122,21 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
             with self.subTest(case=item):
                 self.assertIn(item, actual)
 
+        self.assertEqual(
+            {case.surface for case in cases},
+            {"openai_chat_completions", "anthropic_messages"},
+        )
+        expected_paths = {
+            "compatible_openai_chat_completions_unary": "/openai/v1/chat/completions",
+            "compatible_openai_chat_completions_stream": "/openai/v1/chat/completions",
+            "compatible_anthropic_messages_unary": "/anthropic/v1/messages",
+            "compatible_anthropic_messages_stream": "/anthropic/v1/messages",
+            "compatible_openai_responses_state_fail_closed": "/openai/v1/responses",
+        }
+        for case in cases:
+            with self.subTest(path=case.case_id):
+                self.assertEqual(case.path, expected_paths[case.case_id])
+
         self.assertNotIn("minimax", json.dumps([case.__dict__ for case in cases]).lower())
         self.assertNotIn("gemini", json.dumps([case.__dict__ for case in cases]).lower())
         self.assertFalse(
@@ -141,6 +156,20 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
                 rendered_payload = json.dumps(case.payload)
                 for secret_marker in ("sk-proj-", "sk-ant-", "AIza", "minimax"):
                     self.assertNotIn(secret_marker, rendered_payload.lower())
+
+    def test_compatible_provider_claim_scope_names_chat_completions_route(self):
+        module = load_endpoint_matrix_module()
+
+        self.assertEqual(
+            module.COMPATIBLE_PROVIDER_CLAIM_SCOPE,
+            "compatible_provider_openai_chat_completions_and_anthropic_messages",
+        )
+        self.assertNotIn(
+            "compatible_provider_openai_completion_and_anthropic_messages",
+            module.COMPATIBLE_PROVIDER_CLAIM_SCOPE,
+        )
+        self.assertIn("openai_chat_completions", module.COMPATIBLE_PROVIDER_CLAIM_SCOPE)
+        self.assertIn("anthropic_messages", module.COMPATIBLE_PROVIDER_CLAIM_SCOPE)
 
     def test_compatible_openai_stream_accepts_sse_data_without_done_marker(self):
         module = load_endpoint_matrix_module()
@@ -403,7 +432,11 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         self.assertEqual(report["gate"], "compatible-provider-smoke")
         self.assertEqual(
             report["claim_scope"],
+            "compatible_provider_openai_chat_completions_and_anthropic_messages",
+        )
+        self.assertNotIn(
             "compatible_provider_openai_completion_and_anthropic_messages",
+            report_text,
         )
         self.assertEqual(report["provider_label"], "compatible-provider")
         self.assertEqual(

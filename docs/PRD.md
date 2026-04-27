@@ -14,7 +14,7 @@ LLM Universal Proxy (public short name: llmup)
 
 ### 1.2 Product Definition
 
-A single-binary HTTP proxy that provides protocol-namespaced entrypoints and translation between supported LLM API surfaces. Clients using OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, or Google Gemini can route through one stable proxy to configured upstream endpoints; same-protocol paths stay native where possible, while translated paths preserve the portable core and warn or reject non-portable provider-native features.
+A single-binary HTTP proxy that provides protocol-namespaced entrypoints and translation between supported LLM API surfaces. Clients using OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, or Google Gemini can route through one stable proxy to configured upstream endpoints; same-provider/native passthrough preserves provider-native fields and lifecycle state, while compatible same-protocol lanes preserve only portable core/portable fields and are not native provider passthrough. Translated paths preserve the portable core and warn or reject non-portable provider-native features.
 
 ### 1.3 Problem Statement
 
@@ -65,7 +65,7 @@ The proxy MUST support bidirectional translation between all four protocols:
 | 15 | Google Gemini | Anthropic Messages | Yes |
 | 16 | Google Gemini | Google Gemini | No (passthrough) |
 
-All 16 combinations (4 passthrough + 12 translated) MUST be supported within documented portability boundaries. Passthrough remains lossless; translated paths may warn or reject non-portable semantics rather than silently approximating them.
+All 16 combinations (4 passthrough + 12 translated) MUST be supported within documented portability boundaries. Same-provider/native passthrough remains lossless for provider-native fields; compatible same-protocol lanes and translated paths may warn or reject non-portable semantics rather than silently approximating them.
 
 ### 2.2 Client Endpoints
 
@@ -263,7 +263,7 @@ Admin namespace writes MUST use server-owned revisions with exact compare-and-sw
 ### 3.3 Compatibility
 
 - Compatible with HTTP clients that speak one of the four supported protocol surfaces and can use a configured proxy base URL.
-- No SDK changes are required for portable request/response fields; provider-native extensions may require same-provider paths or a documented shim.
+- No SDK changes are required for portable request/response fields; provider-native extensions may require same-provider/native passthrough or a documented shim.
 - Works with official vendor APIs and third-party compatible endpoints within documented portability boundaries.
 
 ### 3.4 Deployment
@@ -293,8 +293,9 @@ This reduces the translation matrix from O(N²) to O(N) — adding a new protoco
 1. Client sends request in format A
 2. Detect client format from path + body
 3. Resolve model → upstream + real model name
-4. If client format == upstream format → passthrough
-5. Otherwise:
+4. If the route is same-provider/native and no proxy policy requires translation -> native passthrough
+5. If the client and upstream share only a compatible wire format -> preserve portable fields within the documented compatibility lane
+6. Otherwise:
    a. Translate request: A → OpenAI Chat → B
    b. Send translated request to upstream
    c. Receive response from upstream
@@ -353,28 +354,54 @@ Stateful accumulators track message IDs, tool call IDs, content buffers, and fin
 
 ### 6.1 Test Environments
 
-The proxy MUST be tested against the following real upstream endpoints:
+Portable-core GA uses provider-neutral protected `COMPAT_*` evidence rather than
+a fixed named-provider live matrix. Official providers and concrete compatible
+providers are operator validation/example lanes, not portable-core GA hard dependencies.
 
-| Name | Endpoint URL | Protocol | Model | Context |
-|------|-------------|----------|-------|---------|
-| MiniMax (Anthropic) | `https://api.minimaxi.com/anthropic/v1` | Anthropic Messages | `MiniMax-M2.7-highspeed` | 204,800 tokens |
-| MiniMax (OpenAI) | `https://api.minimaxi.com/v1` | OpenAI Chat Completions | `MiniMax-M2.7-highspeed` | 204,800 tokens |
-| Local qwen3.5-9b-awq | `http://192.168.0.220:9997/v1` | OpenAI Chat Completions | `qwen3.5-9b-awq` | 16,384 tokens |
+The protected compatible-provider smoke evidence is configured by the release
+environment:
+
+| Variable | Purpose |
+|----------|---------|
+| `COMPAT_PROVIDER_API_KEY` | Optional shared credential when one compatible provider exposes both required surfaces |
+| `COMPAT_OPENAI_API_KEY` | OpenAI-compatible surface credential when separate credentials are needed |
+| `COMPAT_ANTHROPIC_API_KEY` | Anthropic-compatible surface credential when separate credentials are needed |
+| `COMPAT_OPENAI_BASE_URL` | OpenAI-compatible upstream base URL |
+| `COMPAT_OPENAI_MODEL` | Model for the OpenAI-compatible smoke |
+| `COMPAT_ANTHROPIC_BASE_URL` | Anthropic-compatible upstream base URL |
+| `COMPAT_ANTHROPIC_MODEL` | Model for the Anthropic-compatible smoke |
+| `COMPAT_PROVIDER_LABEL` | Optional label for release evidence |
+
+The compatible-provider smoke MUST cover the OpenAI-compatible
+chat-completions route `/openai/v1/chat/completions` and the
+Anthropic-compatible messages route `/anthropic/v1/messages`, in both unary and
+stream modes. It MAY include a fail-closed Responses state-control case against
+the OpenAI-compatible lane, but that does not make OpenAI Responses support a
+portable compatible-provider GA claim.
+
+OpenAI, Anthropic, Google, MiniMax, GLM, Kimi, DeepSeek, Mistral, vLLM, Ollama,
+llama.cpp, and local qwen-style endpoints remain valid operator
+validation/example choices when configured by the operator. They MUST NOT become
+the portable-core release gate unless a future release contract explicitly
+promotes that evidence.
 
 ### 6.2 Test Matrix
 
-For each upstream, test all applicable client entrypoints:
+Deterministic local gates MUST cover the supported public protocol surfaces
+without relying on live provider credentials:
 
-| Client Entry | MiniMax Anthropic | MiniMax OpenAI | Local qwen3.5 |
-|-------------|-------------------|----------------|---------------|
-| `/openai/v1/chat/completions` (non-stream) | Translate | Passthrough | Passthrough |
-| `/openai/v1/chat/completions` (stream) | Translate | Passthrough | Passthrough |
-| `/openai/v1/responses` (non-stream) | Translate | Translate | Translate |
-| `/openai/v1/responses` (stream) | Translate | Translate | Translate |
-| `/anthropic/v1/messages` (non-stream) | Passthrough | Translate | Translate |
-| `/anthropic/v1/messages` (stream) | Passthrough | Translate | Translate |
-| `/google/v1beta/models/:id` (non-stream) | Translate | Translate | Translate |
-| `/google/v1beta/models/:id` (stream) | Translate | Translate | Translate |
+| Surface | Required local modes |
+|---------|----------------------|
+| OpenAI Chat Completions | Unary, stream, tool, error |
+| OpenAI Responses | Unary, stream, tool, error |
+| Anthropic Messages | Unary, stream, tool, error |
+| Google Gemini GenerateContent | Unary, stream, tool, error |
+
+Protected compatible-provider smoke is narrower than the local mock matrix. It
+validates real OpenAI-compatible chat-completions and Anthropic-compatible
+messages behavior using provider-neutral `COMPAT_*` configuration, while
+official provider live smoke and concrete provider matrix expansion remain
+operator validation/example evidence.
 
 ### 6.3 Client Tool Tests
 

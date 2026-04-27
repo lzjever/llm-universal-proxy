@@ -18,15 +18,16 @@ ghcr.io/lzjever/llm-universal-proxy
 
 ## Admin Plane and Dashboard Boundary
 
-The admin API and Web Admin Dashboard share one admin boundary:
+Container deployments expose the same split between public dashboard resources and protected admin API calls:
 
-- keep `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` as the admin credential
+- `/dashboard` shell and static assets are public UI resources. Loading the shell or assets does not grant admin API access.
+- Dashboard JavaScript sends `Authorization: Bearer <admin-token>` only when it calls existing `/admin/*` APIs.
+- Admin-plane routes use `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`; when the token is set to a non-empty value, `/admin/*` requests must provide a matching bearer token.
+- data-plane provider/model/resource routes use `LLM_UNIVERSAL_PROXY_DATA_TOKEN` separately and do not accept the admin token
 - do not introduce a separate service key
-- dashboard login is admin-token based
-- dashboard shell/admin actions use the same admin-plane boundary
 - do not add multi-user accounts, readonly roles, or a complex session model in this plan
 
-If `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is unset, admin access is limited to loopback clients. Container deployments should normally set a non-empty token because the process runs behind Docker networking and may be exposed through an explicit port mapping.
+If `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is unset, admin API access is limited to loopback clients. Container deployments should normally set a non-empty token because the process runs behind Docker networking and may be exposed through an explicit port mapping.
 
 ## Data Plane Boundary
 
@@ -88,7 +89,7 @@ make docker-smoke
 CI uses the same shape as local smoke:
 
 - `ci.yml`: build a local image, load it into Docker, and run `scripts/test_container_smoke.sh`; `push: false` is required.
-- `release.yml`: run the same Rust and Python contract test gates as CI, then require the mock endpoint matrix, CLI wrapper matrix, perf gate, protected compatible provider smoke, and supply-chain gates before the GHCR publishing job can run. The job builds a local `linux/amd64` image for smoke first, then pushes the multi-arch GHCR image only when the ref is a release tag.
+- `release.yml`: run the same Rust and Python contract test gates as CI, then require the mock endpoint matrix, CLI wrapper matrix, perf gate, the protected `release-compatible-provider` smoke job, and supply-chain gates before the GHCR publishing job can run. The job builds a local `linux/amd64` image for smoke first, then pushes the multi-arch GHCR image only when the ref is a release tag.
 - The mock endpoint matrix runs `scripts/real_endpoint_matrix.py --mock` against a local mock upstream and covers unary, stream, tool, and error paths before release publication.
 - The CLI wrapper matrix gates the wrapper surface in two deterministic parts:
   a structure gate expands the tracked basic matrix.
@@ -98,7 +99,7 @@ CI uses the same shape as local smoke:
   live client evidence remains GA/operator validation when CLIs and provider
   credentials are available.
 - The perf gate runs `scripts/real_endpoint_matrix.py --mock --perf` against the same local mock path and emits threshold-checked JSON.
-- The compatible provider smoke gate is separate from container smoke and runs only in the protected `release-compatible-provider` environment. It should run as provider-neutral compatible live evidence over the OpenAI-compatible completions/chat-completions surface and the Anthropic-compatible messages surface. Configure either `COMPAT_PROVIDER_API_KEY` for one compatible provider that exposes both surfaces, or `COMPAT_OPENAI_API_KEY` plus `COMPAT_ANTHROPIC_API_KEY` when the surfaces use separate credentials; also set `COMPAT_OPENAI_BASE_URL`, `COMPAT_OPENAI_MODEL`, `COMPAT_ANTHROPIC_BASE_URL`, and `COMPAT_ANTHROPIC_MODEL`, with optional `COMPAT_PROVIDER_LABEL`. The job uploads `artifacts/compatible-provider-smoke.json` as the `compatible-provider-smoke` release evidence artifact.
+- The compatible provider smoke gate is separate from container smoke and runs only in the protected `release-compatible-provider` environment. It should run as provider-neutral compatible live evidence over the OpenAI-compatible chat-completions route `/openai/v1/chat/completions` and the Anthropic-compatible messages route `/anthropic/v1/messages`; it does not imply legacy `/openai/v1/completions` coverage. Configure either `COMPAT_PROVIDER_API_KEY` for one compatible provider that exposes both surfaces, or `COMPAT_OPENAI_API_KEY` plus `COMPAT_ANTHROPIC_API_KEY` when the surfaces use separate credentials; also set `COMPAT_OPENAI_BASE_URL`, `COMPAT_OPENAI_MODEL`, `COMPAT_ANTHROPIC_BASE_URL`, and `COMPAT_ANTHROPIC_MODEL`, with optional `COMPAT_PROVIDER_LABEL`. The job uploads `artifacts/compatible-provider-smoke.json` as the `compatible-provider-smoke` GitHub Actions artifact for external release evidence; it is not a GitHub Release asset unless the workflow is changed to attach it to the release.
 - Official OpenAI Responses, Gemini, and broader four-provider live smoke can be kept as optional extended evidence, but they do not block portable-core GA once the provider-neutral compatible smoke and deterministic gates pass.
 - The GHCR image tags, including `latest`, are published only after those release gates pass.
 - Governance runs a local secret scan over tracked fixtures, docs, examples, and scripts before CI or release jobs proceed.

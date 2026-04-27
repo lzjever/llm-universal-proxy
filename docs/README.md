@@ -5,15 +5,19 @@ This is the main docs entrypoint for `llmup`.
 Start here based on what you need:
 
 - [configuration.md](./configuration.md)
-  Static YAML configuration, full field reference, and upstream proxy support
+  Static YAML configuration, provider-neutral preset sources, full field reference, and upstream proxy support
 - [clients.md](./clients.md)
   Codex, Claude Code, and Gemini wrapper setup plus common client notes
 - [container.md](./container.md)
   GHCR image usage, Docker Compose example, container smoke, and release policy
 - [admin-dynamic-config.md](./admin-dynamic-config.md)
   Admin API, live namespace config updates, CAS / revision behavior, and redacted state
+- [docs/ga-readiness-review.md](./ga-readiness-review.md)
+  GA scope, required release evidence, and compatibility boundaries
+- [../examples/quickstart-provider-neutral.yaml](../examples/quickstart-provider-neutral.yaml)
+  Provider-neutral config source for the CLI-wrapper preset path
 - [../examples/quickstart-openai-minimax.yaml](../examples/quickstart-openai-minimax.yaml)
-  Public quickstart config for the homepage OpenAI + MiniMax example
+  Historical concrete OpenAI + MiniMax example; MiniMax is not the GA-required provider path
 - [protocol-compatibility-matrix.md](./protocol-compatibility-matrix.md)
   Compatibility boundaries and portability summary
 - [max-compat-design.md](./max-compat-design.md)

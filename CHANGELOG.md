@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Documented provider-neutral preset naming as the portable GA path, keeping named official and compatible providers as operator examples rather than release-blocking dependencies.
+- Clarified Responses reasoning/compaction continuity degradation boundaries for opaque state: visible summaries or transcript context may degrade in compatible modes, while opaque-only continuity still fails closed outside native passthrough.
+- Recorded the hermetic Codex wrapper interaction gate as the deterministic release check for scripted two-turn wrapper behavior.
+- Aligned GA docs alignment around protected `COMPAT_*` smoke evidence, precise chat-completions/messages route coverage, and Actions artifact retention.
+
 ## v0.2.21 - 2026-04-26
 
 - Bumped the release identity past the occupied `v0.2.20` tag without moving, deleting, or reusing the existing tag.
@@ -27,7 +32,7 @@
 
 ## v0.2.17 - 2026-04-25
 
-- Added an embedded Web Admin Dashboard at `/dashboard` as a single-binary static shell that uses the existing admin API and `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` boundary without introducing service keys, multi-user auth, sessions, or a separate frontend runtime.
+- Added an embedded Web Admin Dashboard at `/dashboard` as a single-binary static shell. `/dashboard` shell and static assets are public UI resources; admin work stays behind the existing `/admin/*` APIs, where `/admin/*` API calls require `Authorization: Bearer <admin-token>` using `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`. The data-plane token is separate, and the dashboard does not introduce service keys, multi-user auth, sessions, or a separate frontend runtime.
 - Added dashboard regression coverage for public shell loading, admin-token-protected API access, static asset content types, no inherited CORS, redacted-state read-only guidance, and responsive mobile layout boundaries.
 - Productionized container support with a non-root Docker image, `/etc/llmup/config.yaml` default config path, OCI labels, `/health` Docker `HEALTHCHECK`, Makefile Docker targets, and a container smoke test that verifies image metadata, admin-token gating, Docker health, and a streaming proxy path through a mock upstream.
 - Added GHCR release publishing for `ghcr.io/lzjever/llm-universal-proxy`, including CI image build/smoke without push, tag-only multi-arch release publishing, container examples, and container/admin dashboard documentation.

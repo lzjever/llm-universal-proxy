@@ -2,20 +2,27 @@
 
 This guide explains how to connect Codex CLI, Claude Code, and Gemini CLI to `llmup`.
 
-Use the wrapper scripts first. They are the least fragile path because they isolate local client state, inject the correct base URL, and add client-specific metadata where needed.
+Use the wrapper scripts first. They are the least fragile path because they isolate local client state, hydrate provider-neutral preset variables, inject the correct base URL, and add client-specific metadata where needed.
 
-The quickstart config used throughout this guide is [examples/quickstart-openai-minimax.yaml](../examples/quickstart-openai-minimax.yaml). Its stable aliases are:
+The quickstart config source used throughout this guide is [examples/quickstart-provider-neutral.yaml](../examples/quickstart-provider-neutral.yaml). Its stable aliases are:
 
-- `gpt-5-4` for OpenAI `gpt-5.4`
-- `gpt-5-4-mini` as a local alias that routes to MiniMax `MiniMax-M2.7-highspeed`
+- `preset-openai-compatible` for the OpenAI-compatible lane
+- `preset-anthropic-compatible` for the Anthropic-compatible lane
 
-If you want the MiniMax lane, swap `--model gpt-5-4` for `--model gpt-5-4-mini`.
-MiniMax is an OpenAI-compatible lane, not an OpenAI Responses certified clone;
-use the same documented portability and fail-closed boundaries as other
-cross-provider routes.
-This quickstart lane is an example only. Release/GA live evidence should use
-provider-neutral `COMPAT_*` configuration and should not treat MiniMax as a
-required provider.
+MiniMax is an OpenAI-compatible lane when a user chooses it. MiniMax is only a replaceable OpenAI-compatible example, not a GA-required provider and not the main CLI-wrapper preset path. Release/GA live evidence should use provider-neutral compatible configuration rather than treating any named provider as required.
+
+## Preset Environment
+
+Before running a managed wrapper session, export:
+
+```bash
+export PRESET_OPENAI_ENDPOINT_BASE_URL="https://openai-compatible.example/v1"
+export PRESET_ANTHROPIC_ENDPOINT_BASE_URL="https://anthropic-compatible.example/v1"
+export PRESET_ENDPOINT_MODEL="provider-model-id"
+export PRESET_ENDPOINT_API_KEY="provider-api-key"
+```
+
+`PRESET_OPENAI_ENDPOINT_BASE_URL` is the OpenAI-compatible API root, `PRESET_ANTHROPIC_ENDPOINT_BASE_URL` is the Anthropic-compatible API root, `PRESET_ENDPOINT_MODEL` is the real provider model ID hydrated into both preset aliases, and `PRESET_ENDPOINT_API_KEY` is the server-side provider credential. These placeholders are rendered by the wrapper before proxy startup; a directly loaded static YAML file should use concrete URL and model values.
 
 ## Recommended Path: Start With the Wrapper Scripts
 
@@ -38,23 +45,23 @@ Wrapper commands are safe by default: they do not pass no-sandbox, `yolo`, or pe
 
 ### Codex CLI
 
+Managed mode, where the wrapper renders the preset config and starts the proxy:
+
+```bash
+./scripts/run_codex_proxy.sh \
+  --config-source examples/quickstart-provider-neutral.yaml \
+  --workspace "$PWD" \
+  --model preset-openai-compatible
+```
+
 Connect Codex to an already running proxy:
 
 ```bash
 ./scripts/run_codex_proxy.sh \
   --proxy-base http://127.0.0.1:8080 \
-  --config-source examples/quickstart-openai-minimax.yaml \
+  --config-source examples/quickstart-provider-neutral.yaml \
   --workspace "$PWD" \
-  --model gpt-5-4
-```
-
-Managed mode, where the wrapper starts the proxy for you:
-
-```bash
-./scripts/run_codex_proxy.sh \
-  --config-source examples/quickstart-openai-minimax.yaml \
-  --workspace "$PWD" \
-  --model gpt-5-4
+  --model preset-openai-compatible
 ```
 
 Codex benefits the most from the wrapper because it fetches live `llmup.surface` metadata from the proxy model catalog and writes the temporary catalog payload from that runtime truth, instead of relying on legacy hard-coded Codex assumptions or the unknown-model fallback path.
@@ -65,19 +72,19 @@ For throwaway harness work only, `--dangerous-harness` allows the wrapper to pas
 
 ```bash
 ./scripts/run_claude_proxy.sh \
-  --proxy-base http://127.0.0.1:8080 \
-  --config-source examples/quickstart-openai-minimax.yaml \
+  --config-source examples/quickstart-provider-neutral.yaml \
   --workspace "$PWD" \
-  --model gpt-5-4
+  --model preset-anthropic-compatible
 ```
 
-Managed mode:
+Attach to an existing proxy:
 
 ```bash
 ./scripts/run_claude_proxy.sh \
-  --config-source examples/quickstart-openai-minimax.yaml \
+  --proxy-base http://127.0.0.1:8080 \
+  --config-source examples/quickstart-provider-neutral.yaml \
   --workspace "$PWD" \
-  --model gpt-5-4
+  --model preset-anthropic-compatible
 ```
 
 For throwaway harness work only, `--dangerous-harness` allows the wrapper to pass Claude's permission-skip flag. Leave it off for normal use.
@@ -86,19 +93,19 @@ For throwaway harness work only, `--dangerous-harness` allows the wrapper to pas
 
 ```bash
 ./scripts/run_gemini_proxy.sh \
-  --proxy-base http://127.0.0.1:8080 \
-  --config-source examples/quickstart-openai-minimax.yaml \
+  --config-source examples/quickstart-provider-neutral.yaml \
   --workspace "$PWD" \
-  --model gpt-5-4
+  --model preset-openai-compatible
 ```
 
-Managed mode:
+Attach to an existing proxy:
 
 ```bash
 ./scripts/run_gemini_proxy.sh \
-  --config-source examples/quickstart-openai-minimax.yaml \
+  --proxy-base http://127.0.0.1:8080 \
+  --config-source examples/quickstart-provider-neutral.yaml \
   --workspace "$PWD" \
-  --model gpt-5-4
+  --model preset-openai-compatible
 ```
 
 For throwaway harness work only, `--dangerous-harness` allows the wrapper to pass Gemini's no-sandbox and `yolo` flags. Leave it off for normal use.
@@ -119,17 +126,17 @@ For Codex specifically, the wrapper currently fixes `wire_api="responses"`. That
 
 That is why the homepage no longer presents one flat endpoint table for manual client setup. For Codex, Claude, and Gemini, the wrapper-level base URL and the server-side route live at different layers.
 
+## Reasoning And Continuity Boundaries
+
+Reasoning effort such as `xhigh` is still a request-side or client-side setting. Keep that out of the alias name.
+
+Responses reasoning/compaction continuity is intentionally bounded for cross-provider routes: default/max_compat may drop an opaque carrier only when visible summary text or visible transcript history remains; strict/balanced fail closed; opaque-only reasoning and opaque-only compaction fail closed; same-provider/native passthrough preserves provider-owned state.
+
 ## Manual Wiring Without Wrappers
 
 Wrappers are still recommended, but the underlying client contracts are straightforward if you prefer to wire things by hand.
 
-The release CLI wrapper matrix currently gates the wrapper surface in two
-deterministic parts: a structure gate that expands the tracked basic matrix for
-Codex CLI, Claude Code, and Gemini CLI, plus a hermetic scripted interactive Codex wrapper gate.
-That gate executes `scripts/run_codex_proxy.sh` with a fake Codex binary and fake
-local proxy for two stdin turns. This is not a full live multi-client/provider matrix;
-real live client evidence remains final GA/operator validation when those CLIs
-and provider credentials are available.
+The release CLI wrapper matrix currently gates the wrapper surface in two deterministic parts: a structure gate that expands the tracked basic matrix for Codex CLI, Claude Code, and Gemini CLI, plus a hermetic scripted interactive Codex wrapper gate. That gate executes `scripts/run_codex_proxy.sh` with a fake Codex binary and fake local proxy for two stdin turns. This is not a full live multi-client/provider matrix; real live client evidence remains final GA/operator validation when those CLIs and provider credentials are available.
 
 ### Codex
 
@@ -164,22 +171,20 @@ Dummy keys are usually enough when the real upstream credential lives on the pro
 
 Clients can use either:
 
-- a stable alias from `model_aliases`, such as `gpt-5-4` or `gpt-5-4-mini`
-- an explicit upstream-qualified name such as `OPENAI:gpt-5.4`
+- a stable alias from `model_aliases`, such as `preset-openai-compatible` or `preset-anthropic-compatible`
+- an explicit upstream-qualified name such as `PRESET-OPENAI-COMPATIBLE:provider-model-id`
 
 Aliases are the better default for day-to-day client use because they decouple the client from provider-specific model IDs.
-
-Reasoning effort such as `xhigh` is still a request-side or client-side setting. Keep that out of the alias name.
 
 ## A Good First Setup
 
 If you are new to the project, use this order:
 
-1. start from [examples/quickstart-openai-minimax.yaml](../examples/quickstart-openai-minimax.yaml)
-2. start the proxy
-3. attach one client with `--model gpt-5-4`
-4. confirm the session works
-5. switch to `gpt-5-4-mini` only after the first lane is already healthy
+1. start from [examples/quickstart-provider-neutral.yaml](../examples/quickstart-provider-neutral.yaml)
+2. export the four `PRESET_*` variables
+3. attach Codex or Gemini with `--model preset-openai-compatible`, or Claude Code with `--model preset-anthropic-compatible`
+4. confirm the wrapper-managed session works
+5. replace the preset endpoints with a concrete provider config only after the provider-neutral path is healthy
 
 For the YAML side, see [Configuration Guide](./configuration.md).
 
