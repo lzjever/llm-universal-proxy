@@ -393,11 +393,6 @@ class InteractiveCliTests(unittest.TestCase):
         )
 
     def test_codex_wrapper_executes_scripted_interactive_two_turns_hermetically(self):
-        scripts_pycache = REPO_ROOT / "scripts" / "__pycache__"
-        self.assertFalse(
-            scripts_pycache.exists(),
-            "hermetic wrapper test must start without scripts/__pycache__",
-        )
         server, thread, proxy_base, proxy_requests = run_hermetic_proxy_server()
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -406,6 +401,8 @@ class InteractiveCliTests(unittest.TestCase):
                 fake_bin.mkdir()
                 workspace = root / "workspace"
                 workspace.mkdir()
+                bytecode_probe = root / "bytecode-probe"
+                bytecode_probe.mkdir()
                 outer_tmp = root / "tmp"
                 outer_tmp.mkdir()
                 host_home = root / "host-home"
@@ -545,8 +542,9 @@ if __name__ == "__main__":
                     "HOME": str(host_home),
                     "TMPDIR": str(outer_tmp),
                     "LANG": os.environ.get("LANG", "C.UTF-8"),
-                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONPYCACHEPREFIX": str(bytecode_probe),
                 }
+                self.assertNotIn("PYTHONDONTWRITEBYTECODE", env)
 
                 command = [
                     "bash",
@@ -579,9 +577,14 @@ if __name__ == "__main__":
                     msg=completed.stderr or completed.stdout,
                 )
                 record = json.loads(record_path.read_text(encoding="utf-8"))
-                self.assertFalse(
-                    scripts_pycache.exists(),
-                    "run_codex_proxy.sh must not create scripts/__pycache__",
+                probe_pycs = sorted(
+                    path.relative_to(bytecode_probe)
+                    for path in bytecode_probe.rglob("*.pyc")
+                )
+                self.assertEqual(
+                    [],
+                    probe_pycs,
+                    "run_codex_proxy.sh must disable bytecode for interactive_cli.py",
                 )
 
             self.assertEqual(record["cwd"], str(workspace.resolve()))

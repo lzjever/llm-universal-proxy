@@ -7,3 +7,5 @@ test-codex-config.toml
 .env.test
 .env*.local
 proxy-test-*.yaml
+__pycache__/
+*.py[co]
