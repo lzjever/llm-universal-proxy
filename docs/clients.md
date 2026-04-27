@@ -123,12 +123,13 @@ That is why the homepage no longer presents one flat endpoint table for manual c
 
 Wrappers are still recommended, but the underlying client contracts are straightforward if you prefer to wire things by hand.
 
-The release CLI wrapper matrix currently gates the wrapper surface by expanding
-the tracked basic matrix for Codex CLI, Claude Code, and Gemini CLI. It is a
-structure gate: it verifies that the wrapper cases remain defined without
-requiring provider secrets or locally installed interactive clients in the
-release runner. Real client execution remains an operator/local validation step
-when those CLIs are installed.
+The release CLI wrapper matrix currently gates the wrapper surface in two
+deterministic parts: a structure gate that expands the tracked basic matrix for
+Codex CLI, Claude Code, and Gemini CLI, plus a hermetic scripted interactive Codex wrapper gate.
+That gate executes `scripts/run_codex_proxy.sh` with a fake Codex binary and fake
+local proxy for two stdin turns. This is not a full live multi-client/provider matrix;
+real live client evidence remains final GA/operator validation when those CLIs
+and provider credentials are available.
 
 ### Codex
 

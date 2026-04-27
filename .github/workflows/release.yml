@@ -217,6 +217,7 @@ jobs:
 
       - name: Run CLI wrapper matrix
         run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_interactive_cli.InteractiveCliTests.test_codex_wrapper_executes_scripted_interactive_two_turns_hermetically
           python3 scripts/real_cli_matrix.py --test basic --skip-slow --list-matrix | tee cli-wrapper-matrix.txt
           test "$(wc -l < cli-wrapper-matrix.txt)" -gt 0
 

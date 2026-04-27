@@ -15,6 +15,8 @@ CHANGELOG_VERSION="$(meta changelog_version)"
 TOOLCHAIN="$(meta rust_toolchain)"
 TOOLCHAIN_ACTION_REF="$(meta rust_toolchain_action_ref)"
 PYTHON_CONTRACT_TEST_COMMAND="PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
+CLI_WRAPPER_LIST_COMMAND="python3 scripts/real_cli_matrix.py --test basic --skip-slow --list-matrix"
+CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND="PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_interactive_cli.InteractiveCliTests.test_codex_wrapper_executes_scripted_interactive_two_turns_hermetically"
 OFFICIAL_PROVIDER_SECRET_ENVS=(
     "OPENAI_API_KEY"
     "ANTHROPIC_API_KEY"
@@ -477,6 +479,17 @@ PY
     fi
 }
 
+check_cli_wrapper_matrix_contract() {
+    check_contains ".github/workflows/release.yml" "CLI Wrapper Matrix"
+    check_contains ".github/workflows/release.yml" "$CLI_WRAPPER_LIST_COMMAND"
+    check_contains ".github/workflows/release.yml" "$CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND"
+    check_contains "tests/test_interactive_cli.py" "test_codex_wrapper_executes_scripted_interactive_two_turns_hermetically"
+    check_contains "tests/test_interactive_cli.py" "run_codex_proxy.sh"
+    check_contains "tests/test_interactive_cli.py" "/openai/v1/responses"
+    check_absent ".github/workflows/release.yml" "--test live"
+    check_absent ".github/workflows/release.yml" "--mode real-provider-smoke"
+}
+
 if ! SECRET_SCAN_OUTPUT="$(scan_tracked_secret_risks)"; then
     while IFS= read -r failure; do
         [[ -n "$failure" ]] && FAILURES+=("$failure")
@@ -490,6 +503,7 @@ if ! RELEASE_PUBLISH_GATE_OUTPUT="$(check_release_publish_jobs_need_ga_gates)"; 
 fi
 
 check_compatible_provider_smoke_invocation
+check_cli_wrapper_matrix_contract
 
 check_checkout_tag_visibility
 check_governance_checkout_fetch_depth ".github/workflows/ci.yml"

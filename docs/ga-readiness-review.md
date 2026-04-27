@@ -31,9 +31,9 @@ upstream calls, and low-risk degradation must be visible rather than silent.
   request, response, stream, hook, and trace paths must fail predictably when
   they exceed supported bounds.
 - GA release gates now cover Rust tests, Python contract tests, governance and
-  local secret scan, mock endpoint matrix, CLI wrapper matrix, perf gate, a
-  protected compatible provider smoke slot, container smoke, and supply-chain
-  checks.
+  local secret scan, mock endpoint matrix, CLI wrapper matrix plus a hermetic
+  scripted interactive Codex wrapper gate, perf gate, a protected compatible
+  provider smoke slot, container smoke, and supply-chain checks.
 
 ## Remaining External Prerequisites
 
@@ -96,7 +96,7 @@ GA release gating includes:
 - Deterministic mock endpoint matrix over OpenAI Chat, OpenAI Responses,
   Anthropic Messages, and Gemini GenerateContent unary, stream, tool, and error
   paths.
-- CLI wrapper matrix structure check.
+- CLI wrapper matrix structure check plus a hermetic scripted interactive Codex wrapper gate.
 - Deterministic local perf gate with machine-readable JSON output and threshold
   checks.
 - Compatible provider smoke tests from the protected `release-compatible-provider`
@@ -107,10 +107,12 @@ GA release gating includes:
 - Documentation consistency checks for admin/data-plane boundaries and protocol
   compatibility claims.
 
-Official OpenAI Responses live smoke, official Gemini live smoke, and broader
-four-provider real smoke are optional extended evidence. They can strengthen a
-release record, but they do not block portable-core GA when the provider-neutral
-compatible live smoke and deterministic contract/mock/structure gates pass.
+The CLI wrapper gate is not a full live multi-client/provider matrix; final
+real live client evidence remains GA/operator validation. Official OpenAI
+Responses live smoke, official Gemini live smoke, and broader four-provider real
+smoke are optional extended evidence. They can strengthen a release record, but
+they do not block portable-core GA when the provider-neutral compatible live
+smoke and deterministic contract/mock/structure gates pass.
 
 ## Baseline GA Definition
 

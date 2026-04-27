@@ -18,6 +18,11 @@ LOCKFILE_INTEGRITY_COMMAND = "cargo metadata --locked --format-version 1 --no-de
 PYTHON_CONTRACT_TEST_COMMAND = (
     "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
 )
+CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND = (
+    "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "
+    "tests.test_interactive_cli.InteractiveCliTests."
+    "test_codex_wrapper_executes_scripted_interactive_two_turns_hermetically"
+)
 PROVIDER_KEY_PATTERN_SNIPPETS = (
     "sk-cp-",
     "sk-ant-",
@@ -512,6 +517,36 @@ os.execv(real_git, [real_git, *args])
             "name: compatible-provider-smoke",
             f"path: {COMPAT_PROVIDER_SMOKE_JSON}",
             "if-no-files-found: error",
+        ):
+            with self.subTest(governance_snippet=snippet):
+                self.assertIn(snippet, governance)
+
+    def test_cli_wrapper_release_gate_contract_is_governed(self):
+        release = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+        governance = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
+
+        job = workflow_jobs(RELEASE_WORKFLOW).get("cli-wrapper-matrix", "")
+        self.assertTrue(job, "release workflow must define cli-wrapper-matrix")
+        run_step = workflow_step_block(job, "Run CLI wrapper matrix")
+        self.assertTrue(run_step)
+        self.assertIn(CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND, run_step)
+        self.assertIn(
+            "python3 scripts/real_cli_matrix.py --test basic --skip-slow --list-matrix",
+            run_step,
+        )
+        self.assertNotIn("--test live", run_step)
+        self.assertNotIn("--mode real-provider-smoke", run_step)
+        self.assertIn(CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND, release)
+
+        for snippet in (
+            "CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND",
+            CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND,
+            "check_cli_wrapper_matrix_contract",
+            'check_contains ".github/workflows/release.yml" "$CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND"',
+            'check_contains "tests/test_interactive_cli.py" "test_codex_wrapper_executes_scripted_interactive_two_turns_hermetically"',
+            'check_absent ".github/workflows/release.yml" "--test live"',
         ):
             with self.subTest(governance_snippet=snippet):
                 self.assertIn(snippet, governance)

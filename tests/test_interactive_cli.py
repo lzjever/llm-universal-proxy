@@ -1,10 +1,12 @@
 import importlib.util
+import http.server
 import json
 import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -45,6 +47,79 @@ def codex_proxy_configs(command):
         for value in (command[index + 1],)
         if value.startswith(CODEX_PROXY_CONFIG_PREFIXES)
     ]
+
+
+def run_hermetic_proxy_server():
+    requests = []
+    lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, _format, *_args):
+            return
+
+        def send_json(self, status, payload):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_json(200, {"status": "ok"})
+                return
+            if self.path.startswith("/openai/v1/models/"):
+                model = self.path.removeprefix("/openai/v1/models/")
+                self.send_json(
+                    200,
+                    {
+                        "id": model,
+                        "object": "model",
+                        "llmup": {
+                            "surface": {
+                                "limits": {
+                                    "context_window": 200000,
+                                    "max_output_tokens": 128000,
+                                },
+                                "modalities": {
+                                    "input": ["text"],
+                                    "output": ["text"],
+                                },
+                                "tools": {
+                                    "supports_search": False,
+                                    "supports_view_image": False,
+                                    "apply_patch_transport": "freeform",
+                                    "supports_parallel_calls": False,
+                                },
+                            },
+                        },
+                    },
+                )
+                return
+            self.send_json(404, {"error": "not found"})
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8")
+            payload = json.loads(body) if body else None
+            with lock:
+                requests.append({"path": self.path, "payload": payload})
+                request_number = len(requests)
+            self.send_json(
+                200,
+                {
+                    "id": f"resp_hermetic_{request_number}",
+                    "object": "response",
+                    "output_text": "ok",
+                },
+            )
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    proxy_base = f"http://127.0.0.1:{server.server_port}"
+    return server, thread, proxy_base, requests
 
 
 class InteractiveCliTests(unittest.TestCase):
@@ -316,6 +391,236 @@ class InteractiveCliTests(unittest.TestCase):
             "model_providers.proxy.supports_websockets=false",
             codex_proxy_configs(interactive_command),
         )
+
+    def test_codex_wrapper_executes_scripted_interactive_two_turns_hermetically(self):
+        scripts_pycache = REPO_ROOT / "scripts" / "__pycache__"
+        self.assertFalse(
+            scripts_pycache.exists(),
+            "hermetic wrapper test must start without scripts/__pycache__",
+        )
+        server, thread, proxy_base, proxy_requests = run_hermetic_proxy_server()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = pathlib.Path(temp_dir)
+                fake_bin = root / "bin"
+                fake_bin.mkdir()
+                workspace = root / "workspace"
+                workspace.mkdir()
+                outer_tmp = root / "tmp"
+                outer_tmp.mkdir()
+                host_home = root / "host-home"
+                host_home.mkdir()
+                record_path = root / "fake-codex-record.json"
+                fake_codex = fake_bin / "codex"
+                fake_codex.write_text(
+                    f"""#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+import urllib.request
+
+record_path = pathlib.Path({json.dumps(str(record_path))})
+
+
+def config_values(argv):
+    return [
+        argv[index + 1]
+        for index, arg in enumerate(argv[:-1])
+        if arg == "-c"
+    ]
+
+
+def post_response(payload):
+    base_url = os.environ["OPENAI_BASE_URL"].rstrip("/")
+    request = urllib.request.Request(
+        base_url + "/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={{"Content-Type": "application/json"}},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return {{
+            "status": response.status,
+            "body": response.read().decode("utf-8"),
+        }}
+
+
+def main():
+    lines = [line.rstrip("\\n") for line in sys.stdin.readlines()]
+    model = sys.argv[sys.argv.index("-m") + 1] if "-m" in sys.argv else "unknown"
+    configs = config_values(sys.argv)
+    record = {{
+        "argv": sys.argv,
+        "cwd": os.getcwd(),
+        "env": {{
+            key: os.environ.get(key)
+            for key in (
+                "HOME",
+                "CODEX_HOME",
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "TMPDIR",
+            )
+        }},
+        "configs": configs,
+        "stdin_lines": lines,
+        "post_results": [],
+    }}
+    try:
+        if len(lines) < 2:
+            raise RuntimeError("expected at least two scripted interactive turns")
+        payloads = [
+            {{
+                "model": model,
+                "input": [
+                    {{
+                        "role": "user",
+                        "content": lines[0],
+                    }}
+                ],
+                "metadata": {{
+                    "hermetic_round": "one",
+                }},
+            }},
+            {{
+                "model": model,
+                "input": [
+                    {{
+                        "role": "user",
+                        "content": lines[0],
+                    }},
+                    {{
+                        "type": "reasoning",
+                        "summary": [
+                            {{
+                                "type": "summary_text",
+                                "text": "visible first-turn reasoning summary",
+                            }}
+                        ],
+                    }},
+                    {{
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {{
+                                "type": "input_text",
+                                "text": lines[1],
+                            }}
+                        ],
+                    }},
+                    {{
+                        "type": "compaction",
+                        "summary": "visible transcript carries the first turn",
+                    }},
+                ],
+                "previous_response_id": "resp_hermetic_1",
+                "metadata": {{
+                    "hermetic_round": "two",
+                }},
+            }},
+        ]
+        for payload in payloads:
+            record["post_results"].append(post_response(payload))
+    except Exception as error:
+        record["error"] = repr(error)
+        record_path.write_text(json.dumps(record, indent=2) + "\\n", encoding="utf-8")
+        return 19
+    record_path.write_text(json.dumps(record, indent=2) + "\\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+""",
+                    encoding="utf-8",
+                )
+                fake_codex.chmod(0o755)
+                env = {
+                    "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "HOME": str(host_home),
+                    "TMPDIR": str(outer_tmp),
+                    "LANG": os.environ.get("LANG", "C.UTF-8"),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+
+                command = [
+                    "bash",
+                    str(REPO_ROOT / "scripts" / "run_codex_proxy.sh"),
+                    "--proxy-base",
+                    proxy_base,
+                    "--workspace",
+                    str(workspace),
+                    "--model",
+                    "preset-openai-compatible",
+                    "--proxy-health-timeout-secs",
+                    "5",
+                ]
+                completed = subprocess.run(
+                    command,
+                    cwd=REPO_ROOT,
+                    env=env,
+                    input="first scripted turn\nsecond scripted turn\n",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+
+                self.assertEqual(command[1], str(REPO_ROOT / "scripts" / "run_codex_proxy.sh"))
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    msg=completed.stderr or completed.stdout,
+                )
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+                self.assertFalse(
+                    scripts_pycache.exists(),
+                    "run_codex_proxy.sh must not create scripts/__pycache__",
+                )
+
+            self.assertEqual(record["cwd"], str(workspace.resolve()))
+            self.assertEqual(record["stdin_lines"][:2], ["first scripted turn", "second scripted turn"])
+            self.assertEqual(pathlib.Path(record["argv"][0]).name, "codex")
+            self.assertEqual(record["argv"][1], "-C")
+            self.assertNotIn("exec", record["argv"][1:])
+            for forbidden_arg in FORBIDDEN_DANGEROUS_ARGS:
+                self.assertNotIn(forbidden_arg, record["argv"])
+            self.assertIn('model_providers.proxy.wire_api="responses"', record["configs"])
+            self.assertIn(
+                "model_providers.proxy.supports_websockets=false",
+                record["configs"],
+            )
+            self.assertIn(
+                f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
+                record["configs"],
+            )
+            self.assertNotEqual(record["env"]["HOME"], str(host_home))
+            self.assertTrue(record["env"]["HOME"].startswith(str(outer_tmp)))
+            self.assertTrue(record["env"]["CODEX_HOME"].startswith(record["env"]["HOME"]))
+            self.assertEqual(record["env"]["OPENAI_BASE_URL"], f"{proxy_base}/openai/v1")
+            self.assertEqual(record["env"]["OPENAI_API_KEY"], "dummy")
+            response_requests = [
+                request
+                for request in proxy_requests
+                if request["path"] == "/openai/v1/responses"
+            ]
+            self.assertEqual(len(response_requests), 2)
+            self.assertIn("first scripted turn", json.dumps(response_requests[0]["payload"]))
+            second_payload_text = json.dumps(response_requests[1]["payload"])
+            self.assertIn("first scripted turn", second_payload_text)
+            self.assertIn("second scripted turn", second_payload_text)
+            self.assertIn("reasoning", second_payload_text)
+            self.assertIn("compaction", second_payload_text)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_build_interactive_command_skips_view_image_disable_for_image_capable_models(self):
         module = load_module()

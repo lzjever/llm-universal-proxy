@@ -16,6 +16,11 @@ ENDPOINT_MATRIX_SCRIPT = REPO_ROOT / "scripts" / "real_endpoint_matrix.py"
 PYTHON_CONTRACT_TEST_COMMAND = (
     "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test*.py'"
 )
+CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND = (
+    "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest "
+    "tests.test_interactive_cli.InteractiveCliTests."
+    "test_codex_wrapper_executes_scripted_interactive_two_turns_hermetically"
+)
 REQUIRED_RELEASE_GATE_NEEDS = (
     "mock-endpoint-matrix",
     "cli-wrapper-matrix",
@@ -152,6 +157,7 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "python3 scripts/real_endpoint_matrix.py --mock",
             "CLI Wrapper Matrix",
             "python3 scripts/real_cli_matrix.py --test basic --skip-slow --list-matrix",
+            CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND,
             "Perf Gate",
             "python3 scripts/real_endpoint_matrix.py --mock --perf",
             "Supply Chain",
@@ -173,6 +179,22 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             r"cli-wrapper-matrix[^\]]*perf-gate[^\]]*compatible-provider-smoke[^\]]*"
             r"supply-chain[^\]]*\]",
         )
+
+    def test_release_cli_wrapper_matrix_runs_structure_and_hermetic_interactive_gates(self):
+        jobs = release_workflow_jobs()
+        job = jobs.get("cli-wrapper-matrix", "")
+        self.assertTrue(job, "release workflow must define cli-wrapper-matrix")
+
+        run_step = workflow_step_block(job, "Run CLI wrapper matrix")
+        self.assertTrue(run_step, "cli-wrapper-matrix must keep a script run step")
+        self.assertIn(CODEX_SCRIPTED_INTERACTIVE_GATE_COMMAND, run_step)
+        self.assertIn(
+            "python3 scripts/real_cli_matrix.py --test basic --skip-slow --list-matrix",
+            run_step,
+        )
+        self.assertIn("cli-wrapper-matrix.txt", run_step)
+        self.assertNotIn("--mode real-provider-smoke", run_step)
+        self.assertNotIn("--test live", run_step)
 
     def test_governance_checkout_fetches_full_history_for_release_tag_visibility(self):
         for workflow_path in (CI_WORKFLOW, RELEASE_WORKFLOW):
@@ -391,6 +413,8 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "mock endpoint matrix",
             "perf gate",
             "compatible provider smoke",
+            "hermetic scripted interactive Codex wrapper gate",
+            "not a full live multi-client/provider matrix",
             "release-compatible-provider",
             "portable-core production GA",
             "same-provider native passthrough",
@@ -400,8 +424,13 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
                 self.assertIn(snippet, ga_review)
 
         self.assertIn("CLI wrapper matrix", clients)
+        self.assertIn("hermetic scripted interactive Codex wrapper gate", clients)
+        self.assertIn("not a full live multi-client/provider matrix", clients)
         self.assertIn("MiniMax is an OpenAI-compatible lane", clients)
         self.assertIn("CLI wrapper matrix", container)
+        self.assertIn("structure gate", container)
+        self.assertIn("hermetic scripted interactive Codex wrapper gate", container)
+        self.assertIn("not a full live multi-client/provider matrix", container)
         self.assertIn("mock endpoint matrix", container)
         self.assertIn("perf gate", container)
         self.assertIn("compatible-provider-smoke.json", container)

@@ -90,7 +90,13 @@ CI uses the same shape as local smoke:
 - `ci.yml`: build a local image, load it into Docker, and run `scripts/test_container_smoke.sh`; `push: false` is required.
 - `release.yml`: run the same Rust and Python contract test gates as CI, then require the mock endpoint matrix, CLI wrapper matrix, perf gate, protected compatible provider smoke, and supply-chain gates before the GHCR publishing job can run. The job builds a local `linux/amd64` image for smoke first, then pushes the multi-arch GHCR image only when the ref is a release tag.
 - The mock endpoint matrix runs `scripts/real_endpoint_matrix.py --mock` against a local mock upstream and covers unary, stream, tool, and error paths before release publication.
-- The CLI wrapper matrix expands the supported wrapper surface before release publication.
+- The CLI wrapper matrix gates the wrapper surface in two deterministic parts:
+  a structure gate expands the tracked basic matrix.
+  The hermetic scripted interactive Codex wrapper gate runs
+  `scripts/run_codex_proxy.sh` against a fake Codex binary and local mock proxy
+  for two stdin turns. It is not a full live multi-client/provider matrix; real
+  live client evidence remains GA/operator validation when CLIs and provider
+  credentials are available.
 - The perf gate runs `scripts/real_endpoint_matrix.py --mock --perf` against the same local mock path and emits threshold-checked JSON.
 - The compatible provider smoke gate is separate from container smoke and runs only in the protected `release-compatible-provider` environment. It should run as provider-neutral compatible live evidence over the OpenAI-compatible completions/chat-completions surface and the Anthropic-compatible messages surface. Configure either `COMPAT_PROVIDER_API_KEY` for one compatible provider that exposes both surfaces, or `COMPAT_OPENAI_API_KEY` plus `COMPAT_ANTHROPIC_API_KEY` when the surfaces use separate credentials; also set `COMPAT_OPENAI_BASE_URL`, `COMPAT_OPENAI_MODEL`, `COMPAT_ANTHROPIC_BASE_URL`, and `COMPAT_ANTHROPIC_MODEL`, with optional `COMPAT_PROVIDER_LABEL`. The job uploads `artifacts/compatible-provider-smoke.json` as the `compatible-provider-smoke` release evidence artifact.
 - Official OpenAI Responses, Gemini, and broader four-provider live smoke can be kept as optional extended evidence, but they do not block portable-core GA once the provider-neutral compatible smoke and deterministic gates pass.
