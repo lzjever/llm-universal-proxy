@@ -4,7 +4,13 @@
 
 ## v0.2.23 - 2026-04-28
 
-- Bumped the release identity past the occupied `v0.2.22` tag without moving, deleting, or reusing the existing tag, keeping GA governance on the next patch version.
+- Kept the release identity on Cargo package version `0.2.23`, the next patch version after the occupied `v0.2.22` tag, without moving, deleting, or reusing the existing tag and without jumping to `0.2.24` while `v0.2.23` remains available.
+- Stabilized the real CLI matrix by inferring tool-loop requirements from workspace templates, long-horizon fixtures, and nested verifiers, so Codex, Claude Code, and Gemini workspace-edit cases are classified consistently.
+- Aligned Codex wrapper provider configuration on `model_providers.proxy.env_key="OPENAI_API_KEY"` while preserving the hermetic proxy base URL, Responses wire API, and scripted interactive gate behavior shared by the matrix and interactive wrapper tests.
+- Tightened expected fail-closed handling by canonicalizing upstream format aliases such as `chat`, `openai`, `claude`, and `gemini`, and by requiring complete Gemini thought-signature error evidence instead of treating bare marker strings as expected failures.
+- Split checked-in container publication state from the next release identity: the new release container manifest records the current published `v0.2.22` tag and digest, while docs and Compose pin that published image and describe `0.2.23` / `v0.2.23` as not published yet.
+- Added the release workflow digest artifact path for the pushed GHCR image, including a machine-readable `artifacts/container-image.json` with image, release/version tags, digest, package version, git SHA, publish timestamp, run URL, and post-release next identity.
+- Expanded docs and governance coverage for README/container current-vs-next release wording, manifest schema and digest invariants, workflow digest artifact upload, protected release gates, and the real CLI matrix fail-closed contracts.
 
 ## v0.2.22 - 2026-04-27
 

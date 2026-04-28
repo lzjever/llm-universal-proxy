@@ -64,7 +64,18 @@ TRACE_PATH_PREFIX_BY_CLIENT = {
     "gemini": "/google/",
 }
 ANTHROPIC_NATIVE_UPSTREAM_FORMAT = "anthropic"
-GEMINI_NATIVE_UPSTREAM_FORMATS = frozenset({"google", "gemini"})
+GEMINI_NATIVE_UPSTREAM_FORMATS = frozenset({"google"})
+CANONICAL_UPSTREAM_FORMAT_BY_ALIAS = {
+    "google": "google",
+    "gemini": "google",
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+    "openai": "openai-completion",
+    "chat": "openai-completion",
+    "openai-completion": "openai-completion",
+    "responses": "openai-responses",
+    "openai-responses": "openai-responses",
+}
 EXPECTED_FAIL_CLOSED_STATUS = "expected_fail_closed"
 UNEXPECTED_SUCCESS_STATUS = "unexpected_success"
 SAFE_ENV_KEYS = (
@@ -1631,6 +1642,43 @@ def validate_prompt_template(fixture_id: str, prompt_template: str) -> None:
             )
 
 
+WORKSPACE_TOOL_LOOP_VERIFIER_TYPES = frozenset(
+    {
+        "command_success",
+        "codex_json_event_contract",
+        "file_contains",
+        "file_sha256",
+        "python_source_and_output",
+    }
+)
+
+
+def verifier_requires_tool_loop(verifier: object) -> bool:
+    if not isinstance(verifier, dict):
+        return False
+    verifier_type = verifier.get("type")
+    if verifier_type == "all_of":
+        nested_verifiers = verifier.get("verifiers", [])
+        return isinstance(nested_verifiers, list) and any(
+            verifier_requires_tool_loop(nested) for nested in nested_verifiers
+        )
+    return (
+        isinstance(verifier_type, str)
+        and verifier_type in WORKSPACE_TOOL_LOOP_VERIFIER_TYPES
+    )
+
+
+def fixture_requires_tool_loop(payload: dict[str, object]) -> bool:
+    if payload.get("requires_tool_loop", False) is True:
+        return True
+    workspace_template = payload.get("workspace_template")
+    if not workspace_template:
+        return False
+    if payload.get("kind") == "long_horizon":
+        return True
+    return verifier_requires_tool_loop(payload.get("verifier"))
+
+
 def load_fixtures(fixtures_root: pathlib.Path) -> list[TaskFixture]:
     fixtures: list[TaskFixture] = []
     for path in sorted(fixtures_root.rglob("*.json")):
@@ -1658,7 +1706,7 @@ def load_fixtures(fixtures_root: pathlib.Path) -> list[TaskFixture]:
                     unsupported_lanes=tuple(
                         str(lane_name) for lane_name in payload.get("unsupported_lanes", [])
                     ),
-                    requires_tool_loop=payload.get("requires_tool_loop", False) is True,
+                    requires_tool_loop=fixture_requires_tool_loop(payload),
                 )
             )
         except ValueError as error:
@@ -1756,8 +1804,15 @@ def _normalized_upstream_format(upstream_format: str | None) -> str | None:
     return normalized or None
 
 
+def canonical_upstream_format(upstream_format: str | None) -> str | None:
+    normalized = _normalized_upstream_format(upstream_format)
+    if normalized is None:
+        return None
+    return CANONICAL_UPSTREAM_FORMAT_BY_ALIAS.get(normalized, normalized)
+
+
 def expected_fail_closed_for_case(case: MatrixCase) -> ExpectedFailClosed | None:
-    upstream_format = _normalized_upstream_format(case.lane.upstream_format)
+    upstream_format = canonical_upstream_format(case.lane.upstream_format)
     if upstream_format is None:
         return None
     if (
@@ -1781,8 +1836,12 @@ def expected_fail_closed_for_case(case: MatrixCase) -> ExpectedFailClosed | None
                 "Gemini tool-loop provider thought-signature state requires native "
                 "Gemini upstream format"
             ),
-            required_all=(),
-            required_any=("thoughtSignature", "provider thought-signature state"),
+            required_all=(
+                "Gemini content part field",
+                "provider thought-signature state",
+                "cannot be faithfully translated",
+            ),
+            required_any=("thoughtSignature", "thought_signature"),
         )
     return None
 

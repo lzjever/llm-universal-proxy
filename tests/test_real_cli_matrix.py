@@ -315,7 +315,7 @@ class RealCliMatrixTests(unittest.TestCase):
             "Current client: claude. Reply with only the exact public editing tool names visible here.",
         )
 
-    def test_load_fixtures_marks_only_tool_loop_workspace_edit_fixture(self):
+    def test_load_fixtures_infers_tool_loop_from_workspace_capabilities(self):
         module = load_module()
 
         fixtures = {
@@ -328,8 +328,60 @@ class RealCliMatrixTests(unittest.TestCase):
                 "public_editing_tool_workspace_edit_contract"
             ].requires_tool_loop
         )
+        self.assertTrue(fixtures["codex_observable_edit_contract"].requires_tool_loop)
+        self.assertTrue(
+            fixtures["codex_prework_signal_work_summary_contract"].requires_tool_loop
+        )
+        self.assertTrue(fixtures["python_bugfix"].requires_tool_loop)
+        self.assertTrue(fixtures["rust_6502_cpu"].requires_tool_loop)
         self.assertFalse(fixtures["smoke_pong"].requires_tool_loop)
         self.assertFalse(fixtures["tool_identity_public_contract"].requires_tool_loop)
+
+    def test_load_fixtures_infers_tool_loop_for_nested_workspace_verifier_without_manual_flag(self):
+        module = load_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixtures_root = pathlib.Path(temp_dir)
+            (fixtures_root / "nested.json").write_text(
+                json.dumps(
+                    {
+                        "id": "nested_workspace_edit",
+                        "kind": "smoke",
+                        "prompt": "Fix calc.py",
+                        "timeout_secs": 30,
+                        "workspace_template": "workspace",
+                        "verifier": {
+                            "type": "all_of",
+                            "verifiers": [
+                                {"type": "contains", "value": "done"},
+                                {
+                                    "type": "python_source_and_output",
+                                    "source": {
+                                        "path": "calc.py",
+                                        "function": "add",
+                                        "args": ["a", "b"],
+                                        "returns": {
+                                            "kind": "binary_op",
+                                            "operator": "+",
+                                            "left": "a",
+                                            "right": "b",
+                                        },
+                                    },
+                                    "entrypoint": {
+                                        "path": "main.py",
+                                        "expect_stdout_contains": ["2 + 3 = 5"],
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            [fixture] = module.load_fixtures(fixtures_root)
+
+        self.assertTrue(fixture.requires_tool_loop)
 
     def test_default_proxy_binary_path_prefers_newer_debug_build(self):
         module = load_module()
@@ -2366,6 +2418,30 @@ class RealCliMatrixTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown matrix case"):
             module.filter_matrix_cases(cases, selected_case_ids=["missing-case"])
 
+    def test_canonical_upstream_format_matches_rust_aliases(self):
+        module = load_module()
+
+        cases = {
+            "claude": "anthropic",
+            "anthropic": "anthropic",
+            "gemini": "google",
+            "google": "google",
+            "openai": "openai-completion",
+            "chat": "openai-completion",
+            "openai-completion": "openai-completion",
+            "responses": "openai-responses",
+            "openai-responses": "openai-responses",
+            "  CHAT  ": "openai-completion",
+        }
+
+        for raw_format, canonical_format in cases.items():
+            with self.subTest(raw_format=raw_format):
+                self.assertEqual(
+                    module.canonical_upstream_format(raw_format),
+                    canonical_format,
+                )
+        self.assertIsNone(module.canonical_upstream_format(None))
+
     def test_expected_fail_closed_classifies_claude_by_upstream_format(self):
         module = load_module()
         case = make_case(
@@ -2395,6 +2471,29 @@ class RealCliMatrixTests(unittest.TestCase):
                 "HTTP 500 from upstream",
             )
         )
+
+        for upstream_format in ("anthropic", "claude"):
+            with self.subTest(native_alias=upstream_format):
+                native_case = make_case(
+                    module,
+                    client_name="claude",
+                    lane=make_lane(module, upstream_format=upstream_format),
+                )
+                self.assertIsNone(module.expected_fail_closed_for_case(native_case))
+
+        for upstream_format in ("openai", "chat"):
+            with self.subTest(non_native_alias=upstream_format):
+                alias_case = make_case(
+                    module,
+                    client_name="claude",
+                    lane=make_lane(module, upstream_format=upstream_format),
+                )
+                alias_expectation = module.expected_fail_closed_for_case(alias_case)
+                self.assertIsNotNone(alias_expectation)
+                self.assertEqual(
+                    alias_expectation.category,
+                    "anthropic_native_controls",
+                )
 
         native_case = make_case(
             module,
@@ -2429,10 +2528,30 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertTrue(
             module.expected_fail_closed_error_matches(
                 expectation,
-                "thoughtSignature carries provider thought-signature state and cannot be faithfully translated",
+                (
+                    "Gemini content part field `thoughtSignature` carries provider "
+                    "thought-signature state and cannot be faithfully translated "
+                    "to OpenAI Chat Completions"
+                ),
             )
         )
         self.assertTrue(
+            module.expected_fail_closed_error_matches(
+                expectation,
+                (
+                    "Gemini content part field `thought_signature` carries provider "
+                    "thought-signature state and cannot be faithfully translated "
+                    "to Anthropic"
+                ),
+            )
+        )
+        self.assertFalse(
+            module.expected_fail_closed_error_matches(
+                expectation,
+                "thoughtSignature",
+            )
+        )
+        self.assertFalse(
             module.expected_fail_closed_error_matches(
                 expectation,
                 "provider thought-signature state cannot be faithfully translated",
@@ -2453,6 +2572,30 @@ class RealCliMatrixTests(unittest.TestCase):
         )
         self.assertIsNone(module.expected_fail_closed_for_case(native_case))
         self.assertIsNone(module.expected_fail_closed_for_case(smoke_case))
+
+    def test_expected_fail_closed_classifies_gemini_long_horizon_non_native_from_inferred_capability(self):
+        module = load_module()
+        fixtures = {
+            fixture.fixture_id: fixture
+            for fixture in module.load_fixtures(DEFAULT_CONFIG_PATH.parent)
+        }
+        case = make_case(
+            module,
+            client_name="gemini",
+            lane=make_lane(
+                module,
+                name="preset-openai-compatible",
+                upstream_name="PRESET-OPENAI-COMPATIBLE",
+                upstream_format="chat",
+            ),
+            fixture=fixtures["python_bugfix"],
+        )
+
+        expectation = module.expected_fail_closed_for_case(case)
+
+        self.assertTrue(fixtures["python_bugfix"].requires_tool_loop)
+        self.assertIsNotNone(expectation)
+        self.assertEqual(expectation.category, "gemini_provider_thought_signature")
 
     def test_classify_lane_health_skips_optional_qwen_probe_failures(self):
         module = load_module()
@@ -4042,6 +4185,51 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "failed")
         self.assertNotIn("expected_fail_closed", result)
+
+    def test_run_matrix_case_keeps_bare_gemini_thought_signature_nonzero_as_failure(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="gemini",
+            lane=make_lane(
+                module,
+                name="preset-openai-compatible",
+                upstream_name="PRESET-OPENAI-COMPATIBLE",
+                upstream_format="openai-completion",
+            ),
+            fixture=make_fixture(
+                module,
+                fixture_id="python_bugfix",
+                requires_tool_loop=True,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = pathlib.Path(temp_dir)
+            with mock.patch.object(
+                module.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    ["gemini"],
+                    1,
+                    stdout="",
+                    stderr="thoughtSignature",
+                ),
+            ):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(
+            result["expected_fail_closed"],
+            "gemini_provider_thought_signature",
+        )
+        self.assertIn("markers missing", result["message"])
+        self.assertEqual(module.summarize_results([result]), (0, 1, 0, 0))
 
     def test_wait_for_health_rejects_old_proxy_health_without_owned_listening_proof(self):
         module = load_module()

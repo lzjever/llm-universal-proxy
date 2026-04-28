@@ -1,20 +1,48 @@
+import json
 import pathlib
 import re
 import unittest
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+CONTAINER_IMAGE_MANIFEST = REPO_ROOT / "docs" / "release-artifacts" / "container-image.json"
 IMAGE_REPO = "ghcr.io/agentsmith-project/llm-universal-proxy"
-CURRENT_RELEASE_TAG = "v0.2.23"
-CURRENT_VERSION_TAG = "0.2.23"
-CURRENT_IMAGE_DIGEST = (
-    "ghcr.io/agentsmith-project/llm-universal-proxy@"
-    "sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89"
-)
 
 
 def read_doc(relative_path: str) -> str:
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def load_container_manifest() -> dict:
+    return json.loads(CONTAINER_IMAGE_MANIFEST.read_text(encoding="utf-8"))
+
+
+def cargo_package_version() -> str:
+    cargo = read_doc("Cargo.toml")
+    match = re.search(r'^version = "([^"]+)"', cargo, flags=re.MULTILINE)
+    if match is None:
+        raise AssertionError("Cargo.toml must declare package version")
+    return match.group(1)
+
+
+def container_refs() -> dict:
+    manifest = load_container_manifest()
+    published = manifest["published"]
+    next_release = manifest["next_release"]
+    image = manifest["image"]
+    return {
+        "image": image,
+        "published_release_tag": published["release_tag"],
+        "published_version_tag": published["version_tag"],
+        "published_digest": published["digest"],
+        "published_digest_ref": f'{image}@{published["digest"]}',
+        "next_release_tag": next_release["release_tag"],
+        "next_package_version": next_release["cargo_package_version"],
+    }
+
+
+def normalized_whitespace(text: str) -> str:
+    return " ".join(text.split())
 
 
 def markdown_section(text: str, heading: str) -> str:
@@ -48,30 +76,53 @@ def markdown_subsection(text: str, heading: str) -> str:
 
 
 class GaDocsContractTests(unittest.TestCase):
+    def test_container_image_manifest_separates_published_image_from_next_release_identity(self):
+        manifest = load_container_manifest()
+        published = manifest["published"]
+        next_release = manifest["next_release"]
+
+        self.assertEqual(manifest["schema"], 1)
+        self.assertEqual(manifest["image"], IMAGE_REPO)
+        self.assertRegex(published["release_tag"], r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+        self.assertEqual(
+            published["version_tag"], published["release_tag"].removeprefix("v")
+        )
+        self.assertRegex(published["digest"], r"^sha256:[0-9a-f]{64}$")
+        self.assertIn("published_at", published)
+        self.assertNotIn("released_at", published)
+        self.assertEqual(next_release["cargo_package_version"], cargo_package_version())
+        self.assertEqual(next_release["release_tag"], f"v{cargo_package_version()}")
+        self.assertEqual(next_release["status"], "not_published")
+        self.assertNotEqual(published["release_tag"], next_release["release_tag"])
+
     def test_published_docker_image_usage_docs_are_ga_ready(self):
+        refs = container_refs()
         container_doc = read_doc("docs/container.md")
 
         current_release = markdown_section(container_doc, "Current Release")
         for snippet in (
-            f"{IMAGE_REPO}:{CURRENT_RELEASE_TAG}",
-            f"{IMAGE_REPO}:{CURRENT_VERSION_TAG}",
-            f"{IMAGE_REPO}:latest",
-            CURRENT_IMAGE_DIGEST,
+            f'{refs["image"]}:{refs["published_release_tag"]}',
+            f'{refs["image"]}:{refs["published_version_tag"]}',
+            f'{refs["image"]}:latest',
+            refs["published_digest_ref"],
+            f'Cargo package version `{refs["next_package_version"]}`',
+            "next release identity",
+            "not a published container tag yet",
         ):
             with self.subTest(section="current_release", snippet=snippet):
                 self.assertIn(snippet, current_release)
 
         pull = markdown_section(container_doc, "Pull")
         for snippet in (
-            f"docker pull {IMAGE_REPO}:{CURRENT_RELEASE_TAG}",
-            f"docker pull {CURRENT_IMAGE_DIGEST}",
+            f'docker pull {refs["image"]}:{refs["published_release_tag"]}',
+            f'docker pull {refs["published_digest_ref"]}',
         ):
             with self.subTest(section="pull", snippet=snippet):
                 self.assertIn(snippet, pull)
 
         smoke = markdown_section(container_doc, "Verify in One Minute")
         for snippet in (
-            f"docker pull {IMAGE_REPO}:{CURRENT_RELEASE_TAG}",
+            f'docker pull {refs["image"]}:{refs["published_release_tag"]}',
             "docker run --rm",
             "127.0.0.1:8080:8080",
             "/etc/llmup/config.yaml",
@@ -85,8 +136,8 @@ class GaDocsContractTests(unittest.TestCase):
 
         production_pinning = markdown_section(container_doc, "Production Pinning")
         for snippet in (
-            f"{IMAGE_REPO}:{CURRENT_RELEASE_TAG}",
-            CURRENT_IMAGE_DIGEST,
+            f'{refs["image"]}:{refs["published_release_tag"]}',
+            refs["published_digest_ref"],
             "Pin a release tag or digest for production",
             "Do not use `latest` for production pinning",
         ):
@@ -126,33 +177,71 @@ class GaDocsContractTests(unittest.TestCase):
             run_section,
         )
         self.assertIn("replace the placeholder base URLs and model aliases", run_section)
+        self.assertNotIn(
+            f'{refs["image"]}:{refs["next_release_tag"]}',
+            container_doc,
+            "docs must not bind the next release tag to the published digest",
+        )
+        self.assertNotRegex(
+            container_doc.casefold(),
+            rf"current (?:published )?(?:container )?release is `{re.escape(refs['next_release_tag'].casefold())}`",
+        )
 
     def test_readmes_summarize_published_container_usage(self):
-        for path in ("README.md", "README_CN.md"):
-            text = read_doc(path)
+        refs = container_refs()
+        english = normalized_whitespace(read_doc("README.md"))
+        chinese = normalized_whitespace(read_doc("README_CN.md"))
+
+        readme_expectations = {
+            "README.md": (
+                english,
+                f'The current published container release is `{refs["published_release_tag"]}`',
+                f'Cargo package version `{refs["next_package_version"]}` is the next release identity, not a published container tag yet',
+                rf"current published .*`{re.escape(refs['next_release_tag'])}`",
+            ),
+            "README_CN.md": (
+                chinese,
+                f'当前已发布容器版本是 `{refs["published_release_tag"]}`',
+                f'Cargo package version `{refs["next_package_version"]}` 是下一次 release identity，并不是已发布容器 tag',
+                rf"当前已发布.*`{re.escape(refs['next_release_tag'])}`",
+            ),
+        }
+
+        for path, (text, published_semantics, next_semantics, forbidden) in readme_expectations.items():
             with self.subTest(path=path):
-                self.assertIn(IMAGE_REPO, text)
-                self.assertIn(CURRENT_RELEASE_TAG, text)
-                self.assertIn("pin", text)
+                self.assertIn(refs["image"], text)
+                self.assertIn(published_semantics, text)
+                self.assertIn(next_semantics, text)
                 self.assertIn("digest", text)
                 self.assertIn("docs/container.md", text)
+                self.assertNotIn(f'{refs["image"]}:{refs["next_release_tag"]}', text)
+                self.assertNotRegex(text.casefold(), forbidden.casefold())
 
     def test_docker_compose_defaults_to_current_release_not_latest(self):
+        refs = container_refs()
         compose = read_doc("examples/docker-compose.yaml")
 
-        self.assertIn(f"{IMAGE_REPO}:{CURRENT_RELEASE_TAG}", compose)
+        self.assertIn(f'{refs["image"]}:{refs["published_release_tag"]}', compose)
+        self.assertNotIn(f'{refs["image"]}:{refs["next_release_tag"]}', compose)
         self.assertNotIn(":latest", compose)
         self.assertRegex(
             compose,
-            rf"(?m)^\s*image:\s*\$\{{LLMUP_IMAGE:-{re.escape(IMAGE_REPO)}:{CURRENT_RELEASE_TAG}\}}\s*$",
+            rf"(?m)^\s*image:\s*\$\{{LLMUP_IMAGE:-{re.escape(refs['image'])}:{refs['published_release_tag']}\}}\s*$",
         )
 
     def test_governance_locks_published_docker_image_docs_contract(self):
+        refs = container_refs()
         governance = read_doc("scripts/check-governance.sh")
 
         for snippet in (
-            f'check_contains "docs/container.md" "{IMAGE_REPO}:{CURRENT_RELEASE_TAG}"',
-            f'check_contains "docs/container.md" "{CURRENT_IMAGE_DIGEST}"',
+            "CONTAINER_IMAGE_MANIFEST",
+            "PUBLISHED_CONTAINER_RELEASE_TAG",
+            "PUBLISHED_CONTAINER_VERSION_TAG",
+            "PUBLISHED_CONTAINER_DIGEST",
+            "NEXT_RELEASE_TAG",
+            'check_contains "docs/container.md" "${PUBLISHED_CONTAINER_IMAGE}:${PUBLISHED_CONTAINER_RELEASE_TAG}"',
+            'check_contains "docs/container.md" "${PUBLISHED_CONTAINER_DIGEST_REF}"',
+            'check_contains "docs/container.md" "not a published container tag yet"',
             'check_contains "docs/container.md" "Pin a release tag or digest for production"',
             'check_contains "docs/container.md" \'Do not use `latest` for production pinning\'',
             'check_contains "docs/container.md" "docker login ghcr.io"',
@@ -161,15 +250,29 @@ class GaDocsContractTests(unittest.TestCase):
             'check_contains "docs/container.md" "GITHUB_USERNAME"',
             'check_contains "docs/container.md" "If the package is public"',
             'check_contains "docs/container.md" "unauthorized, 403, or package page appears 404"',
-            'check_contains "README.md" "v0.2.23"',
-            'check_contains "README_CN.md" "v0.2.23"',
+            'check_contains "README.md" "${PUBLISHED_CONTAINER_RELEASE_TAG}"',
+            'check_contains "README_CN.md" "${PUBLISHED_CONTAINER_RELEASE_TAG}"',
+            'check_contains "README.md" "${NEXT_PACKAGE_VERSION}"',
+            'check_contains "README_CN.md" "${NEXT_PACKAGE_VERSION}"',
+            'check_readme_container_release_semantics "README.md" en',
+            'check_readme_container_release_semantics "README_CN.md" zh',
             'check_absent "docs/container.md" "fine-grained personal access token"',
             'check_absent "docs/container.md" \'$GITHUB_ACTOR\'',
-            f'check_contains "examples/docker-compose.yaml" "{IMAGE_REPO}:{CURRENT_RELEASE_TAG}"',
+            'check_contains "examples/docker-compose.yaml" "${PUBLISHED_CONTAINER_IMAGE}:${PUBLISHED_CONTAINER_RELEASE_TAG}"',
             'check_absent "examples/docker-compose.yaml" ":latest"',
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, governance)
+        self.assertNotIn(
+            refs["published_digest"],
+            governance,
+            "governance must read the published digest from the manifest",
+        )
+        self.assertNotIn(
+            f'{refs["image"]}:{refs["next_release_tag"]}',
+            governance,
+            "governance must not hard-code the next release tag as published",
+        )
 
     def test_prd_metadata_and_section_numbers_are_current_for_ga(self):
         prd = read_doc("docs/PRD.md")
@@ -478,12 +581,15 @@ class GaDocsContractTests(unittest.TestCase):
                 self.assertNotIn("OpenAI-compatible completions and", text)
 
     def test_changelog_latest_release_records_current_release_metadata(self):
+        refs = container_refs()
         changelog = read_doc("CHANGELOG.md")
-        latest_release = markdown_section(changelog, "v0.2.23 - 2026-04-28")
+        latest_release = markdown_section(
+            changelog, f"v{cargo_package_version()} - 2026-04-28"
+        )
 
         for snippet in (
             "release identity",
-            "occupied `v0.2.22` tag",
+            f"occupied `{refs['published_release_tag']}` tag",
             "reusing the existing tag",
             "next patch version",
         ):

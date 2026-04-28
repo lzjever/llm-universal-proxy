@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "image": "ghcr.io/agentsmith-project/llm-universal-proxy",
+  "published": {
+    "release_tag": "v0.2.22",
+    "version_tag": "0.2.22",
+    "digest": "sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89",
+    "published_at": "2026-04-27"
+  },
+  "next_release": {
+    "cargo_package_version": "0.2.23",
+    "release_tag": "v0.2.23",
+    "status": "not_published"
+  }
+}

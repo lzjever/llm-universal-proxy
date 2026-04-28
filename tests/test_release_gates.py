@@ -1,7 +1,11 @@
+import json
+import os
 import importlib.util
 import pathlib
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -10,6 +14,9 @@ RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 GOVERNANCE_SCRIPT = REPO_ROOT / "scripts" / "check-governance.sh"
 SUPPLY_CHAIN_AUDIT_SCRIPT = REPO_ROOT / "scripts" / "supply_chain_audit.sh"
+CHECKED_IN_CONTAINER_IMAGE_MANIFEST = (
+    REPO_ROOT / "docs" / "release-artifacts" / "container-image.json"
+)
 SUPPLY_CHAIN_AUDIT_COMMAND = "bash scripts/supply_chain_audit.sh"
 LOCKFILE_INTEGRITY_COMMAND = "cargo metadata --locked --format-version 1 --no-deps"
 ENDPOINT_MATRIX_SCRIPT = REPO_ROOT / "scripts" / "real_endpoint_matrix.py"
@@ -47,6 +54,7 @@ COMPAT_PROVIDER_VAR_ENVS = (
     "COMPAT_PROVIDER_LABEL",
 )
 COMPAT_PROVIDER_SMOKE_JSON = "artifacts/compatible-provider-smoke.json"
+PUSHED_CONTAINER_IMAGE_MANIFEST_JSON = "artifacts/container-image.json"
 RELEASE_PUBLISH_JOB_MARKERS = (
     "push: true",
     "packages: write",
@@ -123,6 +131,28 @@ def workflow_step_block(text: str, step_name: str) -> str:
     if next_step == -1:
         return text[start:]
     return text[start:next_step]
+
+
+def workflow_step_inline_python(step_block: str) -> str:
+    marker = "          python3 - <<'PY'\n"
+    start = step_block.find(marker)
+    if start == -1:
+        return ""
+    start += len(marker)
+    end = step_block.find("\n          PY", start)
+    if end == -1:
+        return ""
+
+    lines = []
+    for line in step_block[start:end].splitlines():
+        if line.startswith("          "):
+            line = line[10:]
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def published_timestamp_fields(manifest: dict) -> set[str]:
+    return {"published_at", "released_at"} & set(manifest["published"])
 
 
 class ReleaseGateWorkflowContractTests(unittest.TestCase):
@@ -293,6 +323,7 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
         push_step = workflow_step_block(container, "Build and push multi-arch image")
         self.assertTrue(push_step, "container job must keep a multi-arch push step")
         for snippet in (
+            "id: push_image",
             "${{ env.GHCR_IMAGE }}:${{ github.ref_name }}",
             "${{ env.GHCR_IMAGE }}:${{ steps.repo_meta.outputs.version }}",
             "${{ env.GHCR_IMAGE }}:latest",
@@ -301,6 +332,120 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, push_step)
+
+    def test_release_container_job_exports_pushed_digest_manifest_artifact(self):
+        jobs = release_workflow_jobs()
+        container = jobs.get("container", "")
+        self.assertTrue(container, "release workflow must define container job")
+
+        push_step = workflow_step_block(container, "Build and push multi-arch image")
+        self.assertTrue(push_step, "container job must keep a multi-arch push step")
+        self.assertIn("id: push_image", push_step)
+
+        write_step = workflow_step_block(container, "Write pushed container image manifest")
+        self.assertTrue(
+            write_step,
+            "container job must write the pushed image digest to a machine-readable manifest",
+        )
+        for snippet in (
+            "PUSH_DIGEST: ${{ steps.push_image.outputs.digest }}",
+            "RELEASE_TAG: ${{ github.ref_name }}",
+            "VERSION: ${{ steps.repo_meta.outputs.version }}",
+            PUSHED_CONTAINER_IMAGE_MANIFEST_JSON,
+            '"digest": digest',
+            '"release_tag": release_tag',
+            '"cargo_package_version": version',
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, write_step)
+
+        upload_step = workflow_step_block(container, "Upload pushed container image manifest")
+        self.assertTrue(
+            upload_step,
+            "container job must upload the pushed digest manifest for docs refresh",
+        )
+        for snippet in (
+            "uses: actions/upload-artifact@v4",
+            "name: container-image",
+            f"path: {PUSHED_CONTAINER_IMAGE_MANIFEST_JSON}",
+            "if-no-files-found: error",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, upload_step)
+
+    def test_release_container_manifest_writer_emits_drop_in_post_release_schema(self):
+        jobs = release_workflow_jobs()
+        container = jobs.get("container", "")
+        self.assertTrue(container, "release workflow must define container job")
+
+        write_step = workflow_step_block(container, "Write pushed container image manifest")
+        script = workflow_step_inline_python(write_step)
+        self.assertTrue(script, "manifest writer must be executable Python")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = pathlib.Path(tmpdir)
+            (tmp_path / "artifacts").mkdir()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "GHCR_IMAGE": "ghcr.io/agentsmith-project/llm-universal-proxy",
+                    "RELEASE_TAG": "v0.2.23",
+                    "VERSION": "0.2.23",
+                    "PUSH_DIGEST": f"sha256:{'a' * 64}",
+                    "GIT_SHA": "b" * 40,
+                    "GITHUB_SERVER_URL": "https://github.com",
+                    "GITHUB_REPOSITORY": "agentsmith-project/llm-universal-proxy",
+                    "GITHUB_RUN_ID": "123456789",
+                }
+            )
+            subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=tmp_path,
+                env=env,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            manifest = json.loads(
+                (tmp_path / PUSHED_CONTAINER_IMAGE_MANIFEST_JSON).read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(manifest["schema"], 1)
+        self.assertEqual(
+            manifest["image"], "ghcr.io/agentsmith-project/llm-universal-proxy"
+        )
+        self.assertEqual(manifest["published"]["release_tag"], "v0.2.23")
+        self.assertEqual(manifest["published"]["version_tag"], "0.2.23")
+        self.assertEqual(manifest["published"]["digest"], f"sha256:{'a' * 64}")
+        self.assertEqual(manifest["published"]["cargo_package_version"], "0.2.23")
+        self.assertEqual(manifest["published"]["git_sha"], "b" * 40)
+        self.assertEqual(manifest["published"]["status"], "published")
+        checked_in_manifest = json.loads(
+            CHECKED_IN_CONTAINER_IMAGE_MANIFEST.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            {"published_at"}, published_timestamp_fields(checked_in_manifest)
+        )
+        self.assertEqual(
+            published_timestamp_fields(checked_in_manifest),
+            published_timestamp_fields(manifest),
+        )
+        self.assertRegex(
+            manifest["published"]["published_at"],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+        )
+        self.assertEqual(
+            manifest["published"]["run_url"],
+            "https://github.com/agentsmith-project/llm-universal-proxy/actions/runs/123456789",
+        )
+
+        self.assertEqual(manifest["next_release"]["cargo_package_version"], "0.2.24")
+        self.assertEqual(manifest["next_release"]["release_tag"], "v0.2.24")
+        self.assertEqual(manifest["next_release"]["status"], "not_published")
+        self.assertIn("main", manifest["next_release"]["main_branch_action"])
+        self.assertIn("0.2.24", manifest["next_release"]["main_branch_action"])
 
     def test_ci_workflow_contains_local_mock_perf_and_supply_chain_gates(self):
         ci = CI_WORKFLOW.read_text(encoding="utf-8")
@@ -411,6 +556,13 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "git rev-parse --is-shallow-repository",
             "fetch-depth: 0",
             "tag visibility",
+            "CONTAINER_IMAGE_MANIFEST",
+            "check_container_image_manifest_contract",
+            "PUBLISHED_CONTAINER_DIGEST_REF",
+            "NEXT_RELEASE_TAG",
+            "published_at",
+            "released_at",
+            "pushed container image manifest",
             SUPPLY_CHAIN_AUDIT_COMMAND,
             LOCKFILE_INTEGRITY_COMMAND,
             "cargo audit --locked",

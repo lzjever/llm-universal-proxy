@@ -36,6 +36,44 @@ COMPAT_PROVIDER_VAR_ENVS=(
     "COMPAT_PROVIDER_LABEL"
 )
 COMPAT_PROVIDER_SMOKE_JSON="artifacts/compatible-provider-smoke.json"
+CONTAINER_IMAGE_MANIFEST="docs/release-artifacts/container-image.json"
+
+manifest_field() {
+    local field_path="$1"
+
+    MANIFEST_PATH="$CONTAINER_IMAGE_MANIFEST" FIELD_PATH="$field_path" python3 - <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+manifest_path = pathlib.Path(os.environ["MANIFEST_PATH"])
+field_path = os.environ["FIELD_PATH"].split(".")
+
+try:
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for segment in field_path:
+        value = value[segment]
+except Exception as exc:
+    print(f"failed to read {'.'.join(field_path)} from {manifest_path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(value, (str, int)):
+    print(f"{'.'.join(field_path)} in {manifest_path} must be a scalar", file=sys.stderr)
+    sys.exit(1)
+
+print(value)
+PY
+}
+
+PUBLISHED_CONTAINER_IMAGE="$(manifest_field image)"
+PUBLISHED_CONTAINER_RELEASE_TAG="$(manifest_field published.release_tag)"
+PUBLISHED_CONTAINER_VERSION_TAG="$(manifest_field published.version_tag)"
+PUBLISHED_CONTAINER_DIGEST="$(manifest_field published.digest)"
+PUBLISHED_CONTAINER_DIGEST_REF="${PUBLISHED_CONTAINER_IMAGE}@${PUBLISHED_CONTAINER_DIGEST}"
+NEXT_PACKAGE_VERSION="$(manifest_field next_release.cargo_package_version)"
+NEXT_RELEASE_TAG="$(manifest_field next_release.release_tag)"
+NEXT_RELEASE_STATUS="$(manifest_field next_release.status)"
 
 FAILURES=()
 
@@ -61,6 +99,70 @@ check_absent() {
     local pattern="$2"
     if grep -Fq -- "$pattern" "$file"; then
         FAILURES+=("$file still contains forbidden pattern: $pattern")
+    fi
+}
+
+check_readme_container_release_semantics() {
+    local file="$1"
+    local language="$2"
+    local readme_output
+
+    if ! readme_output="$(README_PATH="$file" README_LANGUAGE="$language" PUBLISHED_CONTAINER_RELEASE_TAG="$PUBLISHED_CONTAINER_RELEASE_TAG" NEXT_PACKAGE_VERSION="$NEXT_PACKAGE_VERSION" NEXT_RELEASE_TAG="$NEXT_RELEASE_TAG" python3 - <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(os.environ["README_PATH"])
+language = os.environ["README_LANGUAGE"]
+published = os.environ["PUBLISHED_CONTAINER_RELEASE_TAG"]
+next_version = os.environ["NEXT_PACKAGE_VERSION"]
+next_tag = os.environ["NEXT_RELEASE_TAG"]
+text = " ".join(path.read_text(encoding="utf-8").split())
+failures = []
+
+if language == "en":
+    required = (
+        f"The current published container release is `{published}`",
+        f"Cargo package version `{next_version}` is the next release identity, not a published container tag yet",
+    )
+    forbidden = (
+        (
+            rf"current published .*`{re.escape(next_tag)}`",
+            f"must not describe next release tag `{next_tag}` as the current published container release",
+        ),
+    )
+elif language == "zh":
+    required = (
+        f"当前已发布容器版本是 `{published}`",
+        f"Cargo package version `{next_version}` 是下一次 release identity，并不是已发布容器 tag",
+    )
+    forbidden = (
+        (
+            rf"当前已发布.*`{re.escape(next_tag)}`",
+            f"不能把下一次 release tag `{next_tag}` 写成当前已发布容器版本",
+        ),
+    )
+else:
+    print(f"unsupported README language contract: {language}", file=sys.stderr)
+    sys.exit(1)
+
+for snippet in required:
+    if snippet not in text:
+        failures.append(f"{path} is missing README container release semantics: {snippet}")
+
+for pattern, message in forbidden:
+    if re.search(pattern, text, flags=re.IGNORECASE):
+        failures.append(f"{path} {message}")
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+PY
+    )"; then
+        while IFS= read -r failure; do
+            [[ -n "$failure" ]] && FAILURES+=("$failure")
+        done <<< "$readme_output"
     fi
 }
 
@@ -165,6 +267,72 @@ check_release_tag_identity() {
         if [[ "$tag_head" != "$current_head" ]]; then
             FAILURES+=("${release_tag} already points to ${tag_head}, not current HEAD ${current_head}; bump the package version instead of reusing or moving an existing tag")
         fi
+    fi
+}
+
+check_container_image_manifest_contract() {
+    local manifest_output
+
+    if ! manifest_output="$(VERSION="$VERSION" CONTAINER_IMAGE_MANIFEST="$CONTAINER_IMAGE_MANIFEST" python3 - <<'PY'
+import json
+import os
+import pathlib
+import re
+import sys
+
+version = os.environ["VERSION"]
+manifest_path = pathlib.Path(os.environ["CONTAINER_IMAGE_MANIFEST"])
+failures = []
+
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"{manifest_path} could not be read as JSON: {exc}")
+    sys.exit(1)
+
+published = manifest.get("published", {})
+next_release = manifest.get("next_release", {})
+image = manifest.get("image")
+published_release_tag = published.get("release_tag")
+published_version_tag = published.get("version_tag")
+published_digest = published.get("digest")
+next_package_version = next_release.get("cargo_package_version")
+next_release_tag = next_release.get("release_tag")
+next_status = next_release.get("status")
+
+if manifest.get("schema") != 1:
+    failures.append("container image manifest schema must be 1")
+if image != "ghcr.io/agentsmith-project/llm-universal-proxy":
+    failures.append("container image manifest must name the GHCR image repository")
+if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", str(published_release_tag)):
+    failures.append("published release tag must be a v-prefixed semantic version")
+if published_version_tag != str(published_release_tag).removeprefix("v"):
+    failures.append("published version tag must match the release tag without the v prefix")
+if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(published_digest)):
+    failures.append("published digest must be a sha256 digest")
+if "published_at" not in published:
+    failures.append("published schema 1 manifest must use published_at")
+if "released_at" in published:
+    failures.append("published schema 1 manifest must not use released_at")
+if next_package_version != version:
+    failures.append(
+        f"next release package version must match Cargo.toml version {version}"
+    )
+if next_release_tag != f"v{version}":
+    failures.append(f"next release tag must be v{version}")
+if next_status != "not_published":
+    failures.append("next release status must remain not_published until the tag is pushed")
+if published_release_tag == next_release_tag:
+    failures.append("published release tag must differ from the next release tag")
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+PY
+    )"; then
+        while IFS= read -r failure; do
+            [[ -n "$failure" ]] && FAILURES+=("$failure")
+        done <<< "$manifest_output"
     fi
 }
 
@@ -565,6 +733,7 @@ check_governance_checkout_fetch_depth ".github/workflows/release.yml"
 check_eq "Cargo.lock package version" "$LOCK_VERSION" "$VERSION"
 check_eq "CHANGELOG latest version" "$CHANGELOG_VERSION" "$VERSION"
 check_release_tag_identity
+check_container_image_manifest_contract
 
 if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
     check_eq "Git tag" "${GITHUB_REF}" "refs/tags/v${VERSION}"
@@ -698,18 +867,37 @@ check_contains ".github/workflows/release.yml" "platforms: linux/amd64,linux/arm
 check_contains ".github/workflows/release.yml" "push: true"
 check_contains ".github/workflows/release.yml" '${{ env.GHCR_IMAGE }}:latest'
 check_contains ".github/workflows/release.yml" 'DOCKER_BUILD_RECORD_UPLOAD: "false"'
+check_contains ".github/workflows/release.yml" "id: push_image"
+check_contains ".github/workflows/release.yml" "Write pushed container image manifest"
+check_contains ".github/workflows/release.yml" 'PUSH_DIGEST: ${{ steps.push_image.outputs.digest }}'
+check_contains ".github/workflows/release.yml" "Upload pushed container image manifest"
+check_contains ".github/workflows/release.yml" "name: container-image"
+check_contains ".github/workflows/release.yml" "path: artifacts/container-image.json"
 check_contains ".github/workflows/release.yml" "pattern: llm-universal-proxy-*"
 check_contains ".github/workflows/release.yml" "IMAGE=llm-universal-proxy:release-smoke bash scripts/test_container_smoke.sh"
 
 check_contains "docs/README.md" "container.md"
 check_contains "README.md" "docs/container.md"
 check_contains "README_CN.md" "docs/container.md"
-check_contains "README.md" "v0.2.23"
-check_contains "README_CN.md" "v0.2.23"
+check_contains "README.md" "${PUBLISHED_CONTAINER_RELEASE_TAG}"
+check_contains "README_CN.md" "${PUBLISHED_CONTAINER_RELEASE_TAG}"
+check_contains "README.md" "${NEXT_PACKAGE_VERSION}"
+check_contains "README_CN.md" "${NEXT_PACKAGE_VERSION}"
+check_readme_container_release_semantics "README.md" en
+check_readme_container_release_semantics "README_CN.md" zh
+check_absent "README.md" "${PUBLISHED_CONTAINER_IMAGE}:${NEXT_RELEASE_TAG}"
+check_absent "README_CN.md" "${PUBLISHED_CONTAINER_IMAGE}:${NEXT_RELEASE_TAG}"
+check_contains "$CONTAINER_IMAGE_MANIFEST" '"published"'
+check_contains "$CONTAINER_IMAGE_MANIFEST" '"next_release"'
 check_contains "docs/container.md" "ghcr.io/agentsmith-project/llm-universal-proxy"
-check_contains "docs/container.md" "ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23"
-check_contains "docs/container.md" "ghcr.io/agentsmith-project/llm-universal-proxy@sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89"
-check_contains "docs/container.md" "docker pull ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23"
+check_contains "docs/container.md" "${PUBLISHED_CONTAINER_IMAGE}:${PUBLISHED_CONTAINER_RELEASE_TAG}"
+check_contains "docs/container.md" "${PUBLISHED_CONTAINER_IMAGE}:${PUBLISHED_CONTAINER_VERSION_TAG}"
+check_contains "docs/container.md" "${PUBLISHED_CONTAINER_DIGEST_REF}"
+check_contains "docs/container.md" "docker pull ${PUBLISHED_CONTAINER_IMAGE}:${PUBLISHED_CONTAINER_RELEASE_TAG}"
+check_contains "docs/container.md" "Cargo package version \`${NEXT_PACKAGE_VERSION}\`"
+check_contains "docs/container.md" "next release identity"
+check_contains "docs/container.md" "not a published container tag yet"
+check_absent "docs/container.md" "${PUBLISHED_CONTAINER_IMAGE}:${NEXT_RELEASE_TAG}"
 check_contains "docs/container.md" "Pin a release tag or digest for production"
 check_contains "docs/container.md" 'Do not use `latest` for production pinning'
 check_contains "docs/container.md" "docker login ghcr.io"
@@ -745,7 +933,8 @@ check_absent "examples/container-config.yaml" "MINIMAX"
 check_absent "examples/container-config.yaml" "PRESET_"
 check_contains "examples/docker-compose.yaml" 'OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:?set OPENAI_COMPATIBLE_API_KEY}'
 check_contains "examples/docker-compose.yaml" 'ANTHROPIC_COMPATIBLE_API_KEY: ${ANTHROPIC_COMPATIBLE_API_KEY:?set ANTHROPIC_COMPATIBLE_API_KEY}'
-check_contains "examples/docker-compose.yaml" "ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23"
+check_contains "examples/docker-compose.yaml" "${PUBLISHED_CONTAINER_IMAGE}:${PUBLISHED_CONTAINER_RELEASE_TAG}"
+check_absent "examples/docker-compose.yaml" "${PUBLISHED_CONTAINER_IMAGE}:${NEXT_RELEASE_TAG}"
 check_absent "examples/docker-compose.yaml" ":latest"
 check_absent "examples/docker-compose.yaml" "MINIMAX"
 check_absent "examples/docker-compose.yaml" "PRESET_"

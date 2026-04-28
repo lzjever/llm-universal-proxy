@@ -384,6 +384,7 @@ jobs:
         run: IMAGE=llm-universal-proxy:release-smoke bash scripts/test_container_smoke.sh
 
       - name: Build and push multi-arch image
+        id: push_image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -402,6 +403,91 @@ jobs:
             org.opencontainers.image.version=${{ steps.repo_meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Write pushed container image manifest
+        env:
+          GHCR_IMAGE: ${{ env.GHCR_IMAGE }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.repo_meta.outputs.version }}
+          PUSH_DIGEST: ${{ steps.push_image.outputs.digest }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p artifacts
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import re
+
+          image = os.environ["GHCR_IMAGE"]
+          release_tag = os.environ["RELEASE_TAG"]
+          version = os.environ["VERSION"]
+          digest = os.environ["PUSH_DIGEST"]
+          git_sha = os.environ["GIT_SHA"]
+
+          if release_tag != f"v{version}":
+              raise SystemExit(f"release tag {release_tag!r} does not match package version {version!r}")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit(f"docker/build-push-action did not emit a sha256 digest: {digest!r}")
+
+          def next_patch_version(value):
+              match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", value)
+              if match is None:
+                  raise SystemExit(f"package version is not a simple semantic version: {value!r}")
+              major, minor, patch = (int(part) for part in match.groups())
+              return f"{major}.{minor}.{patch + 1}"
+
+          published_at = (
+              datetime.datetime.now(datetime.timezone.utc)
+              .replace(microsecond=0)
+              .isoformat()
+              .replace("+00:00", "Z")
+          )
+          run_url = None
+          if all(os.environ.get(name) for name in ("GITHUB_SERVER_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID")):
+              run_url = (
+                  f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+              )
+
+          next_version = next_patch_version(version)
+          published = {
+              "release_tag": release_tag,
+              "version_tag": version,
+              "digest": digest,
+              "cargo_package_version": version,
+              "git_sha": git_sha,
+              "status": "published",
+              "published_at": published_at,
+          }
+          if run_url is not None:
+              published["run_url"] = run_url
+
+          payload = {
+              "schema": 1,
+              "image": image,
+              "published": published,
+              "next_release": {
+                  "cargo_package_version": next_version,
+                  "release_tag": f"v{next_version}",
+                  "status": "not_published",
+                  "main_branch_action": (
+                      f"After publishing {release_tag}, advance main to Cargo package "
+                      f"version {next_version} before the next release."
+                  ),
+              },
+          }
+          output_path = pathlib.Path("artifacts/container-image.json")
+          output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload pushed container image manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-image
+          path: artifacts/container-image.json
+          if-no-files-found: error
 
   release:
     name: Create Release
