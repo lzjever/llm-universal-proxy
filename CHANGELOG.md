@@ -6,6 +6,10 @@
 
 - Advanced the main-branch release identity to Cargo package version `0.2.24`, the next patch version after the occupied `v0.2.23` tag, without moving, deleting, or reusing the existing tag, so the published `v0.2.23` container tag remains immutable.
 - Refreshed the checked-in container publication manifest and docs around the actual published `v0.2.23` image digest while keeping `0.2.24` / `v0.2.24` as the next release identity, not a published container tag yet.
+- Added container API bootstrap support for control-plane-managed deployments: the image now ships a secret-free empty `/etc/llmup/config.yaml`, `/health` remains liveness, `/ready` reports readiness only after at least one namespace is loaded, and Docker health checks target `/ready`.
+- Added the explicit `--admin-bootstrap` binary mode for direct all-Admin-API startup, requiring a non-empty `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` before serving an initially empty runtime.
+- Expanded container smoke coverage to exercise both static config mounts and the no-mount bootstrap path: start from the built-in empty config, apply runtime config through the Admin API, wait for readiness, and complete a streaming proxy request through a mock upstream.
+- Clarified GA container and configuration docs for static YAML versus runtime Admin API payloads, `proxy_key` versus `client_provider_key` data-plane auth, and the boundary between the currently published `v0.2.23` image and the next-release bootstrap behavior.
 
 ## v0.2.23 - 2026-04-28
 
