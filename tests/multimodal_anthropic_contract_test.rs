@@ -8,10 +8,14 @@ use common::mock_upstream::{
 use common::proxy_helpers::proxy_config;
 use common::runtime_proxy::start_proxy;
 use llm_universal_proxy::formats::UpstreamFormat;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client as ReqwestClient,
+};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+const TEST_PROVIDER_KEY: &str = "provider-secret";
 const AUDIO_WAV_B64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 const PDF_B64: &str = "JVBERi0x";
 const POLLUTED_PDF_B64: &str = "JVBE\r\nRi0x";
@@ -30,6 +34,18 @@ const REMOTE_PDF_URL: &str = "https://example.test/papers/policy.pdf";
 const TEXT_DATA_URI: &str = "data:text/plain;base64,SGVsbG8=";
 const VIDEO_DATA_URI: &str = "data:video/mp4;base64,AAAA";
 
+fn authenticated_reqwest_client() -> ReqwestClient {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TEST_PROVIDER_KEY}")).unwrap(),
+    );
+    ReqwestClient::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn openai_chat_remote_image_url_to_anthropic_uses_url_source() {
     let (mock_base, _mock, captured) =
@@ -37,7 +53,7 @@ async fn openai_chat_remote_image_url_to_anthropic_uses_url_source() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3-5-sonnet",
@@ -65,7 +81,7 @@ async fn openai_responses_remote_image_url_to_anthropic_uses_url_source() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "claude-3-5-sonnet",
@@ -160,7 +176,7 @@ async fn openai_polluted_http_image_urls_to_anthropic_fail_closed_before_upstrea
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!("{proxy_base}{path}"))
             .json(&body)
             .send()
@@ -276,7 +292,7 @@ async fn openai_non_http_image_urls_to_anthropic_fail_closed_before_upstream() {
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!("{proxy_base}{path}"))
             .json(&body)
             .send()
@@ -295,7 +311,7 @@ async fn openai_chat_pdf_data_uri_to_anthropic_document_base64() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3-5-sonnet",
@@ -327,7 +343,7 @@ async fn openai_responses_pdf_data_uri_to_anthropic_document_base64() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "claude-3-5-sonnet",
@@ -359,7 +375,7 @@ async fn openai_chat_pdf_url_to_anthropic_document_url_with_pdf_provenance() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3-5-sonnet",
@@ -391,7 +407,7 @@ async fn openai_responses_pdf_file_url_to_anthropic_document_url_with_pdf_proven
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "claude-3-5-sonnet",
@@ -503,7 +519,7 @@ async fn openai_polluted_http_pdf_urls_to_anthropic_fail_closed_before_upstream(
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!("{proxy_base}{path}"))
             .json(&body)
             .send()
@@ -583,7 +599,7 @@ async fn openai_non_http_pdf_urls_to_anthropic_fail_closed_before_upstream() {
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!("{proxy_base}{path}"))
             .json(&body)
             .send()
@@ -667,7 +683,7 @@ async fn openai_file_data_and_file_url_to_anthropic_fail_closed_before_upstream(
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!("{proxy_base}{path}"))
             .json(&body)
             .send()
@@ -730,7 +746,7 @@ async fn openai_file_id_with_file_data_to_anthropic_fails_closed_before_upstream
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!("{proxy_base}{path}"))
             .json(&body)
             .send()
@@ -793,7 +809,7 @@ async fn openai_non_string_file_id_with_file_data_to_anthropic_fails_closed_befo
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!("{proxy_base}{path}"))
             .json(&body)
             .send()
@@ -885,7 +901,7 @@ async fn openai_non_pdf_file_audio_and_video_to_anthropic_fail_closed_before_ups
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!("{proxy_base}{path}"))
             .json(&body)
             .send()
@@ -904,7 +920,7 @@ async fn gemini_pdf_inline_and_file_data_to_anthropic_documents() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!(
             "{proxy_base}/google/v1beta/models/claude-3-5-sonnet:generateContent"
         ))
@@ -940,7 +956,7 @@ async fn gemini_polluted_inline_data_to_anthropic_fails_closed_before_upstream()
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!(
             "{proxy_base}/google/v1beta/models/claude-3-5-sonnet:generateContent"
         ))
@@ -981,7 +997,7 @@ async fn gemini_audio_and_video_to_anthropic_fail_closed_before_upstream() {
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!(
                 "{proxy_base}/google/v1beta/models/claude-3-5-sonnet:generateContent"
             ))

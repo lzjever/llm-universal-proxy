@@ -179,18 +179,6 @@ provider_key_patterns = ("sk-cp-", "sk-ant-", "sk-proj-", "sk-live-", "sk-test-"
 provider_key_re = re.compile(
     r"sk-(?:cp|ant|proj|live|test)-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{32,}"
 )
-credential_actual_re = re.compile(r"^\s*credential_actual:\s*(?P<value>.+)")
-dummy_credential_values = {
-    "dummy",
-    "dummy-key",
-    "example",
-    "example-key",
-    "not-needed",
-    "placeholder",
-    "redacted",
-    "test",
-    "test-key",
-}
 
 # Keep the scan limited to git ls-files under tracked fixtures, docs, examples, and scripts.
 tracked_paths = subprocess.check_output(
@@ -207,17 +195,76 @@ for path_text in tracked_paths:
     for match in provider_key_re.finditer(text):
         line_no = text.count("\n", 0, match.start()) + 1
         failures.append(f"{path_text}:{line_no}: provider key pattern detected")
-    for line_no, line in enumerate(text.splitlines(), start=1):
-        match = credential_actual_re.search(line)
-        if not match:
+
+if failures:
+    print("\n".join(failures))
+    sys.exit(1)
+PY
+}
+
+scan_tracked_auth_contract() {
+    python3 - <<'PY'
+import pathlib
+import re
+import subprocess
+import sys
+
+data_prefix = "LLM_UNIVERSAL_PROXY_" + "DATA"
+credential = "credential"
+fallback = "fallback"
+old_terms = (
+    data_prefix + "_TOKEN",
+    data_prefix + "_AUTH",
+    "X-LLMUP-" + "Data-" + "Token",
+    "_".join(("auth", "policy")),
+    "_".join(("client", "or", fallback)),
+    "_".join(("force", "server")),
+    "_".join((credential, "env")),
+    "_".join((credential, "actual")),
+    "_".join((fallback, credential, "env")),
+    "_".join((fallback, credential, "actual")),
+    "_".join((fallback, "api", "key")),
+)
+parts = ("data", "token")
+old_prose_re = re.compile(r"\b" + parts[0] + r"[-_\s]+" + parts[1] + r"s?\b", re.IGNORECASE)
+required_terms = (
+    "LLM_UNIVERSAL_PROXY_AUTH_MODE",
+    "LLM_UNIVERSAL_PROXY_KEY",
+    "provider_key_env",
+    "client_provider_key",
+    "proxy_key",
+)
+
+tracked_paths = subprocess.check_output(
+    ["git", "ls-files", "README.md", "README_CN.md", "docs", "examples", "scripts"],
+    text=True,
+).splitlines()
+failures = []
+combined_active_text = []
+
+for path_text in tracked_paths:
+    path = pathlib.Path(path_text)
+    if not path.is_file():
+        continue
+    if "protocol-baselines" in path.parts:
+        continue
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    combined_active_text.append(text)
+    for term in old_terms:
+        index = text.find(term)
+        if index == -1:
             continue
-        value = match.group("value").split("#", 1)[0].strip().strip('"').strip("'")
-        if not value or value.startswith(("{", "$")):
-            continue
-        if value not in dummy_credential_values:
-            failures.append(
-                f"{path_text}:{line_no}: non-dummy credential_actual is not allowed"
-            )
+        line_no = text.count("\n", 0, index) + 1
+        failures.append(f"{path_text}:{line_no}: legacy auth contract term is not allowed: {term}")
+    for match in old_prose_re.finditer(text):
+        line_no = text.count("\n", 0, match.start()) + 1
+        failures.append(f"{path_text}:{line_no}: legacy auth prose is not allowed: {match.group(0)}")
+
+active_text = "\n".join(combined_active_text)
+for term in required_terms:
+    if term not in active_text:
+        failures.append(f"active docs/examples/scripts are missing new auth contract term: {term}")
 
 if failures:
     print("\n".join(failures))
@@ -496,6 +543,12 @@ if ! SECRET_SCAN_OUTPUT="$(scan_tracked_secret_risks)"; then
     done <<< "$SECRET_SCAN_OUTPUT"
 fi
 
+if ! AUTH_CONTRACT_OUTPUT="$(scan_tracked_auth_contract)"; then
+    while IFS= read -r failure; do
+        [[ -n "$failure" ]] && FAILURES+=("$failure")
+    done <<< "$AUTH_CONTRACT_OUTPUT"
+fi
+
 if ! RELEASE_PUBLISH_GATE_OUTPUT="$(check_release_publish_jobs_need_ga_gates)"; then
     while IFS= read -r failure; do
         [[ -n "$failure" ]] && FAILURES+=("$failure")
@@ -537,12 +590,29 @@ check_contains "Makefile" "scripts/test_container_smoke.sh"
 check_contains "scripts/test-and-report.sh" "test --locked --no-fail-fast"
 check_contains "scripts/test-and-report.sh" "$PYTHON_CONTRACT_TEST_COMMAND"
 check_contains "scripts/test_container_smoke.sh" "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN=\${ADMIN_TOKEN}"
+check_contains "scripts/test_container_smoke.sh" "LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key"
+check_contains "scripts/test_container_smoke.sh" "LLM_UNIVERSAL_PROXY_KEY=\${PROXY_KEY}"
+check_contains "scripts/test_container_smoke.sh" 'CONTAINER_SMOKE_UPSTREAM_API_KEY=container-smoke-provider-key'
+check_contains "scripts/test_container_smoke.sh" 'EXPECTED_X_API_KEY = "container-smoke-provider-key"'
+check_contains "scripts/test_container_smoke.sh" 'self.headers.get("x-api-key")'
+check_contains "scripts/test_container_smoke.sh" "unexpected upstream authorization"
 check_contains "scripts/test_container_smoke.sh" "/etc/llmup/config.yaml"
 check_contains "scripts/test_container_smoke.sh" "host.docker.internal:host-gateway"
 check_contains "scripts/test_container_smoke.sh" 'CONTAINER_PORT="8080"'
 check_contains "scripts/test_container_smoke.sh" 'listen: 0.0.0.0:${CONTAINER_PORT}'
+check_contains "scripts/test_container_smoke.sh" "format: anthropic"
+check_contains "scripts/test_container_smoke.sh" "provider_key_env: CONTAINER_SMOKE_UPSTREAM_API_KEY"
 check_contains "scripts/test_container_smoke.sh" '-p "${HOST}:${PROXY_PORT}:${CONTAINER_PORT}"'
 check_contains "scripts/test_container_smoke.sh" "wait_for_container_healthy"
+check_contains "scripts/test_binary_smoke.sh" 'LLM_UNIVERSAL_PROXY_AUTH_MODE=client_provider_key'
+check_contains "scripts/test_binary_smoke.sh" 'SMOKE_PROVIDER_KEY="binary-smoke-provider-key"'
+check_contains "scripts/test_binary_smoke.sh" 'python3 -u - "$MOCK_PORT_FILE" "$SMOKE_PROVIDER_KEY"'
+check_contains "scripts/test_binary_smoke.sh" 'self.headers.get("x-api-key")'
+check_contains "scripts/test_binary_smoke.sh" 'self.headers.get("Authorization")'
+check_contains "scripts/test_binary_smoke.sh" 'unexpected upstream authorization'
+check_contains "scripts/test_binary_smoke.sh" 'Authorization: Bearer ${SMOKE_PROVIDER_KEY}'
+check_absent "scripts/test_binary_smoke.sh" "provider_key_env:"
+check_absent "scripts/test_binary_smoke.sh" "LLM_UNIVERSAL_PROXY_KEY="
 check_contains "scripts/test_cli_clients.sh" "real_cli_matrix.py"
 check_contains "scripts/real_cli_matrix.py" "def default_proxy_binary_path("
 check_contains "scripts/real_cli_matrix.py" 'DEFAULT_RELEASE_PROXY_BINARY = REPO_ROOT / "target" / "release" / "llm-universal-proxy"'
@@ -634,21 +704,54 @@ check_contains ".github/workflows/release.yml" "IMAGE=llm-universal-proxy:releas
 check_contains "docs/README.md" "container.md"
 check_contains "README.md" "docs/container.md"
 check_contains "README_CN.md" "docs/container.md"
+check_contains "README.md" "v0.2.22"
+check_contains "README_CN.md" "v0.2.22"
 check_contains "docs/container.md" "ghcr.io/agentsmith-project/llm-universal-proxy"
+check_contains "docs/container.md" "ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22"
+check_contains "docs/container.md" "ghcr.io/agentsmith-project/llm-universal-proxy@sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89"
+check_contains "docs/container.md" "docker pull ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22"
+check_contains "docs/container.md" "Pin a release tag or digest for production"
+check_contains "docs/container.md" 'Do not use `latest` for production pinning'
+check_contains "docs/container.md" "docker login ghcr.io"
+check_contains "docs/container.md" "personal access token (classic)"
+check_contains "docs/container.md" "read:packages"
+check_contains "docs/container.md" "GITHUB_USERNAME"
+check_contains "docs/container.md" "If the package is public"
+check_contains "docs/container.md" "unauthorized, 403, or package page appears 404"
+check_absent "docs/container.md" "fine-grained personal access token"
+check_absent "docs/container.md" '$GITHUB_ACTOR'
 check_contains "docs/container.md" "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN"
+check_contains "docs/container.md" "LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key"
+check_contains "docs/container.md" "LLM_UNIVERSAL_PROXY_KEY"
+check_contains "docs/container.md" "provider_key_env"
 check_contains "docs/container.md" "Do not mount the local quickstart config unchanged for container service mode"
+check_contains "docs/container.md" "Do not use the unedited example config for real provider requests"
+check_absent "docs/clients.md" "OPENAI_API_KEY=dummy"
+check_absent "docs/clients.md" "ANTHROPIC_API_KEY=dummy"
+check_absent "docs/clients.md" "GEMINI_API_KEY=dummy"
+check_contains "docs/clients.md" 'OPENAI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY'
+check_contains "docs/clients.md" 'ANTHROPIC_API_KEY=$LLM_UNIVERSAL_PROXY_KEY'
+check_contains "docs/clients.md" 'GEMINI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY'
+check_contains "docs/clients.md" 'client_provider_key` mode, set these SDK keys to the real provider key'
 check_contains "docs/admin-dynamic-config.md" "do not introduce a separate service key"
+check_absent "docs/admin-dynamic-config.md" "fallback credential"
+check_absent "docs/admin-dynamic-config.md" "fallback_credential"
+check_contains "docs/admin-dynamic-config.md" "whether a provider key is configured"
+check_contains "docs/admin-dynamic-config.md" "provider_key_env presence"
 check_contains "examples/container-config.yaml" "listen: 0.0.0.0:8080"
-check_contains "examples/container-config.yaml" "credential_env: OPENAI_COMPATIBLE_API_KEY"
-check_contains "examples/container-config.yaml" "credential_env: ANTHROPIC_COMPATIBLE_API_KEY"
+check_contains "examples/container-config.yaml" "provider_key_env: OPENAI_COMPATIBLE_API_KEY"
+check_contains "examples/container-config.yaml" "provider_key_env: ANTHROPIC_COMPATIBLE_API_KEY"
 check_absent "examples/container-config.yaml" "MINIMAX"
 check_absent "examples/container-config.yaml" "PRESET_"
 check_contains "examples/docker-compose.yaml" 'OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:?set OPENAI_COMPATIBLE_API_KEY}'
 check_contains "examples/docker-compose.yaml" 'ANTHROPIC_COMPATIBLE_API_KEY: ${ANTHROPIC_COMPATIBLE_API_KEY:?set ANTHROPIC_COMPATIBLE_API_KEY}'
+check_contains "examples/docker-compose.yaml" "ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22"
+check_absent "examples/docker-compose.yaml" ":latest"
 check_absent "examples/docker-compose.yaml" "MINIMAX"
 check_absent "examples/docker-compose.yaml" "PRESET_"
 check_contains "examples/docker-compose.yaml" 'LLM_UNIVERSAL_PROXY_ADMIN_TOKEN: ${LLM_UNIVERSAL_PROXY_ADMIN_TOKEN:?set LLM_UNIVERSAL_PROXY_ADMIN_TOKEN}'
-check_absent "examples/container-config.yaml" "credential_actual"
+check_contains "examples/docker-compose.yaml" 'LLM_UNIVERSAL_PROXY_AUTH_MODE: proxy_key'
+check_contains "examples/docker-compose.yaml" 'LLM_UNIVERSAL_PROXY_KEY: ${LLM_UNIVERSAL_PROXY_KEY:?set LLM_UNIVERSAL_PROXY_KEY}'
 
 check_contains "scripts/supply_chain_audit.sh" "cargo metadata --locked --format-version 1 --no-deps"
 check_contains "scripts/supply_chain_audit.sh" "cargo audit"

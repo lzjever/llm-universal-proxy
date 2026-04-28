@@ -25,11 +25,11 @@ REQUIRED_COMPAT_PROVIDER_CONFIG = {
     "COMPAT_ANTHROPIC_BASE_URL",
     "COMPAT_ANTHROPIC_MODEL",
 }
-COMPAT_PROVIDER_CREDENTIAL_ALTERNATIVES = {
+COMPAT_PROVIDER_KEY_ALTERNATIVES = {
     "COMPAT_PROVIDER_API_KEY or COMPAT_OPENAI_API_KEY",
     "COMPAT_PROVIDER_API_KEY or COMPAT_ANTHROPIC_API_KEY",
 }
-COMPAT_CREDENTIAL_ENVS = {
+COMPAT_PROVIDER_KEY_ENVS = {
     "COMPAT_PROVIDER_API_KEY",
     "COMPAT_OPENAI_API_KEY",
     "COMPAT_ANTHROPIC_API_KEY",
@@ -71,14 +71,14 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         cases = module.build_compatible_provider_matrix_cases(
             openai_model="compat-openai-contract",
             anthropic_model="compat-anthropic-contract",
-            openai_credential_env="COMPAT_PROVIDER_API_KEY",
-            anthropic_credential_env="COMPAT_PROVIDER_API_KEY",
+            openai_provider_key_env="COMPAT_PROVIDER_API_KEY",
+            anthropic_provider_key_env="COMPAT_PROVIDER_API_KEY",
         )
 
         self.assertGreaterEqual(len(cases), 5)
         self.assertEqual({case.provider for case in cases}, {"compatible"})
         self.assertEqual(
-            {case.env_var for case in cases},
+            {case.provider_key_env for case in cases},
             {"COMPAT_PROVIDER_API_KEY"},
         )
 
@@ -176,8 +176,8 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         cases = module.build_compatible_provider_matrix_cases(
             openai_model="compat-openai-contract",
             anthropic_model="compat-anthropic-contract",
-            openai_credential_env="COMPAT_PROVIDER_API_KEY",
-            anthropic_credential_env="COMPAT_PROVIDER_API_KEY",
+            openai_provider_key_env="COMPAT_PROVIDER_API_KEY",
+            anthropic_provider_key_env="COMPAT_PROVIDER_API_KEY",
         )
         stream_case = next(
             case
@@ -223,7 +223,7 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
             {"openai", "anthropic", "gemini", "minimax"},
         )
         self.assertEqual(
-            {case.env_var for case in cases if case.required},
+            {case.provider_key_env for case in cases if case.required},
             REQUIRED_REAL_PROVIDER_ENVS,
         )
 
@@ -288,7 +288,7 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         module = load_endpoint_matrix_module()
         sentinel_by_env = {
             key: f"compat-matrix-sentinel-{key.lower()}-value"
-            for key in COMPAT_CREDENTIAL_ENVS
+            for key in COMPAT_PROVIDER_KEY_ENVS
         }
         env = {
             "COMPAT_PROVIDER_API_KEY": sentinel_by_env["COMPAT_PROVIDER_API_KEY"],
@@ -308,10 +308,10 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
             module.write_compatible_provider_config(config_path, 43210, compat_config)
             config_text = config_path.read_text(encoding="utf-8")
 
-        self.assertNotIn("credential_actual", config_text)
-        self.assertEqual(config_text.count("credential_env: COMPAT_PROVIDER_API_KEY"), 2)
+        self.assertNotIn("provider_key_inline", config_text)
+        self.assertEqual(config_text.count("provider_key_env: COMPAT_PROVIDER_API_KEY"), 2)
         for official_env in REQUIRED_REAL_PROVIDER_ENVS:
-            self.assertNotIn(f"credential_env: {official_env}", config_text)
+            self.assertNotIn(f"provider_key_env: {official_env}", config_text)
         for secret_value in sentinel_by_env.values():
             self.assertNotIn(secret_value, config_text)
         self.assertNotIn("MINIMAX", config_text.upper())
@@ -339,10 +339,10 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
             module.write_compatible_provider_config(config_path, 43210, compat_config)
             config_text = config_path.read_text(encoding="utf-8")
 
-        self.assertEqual(compat_config.openai_credential_env, "COMPAT_OPENAI_API_KEY")
-        self.assertEqual(compat_config.anthropic_credential_env, "COMPAT_ANTHROPIC_API_KEY")
-        self.assertIn("credential_env: COMPAT_OPENAI_API_KEY", config_text)
-        self.assertIn("credential_env: COMPAT_ANTHROPIC_API_KEY", config_text)
+        self.assertEqual(compat_config.openai_provider_key_env, "COMPAT_OPENAI_API_KEY")
+        self.assertEqual(compat_config.anthropic_provider_key_env, "COMPAT_ANTHROPIC_API_KEY")
+        self.assertIn("provider_key_env: COMPAT_OPENAI_API_KEY", config_text)
+        self.assertIn("provider_key_env: COMPAT_ANTHROPIC_API_KEY", config_text)
         self.assertNotIn("compat-openai-secret", config_text)
         self.assertNotIn("compat-anthropic-secret", config_text)
 
@@ -370,15 +370,15 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
             module.write_real_provider_config(config_path, 43210, args)
             config_text = config_path.read_text(encoding="utf-8")
 
-        self.assertNotIn("credential_actual", config_text)
+        self.assertNotIn("provider_key_inline", config_text)
         for env_name in REQUIRED_REAL_PROVIDER_ENVS:
-            self.assertIn(f"credential_env: {env_name}", config_text)
+            self.assertIn(f"provider_key_env: {env_name}", config_text)
         for secret_value in sentinel_by_env.values():
             self.assertNotIn(secret_value, config_text)
 
     def test_cli_requires_explicit_mode_and_does_not_default_to_real(self):
         env = os.environ.copy()
-        for key in REQUIRED_REAL_PROVIDER_ENVS | COMPAT_CREDENTIAL_ENVS | {"GLM_APIKEY"}:
+        for key in REQUIRED_REAL_PROVIDER_ENVS | COMPAT_PROVIDER_KEY_ENVS | {"GLM_APIKEY"}:
             env.pop(key, None)
 
         completed = subprocess.run(
@@ -399,7 +399,7 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         env = os.environ.copy()
         for key in (
             REQUIRED_REAL_PROVIDER_ENVS
-            | COMPAT_CREDENTIAL_ENVS
+            | COMPAT_PROVIDER_KEY_ENVS
             | REQUIRED_COMPAT_PROVIDER_CONFIG
             | {"GLM_APIKEY", "COMPAT_PROVIDER_LABEL"}
         ):
@@ -441,7 +441,7 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         self.assertEqual(report["provider_label"], "compatible-provider")
         self.assertEqual(
             set(report["missing_config"]),
-            REQUIRED_COMPAT_PROVIDER_CONFIG | COMPAT_PROVIDER_CREDENTIAL_ALTERNATIVES,
+            REQUIRED_COMPAT_PROVIDER_CONFIG | COMPAT_PROVIDER_KEY_ALTERNATIVES,
         )
         self.assertGreaterEqual(report["failed"], 5)
         self.assertEqual(report["passed"], 0)
@@ -466,7 +466,7 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         env = os.environ.copy()
         for key in (
             REQUIRED_REAL_PROVIDER_ENVS
-            | COMPAT_CREDENTIAL_ENVS
+            | COMPAT_PROVIDER_KEY_ENVS
             | REQUIRED_COMPAT_PROVIDER_CONFIG
             | {"GLM_APIKEY"}
         ):

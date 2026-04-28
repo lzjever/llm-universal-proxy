@@ -9,10 +9,14 @@ async fn start_test_proxy() -> (
         .expect("bind proxy");
     let port = listener.local_addr().expect("proxy local addr").port();
     let base = format!("http://127.0.0.1:{port}");
-    let handle =
-        tokio::spawn(
-            async move { run_with_listener(crate::config::Config::default(), listener).await },
-        );
+    let handle = tokio::spawn(async move {
+        run_with_listener_with_data_auth(
+            crate::config::Config::default(),
+            listener,
+            DataAuthConfig::client_provider_key(),
+        )
+        .await
+    });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     (base, handle)
 }

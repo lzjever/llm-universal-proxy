@@ -374,13 +374,11 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-ANTHROPIC:
                     api_root: "https://api.minimaxi.com/anthropic/v1"
                     format: anthropic
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                 model_aliases:
                   minimax-anth: "MINIMAX-ANTHROPIC:MiniMax-M2.7-highspeed"
                   minimax-openai: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
@@ -412,8 +410,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     limits:
                       context_window: 200000
                       max_output_tokens: 128000
@@ -458,8 +455,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     surface_defaults:
                       modalities:
                         input: ["text"]
@@ -671,6 +667,26 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(lanes["qwen-local"].proxy_model, "qwen-local")
         self.assertEqual(lanes["qwen-local"].upstream_name, "LOCAL-QWEN")
 
+    def test_resolve_lanes_skips_qwen_when_provider_key_env_is_missing(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+
+        lanes = {
+            lane.name: lane
+            for lane in module.resolve_lanes(
+                parsed,
+                preset_endpoint_env(
+                    LOCAL_QWEN_BASE_URL="http://127.0.0.1:9997/v1",
+                    LOCAL_QWEN_MODEL="qwen3.5-9b-awq",
+                ),
+            )
+        }
+
+        self.assertFalse(lanes["qwen-local"].enabled)
+        self.assertIn("LOCAL_QWEN_API_KEY", lanes["qwen-local"].skip_reason)
+
     def test_build_runtime_config_overrides_listen_and_injects_qwen(self):
         module = load_module()
         parsed = module.parse_proxy_source(
@@ -717,7 +733,7 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertIn("api_root: https://openai-compatible.example/v1", rendered)
         self.assertIn("PRESET-ANTHROPIC-COMPATIBLE:", rendered)
         self.assertIn("api_root: https://anthropic-compatible.example/v1", rendered)
-        self.assertEqual(rendered.count("credential_env: PRESET_ENDPOINT_API_KEY"), 2)
+        self.assertEqual(rendered.count("provider_key_env: PRESET_ENDPOINT_API_KEY"), 2)
         self.assertIn(
             'preset-openai-compatible: "PRESET-OPENAI-COMPATIBLE:provider-configured-model"',
             rendered,
@@ -789,8 +805,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_env: MINIMAX_API_KEY
-                    auth_policy: force_server
+                    provider_key_env: MINIMAX_API_KEY
                 model_aliases:
                   minimax-openai: "MINIMAX-OPENAI:MiniMax-M2.7-highspeed"
                 """
@@ -809,8 +824,29 @@ class RealCliMatrixTests(unittest.TestCase):
             trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
         )
 
-        self.assertIn("credential_env: LOCAL_QWEN_API_KEY", rendered)
+        self.assertIn("provider_key_env: LOCAL_QWEN_API_KEY", rendered)
         self.assertNotIn("sk-local-secret-that-must-not-be-rendered", rendered)
+
+    def test_build_runtime_config_omits_local_qwen_when_provider_key_env_is_missing(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+
+        rendered = module.build_runtime_config_text(
+            parsed,
+            preset_endpoint_env(
+                LOCAL_QWEN_BASE_URL="http://127.0.0.1:9997/v1",
+                LOCAL_QWEN_MODEL="qwen3.5-9b-awq",
+            ),
+            listen_host="127.0.0.1",
+            listen_port=19999,
+            trace_path=pathlib.Path("/tmp/cli-matrix-trace.jsonl"),
+        )
+
+        self.assertNotIn("LOCAL-QWEN:", rendered)
+        self.assertNotIn('qwen-local: "LOCAL-QWEN:', rendered)
+        self.assertNotIn("provider_key_env: LOCAL_QWEN_API_KEY", rendered)
 
     def test_build_runtime_config_preserves_structured_model_alias_limits(self):
         module = load_module()
@@ -822,8 +858,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     limits:
                       context_window: 200000
                       max_output_tokens: 128000
@@ -863,8 +898,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     surface_defaults:
                       modalities:
                         input: ["text"]
@@ -925,8 +959,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     proxy:
                       url: http://upstream-proxy.example:8080
                     codex:
@@ -1015,8 +1048,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     limits:
                       context_window: 200000
                       max_output_tokens: 128000
@@ -1044,8 +1076,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     limits:
                       context_window: 200000
                       max_output_tokens: 128000
@@ -1072,8 +1103,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     limits:
                       context_window: 200000
                 model_aliases:
@@ -1097,8 +1127,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     codex:
                       input_modalities: ["text"]
                       supports_search_tool: false
@@ -1151,8 +1180,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-ANTHROPIC:
                     api_root: "https://api.minimaxi.com/anthropic/v1"
                     format: anthropic
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                 model_aliases:
                   minimax-anth: "MINIMAX-ANTHROPIC:MiniMax-M2.7-highspeed"
                 debug_trace:
@@ -1184,6 +1212,7 @@ class RealCliMatrixTests(unittest.TestCase):
             "OPENAI_API_KEY": "real-openai",
             "ANTHROPIC_API_KEY": "real-anthropic",
             "GEMINI_API_KEY": "real-gemini",
+            "LLM_UNIVERSAL_PROXY_KEY": "client-proxy-key",
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1198,20 +1227,20 @@ class RealCliMatrixTests(unittest.TestCase):
                 "gemini", base_env, "http://127.0.0.1:18888", root / "gemini-home"
             )
 
-        self.assertEqual(codex_env["OPENAI_API_KEY"], "dummy")
+        self.assertEqual(codex_env["OPENAI_API_KEY"], "client-proxy-key")
         self.assertEqual(
             codex_env["OPENAI_BASE_URL"], "http://127.0.0.1:18888/openai/v1"
         )
         self.assertNotEqual(codex_env["HOME"], "/home/user")
         self.assertNotIn("real-openai", codex_env.values())
 
-        self.assertEqual(claude_env["ANTHROPIC_API_KEY"], "dummy")
+        self.assertEqual(claude_env["ANTHROPIC_API_KEY"], "client-proxy-key")
         self.assertEqual(
             claude_env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18888/anthropic"
         )
         self.assertIn("CLAUDE_CONFIG_DIR", claude_env)
 
-        self.assertEqual(gemini_env["GEMINI_API_KEY"], "dummy")
+        self.assertEqual(gemini_env["GEMINI_API_KEY"], "client-proxy-key")
         self.assertEqual(
             gemini_env["GOOGLE_GEMINI_BASE_URL"], "http://127.0.0.1:18888/google"
         )
@@ -1398,9 +1427,11 @@ class RealCliMatrixTests(unittest.TestCase):
             profile = module.fetch_live_model_profile(
                 "http://127.0.0.1:18888",
                 "MINIMAX-OPENAI:MiniMax-Vision",
+                proxy_key="profile-proxy-key",
             )
 
         self.assertEqual(http_get_json.call_args.args[0], "http://127.0.0.1:18888/openai/v1/models/MINIMAX-OPENAI:MiniMax-Vision")
+        self.assertEqual(http_get_json.call_args.kwargs["bearer_token"], "profile-proxy-key")
         self.assertEqual(profile.limits.context_window, 200000)
         self.assertEqual(profile.limits.max_output_tokens, 128000)
         self.assertEqual(profile.codex_metadata.input_modalities, ("text", "image"))
@@ -1437,6 +1468,7 @@ class RealCliMatrixTests(unittest.TestCase):
                 module.fetch_live_model_profile(
                     "http://127.0.0.1:18888",
                     "minimax-openai",
+                    proxy_key=module.DEFAULT_PROXY_KEY,
                 )
 
     def test_fetch_live_model_profile_requires_llmup_surface_as_the_live_truth_source(self):
@@ -1459,6 +1491,7 @@ class RealCliMatrixTests(unittest.TestCase):
                 module.fetch_live_model_profile(
                     "http://127.0.0.1:18888",
                     "minimax-openai",
+                    proxy_key=module.DEFAULT_PROXY_KEY,
                 )
 
     def test_fetch_live_model_profile_rejects_missing_critical_surface_fields(self):
@@ -1488,6 +1521,7 @@ class RealCliMatrixTests(unittest.TestCase):
                 module.fetch_live_model_profile(
                     "http://127.0.0.1:18888",
                     "minimax-openai",
+                    proxy_key=module.DEFAULT_PROXY_KEY,
                 )
 
     def test_refresh_lane_model_profiles_uses_live_models_for_enabled_lanes(self):
@@ -1526,11 +1560,13 @@ class RealCliMatrixTests(unittest.TestCase):
             module.refresh_lane_model_profiles(
                 "http://127.0.0.1:18888",
                 [enabled_lane, disabled_lane],
+                proxy_key="profile-proxy-key",
             )
 
         fetch_live_model_profile.assert_called_once_with(
             "http://127.0.0.1:18888",
             "MINIMAX-OPENAI:MiniMax-Vision",
+            proxy_key="profile-proxy-key",
         )
         self.assertEqual(enabled_lane.limits, live_profile.limits)
         self.assertEqual(enabled_lane.codex_metadata, live_profile.codex_metadata)
@@ -1732,8 +1768,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     limits:
                       context_window: 200000
                     surface_defaults:
@@ -1798,8 +1833,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     surface_defaults:
                       modalities:
                         input: ["text"]
@@ -1832,8 +1866,7 @@ class RealCliMatrixTests(unittest.TestCase):
                   MINIMAX-OPENAI:
                     api_root: "https://api.minimaxi.com/v1"
                     format: openai-completion
-                    credential_actual: "secret"
-                    auth_policy: force_server
+                    provider_key_env: TEST_PROVIDER_API_KEY
                     surface_defaults:
                       modalities:
                         input: ["text"]
@@ -2042,6 +2075,8 @@ class RealCliMatrixTests(unittest.TestCase):
 
         self.assertEqual(proxy_env["PRESET_ENDPOINT_API_KEY"], "proxy-only-secret")
         self.assertEqual(proxy_env["LOCAL_QWEN_BASE_URL"], "http://127.0.0.1:9997/v1")
+        self.assertEqual(proxy_env["LLM_UNIVERSAL_PROXY_AUTH_MODE"], "proxy_key")
+        self.assertEqual(proxy_env["LLM_UNIVERSAL_PROXY_KEY"], module.DEFAULT_PROXY_KEY)
         self.assertNotIn("PRESET_ENDPOINT_API_KEY", client_env)
         self.assertNotIn("LOCAL_QWEN_BASE_URL", client_env)
 
@@ -2319,8 +2354,18 @@ class RealCliMatrixTests(unittest.TestCase):
                     }
                 ),
             ),
-        ):
-            self.assertIsNone(module.probe_lane("http://127.0.0.1:18888", lane))
+        ) as http_json:
+            self.assertIsNone(
+                module.probe_lane(
+                    "http://127.0.0.1:18888",
+                    lane,
+                    proxy_key="probe-proxy-key",
+                )
+            )
+        self.assertEqual(
+            http_json.call_args.kwargs["bearer_token"],
+            "probe-proxy-key",
+        )
 
     def test_probe_lane_rejects_http_200_body_without_response_shape(self):
         module = load_module()
@@ -2333,7 +2378,14 @@ class RealCliMatrixTests(unittest.TestCase):
         )
 
         with mock.patch.object(module, "http_json", return_value=(200, '{"ok":true}')):
-            self.assertIn("valid response shape", module.probe_lane("http://127.0.0.1:18888", lane))
+            self.assertIn(
+                "valid response shape",
+                module.probe_lane(
+                    "http://127.0.0.1:18888",
+                    lane,
+                    proxy_key=module.DEFAULT_PROXY_KEY,
+                ),
+            )
 
     def test_verify_fixture_output_rejects_comment_only_python_bugfix_edits(self):
         module = load_module()

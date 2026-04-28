@@ -160,7 +160,7 @@ async fn spawn_recording_responses_resource_mock() -> (
             openai_organization: header_value("openai-organization"),
             openai_project: header_value("openai-project"),
             idempotency_key: header_value("idempotency-key"),
-            data_token: header_value(data_auth::DATA_TOKEN_HEADER),
+            data_token: header_value(data_auth::LEGACY_DATA_TOKEN_HEADER),
             content_type: header_value("content-type"),
         });
 
@@ -315,9 +315,8 @@ async fn send_raw_proxy_resource_request(
         .map(|body| serde_json::to_vec(body).expect("serialize raw proxy body"))
         .unwrap_or_default();
     let mut request = format!(
-        "{} {path} HTTP/1.1\r\nHost: {proxy_addr}\r\nopenai-api-key: client-secret\r\nx-stainless-helper-method: {label}\r\nOpenAI-Organization: org-route-preserve\r\nOpenAI-Project: proj-route-preserve\r\nIdempotency-Key: idem-{label}\r\n{}: data-token-must-not-forward\r\nConnection: close\r\n",
-        method.as_str(),
-        data_auth::DATA_TOKEN_HEADER
+        "{} {path} HTTP/1.1\r\nHost: {proxy_addr}\r\nopenai-api-key: client-secret\r\nx-stainless-helper-method: {label}\r\nOpenAI-Organization: org-route-preserve\r\nOpenAI-Project: proj-route-preserve\r\nIdempotency-Key: idem-{label}\r\nConnection: close\r\n",
+        method.as_str()
     );
     if body.is_some() {
         request.push_str("Content-Type: application/json\r\n");
@@ -433,10 +432,9 @@ async fn openai_responses_resource_post_body_limit_rejects_all_json_body_handler
         .await
         .expect("bind proxy listener");
     let proxy_addr = listener.local_addr().expect("proxy addr");
-    let proxy_server =
-        tokio::spawn(
-            async move { run_server(state, listener, data_auth::DataAccess::Disabled).await },
-        );
+    let proxy_server = tokio::spawn(async move {
+        run_server(state, listener, data_auth::DataAccess::ClientProviderKey).await
+    });
     let proxy_base = format!("http://{proxy_addr}");
     let client = reqwest::Client::new();
 
@@ -733,10 +731,9 @@ async fn openai_responses_state_resource_routes_preserve_method_path_query_body_
         .await
         .expect("bind proxy listener");
     let proxy_addr = listener.local_addr().expect("proxy addr");
-    let proxy_server =
-        tokio::spawn(
-            async move { run_server(state, listener, data_auth::DataAccess::Disabled).await },
-        );
+    let proxy_server = tokio::spawn(async move {
+        run_server(state, listener, data_auth::DataAccess::ClientProviderKey).await
+    });
     let proxy_base = format!("http://{proxy_addr}");
     let client = reqwest::Client::new();
 
@@ -930,8 +927,7 @@ async fn openai_responses_state_resource_routes_preserve_method_path_query_body_
                 .header("x-stainless-helper-method", *label)
                 .header("OpenAI-Organization", "org-route-preserve")
                 .header("OpenAI-Project", "proj-route-preserve")
-                .header("Idempotency-Key", format!("idem-{label}"))
-                .header(data_auth::DATA_TOKEN_HEADER, "data-token-must-not-forward");
+                .header("Idempotency-Key", format!("idem-{label}"));
             if let Some(body) = body {
                 request = request.json(body);
             }
@@ -1039,7 +1035,7 @@ async fn openai_responses_state_resource_routes_fail_closed_without_unique_avail
             })),
             metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
             admin_access: AdminAccess::LoopbackOnly,
-            data_auth_policy: loopback_data_auth_policy_for_tests(),
+            data_auth_policy: test_data_auth_policy_for_tests(),
         });
 
         let response = handle_openai_responses_resource(
@@ -1188,6 +1184,7 @@ fn resolve_native_responses_stateful_route_or_error_rejects_multi_upstream_auto_
             "responses".to_string(),
             UpstreamState {
                 config: pinned,
+                provider_key: None,
                 capability: Some(crate::discovery::UpstreamCapability::fixed(
                     crate::formats::UpstreamFormat::OpenAiResponses,
                 )),
@@ -1202,6 +1199,7 @@ fn resolve_native_responses_stateful_route_or_error_rejects_multi_upstream_auto_
             "auto".to_string(),
             UpstreamState {
                 config: auto,
+                provider_key: None,
                 capability: Some(crate::discovery::UpstreamCapability::fixed(
                     crate::formats::UpstreamFormat::Anthropic,
                 )),
@@ -1272,10 +1270,7 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
         name: "responses".to_string(),
         api_root: format!("http://{addr}"),
         fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
-        fallback_credential_env: None,
-        fallback_credential_actual: None,
-        fallback_api_key: None,
-        auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+        provider_key_env: None,
         upstream_headers: Vec::new(),
         proxy: None,
         limits: None,
@@ -1310,6 +1305,7 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
             upstream.name.clone(),
             UpstreamState {
                 config: upstream,
+                provider_key: None,
                 capability: Some(crate::discovery::UpstreamCapability::fixed(
                     crate::formats::UpstreamFormat::OpenAiResponses,
                 )),
@@ -1332,7 +1328,7 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
         })),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
-        data_auth_policy: loopback_data_auth_policy_for_tests(),
+        data_auth_policy: test_data_auth_policy_for_tests(),
     });
 
     let response = handle_openai_responses_resource(

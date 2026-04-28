@@ -9,6 +9,7 @@ cd "$ROOT_DIR"
 PROXY_BIN="${PROXY_BIN:-./target/release/llm-universal-proxy}"
 HOST="127.0.0.1"
 PROXY_PORT="${PROXY_PORT:-}"
+SMOKE_PROVIDER_KEY="binary-smoke-provider-key"
 
 TMP_DIR=""
 MOCK_PID=""
@@ -154,12 +155,13 @@ assert_eq() {
 
 start_mock_upstream() {
     log "Starting mock upstream"
-    python3 -u - "$MOCK_PORT_FILE" >/dev/null 2>"$MOCK_STDERR" <<'PY' &
+    python3 -u - "$MOCK_PORT_FILE" "$SMOKE_PROVIDER_KEY" >/dev/null 2>"$MOCK_STDERR" <<'PY' &
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port_file = sys.argv[1]
+expected_provider_key = sys.argv[2]
 
 
 def anthropic_stream(model: str) -> bytes:
@@ -258,11 +260,34 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.wfile.flush()
 
+    def _send_auth_error(self, expected_header: str):
+        self._send_json(
+            401,
+            {
+                "error": "unexpected upstream authorization",
+                "expected_header": expected_header,
+            },
+        )
+
+    def _require_anthropic_auth(self) -> bool:
+        if self.headers.get("x-api-key") == expected_provider_key:
+            return True
+        self._send_auth_error("x-api-key")
+        return False
+
+    def _require_openai_auth(self) -> bool:
+        if self.headers.get("Authorization") == f"Bearer {expected_provider_key}":
+            return True
+        self._send_auth_error("Authorization")
+        return False
+
     def do_POST(self):
         body = self._read_json()
         model = body.get("model", "missing-model")
 
         if self.path in ("/v1/messages", "/messages"):
+            if not self._require_anthropic_auth():
+                return
             stream = bool(body.get("stream"))
 
             if stream:
@@ -293,6 +318,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path in ("/v1/chat/completions", "/chat/completions"):
+            if not self._require_openai_auth():
+                return
             self._send_json(200, openai_completion(model))
             return
 
@@ -337,7 +364,8 @@ EOF
 
 start_proxy() {
     log "Starting proxy binary"
-    "$PROXY_BIN" --config "$PROXY_CONFIG" >/dev/null 2>"$PROXY_STDERR" &
+    LLM_UNIVERSAL_PROXY_AUTH_MODE=client_provider_key \
+        "$PROXY_BIN" --config "$PROXY_CONFIG" >/dev/null 2>"$PROXY_STDERR" &
     PROXY_PID=$!
     wait_for_http_ok "http://${HOST}:${PROXY_PORT}/health" "proxy" "$PROXY_PID"
 }
@@ -369,6 +397,7 @@ run_responses_anthropic_sse_smoke() {
             -X POST "http://${HOST}:${PROXY_PORT}/openai/v1/responses" \
             -H "Accept: text/event-stream" \
             -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${SMOKE_PROVIDER_KEY}" \
             --data '{"model":"GLM-5","input":"Hi","stream":true}' \
             -w '%{http_code}'
     )"; then
@@ -439,6 +468,7 @@ PY
             -o "$RESP_BODY" \
             -X POST "http://${HOST}:${PROXY_PORT}/namespaces/demo/openai/v1/chat/completions" \
             -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${SMOKE_PROVIDER_KEY}" \
             --data '{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}],"stream":false}' \
             -w '%{http_code}'
     )"; then

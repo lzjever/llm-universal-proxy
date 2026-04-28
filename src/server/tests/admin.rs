@@ -155,10 +155,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
             name: "default".to_string(),
             api_root: "https://user:pass@api.openai.com/v1?api_key=inline-secret#frag".to_string(),
             fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
-            fallback_credential_env: Some("DEMO_KEY".to_string()),
-            fallback_credential_actual: Some("inline-secret".to_string()),
-            fallback_api_key: Some("inline-secret".to_string()),
-            auth_policy: crate::config::AuthPolicy::ForceServer,
+            provider_key_env: None,
             upstream_headers: vec![
                 ("x-tenant".to_string(), "demo".to_string()),
                 (
@@ -200,6 +197,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
         "default".to_string(),
         UpstreamState {
             config: config.upstreams[0].clone(),
+            provider_key: None,
             capability: Some(crate::discovery::UpstreamCapability::fixed(
                 crate::formats::UpstreamFormat::OpenAiResponses,
             )),
@@ -227,7 +225,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
         runtime: Arc::new(RwLock::new(runtime)),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
-        data_auth_policy: loopback_data_auth_policy_for_tests(),
+        data_auth_policy: test_data_auth_policy_for_tests(),
     });
 
     let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))
@@ -316,10 +314,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
             name: "default".to_string(),
             api_root: "https://api.openai.com/v1".to_string(),
             fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
-            fallback_credential_env: None,
-            fallback_credential_actual: None,
-            fallback_api_key: None,
-            auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+            provider_key_env: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -346,6 +341,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
         "default".to_string(),
         UpstreamState {
             config: config.upstreams[0].clone(),
+            provider_key: None,
             capability: Some(crate::discovery::UpstreamCapability::fixed(
                 crate::formats::UpstreamFormat::OpenAiResponses,
             )),
@@ -373,7 +369,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
         runtime: Arc::new(RwLock::new(runtime)),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
-        data_auth_policy: loopback_data_auth_policy_for_tests(),
+        data_auth_policy: test_data_auth_policy_for_tests(),
     });
 
     let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))
@@ -410,10 +406,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
             name: "default".to_string(),
             api_root: "https://api.openai.com/v1".to_string(),
             fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
-            fallback_credential_env: None,
-            fallback_credential_actual: None,
-            fallback_api_key: None,
-            auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+            provider_key_env: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -440,6 +433,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
         "default".to_string(),
         UpstreamState {
             config: config.upstreams[0].clone(),
+            provider_key: None,
             capability: Some(crate::discovery::UpstreamCapability::fixed(
                 crate::formats::UpstreamFormat::OpenAiResponses,
             )),
@@ -467,7 +461,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
         runtime: Arc::new(RwLock::new(runtime)),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
-        data_auth_policy: loopback_data_auth_policy_for_tests(),
+        data_auth_policy: test_data_auth_policy_for_tests(),
     });
 
     let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))

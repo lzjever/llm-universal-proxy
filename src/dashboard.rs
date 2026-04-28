@@ -15,7 +15,7 @@ use ratatui::{
     Terminal,
 };
 
-use crate::config::{AuthPolicy, Config};
+use crate::config::Config;
 use crate::dashboard_logs::DashboardLogSnapshot;
 use crate::hooks::HookSnapshot;
 use crate::server::{DashboardNamespaceSnapshot, DashboardRuntimeHandle, DashboardUpstreamStatus};
@@ -318,10 +318,7 @@ fn render_config(
         .upstreams
         .iter()
         .map(|upstream| {
-            let mode = match upstream.auth_policy {
-                AuthPolicy::ClientOrFallback => "client_or_fallback",
-                AuthPolicy::ForceServer => "force_server",
-            };
+            let provider_key = upstream.provider_key_env.as_deref().unwrap_or("client");
             let format = upstream
                 .fixed_upstream_format
                 .map(|value| format!("{value:?}"))
@@ -331,7 +328,10 @@ fn render_config(
                 .find(|status| status.name == upstream.name)
                 .map(format_dashboard_availability)
                 .unwrap_or_else(|| "status unknown".to_string());
-            format!("{}  [{format}]  {mode}  {availability}", upstream.name)
+            format!(
+                "{}  [{format}]  provider_key_env={provider_key}  {availability}",
+                upstream.name
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");

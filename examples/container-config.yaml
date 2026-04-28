@@ -5,8 +5,7 @@ upstreams:
   OPENAI_COMPATIBLE:
     api_root: https://openai-compatible.example/v1
     format: openai-completion
-    credential_env: OPENAI_COMPATIBLE_API_KEY
-    auth_policy: force_server
+    provider_key_env: OPENAI_COMPATIBLE_API_KEY
     limits:
       context_window: 200000
       max_output_tokens: 128000
@@ -23,8 +22,7 @@ upstreams:
   ANTHROPIC_COMPATIBLE:
     api_root: https://anthropic-compatible.example/v1
     format: anthropic
-    credential_env: ANTHROPIC_COMPATIBLE_API_KEY
-    auth_policy: force_server
+    provider_key_env: ANTHROPIC_COMPATIBLE_API_KEY
     limits:
       context_window: 200000
       max_output_tokens: 128000

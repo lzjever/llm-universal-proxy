@@ -23,8 +23,7 @@ upstreams:
   PRESET-ANTHROPIC-COMPATIBLE:
     api_root: PRESET_ANTHROPIC_ENDPOINT_BASE_URL
     format: anthropic
-    credential_env: PRESET_ENDPOINT_API_KEY
-    auth_policy: force_server
+    provider_key_env: PRESET_ENDPOINT_API_KEY
     limits:
       context_window: 200000
       max_output_tokens: 128000
@@ -41,8 +40,7 @@ upstreams:
   PRESET-OPENAI-COMPATIBLE:
     api_root: PRESET_OPENAI_ENDPOINT_BASE_URL
     format: openai-completion
-    credential_env: PRESET_ENDPOINT_API_KEY
-    auth_policy: force_server
+    provider_key_env: PRESET_ENDPOINT_API_KEY
     limits:
       context_window: 200000
       max_output_tokens: 128000
@@ -77,6 +75,8 @@ export PRESET_OPENAI_ENDPOINT_BASE_URL="https://openai-compatible.example/v1"
 export PRESET_ANTHROPIC_ENDPOINT_BASE_URL="https://anthropic-compatible.example/v1"
 export PRESET_ENDPOINT_MODEL="provider-model-id"
 export PRESET_ENDPOINT_API_KEY="provider-api-key"
+export LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key
+export LLM_UNIVERSAL_PROXY_KEY="local-proxy-key"
 
 ./scripts/run_codex_proxy.sh \
   --config-source examples/quickstart-provider-neutral.yaml \
@@ -90,14 +90,12 @@ Reasoning effort such as `xhigh` stays on the client request; it is not part of 
 
 ## Data Plane Security
 
-The client-facing provider/model/resource routes use a data-plane boundary that is separate from the admin token. Set `LLM_UNIVERSAL_PROXY_DATA_TOKEN` for shared or remote deployments and send it as either:
+Client-facing provider/model/resource routes use a required global auth mode that is separate from the admin token. Set `LLM_UNIVERSAL_PROXY_AUTH_MODE` to exactly one of:
 
-- `Authorization: Bearer <data-token>`
-- `X-LLMUP-Data-Token: <data-token>`
+- `proxy_key`: clients send the proxy key as their normal SDK API key or as `Authorization: Bearer <proxy-key>`. The proxy uses each upstream's `provider_key_env` value to read the real provider key from its own environment.
+- `client_provider_key`: clients send the real provider key as their normal SDK API key or bearer token. The proxy does not need provider key env vars for those upstream calls.
 
-`/health` remains unauthenticated. If the data token is unset, the data plane defaults to loopback-only local access. `LLM_UNIVERSAL_PROXY_DATA_AUTH=disabled` explicitly disables data-plane auth for trusted local/test setups, but a non-loopback listener with server-held credentials or `auth_policy: force_server` fails closed unless a data token is configured.
-
-Data tokens are not provider credentials. The proxy strips the data token before upstream calls and hook payloads; use `X-LLMUP-Data-Token` when you also need to pass a client provider credential in `Authorization`.
+`LLM_UNIVERSAL_PROXY_KEY` is required only in `proxy_key` mode. `/health` remains unauthenticated. Provider/model/resource routes reject missing client keys in both modes. Admin API routes still use `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` and `Authorization: Bearer <admin-token>`.
 
 CORS is off by default. To allow browser callers, set `LLM_UNIVERSAL_PROXY_CORS_ALLOWED_ORIGINS` to a comma-separated list of exact origins, for example `https://app.example,https://console.example`. Wildcard origins are not accepted, and CORS is not an auth mechanism.
 
@@ -142,17 +140,15 @@ Each upstream usually needs:
 
 - `api_root`: the provider API root, including its version segment
 - `format`: the expected upstream protocol when you want to pin it
-- `credential_env` or `credential_actual`: the server-side fallback credential
-- `auth_policy`: whether the client may bring its own credential
+- `provider_key_env`: the environment variable that contains the provider key in `proxy_key` mode
 
 Practical rules:
 
 - `api_root` should point at the provider API root, not a model-specific path
 - include the version segment such as `/v1` or `/v1beta`
 - `upstream_headers` may add non-secret routing or tenant headers, but cannot override auth/secret headers such as `authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `openai-api-key`, `x-goog-api-key`, or `anthropic-api-key`
-- use `credential_env` when you want secrets outside the YAML file
-- use `auth_policy: force_server` when the proxy should always use the server-side credential
-- use `auth_policy: client_or_fallback` when the client may provide its own auth and the proxy only falls back when needed
+- use `provider_key_env` when `LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key`
+- omit `provider_key_env` when `LLM_UNIVERSAL_PROXY_AUTH_MODE=client_provider_key` and clients provide provider keys directly
 
 Provider-specific static headers belong inside the upstream's `headers` field.
 

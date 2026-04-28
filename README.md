@@ -36,8 +36,7 @@ upstreams:
   PRESET-ANTHROPIC-COMPATIBLE:
     api_root: PRESET_ANTHROPIC_ENDPOINT_BASE_URL
     format: anthropic
-    credential_env: PRESET_ENDPOINT_API_KEY
-    auth_policy: force_server
+    provider_key_env: PRESET_ENDPOINT_API_KEY
     limits:
       context_window: 200000
       max_output_tokens: 128000
@@ -54,8 +53,7 @@ upstreams:
   PRESET-OPENAI-COMPATIBLE:
     api_root: PRESET_OPENAI_ENDPOINT_BASE_URL
     format: openai-completion
-    credential_env: PRESET_ENDPOINT_API_KEY
-    auth_policy: force_server
+    provider_key_env: PRESET_ENDPOINT_API_KEY
     limits:
       context_window: 200000
       max_output_tokens: 128000
@@ -85,6 +83,8 @@ export PRESET_OPENAI_ENDPOINT_BASE_URL="https://openai-compatible.example/v1"
 export PRESET_ANTHROPIC_ENDPOINT_BASE_URL="https://anthropic-compatible.example/v1"
 export PRESET_ENDPOINT_MODEL="provider-model-id"
 export PRESET_ENDPOINT_API_KEY="provider-api-key"
+export LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key
+export LLM_UNIVERSAL_PROXY_KEY="local-proxy-key"
 ```
 
 What those variables do:
@@ -95,6 +95,8 @@ What those variables do:
 | `PRESET_ANTHROPIC_ENDPOINT_BASE_URL` | API root for the Anthropic-compatible upstream |
 | `PRESET_ENDPOINT_MODEL` | Provider model ID hydrated into both preset aliases |
 | `PRESET_ENDPOINT_API_KEY` | Server-side provider credential used by both preset upstreams |
+| `LLM_UNIVERSAL_PROXY_AUTH_MODE` | Required proxy auth mode; use `proxy_key` when the proxy holds provider keys |
+| `LLM_UNIVERSAL_PROXY_KEY` | Required in `proxy_key` mode; client SDK API keys must use this value |
 
 The `PRESET_*` values are a wrapper/config-source contract. The wrappers hydrate them into a concrete runtime config before starting the proxy. If you run `llm-universal-proxy --config` directly, replace the placeholders with concrete URLs and model names first.
 
@@ -194,7 +196,13 @@ For the full YAML reference and more examples, see [docs/configuration.md](./doc
 
 ## Container Image
 
-Release images are published at `ghcr.io/agentsmith-project/llm-universal-proxy`. Container usage, Docker Compose, container smoke, Admin Dashboard auth boundaries, and GHCR release policy are documented in [docs/container.md](./docs/container.md).
+Release images are published at `ghcr.io/agentsmith-project/llm-universal-proxy`.
+The current container release is `v0.2.22`; for production, pin
+`ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22` or the published
+digest instead of relying on `latest`. Container usage, Docker Compose,
+one-minute smoke verification, Admin Dashboard auth boundaries, and GHCR access
+for authenticated or public pulls are documented in
+[docs/container.md](./docs/container.md).
 
 ## Dynamic Configuration Overview
 

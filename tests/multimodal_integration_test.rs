@@ -10,10 +10,14 @@ use common::mock_upstream::{
 use common::proxy_helpers::proxy_config;
 use common::runtime_proxy::start_proxy;
 use llm_universal_proxy::formats::UpstreamFormat;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client as ReqwestClient,
+};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+const TEST_PROVIDER_KEY: &str = "provider-secret";
 const PNG_B64: &str = "iVBORw0KGgo=";
 const POLLUTED_PNG_B64: &str = "iVBORw0K\r\nGgo=";
 const PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgo=";
@@ -31,6 +35,18 @@ const ENCODED_CONTROL_REMOTE_IMAGE_URL: &str = "https://example.com/cat%0A.png";
 const ENCODED_CONTROL_REMOTE_PDF_URL: &str = "https://example.com/doc%00.pdf";
 const TEXT_DATA_URI: &str = "data:text/plain;base64,SGVsbG8=";
 
+fn authenticated_reqwest_client() -> ReqwestClient {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TEST_PROVIDER_KEY}")).unwrap(),
+    );
+    ReqwestClient::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn multimodal_openai_chat_to_gemini_maps_inline_and_file_data() {
     let (mock_base, _mock, captured) =
@@ -38,7 +54,7 @@ async fn multimodal_openai_chat_to_gemini_maps_inline_and_file_data() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -75,7 +91,7 @@ async fn multimodal_responses_to_gemini_maps_inline_and_file_data() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -113,7 +129,7 @@ async fn multimodal_openai_chat_to_anthropic_maps_data_uri_image_to_base64_sourc
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "claude-3-5-sonnet",
@@ -319,7 +335,7 @@ async fn multimodal_openai_chat_responses_polluted_media_sources_fail_closed_bef
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gpt-4o",
@@ -345,7 +361,7 @@ async fn multimodal_openai_chat_responses_polluted_media_sources_fail_closed_bef
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gpt-4o",
@@ -376,7 +392,7 @@ async fn multimodal_openai_polluted_input_audio_to_gemini_fails_closed_before_up
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -426,7 +442,7 @@ async fn multimodal_openai_audio_and_non_pdf_file_to_anthropic_fail_closed_befor
         let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
         let (proxy_base, _proxy) = start_proxy(config).await;
 
-        let response = Client::new()
+        let response = authenticated_reqwest_client()
             .post(format!("{proxy_base}/openai/v1/chat/completions"))
             .json(&json!({
                 "model": "claude-3-5-sonnet",
@@ -443,7 +459,7 @@ async fn multimodal_openai_audio_and_non_pdf_file_to_anthropic_fail_closed_befor
 }
 
 async fn send_anthropic_url_image_request(proxy_base: &str, image_url: &str) -> reqwest::Response {
-    Client::new()
+    authenticated_reqwest_client()
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
@@ -468,7 +484,7 @@ async fn send_anthropic_url_image_request(proxy_base: &str, image_url: &str) -> 
 }
 
 async fn send_anthropic_base64_image_request(proxy_base: &str, data: &str) -> reqwest::Response {
-    Client::new()
+    authenticated_reqwest_client()
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
@@ -497,7 +513,7 @@ async fn send_remote_image_chat_request(proxy_base: &str) -> reqwest::Response {
 }
 
 async fn send_openai_chat_image_request(proxy_base: &str, image_url: &str) -> reqwest::Response {
-    Client::new()
+    authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "multimodal-test",

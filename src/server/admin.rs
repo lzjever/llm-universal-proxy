@@ -98,6 +98,7 @@ fn admin_proxy_url(metadata: &crate::upstream::ResolvedProxyMetadata) -> Option<
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdminConfigCasRequest {
     #[serde(default)]
     if_revision: Option<String>,
@@ -367,7 +368,13 @@ pub(super) async fn handle_admin_namespace_config(
         return admin_write_error_response(response);
     }
     let revision = generate_admin_revision();
-    let namespace_state = match build_runtime_namespace_state(revision.clone(), config).await {
+    let namespace_state = match build_runtime_namespace_state(
+        revision.clone(),
+        config,
+        &state.data_auth_policy.access,
+    )
+    .await
+    {
         Ok(state) => state,
         Err(error) => {
             return error_response(

@@ -15,9 +15,26 @@ use common::proxy_helpers::proxy_config;
 use common::runtime_proxy::start_proxy;
 use llm_universal_proxy::config::CompatibilityMode;
 use llm_universal_proxy::formats::UpstreamFormat;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client as ReqwestClient,
+};
 use serde_json::json;
 use serde_json::Value;
+
+const TEST_PROVIDER_KEY: &str = "provider-secret";
+
+fn authenticated_reqwest_client() -> ReqwestClient {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TEST_PROVIDER_KEY}")).unwrap(),
+    );
+    ReqwestClient::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
 
 fn parse_sse_payloads(body: &str) -> Vec<Value> {
     body.split("\n\n")
@@ -109,7 +126,7 @@ async fn anthropic_thinking_to_openai_chat_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -137,7 +154,7 @@ async fn anthropic_thinking_to_gemini_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!(
             "{proxy_base}/google/v1beta/models/test:generateContent"
@@ -166,7 +183,7 @@ async fn anthropic_thinking_to_responses_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
@@ -195,7 +212,7 @@ async fn anthropic_signed_thinking_to_responses_non_streaming_returns_carrier() 
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
@@ -230,7 +247,7 @@ async fn anthropic_signed_thinking_responses_round_trip_non_streaming_degrades_c
     let source_config = proxy_config(&source_base, UpstreamFormat::Anthropic);
     let (source_proxy_base, _source_proxy) = start_proxy(source_config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let first_response = client
         .post(format!("{source_proxy_base}/openai/v1/responses"))
         .json(&json!({
@@ -311,7 +328,7 @@ async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_drops_car
     let source_config = proxy_config(&source_base, UpstreamFormat::Anthropic);
     let (source_proxy_base, _source_proxy) = start_proxy(source_config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let first_response = client
         .post(format!("{source_proxy_base}/openai/v1/responses"))
         .json(&json!({
@@ -396,7 +413,7 @@ async fn openai_reasoning_to_anthropic_non_streaming_preserves_unsigned_thinking
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -417,7 +434,7 @@ async fn openai_reasoning_to_responses_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "mock", "input": "Hi", "stream": false }))
@@ -442,7 +459,7 @@ async fn openai_reasoning_to_gemini_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!(
             "{proxy_base}/google/v1beta/models/test:generateContent"
@@ -472,7 +489,7 @@ async fn responses_reasoning_to_openai_chat_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -500,7 +517,7 @@ async fn responses_reasoning_to_anthropic_non_streaming_preserves_unsigned_think
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -521,7 +538,7 @@ async fn responses_reasoning_to_gemini_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!(
             "{proxy_base}/google/v1beta/models/test:generateContent"
@@ -550,7 +567,7 @@ async fn gemini_thinking_to_openai_chat_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -578,7 +595,7 @@ async fn gemini_thinking_to_anthropic_non_streaming_preserves_unsigned_thinking_
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -599,7 +616,7 @@ async fn gemini_thinking_to_responses_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "gemini-test", "input": "Hi", "stream": false }))
@@ -628,7 +645,7 @@ async fn anthropic_thinking_to_openai_chat_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -655,7 +672,7 @@ async fn anthropic_thinking_to_responses_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "claude-3", "input": "Hi", "stream": true }))
@@ -679,7 +696,7 @@ async fn anthropic_signed_thinking_to_openai_chat_streaming_drops_signature_and_
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -711,7 +728,7 @@ async fn anthropic_omitted_thinking_to_openai_chat_streaming_skips_hidden_reason
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -741,7 +758,7 @@ async fn openai_reasoning_to_anthropic_streaming_preserves_unsigned_thinking_wit
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -762,7 +779,7 @@ async fn openai_reasoning_to_responses_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "mock", "input": "Hi", "stream": true }))
@@ -783,7 +800,7 @@ async fn responses_reasoning_to_openai_chat_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -806,7 +823,7 @@ async fn responses_reasoning_to_anthropic_streaming_preserves_unsigned_thinking_
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -828,7 +845,7 @@ async fn responses_reasoning_with_encrypted_carrier_to_anthropic_streaming_degra
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -849,7 +866,7 @@ async fn gemini_thinking_to_openai_chat_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -871,7 +888,7 @@ async fn gemini_thinking_to_anthropic_streaming_preserves_unsigned_thinking_with
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -892,7 +909,7 @@ async fn gemini_thinking_to_responses_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "gemini-test", "input": "Hi", "stream": true }))
@@ -914,7 +931,7 @@ async fn anthropic_thinking_to_gemini_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!(
             "{proxy_base}/google/v1beta/models/test:streamGenerateContent"
@@ -940,7 +957,7 @@ async fn anthropic_thinking_with_tools_to_openai_chat_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -972,7 +989,7 @@ async fn anthropic_thinking_with_tools_to_responses_non_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
@@ -1011,7 +1028,7 @@ async fn anthropic_thinking_with_tools_to_openai_streaming() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -1045,7 +1062,7 @@ async fn multi_turn_anthropic_thinking_preserved_in_history() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -1079,7 +1096,7 @@ async fn multi_turn_openai_reasoning_in_history_to_claude_preserves_unsigned_thi
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -1109,7 +1126,7 @@ async fn multi_turn_openai_reasoning_to_claude_replays_as_unsigned_thinking_with
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -1151,7 +1168,7 @@ async fn multi_turn_gemini_thought_in_history_to_claude_preserves_unsigned_think
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!(
             "{proxy_base}/google/v1beta/models/test:generateContent"
@@ -1198,7 +1215,7 @@ async fn openai_reasoning_tool_turns_replay_to_gemini_does_not_inject_thought_si
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -1284,7 +1301,7 @@ async fn anthropic_thinking_usage_translated_to_openai() {
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -1307,7 +1324,7 @@ async fn openai_reasoning_usage_to_anthropic_preserves_unsigned_thinking_without
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -1328,7 +1345,7 @@ async fn gemini_thinking_usage_translated_to_openai() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -1352,7 +1369,7 @@ async fn openai_reasoning_with_completion_tokens_details() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "mock", "input": "Hi", "stream": false }))
@@ -1377,7 +1394,7 @@ async fn empty_thinking_block_no_crash() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .json(&json!({
@@ -1401,7 +1418,7 @@ async fn reasoning_and_text_both_present_in_response() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({ "model": "mock", "input": "Hi", "stream": false }))
@@ -1423,7 +1440,7 @@ async fn gemini_thinking_no_signature_streaming_to_openai() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
@@ -1448,7 +1465,7 @@ async fn gemini_thinking_no_signature_non_streaming_to_openai() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let client = Client::new();
+    let client = authenticated_reqwest_client();
     let res = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({

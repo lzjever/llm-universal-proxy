@@ -120,11 +120,11 @@ class DocsHomepageContractTests(unittest.TestCase):
             "PRESET_ANTHROPIC_ENDPOINT_BASE_URL",
         )
         self.assertEqual(
-            parsed.upstreams["PRESET-OPENAI-COMPATIBLE"]["credential_env"],
+            parsed.upstreams["PRESET-OPENAI-COMPATIBLE"]["provider_key_env"],
             "PRESET_ENDPOINT_API_KEY",
         )
         self.assertEqual(
-            parsed.upstreams["PRESET-ANTHROPIC-COMPATIBLE"]["credential_env"],
+            parsed.upstreams["PRESET-ANTHROPIC-COMPATIBLE"]["provider_key_env"],
             "PRESET_ENDPOINT_API_KEY",
         )
         self.assertEqual(

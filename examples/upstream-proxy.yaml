@@ -32,16 +32,14 @@ upstreams:
   OPENAI:
     api_root: https://api.openai.com/v1
     format: openai-responses
-    credential_env: OPENAI_API_KEY
-    auth_policy: force_server
+    provider_key_env: OPENAI_API_KEY
     # No upstream `proxy` here:
     # this upstream inherits the namespace default proxy above.
 
   ANTHROPIC:
     api_root: https://api.anthropic.com/v1
     format: anthropic
-    credential_env: ANTHROPIC_API_KEY
-    auth_policy: force_server
+    provider_key_env: ANTHROPIC_API_KEY
     proxy:
       url: socks5h://regional-proxy.example:1080/anthropic-egress
     # Per-upstream override:
@@ -50,8 +48,7 @@ upstreams:
   GOOGLE:
     api_root: https://generativelanguage.googleapis.com/v1beta
     format: google
-    credential_env: GEMINI_API_KEY
-    auth_policy: force_server
+    provider_key_env: GEMINI_API_KEY
     proxy: direct
     # Explicit direct:
     # this upstream bypasses both the namespace default proxy and env proxies.
@@ -59,8 +56,7 @@ upstreams:
   OPENROUTER:
     api_root: https://openrouter.ai/api/v1
     format: openai-responses
-    credential_env: OPENROUTER_API_KEY
-    auth_policy: force_server
+    provider_key_env: OPENROUTER_API_KEY
     # If you want this upstream to inherit HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY,
     # omit `proxy` here and also remove the top-level namespace `proxy` above.
     # With the file as written, this upstream still uses the namespace default proxy.

@@ -33,10 +33,7 @@ async fn build_runtime_namespace_state_exposes_resolved_per_upstream_clients() {
             name: "primary".to_string(),
             api_root: api_root.clone(),
             fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiCompletion),
-            fallback_credential_env: None,
-            fallback_credential_actual: None,
-            fallback_api_key: None,
-            auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+            provider_key_env: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -48,10 +45,13 @@ async fn build_runtime_namespace_state_exposes_resolved_per_upstream_clients() {
         resource_limits: Default::default(),
     };
 
-    let namespace_state =
-        crate::server::state::build_runtime_namespace_state("rev-test".to_string(), config.clone())
-            .await
-            .expect("build runtime namespace state");
+    let namespace_state = crate::server::state::build_runtime_namespace_state(
+        "rev-test".to_string(),
+        config.clone(),
+        &data_auth::DataAccess::ClientProviderKey,
+    )
+    .await
+    .expect("build runtime namespace state");
 
     let upstream_state = namespace_state
         .upstreams
@@ -117,10 +117,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
             name: "auto".to_string(),
             api_root: "https://example.com/v1".to_string(),
             fixed_upstream_format: None,
-            fallback_credential_env: None,
-            fallback_credential_actual: None,
-            fallback_api_key: None,
-            auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+            provider_key_env: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -163,6 +160,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
         "auto".to_string(),
         UpstreamState {
             config: config.upstreams[0].clone(),
+            provider_key: None,
             capability: None,
             availability: crate::discovery::UpstreamAvailability::Unavailable {
                 reason: "protocol discovery returned no supported formats".to_string(),

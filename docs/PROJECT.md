@@ -104,7 +104,7 @@ docs/
 | `src/server/mod.rs` | Router assembly for admin, dashboard, health, data routes, namespaces, CORS, disconnect wrapping |
 | `src/server/state.rs` | Runtime namespace state, admin policy, upstream resolution bootstrap |
 | `src/server/admin.rs` | Admin token middleware and namespace config/state handlers |
-| `src/server/data_auth.rs` | Data-plane auth policy: `LLM_UNIVERSAL_PROXY_DATA_TOKEN`, `X-LLMUP-Data-Token`, loopback-only, disabled, CORS origins |
+| `src/server/data_auth.rs` | Provider-route auth policy: `LLM_UNIVERSAL_PROXY_AUTH_MODE`, `LLM_UNIVERSAL_PROXY_KEY`, `provider_key_env`, and admin separation |
 | `src/server/body_limits.rs` | JSON request parsing with namespace `max_request_body_bytes` enforcement |
 | `src/server/proxy.rs` | Main request execution path for OpenAI, Anthropic, and Gemini surfaces |
 | `src/server/responses_resources.rs` | Native OpenAI Responses and Conversations lifecycle resource handlers |

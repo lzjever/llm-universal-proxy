@@ -154,8 +154,8 @@ The proxy MUST support:
 - **Model aliases** — map local model names to `upstream:real_model` pairs
 - **Auto-discovery** — probe upstream to detect supported protocols when format is not explicitly set
 - **Credential policies**:
-  - `client_or_fallback` — use client-provided auth if present, otherwise use configured fallback
-  - `force_server` — always use server-side credentials, ignore client auth
+  - `client_provider_key` — clients send provider keys directly; missing keys fail closed
+  - `proxy_key` — clients send `LLM_UNIVERSAL_PROXY_KEY`; upstream calls use `provider_key_env`
 - **Discovery availability split**:
   - fixed-format upstreams are immediately available
   - auto-discovered upstreams are available only when discovery returns at least one supported protocol
@@ -218,8 +218,8 @@ The proxy MUST expose a separate admin control plane with these properties:
 - If `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is not set, admin access MUST be restricted to loopback clients only.
 - In loopback-only mode, admin requests carrying explicit proxy forwarding headers such as `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, or `X-Real-IP` MUST be rejected.
 - Admin read endpoints MUST use a dedicated read/view model rather than serializing the internal runtime `Config`.
-- Admin state responses MUST redact secrets and MUST NOT return upstream `fallback_credential_actual` or hook `authorization` values in plaintext.
-- Admin state responses SHOULD expose non-secret presence signals instead, such as whether a fallback credential or hook authorization is configured.
+- Admin state responses MUST redact secrets and MUST NOT return provider keys or hook `authorization` values in plaintext.
+- Admin state responses SHOULD expose non-secret presence signals instead, such as whether a provider key or hook authorization is configured.
 - Admin state responses MUST sanitize URLs before returning them and MUST NOT return userinfo.
 - Admin state URLs are sanitized display values and MUST NOT include userinfo, query, or fragment components.
 - Config validation MUST reject upstream `api_root` values or hook URLs that contain userinfo.

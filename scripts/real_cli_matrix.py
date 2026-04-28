@@ -104,6 +104,9 @@ PRESET_OPENAI_COMPATIBLE_LANE = "preset-openai-compatible"
 PRESET_ANTHROPIC_COMPATIBLE_LANE = "preset-anthropic-compatible"
 PRESET_OPENAI_COMPATIBLE_UPSTREAM = "PRESET-OPENAI-COMPATIBLE"
 PRESET_ANTHROPIC_COMPATIBLE_UPSTREAM = "PRESET-ANTHROPIC-COMPATIBLE"
+AUTH_MODE_ENV = "LLM_UNIVERSAL_PROXY_AUTH_MODE"
+PROXY_KEY_ENV = "LLM_UNIVERSAL_PROXY_KEY"
+DEFAULT_PROXY_KEY = "llmup-proxy-key"
 SUPPORTED_PROMPT_TEMPLATE_FIELDS = frozenset({"client_name"})
 REPLAY_MARKER_KEY_ENV = "LLMUP_INTERNAL_REPLAY_MARKER_KEY"
 REPLAY_MARKER_KEY_FILENAME = ".llmup-internal-replay-marker-key"
@@ -938,9 +941,18 @@ def parse_proxy_source(text: str) -> ProxySourceConfig:
     )
 
 
+def _has_nonempty_env(dotenv_env: dict[str, str], key: str) -> bool:
+    return bool(dotenv_env.get(key, "").strip())
+
+
 def has_local_qwen(dotenv_env: dict[str, str]) -> bool:
-    return bool(
-        dotenv_env.get("LOCAL_QWEN_BASE_URL") and dotenv_env.get("LOCAL_QWEN_MODEL")
+    return all(
+        _has_nonempty_env(dotenv_env, key)
+        for key in (
+            "LOCAL_QWEN_BASE_URL",
+            "LOCAL_QWEN_MODEL",
+            "LOCAL_QWEN_API_KEY",
+        )
     )
 
 
@@ -989,7 +1001,7 @@ def required_preset_endpoint_env_keys(config: ProxySourceConfig) -> tuple[str, .
             continue
         if upstream.get("api_root") == base_url_env:
             _append_unique(required, base_url_env)
-        if upstream.get("credential_env") == PRESET_ENDPOINT_API_KEY_ENV:
+        if upstream.get("provider_key_env") == PRESET_ENDPOINT_API_KEY_ENV:
             _append_unique(required, PRESET_ENDPOINT_API_KEY_ENV)
 
     preset_upstreams = _preset_upstream_names()
@@ -1032,6 +1044,15 @@ def merge_preset_endpoint_env(
         if base_env.get(key):
             merged[key] = base_env[key]
     return merged
+
+
+def resolve_proxy_key(base_env: dict[str, str], dotenv_env: dict[str, str] | None = None) -> str:
+    dotenv_env = dotenv_env or {}
+    for env_source in (base_env, dotenv_env):
+        value = env_source.get(PROXY_KEY_ENV, "")
+        if value.strip():
+            return value
+    return DEFAULT_PROXY_KEY
 
 
 def _hydrate_preset_endpoint_model_target(
@@ -1090,7 +1111,8 @@ def resolve_lanes(
         if not enabled:
             if lane_name == "qwen-local":
                 skip_reason = (
-                    "LOCAL_QWEN_BASE_URL and LOCAL_QWEN_MODEL are not both configured; "
+                    "LOCAL_QWEN_BASE_URL, LOCAL_QWEN_MODEL, and LOCAL_QWEN_API_KEY "
+                    "are not all configured; "
                     "optional qwen-local lane will be skipped"
                 )
             else:
@@ -1128,13 +1150,9 @@ def _runtime_upstreams(
             [
                 ("api_root", dotenv_env["LOCAL_QWEN_BASE_URL"]),
                 ("format", "openai-completion"),
+                ("provider_key_env", "LOCAL_QWEN_API_KEY"),
             ]
         )
-        if dotenv_env.get("LOCAL_QWEN_API_KEY"):
-            qwen_upstream["credential_env"] = "LOCAL_QWEN_API_KEY"
-        else:
-            qwen_upstream["credential_actual"] = "not-needed"
-        qwen_upstream["auth_policy"] = "force_server"
         upstreams["LOCAL-QWEN"] = qwen_upstream
     return upstreams
 
@@ -2042,6 +2060,7 @@ def build_client_env(
         }
     )
     env.update(_resolve_host_rust_toolchain_env(base_env))
+    proxy_key = resolve_proxy_key(base_env)
 
     if client_name == "codex":
         codex_home = home_dir / ".codex"
@@ -2049,7 +2068,7 @@ def build_client_env(
         env.update(
             {
                 "CODEX_HOME": str(codex_home),
-                "OPENAI_API_KEY": "dummy",
+                "OPENAI_API_KEY": proxy_key,
                 "OPENAI_BASE_URL": f"{proxy_base}/openai/v1",
             }
         )
@@ -2059,14 +2078,14 @@ def build_client_env(
         env.update(
             {
                 "CLAUDE_CONFIG_DIR": str(claude_dir),
-                "ANTHROPIC_API_KEY": "dummy",
+                "ANTHROPIC_API_KEY": proxy_key,
                 "ANTHROPIC_BASE_URL": f"{proxy_base}/anthropic",
             }
         )
     elif client_name == "gemini":
         env.update(
             {
-                "GEMINI_API_KEY": "dummy",
+                "GEMINI_API_KEY": proxy_key,
                 "GOOGLE_GEMINI_BASE_URL": f"{proxy_base}/google",
             }
         )
@@ -2303,8 +2322,23 @@ def wait_for_health(
     )
 
 
-def http_get_json(url: str, timeout: int = 30) -> object:
-    request = urllib.request.Request(url, method="GET")
+def _auth_headers(bearer_token: str | None) -> dict[str, str]:
+    if not bearer_token:
+        return {}
+    return {"Authorization": f"Bearer {bearer_token}"}
+
+
+def http_get_json(
+    url: str,
+    timeout: int = 30,
+    *,
+    bearer_token: str | None = None,
+) -> object:
+    request = urllib.request.Request(
+        url,
+        headers=_auth_headers(bearer_token),
+        method="GET",
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
@@ -2434,10 +2468,13 @@ def fetch_live_model_profile(
     proxy_base: str,
     model_name: str,
     timeout_secs: int = 30,
+    *,
+    proxy_key: str | None = None,
 ) -> LiveModelProfile:
     payload = http_get_json(
         live_model_details_url(proxy_base, model_name),
         timeout=timeout_secs,
+        bearer_token=proxy_key,
     )
     if not isinstance(payload, dict):
         raise RuntimeError("live model lookup must return a JSON object")
@@ -2468,20 +2505,37 @@ def fetch_live_model_profile(
     )
 
 
-def refresh_lane_model_profiles(proxy_base: str, lanes: Iterable[Lane]) -> None:
+def refresh_lane_model_profiles(
+    proxy_base: str,
+    lanes: Iterable[Lane],
+    *,
+    proxy_key: str | None = None,
+) -> None:
     for lane in lanes:
         if not lane.enabled:
             continue
-        profile = fetch_live_model_profile(proxy_base, lane.proxy_model)
+        profile = fetch_live_model_profile(
+            proxy_base,
+            lane.proxy_model,
+            proxy_key=proxy_key,
+        )
         lane.limits = profile.limits
         lane.codex_metadata = profile.codex_metadata
 
 
-def http_json(url: str, payload: dict[str, object], timeout: int = 60) -> tuple[int, str]:
+def http_json(
+    url: str,
+    payload: dict[str, object],
+    timeout: int = 60,
+    *,
+    bearer_token: str | None = None,
+) -> tuple[int, str]:
+    headers = {"Content-Type": "application/json"}
+    headers.update(_auth_headers(bearer_token))
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -2524,11 +2578,17 @@ def probe_response_has_valid_shape(body: str) -> bool:
     return payload.get("object") == "response"
 
 
-def probe_lane(proxy_base: str, lane: Lane) -> str | None:
+def probe_lane(
+    proxy_base: str,
+    lane: Lane,
+    *,
+    proxy_key: str | None = None,
+) -> str | None:
     status, body = http_json(
         f"{proxy_base}/openai/v1/responses",
         {"model": lane.proxy_model, "input": "Reply with exactly PROBE_OK", "stream": False},
         timeout=60,
+        bearer_token=proxy_key,
     )
     if status != 200:
         return f"lane probe returned HTTP {status}: {body[:240]}"
@@ -5408,6 +5468,8 @@ def prepare_proxy_env(
 ) -> dict[str, str]:
     proxy_env = dict(base_env)
     proxy_env.update(dotenv_env)
+    proxy_env[AUTH_MODE_ENV] = "proxy_key"
+    proxy_env[PROXY_KEY_ENV] = resolve_proxy_key(base_env, dotenv_env)
     if runtime_root is not None:
         proxy_env[REPLAY_MARKER_KEY_ENV] = ensure_replay_marker_key(runtime_root)
     return proxy_env
@@ -5576,6 +5638,9 @@ def run(argv: list[str] | None = None) -> int:
         trace_path=trace_path,
     )
     proxy_env = prepare_proxy_env(base_env, dotenv_env, report_dir)
+    proxy_key = proxy_env[PROXY_KEY_ENV]
+    client_base_env = dict(base_env)
+    client_base_env[PROXY_KEY_ENV] = proxy_key
     process = None
     results: list[dict[str, object]] = []
 
@@ -5602,9 +5667,15 @@ def run(argv: list[str] | None = None) -> int:
                 pass
             return 0
 
-        refresh_lane_model_profiles(proxy_base, lanes)
+        refresh_lane_model_profiles(proxy_base, lanes, proxy_key=proxy_key)
 
-        lane_probes = {lane.name: classify_lane_health(lane, probe_lane(proxy_base, lane)) for lane in lanes}
+        lane_probes = {
+            lane.name: classify_lane_health(
+                lane,
+                probe_lane(proxy_base, lane, proxy_key=proxy_key),
+            )
+            for lane in lanes
+        }
         for case in cases:
             lane_status, lane_message = lane_probes[case.lane.name]
             if lane_status != "ready":
@@ -5625,7 +5696,7 @@ def run(argv: list[str] | None = None) -> int:
                     case,
                     proxy_base,
                     report_dir,
-                    base_env,
+                    client_base_env,
                     timeout_policy=timeout_policy,
                     dangerous_harness=args.dangerous_harness,
                 )

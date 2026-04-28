@@ -49,6 +49,33 @@ pub(crate) use state::{
     DashboardNamespaceSnapshot, DashboardRuntimeHandle, DashboardUpstreamStatus,
 };
 
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct DataAuthConfig {
+    access: data_auth::DataAccess,
+}
+
+impl DataAuthConfig {
+    pub fn client_provider_key() -> Self {
+        Self {
+            access: data_auth::DataAccess::ClientProviderKey,
+        }
+    }
+
+    pub fn proxy_key(key: impl Into<String>) -> Self {
+        let key = key.into();
+        let access = if key.trim().is_empty() {
+            data_auth::DataAccess::Misconfigured(format!(
+                "{} must not be empty",
+                data_auth::PROXY_KEY_ENV
+            ))
+        } else {
+            data_auth::DataAccess::ProxyKey { key }
+        };
+        Self { access }
+    }
+}
+
 pub async fn run_with_config_path(
     path: impl AsRef<std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -120,28 +147,21 @@ fn init_tracing(dashboard_enabled: bool) -> Result<(), Box<dyn std::error::Error
 }
 
 /// Run the proxy on an already-bound listener. Used by integration tests to bind to port 0 and get the port.
-pub async fn run_with_listener(
+pub fn run_with_listener(
     config: Config,
     listener: tokio::net::TcpListener,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_listener_internal(config, listener, data_auth::DataAccess::from_env()).await
+) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+    let data_access = data_auth::DataAccess::from_env();
+    async move { run_with_listener_internal(config, listener, data_access).await }
 }
 
 #[doc(hidden)]
-pub async fn run_with_listener_with_data_token(
+pub async fn run_with_listener_with_data_auth(
     config: Config,
     listener: tokio::net::TcpListener,
-    data_token: String,
+    data_auth: DataAuthConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if data_token.trim().is_empty() {
-        return Err(io::Error::other("data auth token must not be empty").into());
-    }
-    run_with_listener_internal(
-        config,
-        listener,
-        data_auth::DataAccess::BearerToken(data_token),
-    )
-    .await
+    run_with_listener_internal(config, listener, data_auth.access).await
 }
 
 async fn run_with_listener_internal(
@@ -159,7 +179,7 @@ async fn run_with_listener_internal(
     let data_auth_policy =
         data_auth::RuntimeConfigValidationPolicy::new(listener_addr, data_access.clone());
     let metrics = RuntimeMetrics::new(&config);
-    let runtime = build_runtime_state(config).await?;
+    let runtime = build_runtime_state(config, &data_access).await?;
     let state = Arc::new(AppState {
         runtime: Arc::new(RwLock::new(runtime)),
         metrics,
@@ -184,7 +204,9 @@ pub async fn run_with_listener_and_dashboard(
     let data_auth_policy =
         data_auth::RuntimeConfigValidationPolicy::new(listener_addr, data_access.clone());
     let metrics = RuntimeMetrics::new(&config);
-    let runtime = Arc::new(RwLock::new(build_runtime_state(config.clone()).await?));
+    let runtime = Arc::new(RwLock::new(
+        build_runtime_state(config.clone(), &data_access).await?,
+    ));
     let dashboard_runtime = DashboardRuntimeHandle::new(runtime.clone());
     let state = Arc::new(AppState {
         runtime,
@@ -462,7 +484,6 @@ fn data_cors_layer_from_env() -> Result<Option<CorsLayer>, String> {
                 header::ACCEPT,
                 header::AUTHORIZATION,
                 header::CONTENT_TYPE,
-                HeaderName::from_static(data_auth::DATA_TOKEN_HEADER),
                 HeaderName::from_static("x-api-key"),
                 HeaderName::from_static("api-key"),
                 HeaderName::from_static("openai-api-key"),

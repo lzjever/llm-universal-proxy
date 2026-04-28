@@ -92,23 +92,22 @@ Locked tool identity contract:
 
 - Protocol format detection and translation (request + response, streaming + non-streaming)
 - Multi-upstream routing with model aliases
-- Credential management (client auth passthrough, server-side fallback, force-server)
+- Credential management for client-provided provider keys and proxy-held provider keys
 - Auto-discovery of upstream protocol capabilities
 - Observability (debug traces, hooks, dashboard)
 - Tool/function call translation across protocols
 - Reasoning/thinking output preservation
 - Usage/token metric normalization
 - Capability-surface projection for real agent clients and compatibility modes
-- Proxy authentication boundaries for health, data-plane, and admin-plane routes
+- Proxy authentication boundaries for health, provider/model/resource, and admin-plane routes
 
 Proxy authentication is in scope:
 
 - `/health` remains unauthenticated so process and container health checks can run without secrets.
-- Data-plane provider/model/resource routes require `LLM_UNIVERSAL_PROXY_DATA_TOKEN` for shared or remote service use. Clients may send it as `X-LLMUP-Data-Token` or `Authorization: Bearer <data-token>`, and the proxy strips that token before upstream calls and hook payloads.
+- Provider/model/resource routes require `LLM_UNIVERSAL_PROXY_AUTH_MODE`. In `proxy_key` mode, clients send `LLM_UNIVERSAL_PROXY_KEY` as the normal SDK API key or `Authorization: Bearer <proxy-key>`, and the proxy reads upstream provider keys from `provider_key_env`. In `client_provider_key` mode, clients send provider keys directly and the proxy does not need provider key env vars for those calls.
 - `/dashboard` shell and static assets are public UI resources. Dashboard JavaScript sends `Authorization: Bearer <admin-token>` only when it calls existing `/admin/*` APIs.
 - Admin-plane routes use `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` when it is configured, sent as `Authorization: Bearer <admin-token>`. Empty or whitespace-only admin tokens are misconfiguration and fail closed.
-- When an admin or data token is not configured, that plane defaults to loopback-only access and rejects proxy-forwarding headers in loopback-only mode.
-- A non-loopback listener with server-held provider credentials, sensitive upstream headers, or `auth_policy: force_server` must fail closed unless the data token boundary is configured.
+- Missing or invalid client keys fail closed on provider/model/resource routes. Admin auth remains separately governed by the admin token boundary.
 
 ### Out of Scope
 

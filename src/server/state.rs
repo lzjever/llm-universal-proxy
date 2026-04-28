@@ -49,6 +49,7 @@ impl AdminAccess {
 #[derive(Clone)]
 pub(super) struct UpstreamState {
     pub(super) config: UpstreamConfig,
+    pub(super) provider_key: Option<String>,
     pub(super) capability: Option<UpstreamCapability>,
     pub(super) availability: UpstreamAvailability,
     pub(super) client: Client,
@@ -138,11 +139,12 @@ impl DashboardNamespaceSnapshot {
 pub(super) async fn build_runtime_namespace_state(
     revision: String,
     config: Config,
+    data_access: &super::data_auth::DataAccess,
 ) -> Result<RuntimeNamespaceState, String> {
     if !config.upstreams.is_empty() {
         config.validate()?;
     }
-    let upstreams = resolve_upstreams(&config).await?;
+    let upstreams = resolve_upstreams(&config, data_access).await?;
     let hooks = HookDispatcher::new(&config.hooks);
     let debug_trace = DebugTraceRecorder::new(&config.debug_trace);
     Ok(RuntimeNamespaceState {
@@ -154,12 +156,15 @@ pub(super) async fn build_runtime_namespace_state(
     })
 }
 
-pub(super) async fn build_runtime_state(config: Config) -> Result<RuntimeState, String> {
+pub(super) async fn build_runtime_state(
+    config: Config,
+    data_access: &super::data_auth::DataAccess,
+) -> Result<RuntimeState, String> {
     let mut state = RuntimeState::default();
     if !config.upstreams.is_empty() {
         state.namespaces.insert(
             DEFAULT_NAMESPACE.to_string(),
-            build_runtime_namespace_state(generate_admin_revision(), config).await?,
+            build_runtime_namespace_state(generate_admin_revision(), config, data_access).await?,
         );
     }
     Ok(state)
@@ -171,6 +176,7 @@ pub(super) fn generate_admin_revision() -> String {
 
 pub(super) async fn resolve_upstreams(
     config: &Config,
+    data_access: &super::data_auth::DataAccess,
 ) -> Result<BTreeMap<String, UpstreamState>, String> {
     let mut upstreams = BTreeMap::new();
     for upstream in &config.upstreams {
@@ -180,13 +186,14 @@ pub(super) async fn resolve_upstreams(
             upstream::build_upstream_clients(config, upstream_proxy, namespace_proxy)?;
         let no_auto_decompression_client =
             upstream::build_no_auto_decompression_client(config.upstream_timeout, &resolved_proxy)?;
+        let provider_key = data_access.provider_key_for_upstream(upstream)?;
         let mut discovered = if let Some(f) = upstream.fixed_upstream_format {
             DiscoveredUpstream::fixed(f)
         } else {
             let supported = crate::discovery::discover_supported_formats(
                 &client,
                 &upstream.api_root,
-                upstream.fallback_api_key.as_deref(),
+                provider_key.as_deref(),
                 &upstream.upstream_headers,
             )
             .await;
@@ -200,6 +207,7 @@ pub(super) async fn resolve_upstreams(
             upstream.name.clone(),
             UpstreamState {
                 config: upstream.clone(),
+                provider_key,
                 capability: discovered.capability,
                 availability: discovered.availability,
                 client,

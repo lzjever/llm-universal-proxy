@@ -13,7 +13,7 @@ fn extract_forwardable_headers_keeps_only_protocol_headers() {
     headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
     headers.insert("connection", HeaderValue::from_static("keep-alive"));
     headers.insert(
-        data_auth::DATA_TOKEN_HEADER,
+        data_auth::LEGACY_DATA_TOKEN_HEADER,
         HeaderValue::from_static("data-token"),
     );
 
@@ -39,5 +39,5 @@ fn extract_forwardable_headers_keeps_only_protocol_headers() {
     assert!(!forwarded.iter().any(|(k, _)| k == "connection"));
     assert!(!forwarded
         .iter()
-        .any(|(k, _)| k == data_auth::DATA_TOKEN_HEADER));
+        .any(|(k, _)| k == data_auth::LEGACY_DATA_TOKEN_HEADER));
 }

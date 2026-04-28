@@ -16,11 +16,14 @@ use common::proxy_helpers::proxy_config;
 use common::runtime_proxy::{start_proxy, upstream_api_root};
 use futures_util::{future::join_all, Stream, StreamExt};
 use llm_universal_proxy::config::{
-    AuthPolicy, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ProxyConfig,
-    RuntimeConfigPayload, RuntimeHookConfig, RuntimeUpstreamConfig,
+    Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ProxyConfig, RuntimeConfigPayload,
+    RuntimeHookConfig, RuntimeUpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap as ReqwestHeaderMap, HeaderValue},
+    Client as ReqwestClient, IntoUrl, RequestBuilder as ReqwestRequestBuilder,
+};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::fs::OpenOptions;
@@ -38,6 +41,32 @@ use tokio::sync::Notify;
 
 static ADMIN_TOKEN_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+const TEST_PROVIDER_KEY: &str = "provider-secret";
+
+#[derive(Clone)]
+struct Client {
+    inner: ReqwestClient,
+}
+
+impl Client {
+    fn new() -> Self {
+        let mut headers = ReqwestHeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {TEST_PROVIDER_KEY}")).unwrap(),
+        );
+        Self {
+            inner: ReqwestClient::builder()
+                .default_headers(headers)
+                .build()
+                .unwrap(),
+        }
+    }
+
+    fn post<U: IntoUrl>(&self, url: U) -> ReqwestRequestBuilder {
+        self.inner.post(url)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CapturedLiveRequest {
@@ -394,8 +423,9 @@ async fn open_raw_http_request(
 
     let request_body = body.map(|value| serde_json::to_vec(value).unwrap());
     let content_length = request_body.as_ref().map_or(0, Vec::len);
-    let mut request =
-        format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\n");
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\nAuthorization: Bearer {TEST_PROVIDER_KEY}\r\n"
+    );
     if request_body.is_some() {
         request.push_str("Content-Type: application/json\r\n");
     }
@@ -943,9 +973,7 @@ fn runtime_namespace_config(
             name: "default".to_string(),
             api_root: upstream_api_root(upstream_base, format),
             fixed_upstream_format: Some(format),
-            fallback_credential_env: None,
-            fallback_credential_actual: None,
-            auth_policy: AuthPolicy::ClientOrFallback,
+            provider_key_env: None,
             upstream_headers: vec![("x-namespace-tag".to_string(), namespace_tag.to_string())],
             proxy: None,
             limits: None,

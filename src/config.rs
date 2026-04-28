@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
+use serde::de::{self, value::MapAccessDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::formats::UpstreamFormat;
@@ -14,15 +15,6 @@ pub use self::model_surface::{
     ApplyPatchTransport, CompatibilityMode, ModelModalities, ModelModality, ModelSurface,
     ModelSurfacePatch, ModelToolSurface,
 };
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub enum AuthPolicy {
-    #[serde(rename = "client_or_fallback", alias = "client-or-fallback")]
-    #[default]
-    ClientOrFallback,
-    #[serde(rename = "force_server", alias = "force-server")]
-    ForceServer,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookConfig {
@@ -54,6 +46,7 @@ impl Default for HookConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DebugTraceConfig {
     pub path: Option<String>,
     pub max_text_chars: usize,
@@ -78,6 +71,7 @@ impl Default for DebugTraceConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
@@ -171,7 +165,7 @@ pub enum ProxyConfig {
     Proxy { url: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 enum ProxyConfigSerde {
     Direct(String),
@@ -197,13 +191,57 @@ impl<'de> Deserialize<'de> for ProxyConfig {
     where
         D: Deserializer<'de>,
     {
-        match ProxyConfigSerde::deserialize(deserializer)? {
-            ProxyConfigSerde::Direct(value) if value == "direct" => Ok(Self::Direct),
-            ProxyConfigSerde::Direct(value) => Err(serde::de::Error::custom(format!(
+        deserializer.deserialize_any(ProxyConfigVisitor)
+    }
+}
+
+struct ProxyConfigVisitor;
+
+impl<'de> Visitor<'de> for ProxyConfigVisitor {
+    type Value = ProxyConfig;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("proxy config string `direct` or object with field `url`")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value == "direct" {
+            Ok(ProxyConfig::Direct)
+        } else {
+            Err(de::Error::custom(format!(
                 "proxy config string must be `direct`, got `{value}`"
-            ))),
-            ProxyConfigSerde::Proxy { url } => Ok(Self::Proxy { url }),
+            )))
         }
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut url = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "url" => {
+                    if url.is_some() {
+                        return Err(de::Error::duplicate_field("url"));
+                    }
+                    url = Some(map.next_value()?);
+                }
+                _ => return Err(de::Error::unknown_field(&key, &["url"])),
+            }
+        }
+        let url = url.ok_or_else(|| de::Error::missing_field("url"))?;
+        Ok(ProxyConfig::Proxy { url })
     }
 }
 
@@ -247,6 +285,7 @@ fn url_has_explicit_authority(value: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -295,14 +334,9 @@ pub struct UpstreamConfig {
     pub api_root: String,
     /// Optional fixed upstream format. When unset, capability discovery is used.
     pub fixed_upstream_format: Option<UpstreamFormat>,
-    /// Optional fallback credential env var name, for example `GLM_APIKEY`.
-    pub fallback_credential_env: Option<String>,
-    /// Optional fallback credential value loaded directly from config.
-    pub fallback_credential_actual: Option<String>,
-    /// Resolved fallback credential value loaded from the env var above.
-    pub fallback_api_key: Option<String>,
-    /// Credential policy for this upstream.
-    pub auth_policy: AuthPolicy,
+    /// Provider credential env var name used when the proxy owns upstream credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_key_env: Option<String>,
     /// Optional static headers to inject into every upstream request.
     pub upstream_headers: Vec<(String, String)>,
     /// Optional per-upstream proxy override. When unset, the namespace default is used.
@@ -318,6 +352,7 @@ pub struct UpstreamConfig {
 
 /// One local model alias that resolves to a named upstream and upstream model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelAlias {
     pub upstream_name: String,
     pub upstream_model: String,
@@ -358,6 +393,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeHookEndpointConfig {
     pub url: String,
     #[serde(default)]
@@ -365,6 +401,7 @@ pub struct RuntimeHookEndpointConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeHookConfig {
     #[serde(default = "default_hook_max_pending_bytes")]
     pub max_pending_bytes: usize,
@@ -394,17 +431,14 @@ impl Default for RuntimeHookConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeUpstreamConfig {
     pub name: String,
     pub api_root: String,
     #[serde(default)]
     pub fixed_upstream_format: Option<UpstreamFormat>,
-    #[serde(default)]
-    pub fallback_credential_env: Option<String>,
-    #[serde(default)]
-    pub fallback_credential_actual: Option<String>,
-    #[serde(default)]
-    pub auth_policy: AuthPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_key_env: Option<String>,
     #[serde(default)]
     pub upstream_headers: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -416,6 +450,7 @@ pub struct RuntimeUpstreamConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfigPayload {
     #[serde(default = "default_listen")]
     pub listen: String,
@@ -489,9 +524,8 @@ pub struct AdminUpstreamConfigView {
     pub name: String,
     pub api_root: String,
     pub fixed_upstream_format: Option<UpstreamFormat>,
-    pub fallback_credential_env: Option<String>,
-    pub fallback_credential_configured: bool,
-    pub auth_policy: AuthPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_key_env: Option<String>,
     pub upstream_headers: Vec<AdminHeaderValueView>,
     pub proxy: Option<ProxyConfig>,
     pub limits: Option<ModelLimits>,
@@ -513,6 +547,7 @@ pub struct AdminConfigView {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default = "default_listen")]
     listen: String,
@@ -535,28 +570,14 @@ struct FileConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpstreamConfigFile {
     #[serde(alias = "url", alias = "upstream_url", alias = "base_url")]
     api_root: String,
     #[serde(default, alias = "upstream_format", alias = "format")]
     fixed_upstream_format: Option<UpstreamFormat>,
-    #[serde(
-        default,
-        alias = "fallback_credential_key",
-        alias = "fallback_credential_env",
-        alias = "credential_env",
-        alias = "api_key_env"
-    )]
-    fallback_credential_env: Option<String>,
-    #[serde(
-        default,
-        alias = "credential_actual",
-        alias = "fallback_credential_actual",
-        alias = "api_key"
-    )]
-    fallback_credential_actual: Option<String>,
     #[serde(default)]
-    auth_policy: AuthPolicy,
+    provider_key_env: Option<String>,
     #[serde(default, alias = "headers", alias = "upstream_headers")]
     upstream_headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -567,14 +588,55 @@ struct UpstreamConfigFile {
     surface_defaults: Option<ModelSurfacePatch>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 enum ModelAliasFile {
     Target(String),
     Structured(StructuredModelAliasFile),
 }
 
+impl<'de> Deserialize<'de> for ModelAliasFile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ModelAliasFileVisitor)
+    }
+}
+
+struct ModelAliasFileVisitor;
+
+impl<'de> Visitor<'de> for ModelAliasFileVisitor {
+    type Value = ModelAliasFile;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("model alias target string or object with field `target`")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(ModelAliasFile::Target(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(ModelAliasFile::Target(value))
+    }
+
+    fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        StructuredModelAliasFile::deserialize(MapAccessDeserializer::new(map))
+            .map(ModelAliasFile::Structured)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StructuredModelAliasFile {
     target: String,
     #[serde(default)]
@@ -584,6 +646,7 @@ struct StructuredModelAliasFile {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HooksFileConfig {
     #[serde(default = "default_hook_max_pending_bytes")]
     max_pending_bytes: usize,
@@ -600,6 +663,7 @@ struct HooksFileConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HookEndpointConfigFile {
     url: String,
     #[serde(default)]
@@ -640,25 +704,15 @@ impl Config {
         let upstreams = parsed
             .upstreams
             .into_iter()
-            .map(|(name, item)| {
-                let fallback_api_key = item.fallback_credential_actual.clone().or_else(|| {
-                    item.fallback_credential_env
-                        .as_deref()
-                        .and_then(|env_name| std::env::var(env_name).ok())
-                });
-                UpstreamConfig {
-                    name,
-                    api_root: item.api_root,
-                    fixed_upstream_format: item.fixed_upstream_format,
-                    fallback_credential_env: item.fallback_credential_env,
-                    fallback_credential_actual: item.fallback_credential_actual,
-                    fallback_api_key,
-                    auth_policy: item.auth_policy,
-                    upstream_headers: item.upstream_headers.into_iter().collect(),
-                    proxy: item.proxy,
-                    limits: item.limits,
-                    surface_defaults: item.surface_defaults,
-                }
+            .map(|(name, item)| UpstreamConfig {
+                name,
+                api_root: item.api_root,
+                fixed_upstream_format: item.fixed_upstream_format,
+                provider_key_env: item.provider_key_env,
+                upstream_headers: item.upstream_headers.into_iter().collect(),
+                proxy: item.proxy,
+                limits: item.limits,
+                surface_defaults: item.surface_defaults,
             })
             .collect();
 
@@ -757,19 +811,13 @@ impl Config {
                     upstream.name
                 ));
             }
-            if upstream.fallback_credential_env.is_some()
-                && upstream.fallback_credential_actual.is_some()
+            if upstream
+                .provider_key_env
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
             {
                 return Err(format!(
-                    "upstream `{}` cannot set both credential_env and credential_actual",
-                    upstream.name
-                ));
-            }
-            if upstream.auth_policy == AuthPolicy::ForceServer
-                && upstream.fallback_api_key.is_none()
-            {
-                return Err(format!(
-                    "upstream `{}` auth_policy=force-server requires a server credential",
+                    "upstream `{}` provider_key_env must not be empty",
                     upstream.name
                 ));
             }
@@ -943,25 +991,15 @@ impl TryFrom<RuntimeConfigPayload> for Config {
         let upstreams = value
             .upstreams
             .into_iter()
-            .map(|item| {
-                let fallback_api_key = item.fallback_credential_actual.clone().or_else(|| {
-                    item.fallback_credential_env
-                        .as_deref()
-                        .and_then(|env_name| std::env::var(env_name).ok())
-                });
-                UpstreamConfig {
-                    name: item.name,
-                    api_root: item.api_root,
-                    fixed_upstream_format: item.fixed_upstream_format,
-                    fallback_credential_env: item.fallback_credential_env,
-                    fallback_credential_actual: item.fallback_credential_actual,
-                    fallback_api_key,
-                    auth_policy: item.auth_policy,
-                    upstream_headers: item.upstream_headers,
-                    proxy: item.proxy,
-                    limits: item.limits,
-                    surface_defaults: item.surface_defaults,
-                }
+            .map(|item| UpstreamConfig {
+                name: item.name,
+                api_root: item.api_root,
+                fixed_upstream_format: item.fixed_upstream_format,
+                provider_key_env: item.provider_key_env,
+                upstream_headers: item.upstream_headers,
+                proxy: item.proxy,
+                limits: item.limits,
+                surface_defaults: item.surface_defaults,
             })
             .collect::<Vec<_>>();
 
@@ -1008,9 +1046,7 @@ impl From<&Config> for RuntimeConfigPayload {
                     name: item.name.clone(),
                     api_root: item.api_root.clone(),
                     fixed_upstream_format: item.fixed_upstream_format,
-                    fallback_credential_env: item.fallback_credential_env.clone(),
-                    fallback_credential_actual: item.fallback_credential_actual.clone(),
-                    auth_policy: item.auth_policy,
+                    provider_key_env: item.provider_key_env.clone(),
                     upstream_headers: item.upstream_headers.clone(),
                     proxy: item.proxy.clone(),
                     limits: item.limits.clone(),
@@ -1060,10 +1096,7 @@ impl From<&Config> for AdminConfigView {
                     name: item.name.clone(),
                     api_root: sanitize_url_for_admin(&item.api_root),
                     fixed_upstream_format: item.fixed_upstream_format,
-                    fallback_credential_env: item.fallback_credential_env.clone(),
-                    fallback_credential_configured: item.fallback_credential_actual.is_some()
-                        || item.fallback_api_key.is_some(),
-                    auth_policy: item.auth_policy,
+                    provider_key_env: item.provider_key_env.clone(),
                     upstream_headers: item
                         .upstream_headers
                         .iter()
@@ -1418,7 +1451,6 @@ mod tests {
 
     #[test]
     fn config_from_yaml_str_parses_multi_upstream_and_aliases() {
-        std::env::set_var("GLM_APIKEY", "glm-secret");
         let c = Config::from_yaml_str(
             r#"
 listen: 127.0.0.1:8080
@@ -1427,7 +1459,7 @@ upstreams:
   GLM-OFFICIAL:
     api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
-    credential_env: GLM_APIKEY
+    provider_key_env: GLM_APIKEY
   OPENAI:
     api_root: https://api.openai.com/v1
     format: openai-responses
@@ -1443,13 +1475,10 @@ model_aliases:
         let glm = c.upstream("GLM-OFFICIAL").unwrap();
         assert_eq!(glm.api_root, "https://open.bigmodel.cn/api/anthropic/v1");
         assert_eq!(glm.fixed_upstream_format, Some(UpstreamFormat::Anthropic));
-        assert_eq!(glm.fallback_credential_env.as_deref(), Some("GLM_APIKEY"));
-        assert_eq!(glm.fallback_api_key.as_deref(), Some("glm-secret"));
-        assert_eq!(glm.auth_policy, AuthPolicy::ClientOrFallback);
+        assert_eq!(glm.provider_key_env.as_deref(), Some("GLM_APIKEY"));
         let alias = c.model_aliases.get("GLM-5").unwrap();
         assert_eq!(alias.upstream_name, "GLM-OFFICIAL");
         assert_eq!(alias.upstream_model, "GLM-5");
-        std::env::remove_var("GLM_APIKEY");
     }
 
     #[test]
@@ -1516,9 +1545,7 @@ upstreams:
                 name: "default".to_string(),
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
-                fallback_credential_env: None,
-                fallback_credential_actual: None,
-                auth_policy: AuthPolicy::ClientOrFallback,
+                provider_key_env: None,
                 upstream_headers: Vec::new(),
                 proxy: Some(ProxyConfig::Proxy {
                     url: "http://regional-proxy.example:8080".to_string(),
@@ -1587,16 +1614,222 @@ upstreams:
     }
 
     #[test]
+    fn config_from_yaml_rejects_legacy_upstream_auth_fields() {
+        for field in [
+            "credential_env: OLD_PROVIDER_KEY",
+            "fallback_credential_env: OLD_PROVIDER_KEY",
+            "credential_actual: inline-secret",
+            "fallback_credential_actual: inline-secret",
+            "fallback_api_key: inline-secret",
+            "auth_policy: force_server",
+        ] {
+            let error = Config::from_yaml_str(&format!(
+                r#"
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+    {field}
+"#
+            ))
+            .expect_err("legacy upstream auth field must fail parsing");
+            let field_name = field.split(':').next().unwrap();
+            assert!(
+                error.contains(field_name),
+                "error should name legacy field `{field_name}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_config_payload_rejects_legacy_upstream_auth_fields() {
+        for field in [
+            "fallback_credential_env",
+            "fallback_credential_actual",
+            "auth_policy",
+        ] {
+            let mut upstream = serde_json::json!({
+                "name": "default",
+                "api_root": "https://api.openai.com/v1",
+                "fixed_upstream_format": "openai-completion"
+            });
+            upstream[field] = serde_json::json!("legacy");
+            let payload = serde_json::json!({
+                "listen": "127.0.0.1:0",
+                "upstreams": [upstream]
+            });
+            let error = serde_json::from_value::<RuntimeConfigPayload>(payload)
+                .expect_err("legacy runtime upstream auth field must fail JSON parsing");
+            assert!(
+                error.to_string().contains(field),
+                "error should name legacy field `{field}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_config_payload_rejects_unknown_nested_fields() {
+        let base_payload = || {
+            serde_json::json!({
+                "listen": "127.0.0.1:0",
+                "proxy": "direct",
+                "upstreams": [{
+                    "name": "default",
+                    "api_root": "https://api.openai.com/v1",
+                    "fixed_upstream_format": "openai-completion"
+                }],
+                "hooks": {
+                    "exchange": {
+                        "url": "https://example.com/hooks/exchange"
+                    }
+                },
+                "debug_trace": {
+                    "path": null,
+                    "max_text_chars": 16384
+                },
+                "resource_limits": {
+                    "max_request_body_bytes": 4096,
+                    "max_non_stream_response_bytes": 8192,
+                    "max_upstream_error_body_bytes": 1024,
+                    "max_sse_frame_bytes": 2048,
+                    "stream_idle_timeout_secs": 7,
+                    "stream_max_duration_secs": 11,
+                    "stream_max_events": 13,
+                    "max_accumulated_stream_state_bytes": 16384
+                }
+            })
+        };
+
+        for (case, field, payload) in [
+            {
+                let mut payload = base_payload();
+                payload["proxy"] = serde_json::json!({
+                    "url": "http://proxy.example:8080",
+                    "future_proxy_option": true
+                });
+                ("proxy", "future_proxy_option", payload)
+            },
+            {
+                let mut payload = base_payload();
+                payload["hooks"]["future_hook_option"] = serde_json::json!(true);
+                ("hooks", "future_hook_option", payload)
+            },
+            {
+                let mut payload = base_payload();
+                payload["hooks"]["exchange"]["future_endpoint_option"] = serde_json::json!(true);
+                ("hook endpoint", "future_endpoint_option", payload)
+            },
+            {
+                let mut payload = base_payload();
+                payload["debug_trace"]["future_debug_option"] = serde_json::json!(true);
+                ("debug trace", "future_debug_option", payload)
+            },
+            {
+                let mut payload = base_payload();
+                payload["resource_limits"]["future_limit"] = serde_json::json!(1);
+                ("resource limits", "future_limit", payload)
+            },
+            {
+                let mut payload = base_payload();
+                payload["upstreams"][0]["limits"] = serde_json::json!({
+                    "context_window": 1024,
+                    "future_limit": 1
+                });
+                ("model limits", "future_limit", payload)
+            },
+            {
+                let mut payload = base_payload();
+                payload["upstreams"][0]["surface_defaults"] = serde_json::json!({
+                    "tools": {
+                        "supports_search": true,
+                        "future_tool": true
+                    }
+                });
+                ("model surface tools", "future_tool", payload)
+            },
+            {
+                let mut payload = base_payload();
+                payload["model_aliases"] = serde_json::json!({
+                    "demo": {
+                        "upstream_name": "default",
+                        "upstream_model": "gpt-4",
+                        "future_alias_option": true
+                    }
+                });
+                ("model alias", "future_alias_option", payload)
+            },
+        ] {
+            let error = serde_json::from_value::<RuntimeConfigPayload>(payload)
+                .expect_err(&format!("{case} unknown field must fail JSON parsing"));
+            assert!(
+                error.to_string().contains(field),
+                "{case} error should name unknown field `{field}`: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_from_yaml_rejects_unknown_nested_fields() {
+        for (case, field, yaml) in [
+            (
+                "model alias",
+                "typo",
+                r#"
+upstreams:
+  default:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+model_aliases:
+  demo:
+    target: default:gpt-4
+    typo: true
+"#,
+            ),
+            (
+                "hooks",
+                "typo",
+                r#"
+hooks:
+  timeout_secs: 8
+  typo: true
+upstreams:
+  default:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+"#,
+            ),
+            (
+                "hook endpoint",
+                "typo",
+                r#"
+hooks:
+  exchange:
+    url: https://example.com/hooks/exchange
+    typo: true
+upstreams:
+  default:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+"#,
+            ),
+        ] {
+            let error = Config::from_yaml_str(yaml)
+                .expect_err(&format!("{case} unknown field must fail YAML parsing"));
+            assert!(
+                error.contains(field),
+                "{case} error should name unknown field `{field}`: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn config_upstream_url_for_format() {
         let c = Config {
             upstreams: vec![UpstreamConfig {
                 name: "default".to_string(),
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
-                fallback_credential_env: None,
-                fallback_credential_actual: None,
-                fallback_api_key: None,
-                auth_policy: AuthPolicy::ClientOrFallback,
+                provider_key_env: None,
                 upstream_headers: Vec::new(),
                 proxy: None,
                 limits: None,
@@ -1629,10 +1862,7 @@ upstreams:
                     name: "glm".to_string(),
                     api_root: "https://example.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::Anthropic),
-                    fallback_credential_env: None,
-                    fallback_credential_actual: None,
-                    fallback_api_key: None,
-                    auth_policy: AuthPolicy::ClientOrFallback,
+                    provider_key_env: None,
                     upstream_headers: Vec::new(),
                     proxy: None,
                     limits: None,
@@ -1642,10 +1872,7 @@ upstreams:
                     name: "openai".to_string(),
                     api_root: "https://api.openai.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
-                    fallback_credential_env: None,
-                    fallback_credential_actual: None,
-                    fallback_api_key: None,
-                    auth_policy: AuthPolicy::ClientOrFallback,
+                    provider_key_env: None,
                     upstream_headers: Vec::new(),
                     proxy: None,
                     limits: None,
@@ -1666,10 +1893,7 @@ upstreams:
                 name: "glm".to_string(),
                 api_root: "https://example.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::Anthropic),
-                fallback_credential_env: None,
-                fallback_credential_actual: None,
-                fallback_api_key: None,
-                auth_policy: AuthPolicy::ClientOrFallback,
+                provider_key_env: None,
                 upstream_headers: Vec::new(),
                 proxy: None,
                 limits: None,
@@ -1698,10 +1922,7 @@ upstreams:
                 name: "default".to_string(),
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
-                fallback_credential_env: None,
-                fallback_credential_actual: None,
-                fallback_api_key: None,
-                auth_policy: AuthPolicy::ClientOrFallback,
+                provider_key_env: None,
                 upstream_headers: Vec::new(),
                 proxy: None,
                 limits: None,
@@ -1722,10 +1943,7 @@ upstreams:
                     name: "a".to_string(),
                     api_root: "https://a.example.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::Anthropic),
-                    fallback_credential_env: None,
-                    fallback_credential_actual: None,
-                    fallback_api_key: None,
-                    auth_policy: AuthPolicy::ClientOrFallback,
+                    provider_key_env: None,
                     upstream_headers: Vec::new(),
                     proxy: None,
                     limits: None,
@@ -1735,10 +1953,7 @@ upstreams:
                     name: "b".to_string(),
                     api_root: "https://b.example.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
-                    fallback_credential_env: None,
-                    fallback_credential_actual: None,
-                    fallback_api_key: None,
-                    auth_policy: AuthPolicy::ClientOrFallback,
+                    provider_key_env: None,
                     upstream_headers: Vec::new(),
                     proxy: None,
                     limits: None,
@@ -1766,7 +1981,7 @@ upstreams:
     }
 
     #[test]
-    fn config_from_yaml_str_parses_hooks_and_force_server_policy() {
+    fn config_from_yaml_str_parses_hooks_and_provider_key_env() {
         let c = Config::from_yaml_str(
             r#"
 hooks:
@@ -1780,8 +1995,7 @@ upstreams:
   GLM-OFFICIAL:
     api_root: https://open.bigmodel.cn/api/anthropic/v1
     format: anthropic
-    credential_actual: secret
-    auth_policy: force_server
+    provider_key_env: GLM_APIKEY
 "#,
         )
         .unwrap();
@@ -1800,24 +2014,18 @@ upstreams:
             "https://example.com/usage"
         );
         let upstream = c.upstream("GLM-OFFICIAL").unwrap();
-        assert_eq!(
-            upstream.fallback_credential_actual.as_deref(),
-            Some("secret")
-        );
-        assert_eq!(upstream.fallback_api_key.as_deref(), Some("secret"));
-        assert_eq!(upstream.auth_policy, AuthPolicy::ForceServer);
+        assert_eq!(upstream.provider_key_env.as_deref(), Some("GLM_APIKEY"));
     }
 
     #[test]
-    fn validate_rejects_conflicting_credential_sources() {
+    fn validate_rejects_empty_provider_key_env() {
         let c = Config::from_yaml_str(
             r#"
 upstreams:
   demo:
     api_root: https://api.openai.com/v1
     format: openai-completion
-    credential_env: OPENAI_API_KEY
-    credential_actual: secret
+    provider_key_env: "   "
 "#,
         )
         .unwrap();
@@ -1868,9 +2076,7 @@ upstreams:
                 name: "default".to_string(),
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
-                fallback_credential_env: None,
-                fallback_credential_actual: None,
-                auth_policy: AuthPolicy::ClientOrFallback,
+                provider_key_env: None,
                 upstream_headers: vec![("openai-api-key".to_string(), "secret".to_string())],
                 proxy: None,
                 limits: None,
@@ -1930,10 +2136,7 @@ upstreams:
                 name: "demo".to_string(),
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
-                fallback_credential_env: None,
-                fallback_credential_actual: None,
-                fallback_api_key: None,
-                auth_policy: AuthPolicy::ClientOrFallback,
+                provider_key_env: None,
                 upstream_headers: Vec::new(),
                 proxy: None,
                 limits: None,
@@ -2044,10 +2247,7 @@ upstreams:
                 api_root: "https://user:pass@api.openai.com/v1?api_key=inline-secret#frag"
                     .to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
-                fallback_credential_env: Some("DEMO_KEY".to_string()),
-                fallback_credential_actual: Some("inline-secret".to_string()),
-                fallback_api_key: Some("inline-secret".to_string()),
-                auth_policy: AuthPolicy::ForceServer,
+                provider_key_env: Some("DEMO_KEY".to_string()),
                 upstream_headers: vec![
                     ("x-tenant".to_string(), "demo".to_string()),
                     (
@@ -2098,10 +2298,9 @@ upstreams:
         let json = serde_json::to_value(&view).unwrap();
 
         assert_eq!(
-            view.upstreams[0].fallback_credential_env.as_deref(),
+            view.upstreams[0].provider_key_env.as_deref(),
             Some("DEMO_KEY")
         );
-        assert!(view.upstreams[0].fallback_credential_configured);
         assert_eq!(view.upstreams[0].api_root, "https://api.openai.com/v1");
         assert_eq!(
             view.proxy,

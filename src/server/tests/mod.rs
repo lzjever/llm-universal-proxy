@@ -55,10 +55,10 @@ impl Drop for ScopedEnvVar {
     }
 }
 
-pub(super) fn loopback_data_auth_policy_for_tests() -> data_auth::RuntimeConfigValidationPolicy {
+pub(super) fn test_data_auth_policy_for_tests() -> data_auth::RuntimeConfigValidationPolicy {
     data_auth::RuntimeConfigValidationPolicy::new(
         "127.0.0.1:0".parse().expect("loopback socket addr"),
-        data_auth::DataAccess::LoopbackOnly,
+        data_auth::DataAccess::ClientProviderKey,
     )
 }
 
@@ -77,10 +77,7 @@ pub(super) fn test_upstream_config_with_fixed_format(
         name: name.to_string(),
         api_root: format!("https://{name}.example/v1"),
         fixed_upstream_format,
-        fallback_credential_env: None,
-        fallback_credential_actual: None,
-        fallback_api_key: None,
-        auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+        provider_key_env: None,
         upstream_headers: Vec::new(),
         proxy: None,
         limits: None,
@@ -125,6 +122,7 @@ pub(super) fn runtime_namespace_state_for_tests(
                 (*name).to_string(),
                 UpstreamState {
                     config: upstream_config,
+                    provider_key: None,
                     capability: Some(crate::discovery::UpstreamCapability::fixed(*format)),
                     availability: if *available {
                         crate::discovery::UpstreamAvailability::available()
@@ -313,10 +311,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         name: "primary".to_string(),
         api_root,
         fixed_upstream_format: Some(upstream_format),
-        fallback_credential_env: None,
-        fallback_credential_actual: None,
-        fallback_api_key: None,
-        auth_policy: crate::config::AuthPolicy::ClientOrFallback,
+        provider_key_env: None,
         upstream_headers: Vec::new(),
         proxy: None,
         limits: None,
@@ -354,6 +349,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
                     upstream.name.clone(),
                     UpstreamState {
                         config: upstream,
+                        provider_key: None,
                         capability: Some(crate::discovery::UpstreamCapability::fixed(
                             upstream_format,
                         )),
@@ -374,7 +370,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         runtime: Arc::new(RwLock::new(runtime)),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
-        data_auth_policy: loopback_data_auth_policy_for_tests(),
+        data_auth_policy: test_data_auth_policy_for_tests(),
     })
 }
 

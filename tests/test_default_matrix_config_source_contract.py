@@ -133,6 +133,63 @@ class DefaultMatrixConfigSourceContractTests(unittest.TestCase):
             completed.stdout + completed.stderr,
         )
 
+    def test_test_compatibility_auto_start_renders_local_qwen_from_shell_env(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_file = pathlib.Path(temp_dir) / ".env.test"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        'export PRESET_ENDPOINT_API_KEY="proxy-only-secret"',
+                        'export PRESET_OPENAI_ENDPOINT_BASE_URL="https://openai-compatible.example/v1"',
+                        'export PRESET_ANTHROPIC_ENDPOINT_BASE_URL="https://anthropic-compatible.example/v1"',
+                        'export PRESET_ENDPOINT_MODEL="provider-configured-model"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            command = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                source scripts/test_compatibility.sh
+                BASE_URL="http://127.0.0.1:19993"
+                render_auto_start_config "{TRACKED_CONFIG_PATH}" "{env_file}"
+                runtime_config="$AUTO_START_RUNTIME_CONFIG"
+                runtime_dir="$AUTO_START_RUNTIME_DIR"
+                grep -Fq "LOCAL-QWEN:" "$runtime_config"
+                grep -Fq "api_root: http://127.0.0.1:9997/v1" "$runtime_config"
+                grep -Fq "provider_key_env: LOCAL_QWEN_API_KEY" "$runtime_config"
+                grep -Fq 'qwen-local: "LOCAL-QWEN:qwen3.5-9b-awq"' "$runtime_config"
+                cleanup_auto_start_runtime_config
+                test ! -e "$runtime_dir"
+                """
+            )
+
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "PRESET_ENDPOINT_API_KEY": "proxy-only-secret",
+                    "PRESET_OPENAI_ENDPOINT_BASE_URL": "https://openai-compatible.example/v1",
+                    "PRESET_ANTHROPIC_ENDPOINT_BASE_URL": "https://anthropic-compatible.example/v1",
+                    "PRESET_ENDPOINT_MODEL": "provider-configured-model",
+                    "LOCAL_QWEN_BASE_URL": "http://127.0.0.1:9997/v1",
+                    "LOCAL_QWEN_MODEL": "qwen3.5-9b-awq",
+                    "LOCAL_QWEN_API_KEY": "not-needed",
+                },
+            )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
     def test_test_compatibility_auto_start_cleans_runtime_dir_on_start_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = pathlib.Path(temp_dir)
@@ -208,6 +265,7 @@ class DefaultMatrixConfigSourceContractTests(unittest.TestCase):
             grep -Fq "[SKIP]" "$output_file"
             grep -Fq "LOCAL_QWEN_BASE_URL" "$output_file"
             grep -Fq "LOCAL_QWEN_MODEL" "$output_file"
+            grep -Fq "LOCAL_QWEN_API_KEY" "$output_file"
             """
         )
 
@@ -224,6 +282,55 @@ class DefaultMatrixConfigSourceContractTests(unittest.TestCase):
                 "PRESET_OPENAI_ENDPOINT_BASE_URL": "https://openai-compatible.example/v1",
                 "PRESET_ANTHROPIC_ENDPOINT_BASE_URL": "https://anthropic-compatible.example/v1",
                 "PRESET_ENDPOINT_MODEL": "provider-configured-model",
+            },
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
+    def test_test_compatibility_skips_local_qwen_when_api_key_is_missing(self):
+        command = textwrap.dedent(
+            """
+            set -euo pipefail
+            source scripts/test_compatibility.sh
+            test_json() {
+                echo "unexpected test_json call: $1" >&2
+                return 99
+            }
+            test_sse() {
+                echo "unexpected test_sse call: $1" >&2
+                return 99
+            }
+            output_file="$(mktemp)"
+            test_local_qwen >"$output_file"
+            test "$SKIP" -eq 1
+            test "$PASS" -eq 0
+            test "$FAIL" -eq 0
+            grep -Fq "[SKIP]" "$output_file"
+            grep -Fq "LOCAL_QWEN_BASE_URL" "$output_file"
+            grep -Fq "LOCAL_QWEN_MODEL" "$output_file"
+            grep -Fq "LOCAL_QWEN_API_KEY" "$output_file"
+            """
+        )
+
+        completed = subprocess.run(
+            ["bash", "-c", command],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PRESET_ENDPOINT_API_KEY": "proxy-only-secret",
+                "PRESET_OPENAI_ENDPOINT_BASE_URL": "https://openai-compatible.example/v1",
+                "PRESET_ANTHROPIC_ENDPOINT_BASE_URL": "https://anthropic-compatible.example/v1",
+                "PRESET_ENDPOINT_MODEL": "provider-configured-model",
+                "LOCAL_QWEN_BASE_URL": "http://127.0.0.1:9997/v1",
+                "LOCAL_QWEN_MODEL": "qwen3.5-9b-awq",
             },
         )
 
@@ -268,6 +375,7 @@ class DefaultMatrixConfigSourceContractTests(unittest.TestCase):
                 "PRESET_ENDPOINT_MODEL": "provider-configured-model",
                 "LOCAL_QWEN_BASE_URL": "http://127.0.0.1:9997/v1",
                 "LOCAL_QWEN_MODEL": "qwen3.5-9b-awq",
+                "LOCAL_QWEN_API_KEY": "not-needed",
             },
         )
 
@@ -280,7 +388,7 @@ class DefaultMatrixConfigSourceContractTests(unittest.TestCase):
     def test_tracked_default_config_uses_env_credentials_without_provider_keys(self):
         config_text = TRACKED_CONFIG_PATH.read_text(encoding="utf-8")
 
-        self.assertIn("credential_env: PRESET_ENDPOINT_API_KEY", config_text)
+        self.assertIn("provider_key_env: PRESET_ENDPOINT_API_KEY", config_text)
         self.assertIn("PRESET-OPENAI-COMPATIBLE", config_text)
         self.assertIn("PRESET-ANTHROPIC-COMPATIBLE", config_text)
         self.assertIn("preset-openai-compatible", config_text)
@@ -288,7 +396,7 @@ class DefaultMatrixConfigSourceContractTests(unittest.TestCase):
         self.assertNotIn("MINIMAX", config_text.upper())
         self.assertNotIn("minimax-openai", config_text)
         self.assertNotIn("minimax-anth", config_text)
-        self.assertNotIn("credential_actual", config_text)
+        self.assertNotIn("provider_key_inline", config_text)
         self.assertIsNone(PROVIDER_KEY_RE.search(config_text))
 
 

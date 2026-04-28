@@ -2,7 +2,7 @@
 
 use llm_universal_proxy::config::Config;
 use llm_universal_proxy::formats::UpstreamFormat;
-use llm_universal_proxy::server::run_with_listener;
+use llm_universal_proxy::server::{run_with_listener_with_data_auth, DataAuthConfig};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -24,7 +24,9 @@ pub async fn start_proxy(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let base = format!("http://127.0.0.1:{port}");
-    let handle = tokio::spawn(async move { run_with_listener(config, listener).await });
+    let server =
+        run_with_listener_with_data_auth(config, listener, DataAuthConfig::client_provider_key());
+    let handle = tokio::spawn(server);
     tokio::time::sleep(Duration::from_millis(50)).await;
     (base, handle)
 }

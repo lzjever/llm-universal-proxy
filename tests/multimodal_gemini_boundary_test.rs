@@ -9,10 +9,14 @@ use common::mock_upstream::{
 use common::proxy_helpers::proxy_config;
 use common::runtime_proxy::start_proxy;
 use llm_universal_proxy::formats::UpstreamFormat;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client as ReqwestClient,
+};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+const TEST_PROVIDER_KEY: &str = "provider-secret";
 const GEMINI_FILE_URI: &str = "gs://llmup-test/policy.pdf";
 const POLLUTED_GEMINI_FILE_URI: &str = "gs://llmup-test/policy.pdf\nfile:///tmp/policy.pdf";
 const LEADING_WHITESPACE_GEMINI_FILE_URI: &str = " gs://llmup-test/policy.pdf";
@@ -27,6 +31,18 @@ const POLLUTED_PDF_B64: &str = "JVBE\r\nRi0x";
 const REMOTE_IMAGE_URL: &str = "https://example.test/assets/cat.png";
 const REMOTE_PDF_URL: &str = "https://example.test/papers/policy.pdf";
 
+fn authenticated_reqwest_client() -> ReqwestClient {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TEST_PROVIDER_KEY}")).unwrap(),
+    );
+    ReqwestClient::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn anthropic_image_base64_to_gemini_uses_inline_data() {
     let (mock_base, _mock, captured) =
@@ -34,7 +50,7 @@ async fn anthropic_image_base64_to_gemini_uses_inline_data() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
@@ -69,7 +85,7 @@ async fn anthropic_remote_image_url_to_gemini_fails_closed_before_upstream() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/anthropic/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
@@ -105,7 +121,7 @@ async fn openai_provider_file_uri_to_gemini_fails_closed_when_polluted_before_up
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -135,7 +151,7 @@ async fn openai_provider_file_uri_to_gemini_fails_closed_when_polluted_before_up
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -171,7 +187,7 @@ async fn openai_provider_file_uri_to_gemini_fails_closed_for_edge_ascii_whitespa
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -201,7 +217,7 @@ async fn openai_provider_file_uri_to_gemini_fails_closed_for_edge_ascii_whitespa
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -237,7 +253,7 @@ async fn openai_provider_file_uri_to_gemini_fails_closed_for_edge_unicode_whites
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -267,7 +283,7 @@ async fn openai_provider_file_uri_to_gemini_fails_closed_for_edge_unicode_whites
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -300,7 +316,7 @@ async fn openai_provider_file_uri_to_gemini_allows_clean_gs_uri() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -328,7 +344,7 @@ async fn openai_provider_file_uri_to_gemini_allows_clean_gs_uri() {
     let config = proxy_config(&mock_base, UpstreamFormat::Google);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!("{proxy_base}/openai/v1/responses"))
         .json(&json!({
             "model": "gemini-2.5-flash",
@@ -363,7 +379,7 @@ async fn gemini_file_data_gs_uri_to_openai_chat_fails_closed_before_upstream() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!(
             "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
         ))
@@ -410,7 +426,7 @@ async fn gemini_file_data_http_uri_to_openai_chat_and_responses_fails_closed_bef
                 let config = proxy_config(&mock_base, upstream_format);
                 let (proxy_base, _proxy) = start_proxy(config).await;
 
-                let response = Client::new()
+                let response = authenticated_reqwest_client()
                     .post(format!(
                         "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
                     ))
@@ -441,7 +457,7 @@ async fn gemini_file_data_http_uri_to_openai_chat_and_responses_fails_closed_bef
                 let config = proxy_config(&mock_base, upstream_format);
                 let (proxy_base, _proxy) = start_proxy(config).await;
 
-                let response = Client::new()
+                let response = authenticated_reqwest_client()
                     .post(format!(
                         "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
                     ))
@@ -480,7 +496,7 @@ async fn gemini_file_data_gs_uri_to_openai_responses_fails_closed_before_upstrea
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!(
             "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
         ))
@@ -513,7 +529,7 @@ async fn gemini_inline_data_image_and_pdf_to_openai_chat_still_succeeds() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!(
             "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
         ))
@@ -545,7 +561,7 @@ async fn gemini_polluted_inline_data_to_openai_chat_and_responses_fails_closed_b
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!(
             "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
         ))
@@ -573,7 +589,7 @@ async fn gemini_polluted_inline_data_to_openai_chat_and_responses_fails_closed_b
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!(
             "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
         ))
@@ -602,7 +618,7 @@ async fn gemini_inline_data_image_and_pdf_to_openai_responses_still_succeeds() {
     let config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
     let (proxy_base, _proxy) = start_proxy(config).await;
 
-    let response = Client::new()
+    let response = authenticated_reqwest_client()
         .post(format!(
             "{proxy_base}/google/v1beta/models/gpt-4o:generateContent"
         ))

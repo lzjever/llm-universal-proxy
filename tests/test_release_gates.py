@@ -285,6 +285,23 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
                     f"{job_name} must not block GA release on the legacy four-provider smoke",
                 )
 
+    def test_release_container_job_publishes_ref_version_and_latest_tags(self):
+        jobs = release_workflow_jobs()
+        container = jobs.get("container", "")
+        self.assertTrue(container, "release workflow must define container job")
+
+        push_step = workflow_step_block(container, "Build and push multi-arch image")
+        self.assertTrue(push_step, "container job must keep a multi-arch push step")
+        for snippet in (
+            "${{ env.GHCR_IMAGE }}:${{ github.ref_name }}",
+            "${{ env.GHCR_IMAGE }}:${{ steps.repo_meta.outputs.version }}",
+            "${{ env.GHCR_IMAGE }}:latest",
+            "VERSION=${{ steps.repo_meta.outputs.version }}",
+            "org.opencontainers.image.version=${{ steps.repo_meta.outputs.version }}",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, push_step)
+
     def test_ci_workflow_contains_local_mock_perf_and_supply_chain_gates(self):
         ci = CI_WORKFLOW.read_text(encoding="utf-8")
 

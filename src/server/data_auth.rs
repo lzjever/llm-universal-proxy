@@ -3,25 +3,24 @@ use std::net::SocketAddr;
 use axum::{
     body::Body,
     extract::State,
-    http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode},
     middleware::Next,
 };
 
-use crate::config::{is_sensitive_header_name, AuthPolicy, Config};
+use crate::config::{Config, UpstreamConfig};
 use crate::formats::UpstreamFormat;
 
 use super::errors::error_response;
 
-pub(super) const DATA_AUTH_MODE_ENV: &str = "LLM_UNIVERSAL_PROXY_DATA_AUTH";
-pub(super) const DATA_TOKEN_ENV: &str = "LLM_UNIVERSAL_PROXY_DATA_TOKEN";
-pub(super) const DATA_TOKEN_HEADER: &str = "x-llmup-data-token";
+pub(super) const AUTH_MODE_ENV: &str = "LLM_UNIVERSAL_PROXY_AUTH_MODE";
+pub(super) const PROXY_KEY_ENV: &str = "LLM_UNIVERSAL_PROXY_KEY";
+pub(super) const LEGACY_DATA_TOKEN_HEADER: &str = "x-llmup-data-token";
 pub(super) const CORS_ALLOWED_ORIGINS_ENV: &str = "LLM_UNIVERSAL_PROXY_CORS_ALLOWED_ORIGINS";
 
 #[derive(Debug, Clone)]
 pub(super) enum DataAccess {
-    BearerToken(String),
-    LoopbackOnly,
-    Disabled,
+    ClientProviderKey,
+    ProxyKey { key: String },
     Misconfigured(String),
 }
 
@@ -32,8 +31,7 @@ pub(super) struct DataAuthState {
 
 #[derive(Debug, Clone)]
 pub(super) struct RuntimeConfigValidationPolicy {
-    listener_addr: SocketAddr,
-    access: DataAccess,
+    pub(super) access: DataAccess,
 }
 
 impl DataAuthState {
@@ -43,116 +41,117 @@ impl DataAuthState {
 }
 
 impl RuntimeConfigValidationPolicy {
-    pub(super) fn new(listener_addr: SocketAddr, access: DataAccess) -> Self {
-        Self {
-            listener_addr,
-            access,
-        }
+    pub(super) fn new(_listener_addr: SocketAddr, access: DataAccess) -> Self {
+        Self { access }
     }
 
     pub(super) fn validate(&self, config: &Config) -> Result<(), String> {
-        validate_runtime_config(config, self.listener_addr, &self.access)
+        validate_runtime_config(config, &self.access)
     }
 }
 
 impl DataAccess {
     pub(super) fn from_env() -> Self {
-        let mode = std::env::var(DATA_AUTH_MODE_ENV);
-        let token = std::env::var(DATA_TOKEN_ENV);
-        Self::from_env_results(mode, token)
+        Self::from_env_results(std::env::var(AUTH_MODE_ENV), std::env::var(PROXY_KEY_ENV))
     }
 
     fn from_env_results(
         mode: Result<String, std::env::VarError>,
-        token: Result<String, std::env::VarError>,
+        proxy_key: Result<String, std::env::VarError>,
     ) -> Self {
         match mode {
             Ok(mode) => match mode.trim().to_ascii_lowercase().as_str() {
-                "token" | "required" | "bearer" => Self::token_from_env_result(token),
-                "loopback" | "loopback-only" | "loopback_only" => Self::LoopbackOnly,
-                "disabled" | "disable" | "off" | "none" | "false" => Self::Disabled,
-                "" => Self::Misconfigured(format!("{DATA_AUTH_MODE_ENV} must not be empty")),
-                value => Self::Misconfigured(format!(
-                    "{DATA_AUTH_MODE_ENV} has unsupported value `{value}`"
-                )),
-            },
-            Err(std::env::VarError::NotPresent) => match token {
-                Ok(token) if token.trim().is_empty() => {
-                    Self::Misconfigured(format!("{DATA_TOKEN_ENV} must not be empty"))
-                }
-                Ok(token) => Self::BearerToken(token),
-                Err(std::env::VarError::NotPresent) => Self::LoopbackOnly,
-                Err(std::env::VarError::NotUnicode(_)) => {
-                    Self::Misconfigured(format!("{DATA_TOKEN_ENV} must be valid UTF-8"))
+                "client_provider_key" => Self::ClientProviderKey,
+                "proxy_key" => Self::proxy_key_from_env_result(proxy_key),
+                "" => Self::Misconfigured(format!("{AUTH_MODE_ENV} must not be empty")),
+                value => {
+                    Self::Misconfigured(format!("{AUTH_MODE_ENV} has unsupported value `{value}`"))
                 }
             },
-            Err(std::env::VarError::NotUnicode(_)) => {
-                Self::Misconfigured(format!("{DATA_AUTH_MODE_ENV} must be valid UTF-8"))
-            }
-        }
-    }
-
-    fn token_from_env_result(token: Result<String, std::env::VarError>) -> Self {
-        match token {
-            Ok(token) if token.trim().is_empty() => {
-                Self::Misconfigured(format!("{DATA_TOKEN_ENV} must not be empty"))
-            }
-            Ok(token) => Self::BearerToken(token),
             Err(std::env::VarError::NotPresent) => {
-                Self::Misconfigured(format!("{DATA_TOKEN_ENV} is required"))
+                Self::Misconfigured(format!("{AUTH_MODE_ENV} is required"))
             }
             Err(std::env::VarError::NotUnicode(_)) => {
-                Self::Misconfigured(format!("{DATA_TOKEN_ENV} must be valid UTF-8"))
+                Self::Misconfigured(format!("{AUTH_MODE_ENV} must be valid UTF-8"))
             }
         }
     }
 
-    fn allows_without_token(&self) -> bool {
-        matches!(self, Self::LoopbackOnly | Self::Disabled)
+    fn proxy_key_from_env_result(proxy_key: Result<String, std::env::VarError>) -> Self {
+        match proxy_key {
+            Ok(key) if key.trim().is_empty() => {
+                Self::Misconfigured(format!("{PROXY_KEY_ENV} must not be empty"))
+            }
+            Ok(key) => Self::ProxyKey { key },
+            Err(std::env::VarError::NotPresent) => Self::Misconfigured(format!(
+                "{PROXY_KEY_ENV} is required when {AUTH_MODE_ENV}=proxy_key"
+            )),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Self::Misconfigured(format!("{PROXY_KEY_ENV} must be valid UTF-8"))
+            }
+        }
+    }
+
+    pub(super) fn provider_key_for_upstream(
+        &self,
+        upstream: &UpstreamConfig,
+    ) -> Result<Option<String>, String> {
+        match self {
+            Self::ClientProviderKey => Ok(None),
+            Self::ProxyKey { .. } => resolve_provider_key(upstream).map(Some),
+            Self::Misconfigured(message) => Err(format!("data auth misconfigured: {message}")),
+        }
     }
 }
 
 pub(super) fn validate_startup(
     config: &Config,
-    listener_addr: SocketAddr,
+    _listener_addr: SocketAddr,
     access: &DataAccess,
 ) -> Result<(), String> {
-    validate_runtime_config(config, listener_addr, access)
+    validate_runtime_config(config, access)
 }
 
-fn validate_runtime_config(
-    config: &Config,
-    listener_addr: SocketAddr,
-    access: &DataAccess,
-) -> Result<(), String> {
+fn validate_runtime_config(config: &Config, access: &DataAccess) -> Result<(), String> {
     if let DataAccess::Misconfigured(message) = access {
         return Err(format!("data auth misconfigured: {message}"));
     }
 
-    if !listener_addr.ip().is_loopback()
-        && access.allows_without_token()
-        && config_uses_server_credentials(config)
-    {
-        return Err(
-            "data auth token required when listening on non-loopback with server credentials, sensitive upstream headers, or force_server"
-                .to_string(),
-        );
+    if matches!(access, DataAccess::ProxyKey { .. }) {
+        for upstream in &config.upstreams {
+            resolve_provider_key(upstream)?;
+        }
     }
 
     Ok(())
 }
 
-fn config_uses_server_credentials(config: &Config) -> bool {
-    config.upstreams.iter().any(|upstream| {
-        upstream.auth_policy == AuthPolicy::ForceServer
-            || upstream.fallback_api_key.is_some()
-            || upstream.fallback_credential_actual.is_some()
-            || upstream.fallback_credential_env.is_some()
-            || upstream
-                .upstream_headers
-                .iter()
-                .any(|(name, _)| is_sensitive_header_name(name))
-    })
+fn resolve_provider_key(upstream: &UpstreamConfig) -> Result<String, String> {
+    let env_name = upstream
+        .provider_key_env
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "upstream `{}` provider_key_env is required when {AUTH_MODE_ENV}=proxy_key",
+                upstream.name
+            )
+        })?;
+    match std::env::var(env_name) {
+        Ok(value) if value.trim().is_empty() => Err(format!(
+            "upstream `{}` provider_key_env `{env_name}` must not be empty",
+            upstream.name
+        )),
+        Ok(value) => Ok(value),
+        Err(std::env::VarError::NotPresent) => Err(format!(
+            "upstream `{}` provider_key_env `{env_name}` is not set",
+            upstream.name
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "upstream `{}` provider_key_env `{env_name}` must be valid UTF-8",
+            upstream.name
+        )),
+    }
 }
 
 pub(super) async fn require_data_access(
@@ -160,13 +159,15 @@ pub(super) async fn require_data_access(
     mut request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    match authorize_data_request(&state.access, request.headers(), remote_addr(&request)) {
+    match authorize_data_request(&state.access, request.headers()) {
         Ok(DataAuthorization {
-            strip_authorization,
+            normalized_provider_key,
         }) => {
-            request.headers_mut().remove(DATA_TOKEN_HEADER);
-            if strip_authorization {
-                request.headers_mut().remove(header::AUTHORIZATION);
+            strip_client_credential_headers(request.headers_mut());
+            if let Some(provider_key) = normalized_provider_key {
+                let value = HeaderValue::from_str(&format!("Bearer {provider_key}"))
+                    .expect("provider key came from a valid client header");
+                request.headers_mut().insert(header::AUTHORIZATION, value);
             }
             next.run(request).await
         }
@@ -175,105 +176,142 @@ pub(super) async fn require_data_access(
 }
 
 struct DataAuthorization {
-    strip_authorization: bool,
+    normalized_provider_key: Option<String>,
 }
 
 fn authorize_data_request<'a>(
     access: &'a DataAccess,
     headers: &HeaderMap,
-    remote_addr: Option<SocketAddr>,
 ) -> Result<DataAuthorization, (StatusCode, &'a str)> {
+    if headers.contains_key(LEGACY_DATA_TOKEN_HEADER) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "x-llmup-data-token is no longer supported",
+        ));
+    }
+
+    let credential = match extract_standard_credential(headers) {
+        Ok(value) => value,
+        Err(error) => return Err((StatusCode::BAD_REQUEST, error.message())),
+    };
+
     match access {
-        DataAccess::BearerToken(expected) => authorize_bearer_data_token(expected, headers),
-        DataAccess::LoopbackOnly => {
-            if contains_proxy_forwarding_headers(headers) {
-                Err((
-                    StatusCode::FORBIDDEN,
-                    "data loopback access rejects proxy forwarding headers",
-                ))
-            } else if remote_addr.is_some_and(|addr| addr.ip().is_loopback()) {
+        DataAccess::ClientProviderKey => {
+            let Some(provider_key) = credential else {
+                return Err((StatusCode::UNAUTHORIZED, "provider credential required"));
+            };
+            Ok(DataAuthorization {
+                normalized_provider_key: Some(provider_key),
+            })
+        }
+        DataAccess::ProxyKey { key } => {
+            let Some(proxy_key) = credential else {
+                return Err((StatusCode::UNAUTHORIZED, "proxy key required"));
+            };
+            if proxy_key == *key {
                 Ok(DataAuthorization {
-                    strip_authorization: false,
+                    normalized_provider_key: None,
                 })
             } else {
-                Err((
-                    StatusCode::FORBIDDEN,
-                    "data access allowed from loopback clients only",
-                ))
+                Err((StatusCode::FORBIDDEN, "proxy key invalid"))
             }
         }
-        DataAccess::Disabled => Ok(DataAuthorization {
-            strip_authorization: false,
-        }),
-        DataAccess::Misconfigured(_) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "data bearer token misconfigured",
-        )),
+        DataAccess::Misconfigured(_) => {
+            Err((StatusCode::SERVICE_UNAVAILABLE, "data auth misconfigured"))
+        }
     }
 }
 
-fn authorize_bearer_data_token<'a>(
-    expected: &str,
+#[derive(Debug, Clone, Copy)]
+enum CredentialError {
+    Empty,
+    Multiple,
+    NonBearerAuthorization,
+    InvalidHeaderValue,
+}
+
+impl CredentialError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "credential must not be empty",
+            Self::Multiple => "multiple credential headers are not supported",
+            Self::NonBearerAuthorization => "authorization credential must use Bearer",
+            Self::InvalidHeaderValue => "credential header must be valid UTF-8",
+        }
+    }
+}
+
+fn strip_client_credential_headers(headers: &mut HeaderMap) {
+    for name in [
+        header::AUTHORIZATION,
+        HeaderName::from_static("x-api-key"),
+        HeaderName::from_static("api-key"),
+        HeaderName::from_static("openai-api-key"),
+        HeaderName::from_static("x-goog-api-key"),
+        HeaderName::from_static("anthropic-api-key"),
+        HeaderName::from_static(LEGACY_DATA_TOKEN_HEADER),
+    ] {
+        headers.remove(name);
+    }
+}
+
+fn extract_standard_credential(headers: &HeaderMap) -> Result<Option<String>, CredentialError> {
+    let mut credentials = Vec::new();
+    collect_authorization_credentials(headers, &mut credentials)?;
+    for name in [
+        "x-api-key",
+        "api-key",
+        "openai-api-key",
+        "x-goog-api-key",
+        "anthropic-api-key",
+    ] {
+        collect_api_key_credentials(headers, name, &mut credentials)?;
+    }
+    match credentials.len() {
+        0 => Ok(None),
+        1 => Ok(credentials.pop()),
+        _ => Err(CredentialError::Multiple),
+    }
+}
+
+fn collect_authorization_credentials(
     headers: &HeaderMap,
-) -> Result<DataAuthorization, (StatusCode, &'a str)> {
-    let explicit_token = headers
-        .get(DATA_TOKEN_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty());
-    let bearer_token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(extract_bearer_token);
-
-    if explicit_token.is_none() && bearer_token.is_none() {
-        return Err((StatusCode::UNAUTHORIZED, "data bearer token required"));
+    credentials: &mut Vec<String>,
+) -> Result<(), CredentialError> {
+    for value in headers.get_all(header::AUTHORIZATION).iter() {
+        let value = value
+            .to_str()
+            .map_err(|_| CredentialError::InvalidHeaderValue)?;
+        let Some(token) = value
+            .get(..7)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("Bearer "))
+            .map(|_| &value[7..])
+        else {
+            return Err(CredentialError::NonBearerAuthorization);
+        };
+        if token.trim().is_empty() {
+            return Err(CredentialError::Empty);
+        }
+        credentials.push(token.to_string());
     }
-
-    let explicit_matches = explicit_token.is_some_and(|token| token == expected);
-    let bearer_matches = bearer_token.is_some_and(|token| token == expected);
-    if explicit_matches || bearer_matches {
-        Ok(DataAuthorization {
-            strip_authorization: bearer_matches,
-        })
-    } else {
-        Err((StatusCode::FORBIDDEN, "data bearer token invalid"))
-    }
+    Ok(())
 }
 
-fn extract_bearer_token(value: &str) -> Option<&str> {
-    let token = value
-        .get(..7)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("Bearer "))
-        .map(|_| &value[7..])?;
-    if token.trim().is_empty() {
-        None
-    } else {
-        Some(token)
+fn collect_api_key_credentials(
+    headers: &HeaderMap,
+    name: &'static str,
+    credentials: &mut Vec<String>,
+) -> Result<(), CredentialError> {
+    for value in headers.get_all(HeaderName::from_static(name)).iter() {
+        let value = value
+            .to_str()
+            .map_err(|_| CredentialError::InvalidHeaderValue)?;
+        if value.trim().is_empty() {
+            return Err(CredentialError::Empty);
+        }
+        credentials.push(value.to_string());
     }
-}
-
-fn remote_addr(request: &Request<Body>) -> Option<SocketAddr> {
-    request
-        .extensions()
-        .get::<axum::extract::connect_info::ConnectInfo<SocketAddr>>()
-        .map(|info| info.0)
-        .or_else(|| request.extensions().get::<SocketAddr>().copied())
-}
-
-fn contains_proxy_forwarding_headers(headers: &HeaderMap) -> bool {
-    const PROXY_HEADERS: &[&str] = &[
-        "forwarded",
-        "x-forwarded-for",
-        "x-forwarded-host",
-        "x-forwarded-proto",
-        "x-real-ip",
-    ];
-
-    headers.keys().any(|name| {
-        PROXY_HEADERS
-            .iter()
-            .any(|forbidden| name.as_str().eq_ignore_ascii_case(forbidden))
-    })
+    Ok(())
 }
 
 pub(super) fn cors_allowed_origins_from_env() -> Result<Vec<HeaderValue>, String> {

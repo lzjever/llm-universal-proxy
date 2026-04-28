@@ -607,7 +607,7 @@ if __name__ == "__main__":
             self.assertTrue(record["env"]["HOME"].startswith(str(outer_tmp)))
             self.assertTrue(record["env"]["CODEX_HOME"].startswith(record["env"]["HOME"]))
             self.assertEqual(record["env"]["OPENAI_BASE_URL"], f"{proxy_base}/openai/v1")
-            self.assertEqual(record["env"]["OPENAI_API_KEY"], "dummy")
+            self.assertEqual(record["env"]["OPENAI_API_KEY"], "llmup-proxy-key")
             response_requests = [
                 request
                 for request in proxy_requests
@@ -723,6 +723,7 @@ if __name__ == "__main__":
         fetch_live_model_profile.assert_called_once_with(
             "http://127.0.0.1:18888",
             "preset-openai-compatible",
+            proxy_key=module.DEFAULT_PROXY_KEY,
         )
         stop_proxy.assert_called_once_with(None, terminate_grace_secs=15)
         launch_args = launch_client.call_args.args
@@ -787,6 +788,7 @@ if __name__ == "__main__":
         fetch_live_model_profile.assert_called_once_with(
             "http://127.0.0.1:18888",
             "preset-openai-compatible",
+            proxy_key=module.DEFAULT_PROXY_KEY,
         )
         launch_args = launch_client.call_args.args
         self.assertEqual(
@@ -890,6 +892,8 @@ if __name__ == "__main__":
         self.assertNotIn("PRESET_ENDPOINT_MODEL", runtime_config_text)
         self.assertNotIn("proxy-only-secret", runtime_config_text)
         self.assertEqual(proxy_env["PRESET_ENDPOINT_API_KEY"], "proxy-only-secret")
+        self.assertEqual(proxy_env["LLM_UNIVERSAL_PROXY_AUTH_MODE"], "proxy_key")
+        self.assertEqual(proxy_env["LLM_UNIVERSAL_PROXY_KEY"], module.DEFAULT_PROXY_KEY)
         wait_for_health.assert_called_once_with(
             "http://127.0.0.1:18888",
             timeout_secs=65,
@@ -900,6 +904,7 @@ if __name__ == "__main__":
         fetch_live_model_profile.assert_called_once_with(
             "http://127.0.0.1:18888",
             "preset-anthropic-compatible",
+            proxy_key=module.DEFAULT_PROXY_KEY,
         )
         stop_proxy.assert_called_once_with(fake_process, terminate_grace_secs=15)
 
@@ -967,8 +972,7 @@ upstreams:
   MINIMAX-OPENAI:
     api_root: "https://api.minimaxi.com/v1"
     format: openai-completion
-    credential_actual: "secret"
-    auth_policy: force_server
+    provider_key_env: TEST_PROVIDER_API_KEY
     surface_defaults:
       modalities:
         input: ["text"]
@@ -1054,7 +1058,7 @@ model_aliases:
         self.assertIn("apply_patch_transport: freeform", runtime_config_text)
         self.assertIn("supports_parallel_calls: false", runtime_config_text)
 
-    def test_start_managed_proxy_preserves_provider_neutral_credential_env(self):
+    def test_start_managed_proxy_preserves_provider_neutral_provider_key_env(self):
         module = load_module()
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1067,8 +1071,7 @@ upstreams:
   PRESET-COMPAT:
     api_root: "https://preset.example/v1"
     format: openai-completion
-    credential_env: PRESET_ENDPOINT_API_KEY
-    auth_policy: force_server
+    provider_key_env: PRESET_ENDPOINT_API_KEY
 model_aliases:
   preset-chat: "PRESET-COMPAT:preset-model"
 """.lstrip(),
@@ -1128,11 +1131,13 @@ model_aliases:
         runtime_config_text = start_proxy.call_args.args[1]
         proxy_env = start_proxy.call_args.args[3]
         self.assertIs(process, fake_process)
-        self.assertIn("credential_env: PRESET_ENDPOINT_API_KEY", runtime_config_text)
-        self.assertNotIn("credential_actual", runtime_config_text)
+        self.assertIn("provider_key_env: PRESET_ENDPOINT_API_KEY", runtime_config_text)
+        self.assertNotIn("provider_key_inline", runtime_config_text)
         self.assertNotIn("proxy-only-secret", runtime_config_text)
         self.assertNotIn("MINIMAX", runtime_config_text.upper())
         self.assertEqual(proxy_env["PRESET_ENDPOINT_API_KEY"], "proxy-only-secret")
+        self.assertEqual(proxy_env["LLM_UNIVERSAL_PROXY_AUTH_MODE"], "proxy_key")
+        self.assertEqual(proxy_env["LLM_UNIVERSAL_PROXY_KEY"], module.DEFAULT_PROXY_KEY)
         self.assertNotIn("PRESET_ENDPOINT_API_KEY", client_env)
 
     def test_start_managed_proxy_hydrates_default_preset_from_base_env_without_env_file(self):
@@ -1201,6 +1206,8 @@ model_aliases:
         self.assertNotIn("PRESET_ENDPOINT_MODEL", runtime_config_text)
         self.assertNotIn("shell-only-secret", runtime_config_text)
         self.assertEqual(proxy_env["PRESET_ENDPOINT_API_KEY"], "shell-only-secret")
+        self.assertEqual(proxy_env["LLM_UNIVERSAL_PROXY_AUTH_MODE"], "proxy_key")
+        self.assertEqual(proxy_env["LLM_UNIVERSAL_PROXY_KEY"], module.DEFAULT_PROXY_KEY)
 
     def test_run_missing_provider_credential_fails_with_proxy_stderr_tail(self):
         module = load_module()
@@ -1219,7 +1226,6 @@ upstreams:
   PRESET-COMPAT:
     api_root: "https://preset.example/v1"
     format: openai-completion
-    auth_policy: force_server
 model_aliases:
   preset-chat: "PRESET-COMPAT:preset-model"
 """.lstrip(),
@@ -1284,7 +1290,7 @@ model_aliases:
         start_proxy.assert_called_once()
         fetch_live_model_profile.assert_not_called()
         launch_interactive_client.assert_not_called()
-        self.assertNotIn("credential_env:", captured_runtime_config["text"])
+        self.assertNotIn("provider_key_env:", captured_runtime_config["text"])
         self.assertNotIn("MINIMAX", captured_runtime_config["text"].upper())
 
     def test_start_managed_proxy_round_trips_namespace_and_upstream_proxy_objects(self):
@@ -1302,8 +1308,7 @@ upstreams:
   MINIMAX-OPENAI:
     api_root: "https://api.minimaxi.com/v1"
     format: openai-completion
-    credential_actual: "secret"
-    auth_policy: force_server
+    provider_key_env: TEST_PROVIDER_API_KEY
     proxy:
       url: http://upstream-proxy.example:8080
 model_aliases:
@@ -1369,8 +1374,7 @@ upstreams:
   MINIMAX-OPENAI:
     api_root: "https://api.minimaxi.com/v1"
     format: openai-completion
-    credential_actual: "secret"
-    auth_policy: force_server
+    provider_key_env: TEST_PROVIDER_API_KEY
     surface_defaults:
       modalities:
         input: ["text"]

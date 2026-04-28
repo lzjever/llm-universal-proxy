@@ -52,6 +52,13 @@ ACTIVE_DOC_PATHS = (
     REPO_ROOT / "README_CN.md",
     *sorted((REPO_ROOT / "docs").glob("*.md")),
 )
+AUTH_CONTRACT_SCAN_PATHS = (
+    REPO_ROOT / "README.md",
+    REPO_ROOT / "README_CN.md",
+    *sorted((REPO_ROOT / "docs").glob("*.md")),
+    *sorted((REPO_ROOT / "examples").glob("**/*")),
+    *sorted((REPO_ROOT / "scripts").glob("**/*")),
+)
 BOUNDARY_LANGUAGE_RE = re.compile(
     r"\b("
     r"portab\w+|"
@@ -112,6 +119,29 @@ UNBOUNDED_COMPAT_PROMISE_PATTERNS = (
         ),
     ),
 )
+
+
+def legacy_auth_terms() -> tuple[str, ...]:
+    data_prefix = "LLM_UNIVERSAL_PROXY_" + "DATA"
+    credential = "credential"
+    fallback = "fallback"
+    return (
+        data_prefix + "_TOKEN",
+        data_prefix + "_AUTH",
+        "X-LLMUP-" + "Data-" + "Token",
+        "_".join(("auth", "policy")),
+        "_".join(("client", "or", fallback)),
+        "_".join(("force", "server")),
+        "_".join((credential, "env")),
+        "_".join((credential, "actual")),
+        "_".join((fallback, credential, "env")),
+        "_".join((fallback, credential, "actual")),
+        "_".join((fallback, "api", "key")),
+    )
+
+
+def legacy_auth_prose_pattern() -> re.Pattern[str]:
+    return re.compile(r"\bdata[-_\s]+tokens?\b", re.IGNORECASE)
 
 
 def has_valid_boundary_language(unit: str) -> bool:
@@ -403,13 +433,23 @@ os.execv(real_git, [real_git, *args])
         self.assertIn("scripts/test_container_smoke.sh", makefile)
         self.assertIn("/etc/llmup/config.yaml", script)
         self.assertIn("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN=${ADMIN_TOKEN}", script)
-        self.assertIn("LLM_UNIVERSAL_PROXY_DATA_TOKEN=${DATA_TOKEN}", script)
-        self.assertIn("CONTAINER_SMOKE_UPSTREAM_API_KEY=dummy", script)
+        self.assertIn("LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key", script)
+        self.assertIn("LLM_UNIVERSAL_PROXY_KEY=${PROXY_KEY}", script)
+        self.assertIn(
+            "CONTAINER_SMOKE_UPSTREAM_API_KEY=container-smoke-provider-key",
+            script,
+        )
+        self.assertIn(
+            'EXPECTED_X_API_KEY = "container-smoke-provider-key"',
+            script,
+        )
+        self.assertIn('self.headers.get("x-api-key")', script)
+        self.assertIn("unexpected upstream authorization", script)
         self.assertIn("host.docker.internal:host-gateway", script)
         self.assertIn('CONTAINER_PORT="8080"', script)
         self.assertIn("listen: 0.0.0.0:${CONTAINER_PORT}", script)
-        self.assertIn("credential_env: CONTAINER_SMOKE_UPSTREAM_API_KEY", script)
-        self.assertIn("auth_policy: force_server", script)
+        self.assertIn("format: anthropic", script)
+        self.assertIn("provider_key_env: CONTAINER_SMOKE_UPSTREAM_API_KEY", script)
         self.assertIn('-p "${HOST}:${PROXY_PORT}:${CONTAINER_PORT}"', script)
         self.assertIn("wait_for_container_healthy", script)
         self.assertNotIn("listen: 0.0.0.0:${PROXY_PORT}", script)
@@ -429,14 +469,75 @@ os.execv(real_git, [real_git, *args])
         )
         for block in data_route_curls:
             with self.subTest(curl=block):
-                has_explicit_data_token = (
-                    "X-LLMUP-Data-Token: ${DATA_TOKEN}" in block
+                self.assertIn(
+                    "Authorization: Bearer ${PROXY_KEY}",
+                    block,
+                    "Every data-plane smoke curl must send the proxy key",
                 )
-                has_bearer_data_token = "Authorization: Bearer ${DATA_TOKEN}" in block
-                self.assertTrue(
-                    has_explicit_data_token or has_bearer_data_token,
-                    "Every data-plane smoke curl must send the data token",
+
+    def test_binary_smoke_uses_client_provider_key_auth_contract(self):
+        script = (REPO_ROOT / "scripts" / "test_binary_smoke.sh").read_text(
+            encoding="utf-8"
+        )
+        governance = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("scripts/test_binary_smoke.sh", governance)
+        self.assertIn("LLM_UNIVERSAL_PROXY_AUTH_MODE=client_provider_key", script)
+        self.assertNotIn("LLM_UNIVERSAL_PROXY_KEY=", script)
+        self.assertIn('SMOKE_PROVIDER_KEY="binary-smoke-provider-key"', script)
+        self.assertIn(
+            'python3 -u - "$MOCK_PORT_FILE" "$SMOKE_PROVIDER_KEY"',
+            script,
+        )
+        self.assertIn("expected_provider_key = sys.argv[2]", script)
+        self.assertIn('self.headers.get("x-api-key")', script)
+        self.assertIn('self.headers.get("Authorization")', script)
+        self.assertIn("unexpected upstream authorization", script)
+        self.assertNotIn("provider_key_env:", script)
+
+        data_route_curls = [
+            block
+            for block in curl_command_blocks(script)
+            if "http://${HOST}:${PROXY_PORT}" in block
+            and "/health" not in block
+            and "/admin/" not in block
+        ]
+        self.assertGreater(
+            len(data_route_curls),
+            0,
+            "Binary smoke must exercise at least one data-plane route",
+        )
+        for block in data_route_curls:
+            with self.subTest(curl=block):
+                self.assertIn(
+                    "Authorization: Bearer ${SMOKE_PROVIDER_KEY}",
+                    block,
+                    "Every data-plane binary smoke curl must send the provider key",
                 )
+
+        for governed_snippet in (
+            "LLM_UNIVERSAL_PROXY_AUTH_MODE=client_provider_key",
+            'SMOKE_PROVIDER_KEY="binary-smoke-provider-key"',
+            'python3 -u - "$MOCK_PORT_FILE" "$SMOKE_PROVIDER_KEY"',
+            'self.headers.get("x-api-key")',
+            'self.headers.get("Authorization")',
+            "unexpected upstream authorization",
+            "Authorization: Bearer ${SMOKE_PROVIDER_KEY}",
+        ):
+            with self.subTest(governed_snippet=governed_snippet):
+                self.assertIn(
+                    f'check_contains "scripts/test_binary_smoke.sh" \'{governed_snippet}\'',
+                    governance,
+                )
+
+        self.assertIn(
+            'check_absent "scripts/test_binary_smoke.sh" "provider_key_env:"',
+            governance,
+        )
+        self.assertIn(
+            'check_absent "scripts/test_binary_smoke.sh" "LLM_UNIVERSAL_PROXY_KEY="',
+            governance,
+        )
 
     def test_ci_and_release_workflows_keep_container_publish_scope_tight(self):
         ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
@@ -625,11 +726,94 @@ os.execv(real_git, [real_git, *args])
             with self.subTest(key_pattern=key_pattern):
                 self.assertIn(key_pattern, script)
                 self.assertNotIn(key_pattern, default_config)
-        self.assertIn("credential_env: PRESET_ENDPOINT_API_KEY", default_config)
+        self.assertIn("provider_key_env: PRESET_ENDPOINT_API_KEY", default_config)
         self.assertIn("PRESET-OPENAI-COMPATIBLE", default_config)
         self.assertIn("PRESET-ANTHROPIC-COMPATIBLE", default_config)
         self.assertNotIn("MINIMAX", default_config.upper())
-        self.assertNotIn("credential_actual", default_config)
+        self.assertNotIn("provider_key_inline", default_config)
+
+    def test_governance_bans_legacy_data_auth_contract_terms_in_active_surfaces(self):
+        script = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
+
+        for snippet in (
+            "scan_tracked_auth_contract",
+            '["git", "ls-files", "README.md", "README_CN.md", "docs", "examples", "scripts"]',
+            'parts = ("data", "token")',
+            "old_prose_re",
+            "LLM_UNIVERSAL_PROXY_AUTH_MODE",
+            "LLM_UNIVERSAL_PROXY_KEY",
+            "provider_key_env",
+            "client_provider_key",
+            "proxy_key",
+        ):
+            with self.subTest(governance_snippet=snippet):
+                self.assertIn(snippet, script)
+
+        violations = []
+        old_prose_re = legacy_auth_prose_pattern()
+        for path in AUTH_CONTRACT_SCAN_PATHS:
+            if (
+                not path.is_file()
+                or "protocol-baselines" in path.parts
+                or "__pycache__" in path.parts
+            ):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for term in legacy_auth_terms():
+                if term in text:
+                    line_no = text.count("\n", 0, text.find(term)) + 1
+                    violations.append(f"{path.relative_to(REPO_ROOT)}:{line_no}: {term}")
+            for match in old_prose_re.finditer(text):
+                line_no = text.count("\n", 0, match.start()) + 1
+                violations.append(
+                    f"{path.relative_to(REPO_ROOT)}:{line_no}: {match.group(0)}"
+                )
+
+        self.assertFalse(
+            violations,
+            "Active docs/examples/scripts must use the new auth contract:\n"
+            + "\n".join(violations),
+        )
+
+    def test_governance_blocks_dummy_sdk_keys_and_stale_fallback_credential_docs(self):
+        script = GOVERNANCE_SCRIPT.read_text(encoding="utf-8")
+        clients_doc = (REPO_ROOT / "docs" / "clients.md").read_text(encoding="utf-8")
+        admin_doc = (REPO_ROOT / "docs" / "admin-dynamic-config.md").read_text(
+            encoding="utf-8"
+        )
+
+        for snippet in (
+            'check_absent "docs/clients.md" "OPENAI_API_KEY=dummy"',
+            'check_absent "docs/clients.md" "ANTHROPIC_API_KEY=dummy"',
+            'check_absent "docs/clients.md" "GEMINI_API_KEY=dummy"',
+            'check_absent "docs/admin-dynamic-config.md" "fallback credential"',
+            'check_absent "docs/admin-dynamic-config.md" "fallback_credential"',
+        ):
+            with self.subTest(governance_snippet=snippet):
+                self.assertIn(snippet, script)
+
+        for forbidden in (
+            "OPENAI_API_KEY=dummy",
+            "ANTHROPIC_API_KEY=dummy",
+            "GEMINI_API_KEY=dummy",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, clients_doc)
+
+        for snippet in (
+            "OPENAI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
+            "ANTHROPIC_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
+            "GEMINI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
+            "`client_provider_key` mode, set these SDK keys to the real provider key",
+        ):
+            with self.subTest(clients_snippet=snippet):
+                self.assertIn(snippet, clients_doc)
+
+        for forbidden in ("fallback credential", "fallback_credential"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, admin_doc)
+        self.assertIn("whether a provider key is configured", admin_doc)
+        self.assertIn("provider_key_env presence", admin_doc)
 
     def test_container_examples_and_docs_do_not_bake_secrets(self):
         container_config = (REPO_ROOT / "examples" / "container-config.yaml").read_text(
@@ -646,12 +830,12 @@ os.execv(real_git, [real_git, *args])
         )
 
         self.assertIn("listen: 0.0.0.0:8080", container_config)
-        self.assertIn("credential_env: OPENAI_COMPATIBLE_API_KEY", container_config)
+        self.assertIn("provider_key_env: OPENAI_COMPATIBLE_API_KEY", container_config)
         self.assertIn(
-            "credential_env: ANTHROPIC_COMPATIBLE_API_KEY",
+            "provider_key_env: ANTHROPIC_COMPATIBLE_API_KEY",
             container_config,
         )
-        self.assertNotIn("credential_actual", container_config)
+        self.assertNotIn("provider_key_inline", container_config)
         self.assertNotIn("MINIMAX", container_config.upper())
         self.assertNotIn("MINIMAX", compose.upper())
         self.assertNotIn("PRESET_", container_config)
@@ -669,13 +853,15 @@ os.execv(real_git, [real_git, *args])
             compose,
         )
         self.assertIn(
-            "${LLM_UNIVERSAL_PROXY_DATA_TOKEN:?set LLM_UNIVERSAL_PROXY_DATA_TOKEN}",
+            "LLM_UNIVERSAL_PROXY_AUTH_MODE: proxy_key",
             compose,
         )
+        self.assertIn("${LLM_UNIVERSAL_PROXY_KEY:?set LLM_UNIVERSAL_PROXY_KEY}", compose)
         self.assertNotRegex(container_config + compose, r"sk-[A-Za-z0-9]")
         self.assertIn("ghcr.io/agentsmith-project/llm-universal-proxy", container_doc)
-        self.assertIn("LLM_UNIVERSAL_PROXY_DATA_TOKEN", container_doc)
-        self.assertIn("X-LLMUP-Data-Token", container_doc)
+        self.assertIn("LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key", container_doc)
+        self.assertIn("LLM_UNIVERSAL_PROXY_KEY", container_doc)
+        self.assertIn("provider_key_env", container_doc)
         self.assertIn(
             "Do not mount the local quickstart config unchanged for container service mode",
             container_doc,

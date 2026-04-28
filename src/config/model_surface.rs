@@ -43,6 +43,7 @@ pub enum ApplyPatchTransport {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelModalities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Vec<ModelModality>>,
@@ -75,6 +76,7 @@ impl ModelModalities {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelToolSurface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_search: Option<bool>,
@@ -115,6 +117,7 @@ impl ModelToolSurface {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelSurfacePatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modalities: Option<ModelModalities>,
@@ -149,6 +152,7 @@ impl ModelSurfacePatch {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelSurface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ModelLimits>,

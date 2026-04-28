@@ -18,8 +18,7 @@ upstreams:
   PRESET-ANTHROPIC-COMPATIBLE:
     api_root: PRESET_ANTHROPIC_ENDPOINT_BASE_URL
     format: anthropic
-    credential_env: PRESET_ENDPOINT_API_KEY
-    auth_policy: force_server
+    provider_key_env: PRESET_ENDPOINT_API_KEY
     limits:
       context_window: 200000
       max_output_tokens: 128000
@@ -36,8 +35,7 @@ upstreams:
   PRESET-OPENAI-COMPATIBLE:
     api_root: PRESET_OPENAI_ENDPOINT_BASE_URL
     format: openai-completion
-    credential_env: PRESET_ENDPOINT_API_KEY
-    auth_policy: force_server
+    provider_key_env: PRESET_ENDPOINT_API_KEY
     limits:
       context_window: 200000
       max_output_tokens: 128000

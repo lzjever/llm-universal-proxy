@@ -13,10 +13,13 @@ use axum::{
 };
 use forward_proxy::spawn_http_forward_proxy;
 use llm_universal_proxy::config::{
-    AuthPolicy, CompatibilityMode, Config, DebugTraceConfig, RuntimeConfigPayload, UpstreamConfig,
+    CompatibilityMode, Config, DebugTraceConfig, RuntimeConfigPayload, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap as ReqwestHeaderMap, HeaderValue},
+    Client,
+};
 use runtime_proxy::{start_proxy, upstream_api_root};
 use serde_json::{json, Value};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -25,6 +28,20 @@ use tokio::net::TcpListener;
 
 static UPSTREAM_PROXY_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+const TEST_PROVIDER_KEY: &str = "provider-secret";
+
+fn direct_data_client() -> Client {
+    let mut headers = ReqwestHeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TEST_PROVIDER_KEY}")).unwrap(),
+    );
+    Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CapturedUpstreamRequest {
@@ -87,10 +104,7 @@ fn openai_auto_discovery_config(upstream_base: &str) -> Config {
             name: "default".to_string(),
             api_root: upstream_api_root(upstream_base, UpstreamFormat::OpenAiCompletion),
             fixed_upstream_format: None,
-            fallback_credential_env: None,
-            fallback_credential_actual: None,
-            fallback_api_key: None,
-            auth_policy: AuthPolicy::ClientOrFallback,
+            provider_key_env: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -302,7 +316,7 @@ async fn env_proxy_is_used_consistently_for_discovery_request_and_resource_paths
 
     let config = openai_auto_discovery_config(&upstream_base);
     let (llmup_base, _proxy_handle) = start_proxy(config).await;
-    let client = Client::builder().no_proxy().build().unwrap();
+    let client = direct_data_client();
 
     let response = client
         .post(format!("{llmup_base}/openai/v1/chat/completions"))
@@ -402,7 +416,7 @@ upstreams:
     );
     let config = Config::from_yaml_str(&yaml).unwrap();
     let (llmup_base, _llmup) = start_proxy(config).await;
-    let client = Client::builder().no_proxy().build().unwrap();
+    let client = direct_data_client();
 
     let response = client
         .post(format!("{llmup_base}/openai/v1/chat/completions"))
@@ -456,7 +470,7 @@ upstreams:
     );
     let config = Config::from_yaml_str(&yaml).unwrap();
     let (llmup_base, _llmup) = start_proxy(config).await;
-    let client = Client::builder().no_proxy().build().unwrap();
+    let client = direct_data_client();
 
     let response = client
         .post(format!("{llmup_base}/openai/v1/chat/completions"))
@@ -513,7 +527,7 @@ upstreams:
     );
     let config = Config::from_yaml_str(&yaml).unwrap();
     let (llmup_base, _llmup) = start_proxy(config).await;
-    let client = Client::builder().no_proxy().build().unwrap();
+    let client = direct_data_client();
 
     let request_response = client
         .post(format!("{llmup_base}/openai/v1/chat/completions"))

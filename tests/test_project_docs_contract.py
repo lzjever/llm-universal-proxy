@@ -25,8 +25,9 @@ class ProjectDocsContractTests(unittest.TestCase):
                 "`src/server/body_limits.rs`",
                 "`src/server/web_dashboard.rs`",
                 "`src/server/web_dashboard/index.html`",
-                "`LLM_UNIVERSAL_PROXY_DATA_TOKEN`",
-                "`X-LLMUP-Data-Token`",
+                "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
+                "`LLM_UNIVERSAL_PROXY_KEY`",
+                "`provider_key_env`",
                 "`max_request_body_bytes`",
             )
         )

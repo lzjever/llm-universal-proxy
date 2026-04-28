@@ -138,11 +138,13 @@ Wrappers are still recommended, but the underlying client contracts are straight
 
 The release CLI wrapper matrix currently gates the wrapper surface in two deterministic parts: a structure gate that expands the tracked basic matrix for Codex CLI, Claude Code, and Gemini CLI, plus a hermetic scripted interactive Codex wrapper gate. That gate executes `scripts/run_codex_proxy.sh` with a fake Codex binary and fake local proxy for two stdin turns. This is not a full live multi-client/provider matrix; real live client evidence remains final GA/operator validation when those CLIs and provider credentials are available.
 
+In `proxy_key` mode, set each client SDK key below to `$LLM_UNIVERSAL_PROXY_KEY`; the proxy reads the real upstream provider key from `provider_key_env`. In `client_provider_key` mode, set these SDK keys to the real provider key for the selected upstream.
+
 ### Codex
 
 Set:
 
-- `OPENAI_API_KEY=dummy`
+- `OPENAI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY`
 - `OPENAI_BASE_URL=<proxy>/openai/v1`
 
 Codex then calls the OpenAI-style surface, typically `POST /openai/v1/responses`.
@@ -151,7 +153,7 @@ Codex then calls the OpenAI-style surface, typically `POST /openai/v1/responses`
 
 Set:
 
-- `ANTHROPIC_API_KEY=dummy`
+- `ANTHROPIC_API_KEY=$LLM_UNIVERSAL_PROXY_KEY`
 - `ANTHROPIC_BASE_URL=<proxy>/anthropic`
 
 Claude then appends `/v1/messages`, which lands on `POST /anthropic/v1/messages`.
@@ -160,12 +162,10 @@ Claude then appends `/v1/messages`, which lands on `POST /anthropic/v1/messages`
 
 Set:
 
-- `GEMINI_API_KEY=dummy`
+- `GEMINI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY`
 - `GOOGLE_GEMINI_BASE_URL=<proxy>/google`
 
 Gemini then appends `/v1beta/models/...`, which lands on `POST /google/v1beta/models/...`.
-
-Dummy keys are usually enough when the real upstream credential lives on the proxy side and the upstream uses `auth_policy: force_server`.
 
 ## Picking Model Names
 

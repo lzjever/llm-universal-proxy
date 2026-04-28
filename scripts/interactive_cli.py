@@ -21,7 +21,9 @@ from real_cli_matrix import (  # noqa: E402
     CodexModelMetadata,
     DEFAULT_CONFIG_SOURCE,
     DEFAULT_ENV_FILE,
+    DEFAULT_PROXY_KEY,
     ModelLimits,
+    PROXY_KEY_ENV,
     add_timeout_policy_args,
     build_client_env,
     build_codex_catalog_args,
@@ -33,6 +35,7 @@ from real_cli_matrix import (  # noqa: E402
     merge_preset_endpoint_env,
     parse_proxy_source,
     prepare_proxy_env,
+    resolve_proxy_key,
     start_proxy,
     stop_proxy,
     timeout_policy_from_args,
@@ -254,6 +257,7 @@ def run(argv: list[str] | None = None) -> int:
         try:
             if args.proxy_base:
                 proxy_base = normalize_proxy_base(args.proxy_base)
+                proxy_key = resolve_proxy_key(base_env)
             else:
                 (
                     proxy_base,
@@ -264,6 +268,10 @@ def run(argv: list[str] | None = None) -> int:
                     args,
                     base_env,
                     runtime_root,
+                )
+                proxy_key = resolve_proxy_key(
+                    base_env,
+                    load_dotenv_file(pathlib.Path(args.env_file)),
                 )
 
             if proxy_process is None:
@@ -279,12 +287,18 @@ def run(argv: list[str] | None = None) -> int:
                     stdout_path=proxy_stdout_path,
                     stderr_path=proxy_stderr_path,
                 )
-            live_profile = fetch_live_model_profile(proxy_base, args.model)
+            live_profile = fetch_live_model_profile(
+                proxy_base,
+                args.model,
+                proxy_key=proxy_key,
+            )
 
             client_home = runtime_root / "homes" / args.client
+            client_base_env = dict(base_env)
+            client_base_env[PROXY_KEY_ENV] = proxy_key
             client_env = build_client_env(
                 args.client,
-                base_env,
+                client_base_env,
                 proxy_base,
                 client_home,
                 model_name=args.model,

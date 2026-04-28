@@ -32,7 +32,7 @@ In other words:
 - local development can often use loopback admin access directly, without forwarding headers such as `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, or `X-Real-IP`
 - shared or remote deployments should normally set a non-empty admin bearer token
 
-The data plane has its own token, `LLM_UNIVERSAL_PROXY_DATA_TOKEN`, and does not accept the admin token for provider/model/resource calls. Dynamic namespace config can add server-held credentials, but those credentials are only usable through the data-plane boundary; non-loopback service mode without a data token fails closed.
+Provider/model/resource routes use `LLM_UNIVERSAL_PROXY_AUTH_MODE` and do not accept the admin token. In `proxy_key` mode, dynamic namespace config can add upstream `provider_key_env` entries, and clients authenticate with `LLM_UNIVERSAL_PROXY_KEY` through their normal SDK API key or bearer token.
 
 ## Admin Dashboard Boundary
 
@@ -43,7 +43,7 @@ Current product boundary:
 - `/dashboard` shell and static assets are public UI resources. Loading the shell or assets does not grant admin API access.
 - Dashboard JavaScript sends `Authorization: Bearer <admin-token>` only when it calls existing `/admin/*` APIs.
 - Admin-plane routes use `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`; when the token is set to a non-empty value, admin API requests must provide a matching bearer token.
-- data-plane provider/model/resource routes use `LLM_UNIVERSAL_PROXY_DATA_TOKEN` separately and do not accept the admin token
+- provider/model/resource routes use `LLM_UNIVERSAL_PROXY_AUTH_MODE` separately and do not accept the admin token
 - do not introduce a separate service key
 - do not add multi-user accounts, readonly roles, or complex session behavior in this plan
 
@@ -143,7 +143,7 @@ The redacted view does not expose sensitive values such as:
 
 What you get instead is enough operational information to understand the runtime safely, for example:
 
-- whether a fallback credential is configured
+- whether a provider key is configured through provider_key_env presence
 - whether hook authorization is configured
 - a sanitized `proxy` or `proxy_url` where that is safe to show
 
@@ -189,8 +189,7 @@ curl -fsS \
         "name": "PRESET-OPENAI-COMPATIBLE",
         "api_root": "https://openai-compatible.example/v1",
         "fixed_upstream_format": "openai-completion",
-        "fallback_credential_env": "PRESET_ENDPOINT_API_KEY",
-        "auth_policy": "force_server",
+        "provider_key_env": "PRESET_ENDPOINT_API_KEY",
         "surface_defaults": {
           "modalities": {
             "input": ["text"],

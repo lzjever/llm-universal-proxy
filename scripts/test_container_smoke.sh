@@ -10,7 +10,7 @@ HOST="127.0.0.1"
 CONTAINER_PORT="8080"
 PROXY_PORT="${PROXY_PORT:-}"
 ADMIN_TOKEN="container-smoke-token"
-DATA_TOKEN="container-smoke-data-token"
+PROXY_KEY="container-smoke-proxy-key"
 
 TMP_DIR=""
 MOCK_PID=""
@@ -166,6 +166,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port_file = sys.argv[1]
+EXPECTED_X_API_KEY = "container-smoke-provider-key"
 
 
 def anthropic_stream(model: str) -> bytes:
@@ -243,6 +244,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self._read_json()
         model = body.get("model", "missing-model")
+        if self.headers.get("x-api-key") != EXPECTED_X_API_KEY:
+            self._send_json(401, {"error": "unexpected upstream authorization"})
+            return
         if self.path in ("/v1/messages", "/messages"):
             payload = anthropic_stream(model)
             self.send_response(200)
@@ -280,8 +284,7 @@ upstreams:
   default:
     api_root: http://host.docker.internal:${MOCK_PORT}/v1
     format: anthropic
-    credential_env: CONTAINER_SMOKE_UPSTREAM_API_KEY
-    auth_policy: force_server
+    provider_key_env: CONTAINER_SMOKE_UPSTREAM_API_KEY
 EOF
 }
 
@@ -311,8 +314,9 @@ start_container() {
         --name "$CONTAINER_NAME" \
         --add-host=host.docker.internal:host-gateway \
         -e "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN=${ADMIN_TOKEN}" \
-        -e "LLM_UNIVERSAL_PROXY_DATA_TOKEN=${DATA_TOKEN}" \
-        -e "CONTAINER_SMOKE_UPSTREAM_API_KEY=dummy" \
+        -e "LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key" \
+        -e "LLM_UNIVERSAL_PROXY_KEY=${PROXY_KEY}" \
+        -e "CONTAINER_SMOKE_UPSTREAM_API_KEY=container-smoke-provider-key" \
         --health-interval=2s \
         --health-timeout=2s \
         --health-retries=15 \
@@ -398,7 +402,7 @@ run_responses_smoke() {
             -X POST "http://${HOST}:${PROXY_PORT}/openai/v1/responses" \
             -H "Accept: text/event-stream" \
             -H "Content-Type: application/json" \
-            -H "X-LLMUP-Data-Token: ${DATA_TOKEN}" \
+            -H "Authorization: Bearer ${PROXY_KEY}" \
             --data '{"model":"GLM-5","input":"Hi","stream":true}' \
             -w '%{http_code}'
     )"

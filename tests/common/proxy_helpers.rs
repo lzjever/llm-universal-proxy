@@ -2,7 +2,7 @@
 
 use super::runtime_proxy::upstream_api_root;
 use llm_universal_proxy::config::{
-    AuthPolicy, CompatibilityMode, Config, DebugTraceConfig, ProxyConfig, UpstreamConfig,
+    CompatibilityMode, Config, DebugTraceConfig, ProxyConfig, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
 use std::time::Duration;
@@ -17,10 +17,7 @@ pub fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
             name: "default".to_string(),
             api_root: upstream_api_root(upstream_base, format),
             fixed_upstream_format: Some(format),
-            fallback_credential_env: None,
-            fallback_credential_actual: None,
-            fallback_api_key: None,
-            auth_policy: AuthPolicy::ClientOrFallback,
+            provider_key_env: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,

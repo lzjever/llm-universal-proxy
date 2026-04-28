@@ -1251,6 +1251,7 @@ pub fn new_request_id() -> String {
 pub fn capture_headers(headers: &axum::http::HeaderMap) -> Vec<HeaderEntry> {
     headers
         .iter()
+        .filter(|(name, _)| !is_client_credential_header_name(name.as_str()))
         .filter_map(|(name, value)| {
             value.to_str().ok().map(|v| HeaderEntry {
                 name: name.as_str().to_string(),
@@ -1258,6 +1259,19 @@ pub fn capture_headers(headers: &axum::http::HeaderMap) -> Vec<HeaderEntry> {
             })
         })
         .collect()
+}
+
+fn is_client_credential_header_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "x-api-key"
+            | "api-key"
+            | "openai-api-key"
+            | "x-goog-api-key"
+            | "anthropic-api-key"
+            | "x-llmup-data-token"
+    )
 }
 
 pub fn json_response_headers() -> Vec<HeaderEntry> {
@@ -2012,6 +2026,50 @@ mod tests {
         assert!(runtime.can_attempt(HookKind::Usage));
         runtime.record_success(HookKind::Usage);
         assert!(runtime.can_attempt(HookKind::Usage));
+    }
+
+    #[test]
+    fn capture_headers_strips_client_credential_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer provider-secret"),
+        );
+        headers.insert(
+            "x-api-key",
+            axum::http::HeaderValue::from_static("provider-secret"),
+        );
+        headers.insert(
+            "openai-api-key",
+            axum::http::HeaderValue::from_static("provider-secret"),
+        );
+        headers.insert(
+            "x-llmup-data-token",
+            axum::http::HeaderValue::from_static("legacy-data-secret"),
+        );
+        headers.insert(
+            "openai-organization",
+            axum::http::HeaderValue::from_static("org_123"),
+        );
+
+        let captured = capture_headers(&headers);
+
+        assert!(captured
+            .iter()
+            .any(|entry| entry.name == "openai-organization" && entry.value == "org_123"));
+        for forbidden in [
+            "authorization",
+            "x-api-key",
+            "openai-api-key",
+            "x-llmup-data-token",
+        ] {
+            assert!(
+                !captured
+                    .iter()
+                    .any(|entry| entry.name.eq_ignore_ascii_case(forbidden)),
+                "hook headers must not capture {forbidden}"
+            );
+        }
     }
 
     #[test]

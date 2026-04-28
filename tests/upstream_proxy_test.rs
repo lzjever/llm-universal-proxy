@@ -9,7 +9,10 @@ use forward_proxy::spawn_http_forward_proxy;
 use llm_universal_proxy::config::Config;
 use llm_universal_proxy::formats::UpstreamFormat;
 use mock_upstream::spawn_openai_completion_mock;
-use reqwest::Client;
+use reqwest::{
+    header::{HeaderMap as ReqwestHeaderMap, HeaderValue},
+    Client,
+};
 use runtime_proxy::{start_proxy, upstream_api_root};
 use serde_json::json;
 use std::sync::LazyLock;
@@ -17,6 +20,20 @@ use std::time::Duration;
 
 static UPSTREAM_PROXY_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+const TEST_PROVIDER_KEY: &str = "provider-secret";
+
+fn direct_data_client() -> Client {
+    let mut headers = ReqwestHeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TEST_PROVIDER_KEY}")).unwrap(),
+    );
+    Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
 
 #[derive(Clone, Copy)]
 enum ProxyLayer<'a> {
@@ -98,7 +115,7 @@ fn install_http_proxy_env(proxy_url: &str) -> Vec<ScopedEnvVar> {
 }
 
 async fn send_chat_completion(proxy_base: &str) -> serde_json::Value {
-    let client = Client::builder().no_proxy().build().unwrap();
+    let client = direct_data_client();
     let response = client
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({

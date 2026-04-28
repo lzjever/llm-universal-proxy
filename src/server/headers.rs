@@ -4,7 +4,6 @@ use axum::{
 };
 use tracing::debug;
 
-use crate::config::AuthPolicy;
 use crate::formats::UpstreamFormat;
 use crate::hooks::{fingerprint_credential, CredentialSource};
 
@@ -40,65 +39,36 @@ pub(super) fn build_auth_headers(
     upstream_format: UpstreamFormat,
 ) -> (Vec<(String, String)>, EffectiveCredential) {
     let mut headers = extract_forwardable_headers(request_headers);
+    if let Some(provider_key) = upstream_state.provider_key.as_ref() {
+        strip_auth_headers(&mut headers);
+        headers.push(auth_header_for_format(upstream_format, provider_key));
+        return (
+            headers,
+            EffectiveCredential {
+                source: CredentialSource::Server,
+                fingerprint: Some(fingerprint_credential(provider_key)),
+            },
+        );
+    }
+
     let client_key = extract_api_key_from_headers(&headers);
-    match upstream_state.config.auth_policy {
-        AuthPolicy::ForceServer => {
-            headers.retain(|(k, _)| {
-                let k = k.to_lowercase();
-                !matches!(
-                    k.as_str(),
-                    "authorization"
-                        | "x-api-key"
-                        | "api-key"
-                        | "openai-api-key"
-                        | "x-goog-api-key"
-                        | "anthropic-api-key"
-                        | "bearer"
-                )
-            });
-            let server_key = upstream_state
-                .config
-                .fallback_api_key
-                .as_ref()
-                .expect("validated force_server requires fallback_api_key");
-            headers.push(auth_header_for_format(upstream_format, server_key));
-            (
-                headers,
-                EffectiveCredential {
-                    source: CredentialSource::Server,
-                    fingerprint: Some(fingerprint_credential(server_key)),
-                },
-            )
-        }
-        AuthPolicy::ClientOrFallback => {
-            if let Some(client_key) = client_key {
-                normalize_auth_headers(&mut headers, upstream_format);
-                (
-                    headers,
-                    EffectiveCredential {
-                        source: CredentialSource::Client,
-                        fingerprint: Some(fingerprint_credential(&client_key)),
-                    },
-                )
-            } else if let Some(server_key) = upstream_state.config.fallback_api_key.as_ref() {
-                headers.push(auth_header_for_format(upstream_format, server_key));
-                (
-                    headers,
-                    EffectiveCredential {
-                        source: CredentialSource::Server,
-                        fingerprint: Some(fingerprint_credential(server_key)),
-                    },
-                )
-            } else {
-                (
-                    headers,
-                    EffectiveCredential {
-                        source: CredentialSource::Client,
-                        fingerprint: None,
-                    },
-                )
-            }
-        }
+    if let Some(client_key) = client_key {
+        normalize_auth_headers(&mut headers, upstream_format);
+        (
+            headers,
+            EffectiveCredential {
+                source: CredentialSource::Client,
+                fingerprint: Some(fingerprint_credential(&client_key)),
+            },
+        )
+    } else {
+        (
+            headers,
+            EffectiveCredential {
+                source: CredentialSource::Client,
+                fingerprint: None,
+            },
+        )
     }
 }
 
@@ -197,23 +167,26 @@ fn normalize_auth_headers(headers: &mut Vec<(String, String)>, target_format: Up
     let extracted_key = extract_api_key_from_headers(headers);
 
     if let Some(key) = extracted_key {
-        headers.retain(|(k, _)| {
-            let k = k.to_lowercase();
-            !matches!(
-                k.as_str(),
-                "authorization"
-                    | "x-api-key"
-                    | "api-key"
-                    | "openai-api-key"
-                    | "x-goog-api-key"
-                    | "anthropic-api-key"
-                    | "bearer"
-            )
-        });
+        strip_auth_headers(headers);
 
         let auth_header = auth_header_for_format(target_format, &key);
         headers.push(auth_header);
     }
+}
+
+fn strip_auth_headers(headers: &mut Vec<(String, String)>) {
+    headers.retain(|(k, _)| {
+        let k = k.to_lowercase();
+        !matches!(
+            k.as_str(),
+            "authorization"
+                | "x-api-key"
+                | "api-key"
+                | "openai-api-key"
+                | "x-goog-api-key"
+                | "anthropic-api-key"
+        )
+    });
 }
 
 /// Extract API key from various auth header formats.
@@ -221,15 +194,12 @@ fn extract_api_key_from_headers(headers: &[(String, String)]) -> Option<String> 
     for (name, value) in headers {
         let name_lower = name.to_lowercase();
         match name_lower.as_str() {
-            "authorization" | "bearer" => {
+            "authorization" => {
                 if let Some(key) = value
                     .strip_prefix("Bearer ")
                     .or_else(|| value.strip_prefix("bearer "))
                 {
                     return Some(key.to_string());
-                }
-                if !value.is_empty() {
-                    return Some(value.clone());
                 }
             }
             "x-api-key" | "api-key" | "openai-api-key" | "x-goog-api-key" | "anthropic-api-key" => {

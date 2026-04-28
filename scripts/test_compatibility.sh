@@ -21,6 +21,7 @@ set -euo pipefail
 BASE_URL="${BASE_URL:-http://127.0.0.1:18888}"
 DEFAULT_CONFIG="scripts/fixtures/cli_matrix/default_proxy_test_matrix.yaml"
 DEFAULT_ENV_FILE=".env.test"
+PROXY_KEY="${LLM_UNIVERSAL_PROXY_KEY:-llmup-compat-proxy-key}"
 PASS=0
 FAIL=0
 SKIP=0
@@ -46,6 +47,7 @@ http_post() {
     local data="$2"
     curl -sS -w "\n%{http_code}" -X POST "$url" \
         -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${PROXY_KEY}" \
         -d "$data" 2>/dev/null || echo -e "\n000"
 }
 
@@ -55,6 +57,7 @@ sse_post() {
     local data="$2"
     curl -sS -w "\n%{http_code}" -X POST "$url" \
         -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${PROXY_KEY}" \
         -d "$data" 2>/dev/null || echo -e "\n000"
 }
 
@@ -125,6 +128,9 @@ spec.loader.exec_module(module)
 parsed = module.parse_proxy_source(config_source.read_text(encoding="utf-8"))
 dotenv_env = module.load_dotenv_file(env_file)
 for key in module.required_preset_endpoint_env_keys(parsed):
+    if os.environ.get(key):
+        dotenv_env[key] = os.environ[key]
+for key in ("LOCAL_QWEN_BASE_URL", "LOCAL_QWEN_MODEL", "LOCAL_QWEN_API_KEY"):
     if os.environ.get(key):
         dotenv_env[key] = os.environ[key]
 module.validate_preset_endpoint_env(parsed, dotenv_env)
@@ -317,9 +323,9 @@ test_preset_openai_compatible() {
 # Local qwen3.5-9b-awq via OpenAI-compatible upstream
 # ============================================================
 test_local_qwen() {
-    if [ -z "${LOCAL_QWEN_BASE_URL:-}" ] || [ -z "${LOCAL_QWEN_MODEL:-}" ]; then
+    if [ -z "${LOCAL_QWEN_BASE_URL:-}" ] || [ -z "${LOCAL_QWEN_MODEL:-}" ] || [ -z "${LOCAL_QWEN_API_KEY:-}" ]; then
         log_header "Local qwen3.5 Upstream"
-        log_skip "Local qwen tests require LOCAL_QWEN_BASE_URL and LOCAL_QWEN_MODEL"
+        log_skip "Local qwen tests require LOCAL_QWEN_BASE_URL, LOCAL_QWEN_MODEL, and LOCAL_QWEN_API_KEY"
         return 0
     fi
 
@@ -433,6 +439,8 @@ main() {
             cargo build --locked --release
         fi
         load_auto_start_env_file "$ENV_FILE"
+        export LLM_UNIVERSAL_PROXY_AUTH_MODE="proxy_key"
+        export LLM_UNIVERSAL_PROXY_KEY="$PROXY_KEY"
         render_auto_start_config "$CONFIG" "$ENV_FILE"
         RUNTIME_CONFIG="$AUTO_START_RUNTIME_CONFIG"
         $BINARY --config "$RUNTIME_CONFIG" &

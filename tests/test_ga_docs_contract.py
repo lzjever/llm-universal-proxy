@@ -4,6 +4,13 @@ import unittest
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+IMAGE_REPO = "ghcr.io/agentsmith-project/llm-universal-proxy"
+CURRENT_RELEASE_TAG = "v0.2.22"
+CURRENT_VERSION_TAG = "0.2.22"
+CURRENT_IMAGE_DIGEST = (
+    "ghcr.io/agentsmith-project/llm-universal-proxy@"
+    "sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89"
+)
 
 
 def read_doc(relative_path: str) -> str:
@@ -41,6 +48,129 @@ def markdown_subsection(text: str, heading: str) -> str:
 
 
 class GaDocsContractTests(unittest.TestCase):
+    def test_published_docker_image_usage_docs_are_ga_ready(self):
+        container_doc = read_doc("docs/container.md")
+
+        current_release = markdown_section(container_doc, "Current Release")
+        for snippet in (
+            f"{IMAGE_REPO}:{CURRENT_RELEASE_TAG}",
+            f"{IMAGE_REPO}:{CURRENT_VERSION_TAG}",
+            f"{IMAGE_REPO}:latest",
+            CURRENT_IMAGE_DIGEST,
+        ):
+            with self.subTest(section="current_release", snippet=snippet):
+                self.assertIn(snippet, current_release)
+
+        pull = markdown_section(container_doc, "Pull")
+        for snippet in (
+            f"docker pull {IMAGE_REPO}:{CURRENT_RELEASE_TAG}",
+            f"docker pull {CURRENT_IMAGE_DIGEST}",
+        ):
+            with self.subTest(section="pull", snippet=snippet):
+                self.assertIn(snippet, pull)
+
+        smoke = markdown_section(container_doc, "Verify in One Minute")
+        for snippet in (
+            f"docker pull {IMAGE_REPO}:{CURRENT_RELEASE_TAG}",
+            "docker run --rm",
+            "127.0.0.1:8080:8080",
+            "/etc/llmup/config.yaml",
+            "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN",
+            "LLM_UNIVERSAL_PROXY_AUTH_MODE",
+            "LLM_UNIVERSAL_PROXY_KEY",
+            "curl -fsS http://127.0.0.1:8080/health",
+        ):
+            with self.subTest(section="smoke", snippet=snippet):
+                self.assertIn(snippet, smoke)
+
+        production_pinning = markdown_section(container_doc, "Production Pinning")
+        for snippet in (
+            f"{IMAGE_REPO}:{CURRENT_RELEASE_TAG}",
+            CURRENT_IMAGE_DIGEST,
+            "Pin a release tag or digest for production",
+            "Do not use `latest` for production pinning",
+        ):
+            with self.subTest(section="production_pinning", snippet=snippet):
+                self.assertIn(snippet, production_pinning)
+
+        ghcr_access = markdown_section(container_doc, "GHCR Access")
+        for snippet in (
+            "personal access token (classic)",
+            "docker login ghcr.io",
+            "read:packages",
+            "GITHUB_USERNAME",
+            "If the package is public",
+            "unauthorized, 403, or package page appears 404",
+        ):
+            with self.subTest(section="ghcr_access", snippet=snippet):
+                self.assertIn(snippet, ghcr_access)
+
+        for snippet in ("fine-grained personal access token", "$GITHUB_ACTOR"):
+            with self.subTest(section="container_doc_forbidden", snippet=snippet):
+                self.assertNotIn(snippet, container_doc)
+
+        smoke = markdown_section(container_doc, "Verify in One Minute")
+        self.assertIn("GHCR Access", smoke)
+        self.assertIn("unauthorized", smoke)
+
+        lower_doc = container_doc.casefold()
+        self.assertIn("quick trials", lower_doc)
+        self.assertIn("convenience", lower_doc)
+        for heading in ("Compose", "Troubleshooting"):
+            with self.subTest(heading=heading):
+                markdown_section(container_doc, heading)
+
+        run_section = markdown_section(container_doc, "Run the Release Image")
+        self.assertIn(
+            "Do not use the unedited example config for real provider requests",
+            run_section,
+        )
+        self.assertIn("replace the placeholder base URLs and model aliases", run_section)
+
+    def test_readmes_summarize_published_container_usage(self):
+        for path in ("README.md", "README_CN.md"):
+            text = read_doc(path)
+            with self.subTest(path=path):
+                self.assertIn(IMAGE_REPO, text)
+                self.assertIn(CURRENT_RELEASE_TAG, text)
+                self.assertIn("pin", text)
+                self.assertIn("digest", text)
+                self.assertIn("docs/container.md", text)
+
+    def test_docker_compose_defaults_to_current_release_not_latest(self):
+        compose = read_doc("examples/docker-compose.yaml")
+
+        self.assertIn(f"{IMAGE_REPO}:{CURRENT_RELEASE_TAG}", compose)
+        self.assertNotIn(":latest", compose)
+        self.assertRegex(
+            compose,
+            rf"(?m)^\s*image:\s*\$\{{LLMUP_IMAGE:-{re.escape(IMAGE_REPO)}:{CURRENT_RELEASE_TAG}\}}\s*$",
+        )
+
+    def test_governance_locks_published_docker_image_docs_contract(self):
+        governance = read_doc("scripts/check-governance.sh")
+
+        for snippet in (
+            f'check_contains "docs/container.md" "{IMAGE_REPO}:{CURRENT_RELEASE_TAG}"',
+            f'check_contains "docs/container.md" "{CURRENT_IMAGE_DIGEST}"',
+            'check_contains "docs/container.md" "Pin a release tag or digest for production"',
+            'check_contains "docs/container.md" \'Do not use `latest` for production pinning\'',
+            'check_contains "docs/container.md" "docker login ghcr.io"',
+            'check_contains "docs/container.md" "personal access token (classic)"',
+            'check_contains "docs/container.md" "read:packages"',
+            'check_contains "docs/container.md" "GITHUB_USERNAME"',
+            'check_contains "docs/container.md" "If the package is public"',
+            'check_contains "docs/container.md" "unauthorized, 403, or package page appears 404"',
+            'check_contains "README.md" "v0.2.22"',
+            'check_contains "README_CN.md" "v0.2.22"',
+            'check_absent "docs/container.md" "fine-grained personal access token"',
+            'check_absent "docs/container.md" \'$GITHUB_ACTOR\'',
+            f'check_contains "examples/docker-compose.yaml" "{IMAGE_REPO}:{CURRENT_RELEASE_TAG}"',
+            'check_absent "examples/docker-compose.yaml" ":latest"',
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, governance)
+
     def test_prd_metadata_and_section_numbers_are_current_for_ga(self):
         prd = read_doc("docs/PRD.md")
 
@@ -112,8 +242,8 @@ class GaDocsContractTests(unittest.TestCase):
         for snippet in (
             "OPENAI_COMPATIBLE",
             "ANTHROPIC_COMPATIBLE",
-            "credential_env: OPENAI_COMPATIBLE_API_KEY",
-            "credential_env: ANTHROPIC_COMPATIBLE_API_KEY",
+            "provider_key_env: OPENAI_COMPATIBLE_API_KEY",
+            "provider_key_env: ANTHROPIC_COMPATIBLE_API_KEY",
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, container_config)
@@ -199,17 +329,57 @@ class GaDocsContractTests(unittest.TestCase):
         for snippet in (
             "Proxy authentication is in scope",
             "`/health` remains unauthenticated",
-            "`LLM_UNIVERSAL_PROXY_DATA_TOKEN`",
-            "`X-LLMUP-Data-Token`",
-            "`Authorization: Bearer <data-token>`",
+            "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
+            "`client_provider_key`",
+            "`proxy_key`",
+            "`LLM_UNIVERSAL_PROXY_KEY`",
+            "`Authorization: Bearer <proxy-key>`",
             "`LLM_UNIVERSAL_PROXY_ADMIN_TOKEN`",
             "`Authorization: Bearer <admin-token>`",
-            "loopback-only",
-            "non-loopback",
+            "`provider_key_env`",
             "fail closed",
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, constitution)
+
+    def test_ga_readiness_review_uses_current_auth_boundary_language(self):
+        ga_review = read_doc("docs/ga-readiness-review.md")
+        completed_baseline = markdown_section(ga_review, "Completed Local Baseline")
+
+        self.assertNotRegex(ga_review, r"\bdata[-_\s]+tokens?\b")
+        for snippet in (
+            "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
+            "`client_provider_key`",
+            "`proxy_key`",
+            "`LLM_UNIVERSAL_PROXY_KEY`",
+            "`provider_key_env`",
+            "admin-token boundary",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, completed_baseline)
+
+    def test_client_manual_wiring_documents_proxy_key_sdk_contract(self):
+        clients = read_doc("docs/clients.md")
+        manual = markdown_section(clients, "Manual Wiring Without Wrappers")
+
+        for forbidden in (
+            "OPENAI_API_KEY=dummy",
+            "ANTHROPIC_API_KEY=dummy",
+            "GEMINI_API_KEY=dummy",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, manual)
+
+        for snippet in (
+            "OPENAI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
+            "ANTHROPIC_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
+            "GEMINI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
+            "`proxy_key` mode",
+            "`client_provider_key` mode, set these SDK keys to the real provider key",
+            "`provider_key_env`",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, manual)
 
     def test_constitution_separates_public_dashboard_from_admin_api_auth(self):
         constitution = read_doc("docs/CONSTITUTION.md")
