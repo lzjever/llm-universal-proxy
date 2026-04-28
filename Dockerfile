@@ -7,7 +7,6 @@ WORKDIR /app
 
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY tests ./tests
 
 RUN cargo build --locked --release
 

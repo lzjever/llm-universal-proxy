@@ -392,6 +392,36 @@ os.execv(real_git, [real_git, *args])
             with self.subTest(pattern=pattern):
                 self.assertIn(pattern, dockerfile)
 
+        from_re = re.compile(
+            r"^\s*FROM\s+\S+(?:\s+AS\s+([A-Za-z0-9_.-]+))?",
+            re.IGNORECASE,
+        )
+        copy_tests_re = re.compile(
+            r"^\s*COPY\s+(?:--[^\s]+\s+)*(?:\./)?tests(?:\s|/|$)",
+            re.IGNORECASE,
+        )
+
+        current_stage = "<before first FROM>"
+        copy_violations = []
+        for line_number, line in enumerate(dockerfile.splitlines(), start=1):
+            from_match = from_re.match(line)
+            if from_match:
+                current_stage = (
+                    from_match.group(1) or f"<stage at line {line_number}>"
+                )
+
+            if copy_tests_re.match(line) and "test" not in current_stage.lower():
+                copy_violations.append(
+                    f"line {line_number} in stage {current_stage}: {line.strip()}"
+                )
+
+        self.assertFalse(
+            copy_violations,
+            "Runtime/release Docker build path must not COPY tests; "
+            "tests may only be copied in an explicit test target:\n"
+            + "\n".join(copy_violations),
+        )
+
     def test_docker_smoke_target_has_script_and_governance_coverage(self):
         makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
         script = (REPO_ROOT / "scripts" / "test_container_smoke.sh").read_text(
