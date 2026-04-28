@@ -75,6 +75,10 @@ def markdown_subsection(text: str, heading: str) -> str:
     return text[start:] if next_heading == -1 else text[start:next_heading]
 
 
+def markdown_code_blocks(text: str, language: str) -> list[str]:
+    return re.findall(rf"```{re.escape(language)}\n(.*?)\n```", text, re.DOTALL)
+
+
 class GaDocsContractTests(unittest.TestCase):
     def test_container_image_manifest_separates_published_image_from_next_release_identity(self):
         manifest = load_container_manifest()
@@ -483,6 +487,145 @@ class GaDocsContractTests(unittest.TestCase):
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, manual)
+
+    def test_configuration_doc_covers_global_auth_and_static_yaml_examples(self):
+        config_doc = read_doc("docs/configuration.md")
+        security = markdown_section(config_doc, "Data Plane Security")
+        static_examples = markdown_subsection(security, "Static YAML Auth Examples")
+        yaml_blocks = markdown_code_blocks(static_examples, "yaml")
+
+        for snippet in (
+            "process-wide",
+            "all namespaces",
+            "all provider/model/resource routes",
+            "not a per-upstream setting",
+            "run separate proxy instances",
+            "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
+            "`LLM_UNIVERSAL_PROXY_KEY`",
+            "environment variables",
+            "Do not put them in YAML",
+            "`provider_key_env` is a per-upstream environment variable name",
+            "`provider_key_env` is not required",
+            "normally omitted",
+            "not rejected",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, security)
+
+        proxy_key_block = next(
+            (
+                block
+                for block in yaml_blocks
+                if "provider_key_env: OPENAI_COMPATIBLE_API_KEY" in block
+                and "provider_key_env: ANTHROPIC_COMPATIBLE_API_KEY" in block
+            ),
+            None,
+        )
+        self.assertIsNotNone(
+            proxy_key_block,
+            "proxy_key static YAML example must show per-upstream provider_key_env",
+        )
+        self.assertIn("#", proxy_key_block)
+        self.assertIn("format: openai-completion", proxy_key_block)
+        self.assertIn("format: anthropic", proxy_key_block)
+        self.assertNotIn("LLM_UNIVERSAL_PROXY_AUTH_MODE", proxy_key_block)
+        self.assertNotIn("LLM_UNIVERSAL_PROXY_KEY", proxy_key_block)
+
+        client_provider_key_block = next(
+            (
+                block
+                for block in yaml_blocks
+                if "CLIENT-KEY-OPENAI-COMPATIBLE" in block
+                and "CLIENT-KEY-ANTHROPIC-COMPATIBLE" in block
+            ),
+            None,
+        )
+        self.assertIsNotNone(
+            client_provider_key_block,
+            "client_provider_key static YAML example must be present",
+        )
+        self.assertIn("#", client_provider_key_block)
+        self.assertNotIn("provider_key_env:", client_provider_key_block)
+        self.assertNotIn("LLM_UNIVERSAL_PROXY_AUTH_MODE", client_provider_key_block)
+        self.assertNotIn("LLM_UNIVERSAL_PROXY_KEY", client_provider_key_block)
+
+    def test_admin_dynamic_config_doc_covers_runtime_payload_and_field_mapping(self):
+        admin_doc = read_doc("docs/admin-dynamic-config.md")
+        write_section = markdown_section(admin_doc, "Update a Namespace Without Restarting")
+        api_examples = markdown_subsection(write_section, "API Configuration Examples")
+        mapping = markdown_section(admin_doc, "Static YAML vs Runtime Payload")
+
+        for snippet in (
+            "process-wide",
+            "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
+            "all namespaces",
+            "not set through the namespace payload",
+            "`proxy_key` mode",
+            "every upstream",
+            "resolvable `provider_key_env`",
+            "`client_provider_key` mode",
+            "does not require `provider_key_env`",
+            "normally omitted",
+            "not rejected",
+        ):
+            with self.subTest(section="write", snippet=snippet):
+                self.assertIn(snippet, write_section)
+
+        for snippet in (
+            "`PRESET_*` URL/model placeholders",
+            "already-hydrated concrete URL/model values",
+            "`provider_key_env` remains an environment variable name",
+            "`PRESET_ENDPOINT_API_KEY` is valid",
+        ):
+            with self.subTest(section="preset", snippet=snippet):
+                self.assertIn(snippet, admin_doc)
+
+        yaml_blocks = markdown_code_blocks(api_examples, "yaml")
+        self.assertTrue(yaml_blocks, "admin docs must include a YAML-shaped payload example")
+        yaml_payload = yaml_blocks[0]
+        for snippet in (
+            "- name: PRESET-OPENAI-COMPATIBLE",
+            "fixed_upstream_format: openai-completion",
+            "provider_key_env: PRESET_ENDPOINT_API_KEY",
+            "upstream_name: PRESET-OPENAI-COMPATIBLE",
+            "upstream_model: provider-model-id",
+        ):
+            with self.subTest(section="yaml_payload", snippet=snippet):
+                self.assertIn(snippet, yaml_payload)
+        self.assertIn("#", yaml_payload)
+        self.assertNotIn("LLM_UNIVERSAL_PROXY_AUTH_MODE", yaml_payload)
+
+        json_or_bash_blocks = markdown_code_blocks(api_examples, "bash") + markdown_code_blocks(
+            api_examples, "json"
+        )
+        self.assertTrue(json_or_bash_blocks, "admin docs must include a real JSON/curl example")
+        combined_blocks = "\n".join(json_or_bash_blocks)
+        for snippet in (
+            "curl -fsS",
+            "/admin/namespaces/default/config",
+            '"upstreams": [',
+            '"name": "PRESET-OPENAI-COMPATIBLE"',
+            '"fixed_upstream_format": "openai-completion"',
+            '"provider_key_env": "PRESET_ENDPOINT_API_KEY"',
+            '"upstream_name": "PRESET-OPENAI-COMPATIBLE"',
+            '"upstream_model": "provider-model-id"',
+        ):
+            with self.subTest(section="json_payload", snippet=snippet):
+                self.assertIn(snippet, combined_blocks)
+
+        for snippet in (
+            "`upstreams` named map",
+            "`upstreams` list of objects",
+            "`format`",
+            "`fixed_upstream_format`",
+            "alias string",
+            "`upstream_name` and `upstream_model`",
+            "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
+            "process environment",
+            "not in namespace payload",
+        ):
+            with self.subTest(section="mapping", snippet=snippet):
+                self.assertIn(snippet, mapping)
 
     def test_constitution_separates_public_dashboard_from_admin_api_auth(self):
         constitution = read_doc("docs/CONSTITUTION.md")

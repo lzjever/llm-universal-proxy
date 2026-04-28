@@ -191,6 +191,7 @@ Practical rules:
 - aliases such as `preset-openai-compatible` and `preset-anthropic-compatible` are local names; they do not need to equal the upstream model ID
 - use structured aliases only when you want extra `limits` or `surface` metadata on top of `target: UPSTREAM:MODEL`
 - the provider-neutral `PRESET_*` placeholders are for wrapper-rendered config sources; direct static YAML should contain concrete URLs and model IDs
+- `LLM_UNIVERSAL_PROXY_AUTH_MODE` is a process-wide setting for all data-plane routes, not a per-upstream YAML or API field; see the static examples in [docs/configuration.md](./docs/configuration.md) and the runtime payload mapping in [docs/admin-dynamic-config.md](./docs/admin-dynamic-config.md)
 
 For the full YAML reference and more examples, see [docs/configuration.md](./docs/configuration.md).
 
@@ -207,7 +208,7 @@ GHCR access for authenticated or public pulls are documented in
 
 ## Dynamic Configuration Overview
 
-Static YAML is the default. If you need live updates, the proxy also exposes admin endpoints for reading runtime state and replacing namespace config without restarting the whole process.
+Static YAML is the default. If you need live updates, the proxy also exposes admin endpoints for reading runtime state and replacing namespace config without restarting the whole process. Admin payloads use a runtime shape, and the data-plane auth mode still comes from the process environment.
 
 Current admin endpoints:
 

@@ -12,8 +12,11 @@ Use admin-driven dynamic config when you need to:
 For the basic YAML shape, start with [Configuration Guide](./configuration.md).
 For CLI-wrapper entrypoints, the provider-neutral preset names are
 `preset-openai-compatible` and `preset-anthropic-compatible`; dynamic admin
-writes should send the already-hydrated concrete URL/model values, not raw
-`PRESET_*` placeholders.
+writes should send already-hydrated concrete URL/model values. `PRESET_*` URL/model placeholders such as `PRESET_OPENAI_ENDPOINT_BASE_URL` and
+`PRESET_ENDPOINT_MODEL` should not be sent as `api_root` or `upstream_model`.
+`provider_key_env` remains an environment variable name, so
+`PRESET_ENDPOINT_API_KEY` is valid when that variable exists in the proxy
+process environment.
 
 ## Admin Access Rules
 
@@ -32,7 +35,7 @@ In other words:
 - local development can often use loopback admin access directly, without forwarding headers such as `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, or `X-Real-IP`
 - shared or remote deployments should normally set a non-empty admin bearer token
 
-Provider/model/resource routes use `LLM_UNIVERSAL_PROXY_AUTH_MODE` and do not accept the admin token. In `proxy_key` mode, dynamic namespace config can add upstream `provider_key_env` entries, and clients authenticate with `LLM_UNIVERSAL_PROXY_KEY` through their normal SDK API key or bearer token.
+Provider/model/resource routes use `LLM_UNIVERSAL_PROXY_AUTH_MODE` and do not accept the admin token. That data-plane auth mode is process-wide across namespaces. In `proxy_key` mode, dynamic namespace config can add upstream `provider_key_env` entries, and clients authenticate with `LLM_UNIVERSAL_PROXY_KEY` through their normal SDK API key or bearer token.
 
 ## Admin Dashboard Boundary
 
@@ -153,6 +156,11 @@ What you get instead is enough operational information to understand the runtime
 
 The write flow supports revision checks so a client does not accidentally overwrite a newer config.
 
+The payload is validated against the current process-wide data-plane auth mode. `LLM_UNIVERSAL_PROXY_AUTH_MODE` applies to all namespaces and is not set through the namespace payload.
+
+- In `proxy_key` mode, every upstream that can receive traffic must include a resolvable `provider_key_env`; the named environment variable must exist in the proxy process environment.
+- In `client_provider_key` mode, the payload does not require `provider_key_env`, and it is normally omitted; a non-empty field is not rejected just because this mode is active, but clients still send the real provider key through their normal SDK API key or bearer-token path.
+
 Runtime writes use the same client-visible surface contract as static YAML. Raw HTTP tests can omit `surface_defaults`, but Codex, Claude Code, and Gemini wrapper/live-profile flows should provide at least the conservative text-only surface shown below, or an accurate alias-level `surface`.
 
 Responses reasoning/compaction continuity follows the same compatibility policy
@@ -168,7 +176,42 @@ fail closed; same-provider/native passthrough preserves provider-owned state.
 3. send a config update with `if_revision`
 4. if the server returns `412 Precondition Failed`, reload and retry with the new revision
 
-### Example write request
+### API Configuration Examples
+
+This YAML-shaped view is for readability. Send JSON to the API.
+
+```yaml
+# POST /admin/namespaces/default/config body, shown in YAML form.
+if_revision: rev-1
+config:
+  listen: 127.0.0.1:8080
+  upstream_timeout_secs: 120
+
+  # Runtime payload uses a list. Each upstream carries its own name.
+  upstreams:
+    - name: PRESET-OPENAI-COMPATIBLE
+      api_root: https://openai-compatible.example/v1
+      fixed_upstream_format: openai-completion
+      # Env var name read by the proxy in proxy_key mode.
+      provider_key_env: PRESET_ENDPOINT_API_KEY
+      surface_defaults:
+        modalities:
+          input: ["text"]
+          output: ["text"]
+        tools:
+          supports_search: false
+          supports_view_image: false
+          apply_patch_transport: freeform
+          supports_parallel_calls: false
+
+  # Runtime aliases are objects, not "UPSTREAM:MODEL" strings.
+  model_aliases:
+    preset-openai-compatible:
+      upstream_name: PRESET-OPENAI-COMPATIBLE
+      upstream_model: provider-model-id
+```
+
+Actual write request:
 
 ```bash
 curl -fsS \
@@ -224,14 +267,22 @@ Successful writes return the new namespace revision.
 
 ## Static YAML vs Runtime Payload
 
-The runtime payload is close to the YAML structure, but not identical.
+The runtime payload is close to the static YAML structure, but not identical. Dynamic config is best treated as an operational API, not as a direct copy-paste replacement for your YAML file.
 
-The biggest practical difference is:
+| Concern | Static YAML | Runtime Admin API payload |
+| --- | --- | --- |
+| Upstreams container | `upstreams` named map keyed by upstream name | `upstreams` list of objects; each item has `name` |
+| Upstream format | `format` is the normal static field name | `fixed_upstream_format` |
+| Alias shorthand | alias string such as `"UPSTREAM:MODEL"` is accepted | alias object with `upstream_name` and `upstream_model` |
+| Structured alias metadata | object with `target`, plus optional `limits` and `surface` | object with `upstream_name`, `upstream_model`, plus optional `limits` and `surface` |
+| Data-plane auth mode | `LLM_UNIVERSAL_PROXY_AUTH_MODE` in the process environment | same process environment; not in namespace payload |
+| Provider key reference | `provider_key_env` names a proxy-side env var in `proxy_key` mode | same mode split; `client_provider_key` mode does not require `provider_key_env` and normally omits it, but non-empty values are not forbidden |
 
-- static YAML defines `upstreams` as a named map
-- admin runtime writes send `upstreams` as a list of named upstream objects
+For provider-neutral wrapper sources, hydrate URL and model placeholders before sending an admin write:
 
-That means dynamic config is best treated as an operational API, not as a direct copy-paste replacement for your YAML file.
+- static config source `api_root: PRESET_OPENAI_ENDPOINT_BASE_URL` becomes runtime `api_root: https://openai-compatible.example/v1`
+- static alias `"PRESET-OPENAI-COMPATIBLE:PRESET_ENDPOINT_MODEL"` becomes runtime `upstream_name: PRESET-OPENAI-COMPATIBLE` and `upstream_model: provider-model-id`
+- static `provider_key_env: PRESET_ENDPOINT_API_KEY` can stay `provider_key_env: PRESET_ENDPOINT_API_KEY` because it is an environment variable name, not the secret value
 
 Good default workflow:
 
