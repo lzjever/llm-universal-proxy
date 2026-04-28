@@ -10,6 +10,13 @@ Use admin-driven dynamic config when you need to:
 - update a namespace config in place
 
 For the basic YAML shape, start with [Configuration Guide](./configuration.md).
+For direct binary startup, use `llm-universal-proxy --config <config.yaml>` when
+you already have static config. Use
+`LLM_UNIVERSAL_PROXY_ADMIN_TOKEN=<token> llm-universal-proxy --admin-bootstrap`
+when a controller will create all namespaces through the Admin API after the
+process starts. `--admin-bootstrap` starts with no namespaces; `/health` can
+succeed immediately, while `/ready` stays unavailable until a namespace config
+is loaded.
 For CLI-wrapper entrypoints, the provider-neutral preset names are
 `preset-openai-compatible` and `preset-anthropic-compatible`; dynamic admin
 writes should send already-hydrated concrete URL/model values. `PRESET_*` URL/model placeholders such as `PRESET_OPENAI_ENDPOINT_BASE_URL` and

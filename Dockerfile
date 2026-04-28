@@ -28,6 +28,7 @@ RUN apt-get update \
   && groupadd --gid 10001 llmup \
   && useradd --uid 10001 --gid llmup --home-dir /nonexistent --shell /usr/sbin/nologin --no-create-home llmup \
   && mkdir -p /etc/llmup \
+  && printf 'listen: 0.0.0.0:8080\n' > /etc/llmup/config.yaml \
   && chown -R llmup:llmup /etc/llmup \
   && rm -rf /var/lib/apt/lists/*
 
@@ -36,6 +37,6 @@ COPY --from=builder /app/target/release/llm-universal-proxy /usr/local/bin/llm-u
 
 USER llmup:llmup
 EXPOSE 8080
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 CMD curl -fsS http://127.0.0.1:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 CMD curl -fsS http://127.0.0.1:8080/ready || exit 1
 ENTRYPOINT ["/usr/local/bin/llm-universal-proxy"]
 CMD ["--config", "/etc/llmup/config.yaml"]

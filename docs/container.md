@@ -101,11 +101,98 @@ Provider/model/resource requests must send the proxy key through the normal
 client SDK API-key setting or as `Authorization: Bearer <proxy-key>`. Do not
 send provider keys in custom proxy headers.
 
+## API Bootstrap
+
+API bootstrap is the control-plane-managed path for container services. It is a
+main-branch and next-release image behavior, not available in the current published `v0.2.23` image.
+
+Images built from the current Dockerfile include a built-in empty bootstrap config at `/etc/llmup/config.yaml`:
+
+```yaml
+listen: 0.0.0.0:8080
+```
+
+Start the image without mounting `/etc/llmup/config.yaml`; the built-in empty
+bootstrap config starts the process with no namespaces. Then POST a runtime
+payload to `/admin/namespaces/:namespace/config`.
+
+Important boundaries:
+
+- Admin API writes are not persisted by the proxy. Keep the source of truth in
+  your controller, init job, or deployment system, and replay the Admin API write after every container restart.
+- `/health` is liveness: it only says the process is running.
+- `/ready` is readiness: it returns success only after at least one namespace
+  has been loaded.
+- The Admin API accepts the runtime payload shape, not static YAML. In runtime
+  payload shape, `upstreams` is a list, `fixed_upstream_format` names the
+  upstream protocol, and aliases use `upstream_name` plus `upstream_model`.
+- Set `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` for container deployments. Admin calls
+  should send `Authorization: Bearer <admin-token>`.
+
+Minimal API bootstrap run:
+
+```bash
+docker build -t llm-universal-proxy:local .
+
+export LLM_UNIVERSAL_PROXY_ADMIN_TOKEN="set-a-random-admin-token"
+export LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key
+export LLM_UNIVERSAL_PROXY_KEY="set-a-random-proxy-key"
+export OPENAI_COMPATIBLE_API_KEY="set-at-runtime"
+
+docker run --rm --name llmup-bootstrap \
+  -p 127.0.0.1:8080:8080 \
+  -e LLM_UNIVERSAL_PROXY_ADMIN_TOKEN \
+  -e LLM_UNIVERSAL_PROXY_AUTH_MODE \
+  -e LLM_UNIVERSAL_PROXY_KEY \
+  -e OPENAI_COMPATIBLE_API_KEY \
+  llm-universal-proxy:local
+```
+
+Apply a runtime config:
+
+```bash
+curl -fsS \
+  -X POST \
+  -H "Authorization: Bearer $LLM_UNIVERSAL_PROXY_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  http://127.0.0.1:8080/admin/namespaces/default/config \
+  -d @- <<'JSON'
+{
+  "if_revision": null,
+  "config": {
+    "listen": "0.0.0.0:8080",
+    "upstream_timeout_secs": 120,
+    "upstreams": [
+      {
+        "name": "OPENAI-COMPATIBLE",
+        "api_root": "https://openai-compatible.example/v1",
+        "fixed_upstream_format": "openai-completion",
+        "provider_key_env": "OPENAI_COMPATIBLE_API_KEY"
+      }
+    ],
+    "model_aliases": {
+      "coding": {
+        "upstream_name": "OPENAI-COMPATIBLE",
+        "upstream_model": "provider-model-id"
+      }
+    }
+  }
+}
+JSON
+```
+
+After the write succeeds, `/ready` should return success:
+
+```bash
+curl -fsS http://127.0.0.1:8080/ready
+```
+
 ## Verify in One Minute
 
 This smoke path checks the published image and `/health` without making a real
-provider request. It is safe to use the example config for this health-only
-check because the proxy does not contact the placeholder upstreams.
+provider request. It mounts the example config so the process can load a static
+namespace immediately. The current published `v0.2.23` image does not include
+the main-branch `/ready` endpoint or built-in empty bootstrap config yet.
 
 Before starting, complete [GHCR Access](#ghcr-access) if `docker pull` returns
 unauthorized, 403, or 404, or if you know the package is private.
@@ -174,6 +261,9 @@ docker compose -f examples/docker-compose.yaml up
 - If the container starts but the host cannot connect, confirm the mounted
   config uses `listen: 0.0.0.0:8080` and Docker maps
   `127.0.0.1:8080:8080`.
+- If `/health` succeeds but `/ready` fails, the process is alive but no
+  namespace has been loaded yet. Apply runtime config through the Admin API, or
+  mount a static config with at least one upstream.
 - If provider requests fail with authentication errors, confirm the
   `OPENAI_COMPATIBLE_API_KEY` and `ANTHROPIC_COMPATIBLE_API_KEY` values match
   the edited config you mounted.
@@ -249,9 +339,9 @@ upstream.
 - Release images get `vX.Y.Z`, `X.Y.Z`, and `latest` tags. `latest` only moves
   on formal release tags.
 - The first container release plan does not publish an `edge` tag.
-- The image starts as a non-root user, exposes port `8080`, reads
-  `/etc/llmup/config.yaml` by default, and declares a `/health` Docker
-  `HEALTHCHECK`.
+- The main-branch image contract starts as a non-root user, exposes port
+  `8080`, reads `/etc/llmup/config.yaml` by default, ships a secret-free empty
+  bootstrap config at that path, and declares a `/ready` Docker `HEALTHCHECK`.
 - Secrets must come from runtime environment variables or mounted secret
   managers. The image and examples do not bake provider keys or admin tokens
   into files.

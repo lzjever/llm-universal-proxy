@@ -411,6 +411,7 @@ async fn run_server(
 
     let data_router = Router::new()
         .route("/health", get(proxy::health))
+        .route("/ready", get(proxy::ready))
         .merge(protected_data_router);
     let data_router = if let Some(cors) = cors {
         data_router.layer(cors)

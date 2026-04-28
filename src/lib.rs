@@ -19,4 +19,7 @@ pub mod translate;
 pub mod upstream;
 
 pub use config::Config;
-pub use server::{run_with_config, run_with_config_path, run_with_config_path_and_dashboard};
+pub use server::{
+    run_with_config, run_with_config_and_dashboard, run_with_config_path,
+    run_with_config_path_and_dashboard,
+};

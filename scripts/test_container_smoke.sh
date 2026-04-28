@@ -302,8 +302,8 @@ assert_image_contract() {
     if [[ "$healthcheck" == "null" ]]; then
         fail "Image must declare a Docker HEALTHCHECK"
     fi
-    if [[ "$healthcheck" != *"http://127.0.0.1:8080/health"* ]]; then
-        fail "Image HEALTHCHECK must target the fixed container port 8080"
+    if [[ "$healthcheck" != *"http://127.0.0.1:8080/ready"* ]]; then
+        fail "Image HEALTHCHECK must target readiness on fixed container port 8080"
     fi
 }
 
@@ -325,7 +325,35 @@ start_container() {
         -v "${PROXY_CONFIG}:/etc/llmup/config.yaml:ro" \
         "$IMAGE" >/dev/null
     wait_for_http_ok "http://${HOST}:${PROXY_PORT}/health" "container proxy"
+    wait_for_http_ok "http://${HOST}:${PROXY_PORT}/ready" "container proxy readiness"
     wait_for_container_healthy
+}
+
+start_bootstrap_container() {
+    CONTAINER_NAME="llmup-container-bootstrap-smoke-$(date +%s)-$$"
+    log "Starting container $CONTAINER_NAME from $IMAGE"
+    log "No bootstrap config bind mount; using image default /etc/llmup/config.yaml"
+    docker run -d --rm \
+        --name "$CONTAINER_NAME" \
+        --add-host=host.docker.internal:host-gateway \
+        -e "LLM_UNIVERSAL_PROXY_ADMIN_TOKEN=${ADMIN_TOKEN}" \
+        -e "LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key" \
+        -e "LLM_UNIVERSAL_PROXY_KEY=${PROXY_KEY}" \
+        -e "CONTAINER_SMOKE_UPSTREAM_API_KEY=container-smoke-provider-key" \
+        --health-interval=2s \
+        --health-timeout=2s \
+        --health-retries=15 \
+        --health-start-period=1s \
+        -p "${HOST}:${PROXY_PORT}:${CONTAINER_PORT}" \
+        "$IMAGE" >/dev/null
+    wait_for_http_ok "http://${HOST}:${PROXY_PORT}/health" "bootstrap container liveness"
+}
+
+stop_container() {
+    if [[ -n "$CONTAINER_NAME" ]]; then
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        CONTAINER_NAME=""
+    fi
 }
 
 wait_for_container_healthy() {
@@ -366,7 +394,7 @@ run_admin_token_smoke() {
     local unauth_code
     local auth_code
 
-    log "Smoke 1/2: admin token boundary"
+    log "Smoke 1/4: admin token boundary"
     reset_response_artifacts
     unauth_code="$(
         curl -sS \
@@ -392,8 +420,9 @@ run_admin_token_smoke() {
 run_responses_smoke() {
     local http_code
     local content_type
+    local label="${1:-Smoke 2/4: Responses -> Anthropic SSE}"
 
-    log "Smoke 2/2: Responses -> Anthropic SSE"
+    log "$label"
     reset_response_artifacts
     http_code="$(
         curl -sS --http1.1 -N \
@@ -419,6 +448,45 @@ run_responses_smoke() {
     if ! grep -Fq 'response.completed' "$RESP_BODY"; then
         fail "Missing response.completed in response stream"
     fi
+}
+
+run_bootstrap_apply_smoke() {
+    local ready_code
+    local admin_payload
+    local admin_http_code
+
+    log "Smoke 3/4: default empty config -> admin apply -> ready"
+
+    reset_response_artifacts
+    ready_code="$(
+        curl -sS \
+            -D "$RESP_HEADERS" \
+            -o "$RESP_BODY" \
+            "http://${HOST}:${PROXY_PORT}/ready" \
+            -w '%{http_code}'
+    )"
+    assert_eq "$ready_code" "503" "Expected empty bootstrap config to start not ready"
+
+    admin_payload="$(
+        cat <<EOF
+{"if_revision":null,"config":{"listen":"0.0.0.0:8080","upstream_timeout_secs":10,"upstreams":[{"name":"default","api_root":"http://host.docker.internal:${MOCK_PORT}/v1","fixed_upstream_format":"anthropic","provider_key_env":"CONTAINER_SMOKE_UPSTREAM_API_KEY"}]}}
+EOF
+    )"
+
+    reset_response_artifacts
+    admin_http_code="$(
+        curl -sS \
+            -D "$RESP_HEADERS" \
+            -o "$RESP_BODY" \
+            -X POST "http://${HOST}:${PROXY_PORT}/admin/namespaces/default/config" \
+            -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$admin_payload" \
+            -w '%{http_code}'
+    )"
+    assert_eq "$admin_http_code" "200" "Expected admin bootstrap config apply to succeed"
+    wait_for_http_ok "http://${HOST}:${PROXY_PORT}/ready" "bootstrap container readiness"
+    wait_for_container_healthy
 }
 
 main() {
@@ -448,6 +516,11 @@ main() {
     start_container
     run_admin_token_smoke
     run_responses_smoke
+    stop_container
+
+    start_bootstrap_container
+    run_bootstrap_apply_smoke
+    run_responses_smoke "Smoke 4/4: bootstrap Responses -> Anthropic SSE"
 
     log "Container smoke passed"
 }

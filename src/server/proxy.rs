@@ -160,6 +160,29 @@ pub(super) async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }
 
+pub(super) async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let runtime = state.runtime.read().await;
+    let namespace_count = runtime.namespaces.len();
+    if namespace_count == 0 {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "reason": "no namespaces configured",
+                "namespace_count": namespace_count,
+            })),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ready",
+                "namespace_count": namespace_count,
+            })),
+        )
+    }
+}
+
 pub(super) async fn handle_openai_chat_completions(
     State(state): State<Arc<AppState>>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,

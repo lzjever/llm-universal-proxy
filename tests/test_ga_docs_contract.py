@@ -134,6 +134,7 @@ class GaDocsContractTests(unittest.TestCase):
             "LLM_UNIVERSAL_PROXY_AUTH_MODE",
             "LLM_UNIVERSAL_PROXY_KEY",
             "curl -fsS http://127.0.0.1:8080/health",
+            f"The current published `{refs['published_release_tag']}` image does not include",
         ):
             with self.subTest(section="smoke", snippet=snippet):
                 self.assertIn(snippet, smoke)
@@ -174,6 +175,23 @@ class GaDocsContractTests(unittest.TestCase):
         for heading in ("Compose", "Troubleshooting"):
             with self.subTest(heading=heading):
                 markdown_section(container_doc, heading)
+
+        bootstrap = markdown_section(container_doc, "API Bootstrap")
+        for snippet in (
+            "main-branch and next-release image behavior",
+            f"not available in the current published `{refs['published_release_tag']}` image",
+            "built-in empty bootstrap config",
+            "docker build -t llm-universal-proxy:local .",
+            "llm-universal-proxy:local",
+            "not persisted by the proxy",
+            "replay the Admin API write after every container restart",
+            "`/health` is liveness",
+            "`/ready` is readiness",
+            "runtime payload shape",
+        ):
+            with self.subTest(section="api_bootstrap", snippet=snippet):
+                self.assertIn(snippet, bootstrap)
+        self.assertNotIn(f'{refs["image"]}:{refs["published_release_tag"]}', bootstrap)
 
         run_section = markdown_section(container_doc, "Run the Release Image")
         self.assertIn(
@@ -576,6 +594,9 @@ class GaDocsContractTests(unittest.TestCase):
             "already-hydrated concrete URL/model values",
             "`provider_key_env` remains an environment variable name",
             "`PRESET_ENDPOINT_API_KEY` is valid",
+            "`llm-universal-proxy --config <config.yaml>`",
+            "`--admin-bootstrap` starts with no namespaces",
+            "`/ready` stays unavailable",
         ):
             with self.subTest(section="preset", snippet=snippet):
                 self.assertIn(snippet, admin_doc)

@@ -414,7 +414,9 @@ os.execv(real_git, [real_git, *args])
             "USER llmup:llmup",
             "EXPOSE 8080",
             "HEALTHCHECK",
-            "http://127.0.0.1:8080/health",
+            "http://127.0.0.1:8080/ready",
+            "/etc/llmup/config.yaml",
+            "listen: 0.0.0.0:8080",
             'CMD ["--config", "/etc/llmup/config.yaml"]',
         )
 
@@ -452,6 +454,10 @@ os.execv(real_git, [real_git, *args])
         self.assertIn("provider_key_env: CONTAINER_SMOKE_UPSTREAM_API_KEY", script)
         self.assertIn('-p "${HOST}:${PROXY_PORT}:${CONTAINER_PORT}"', script)
         self.assertIn("wait_for_container_healthy", script)
+        self.assertIn("/ready", script)
+        self.assertIn("default empty config -> admin apply -> ready", script)
+        self.assertIn("Authorization: Bearer ${ADMIN_TOKEN}", script)
+        self.assertIn("No bootstrap config bind mount", script)
         self.assertNotIn("listen: 0.0.0.0:${PROXY_PORT}", script)
         self.assertIn("scripts/test_container_smoke.sh", governance)
 
@@ -460,6 +466,7 @@ os.execv(real_git, [real_git, *args])
             for block in curl_command_blocks(script)
             if "http://${HOST}:${PROXY_PORT}" in block
             and "/health" not in block
+            and "/ready" not in block
             and "/admin/" not in block
         ]
         self.assertGreater(

@@ -745,8 +745,9 @@ check_contains "Dockerfile" "cargo build --locked --release"
 check_contains "Dockerfile" 'org.opencontainers.image.source="https://github.com/agentsmith-project/llm-universal-proxy"'
 check_contains "Dockerfile" "USER llmup:llmup"
 check_contains "Dockerfile" 'CMD ["--config", "/etc/llmup/config.yaml"]'
+check_contains "Dockerfile" "listen: 0.0.0.0:8080"
 check_contains "Dockerfile" "HEALTHCHECK"
-check_contains "Dockerfile" "http://127.0.0.1:8080/health"
+check_contains "Dockerfile" "http://127.0.0.1:8080/ready"
 
 check_contains "Makefile" "build --locked --release"
 check_contains "Makefile" "test --locked"
@@ -773,6 +774,9 @@ check_contains "scripts/test_container_smoke.sh" "format: anthropic"
 check_contains "scripts/test_container_smoke.sh" "provider_key_env: CONTAINER_SMOKE_UPSTREAM_API_KEY"
 check_contains "scripts/test_container_smoke.sh" '-p "${HOST}:${PROXY_PORT}:${CONTAINER_PORT}"'
 check_contains "scripts/test_container_smoke.sh" "wait_for_container_healthy"
+check_contains "scripts/test_container_smoke.sh" "/ready"
+check_contains "scripts/test_container_smoke.sh" "default empty config -> admin apply -> ready"
+check_contains "scripts/test_container_smoke.sh" "No bootstrap config bind mount"
 check_contains "scripts/test_binary_smoke.sh" 'LLM_UNIVERSAL_PROXY_AUTH_MODE=client_provider_key'
 check_contains "scripts/test_binary_smoke.sh" 'SMOKE_PROVIDER_KEY="binary-smoke-provider-key"'
 check_contains "scripts/test_binary_smoke.sh" 'python3 -u - "$MOCK_PORT_FILE" "$SMOKE_PROVIDER_KEY"'

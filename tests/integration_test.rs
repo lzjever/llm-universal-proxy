@@ -127,7 +127,7 @@ impl RequestBuilder {
 }
 
 fn should_add_default_data_auth(path: &str) -> bool {
-    !(path == "/health" || path.starts_with("/admin/") || path == "/admin")
+    !(path == "/health" || path == "/ready" || path.starts_with("/admin/") || path == "/admin")
 }
 
 fn is_test_credential_header(name: &str) -> bool {
@@ -1113,6 +1113,53 @@ async fn empty_startup_config_keeps_health_route_available() {
     let client = Client::new();
     let response = client.get(format!("{base}/health")).send().await.unwrap();
     assert!(response.status().is_success());
+}
+
+#[tokio::test]
+async fn readiness_reports_not_ready_until_namespace_config_exists() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+    let client = Client::new();
+
+    let health = client
+        .get(format!("{proxy_base}/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let not_ready = client
+        .get(format!("{proxy_base}/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let not_ready_body: Value = not_ready.json().await.unwrap();
+    assert_eq!(not_ready_body["status"], "not_ready");
+    assert_eq!(not_ready_body["namespace_count"], 0);
+
+    let apply = client
+        .post(format!("{proxy_base}/admin/namespaces/default/config"))
+        .json(&json!({
+            "if_revision": null,
+            "config": demo_runtime_config(&mock_base),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(apply.status(), StatusCode::OK);
+
+    let ready = client
+        .get(format!("{proxy_base}/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    let ready_body: Value = ready.json().await.unwrap();
+    assert_eq!(ready_body["status"], "ready");
+    assert_eq!(ready_body["namespace_count"], 1);
 }
 
 #[tokio::test]
