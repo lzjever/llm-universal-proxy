@@ -9,11 +9,11 @@ ghcr.io/agentsmith-project/llm-universal-proxy
 
 ## Current Release
 
-The current published release is `v0.2.22`:
+The current published release is `v0.2.23`:
 
 ```text
-ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22
-ghcr.io/agentsmith-project/llm-universal-proxy:0.2.22
+ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23
+ghcr.io/agentsmith-project/llm-universal-proxy:0.2.23
 ghcr.io/agentsmith-project/llm-universal-proxy:latest
 ghcr.io/agentsmith-project/llm-universal-proxy@sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89
 ```
@@ -53,7 +53,7 @@ been made public yet, or your organization requires authenticated package pulls.
 Pull the current release tag:
 
 ```bash
-docker pull ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22
+docker pull ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23
 ```
 
 Pull the immutable digest when you need the exact published artifact:
@@ -89,7 +89,7 @@ docker run --rm --name llmup \
   -e LLM_UNIVERSAL_PROXY_ADMIN_TOKEN \
   -e LLM_UNIVERSAL_PROXY_AUTH_MODE \
   -e LLM_UNIVERSAL_PROXY_KEY \
-  ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22
+  ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23
 ```
 
 Provider/model/resource requests must send the proxy key through the normal
@@ -114,7 +114,7 @@ export LLM_UNIVERSAL_PROXY_ADMIN_TOKEN="local-admin-token"
 export LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key
 export LLM_UNIVERSAL_PROXY_KEY="local-proxy-key"
 
-docker pull ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22
+docker pull ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23
 
 docker run --rm --name llmup-smoke \
   -p 127.0.0.1:8080:8080 \
@@ -124,7 +124,7 @@ docker run --rm --name llmup-smoke \
   -e LLM_UNIVERSAL_PROXY_ADMIN_TOKEN \
   -e LLM_UNIVERSAL_PROXY_AUTH_MODE \
   -e LLM_UNIVERSAL_PROXY_KEY \
-  ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22
+  ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23
 ```
 
 In another terminal:
@@ -141,11 +141,11 @@ successfully.
 Pin a release tag or digest for production:
 
 ```text
-ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22
+ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23
 ghcr.io/agentsmith-project/llm-universal-proxy@sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89
 ```
 
-Use the `v0.2.22` tag when you want a readable release reference. Use the
+Use the `v0.2.23` tag when you want a readable release reference. Use the
 `sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89`
 digest when rollout tooling requires an immutable artifact identity.
 

@@ -63,6 +63,10 @@ TRACE_PATH_PREFIX_BY_CLIENT = {
     "claude": "/anthropic/",
     "gemini": "/google/",
 }
+ANTHROPIC_NATIVE_UPSTREAM_FORMAT = "anthropic"
+GEMINI_NATIVE_UPSTREAM_FORMATS = frozenset({"google", "gemini"})
+EXPECTED_FAIL_CLOSED_STATUS = "expected_fail_closed"
+UNEXPECTED_SUCCESS_STATUS = "unexpected_success"
 SAFE_ENV_KEYS = (
     "PATH",
     "LANG",
@@ -106,6 +110,7 @@ PRESET_OPENAI_COMPATIBLE_UPSTREAM = "PRESET-OPENAI-COMPATIBLE"
 PRESET_ANTHROPIC_COMPATIBLE_UPSTREAM = "PRESET-ANTHROPIC-COMPATIBLE"
 AUTH_MODE_ENV = "LLM_UNIVERSAL_PROXY_AUTH_MODE"
 PROXY_KEY_ENV = "LLM_UNIVERSAL_PROXY_KEY"
+CODEX_PROXY_PROVIDER_AUTH_ENV = "OPENAI_API_KEY"
 DEFAULT_PROXY_KEY = "llmup-proxy-key"
 SUPPORTED_PROMPT_TEMPLATE_FIELDS = frozenset({"client_name"})
 REPLAY_MARKER_KEY_ENV = "LLMUP_INTERNAL_REPLAY_MARKER_KEY"
@@ -503,6 +508,7 @@ class Lane:
     proxy_model: str
     upstream_name: str
     skip_reason: str | None
+    upstream_format: str | None = None
     upstream_model: str | None = None
     limits: ModelLimits | None = None
     codex_metadata: CodexModelMetadata | None = None
@@ -520,6 +526,7 @@ class TaskFixture:
     description: str = ""
     supported_clients: tuple[str, ...] = ()
     unsupported_lanes: tuple[str, ...] = ()
+    requires_tool_loop: bool = False
 
     def __post_init__(self) -> None:
         if self.prompt_template is None:
@@ -537,6 +544,14 @@ class MatrixCase:
     lane: Lane
     fixture: TaskFixture
     case_id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ExpectedFailClosed:
+    category: str
+    reason: str
+    required_all: tuple[str, ...]
+    required_any: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1071,6 +1086,20 @@ def _hydrate_preset_endpoint_model_target(
     return target
 
 
+def _upstream_format_from_upstreams(
+    upstreams: collections.abc.Mapping[str, collections.abc.Mapping[str, object]],
+    upstream_name: str,
+) -> str | None:
+    upstream = upstreams.get(upstream_name)
+    if upstream is None:
+        return None
+    upstream_format = upstream.get("format")
+    if not isinstance(upstream_format, str):
+        return None
+    upstream_format = upstream_format.strip()
+    return upstream_format or None
+
+
 def resolve_lanes(
     config: ProxySourceConfig,
     dotenv_env: dict[str, str],
@@ -1079,6 +1108,7 @@ def resolve_lanes(
 ) -> list[Lane]:
     if require_preset_endpoint_env:
         validate_preset_endpoint_env(config, dotenv_env)
+    runtime_upstreams = _runtime_upstreams(config, dotenv_env)
     lane_specs = _primary_lane_specs() + (
         ("qwen-local", False, "LOCAL-QWEN"),
     )
@@ -1096,7 +1126,7 @@ def resolve_lanes(
         limits = resolve_model_limits(config, lane_name)
         codex_metadata = resolve_codex_model_metadata(config, lane_name)
 
-        enabled = upstream_name in config.upstreams
+        enabled = upstream_name in runtime_upstreams
         skip_reason = None
 
         if lane_name == "qwen-local" and has_local_qwen(dotenv_env):
@@ -1118,6 +1148,7 @@ def resolve_lanes(
             else:
                 skip_reason = f"missing required routing for lane {lane_name}"
 
+        upstream_format = _upstream_format_from_upstreams(runtime_upstreams, upstream_name)
         lanes.append(
             Lane(
                 name=lane_name,
@@ -1125,6 +1156,7 @@ def resolve_lanes(
                 enabled=enabled,
                 proxy_model=lane_name,
                 upstream_name=upstream_name,
+                upstream_format=upstream_format,
                 upstream_model=upstream_model,
                 limits=limits,
                 codex_metadata=codex_metadata,
@@ -1626,6 +1658,7 @@ def load_fixtures(fixtures_root: pathlib.Path) -> list[TaskFixture]:
                     unsupported_lanes=tuple(
                         str(lane_name) for lane_name in payload.get("unsupported_lanes", [])
                     ),
+                    requires_tool_loop=payload.get("requires_tool_loop", False) is True,
                 )
             )
         except ValueError as error:
@@ -1714,6 +1747,65 @@ def filter_matrix_cases(
 
     wanted_set = set(wanted)
     return [case for case in case_list if case.case_id in wanted_set]
+
+
+def _normalized_upstream_format(upstream_format: str | None) -> str | None:
+    if upstream_format is None:
+        return None
+    normalized = upstream_format.strip().lower()
+    return normalized or None
+
+
+def expected_fail_closed_for_case(case: MatrixCase) -> ExpectedFailClosed | None:
+    upstream_format = _normalized_upstream_format(case.lane.upstream_format)
+    if upstream_format is None:
+        return None
+    if (
+        case.client_name == "claude"
+        and upstream_format != ANTHROPIC_NATIVE_UPSTREAM_FORMAT
+    ):
+        return ExpectedFailClosed(
+            category="anthropic_native_controls",
+            reason="Claude request controls require native Anthropic upstream format",
+            required_all=("Anthropic request controls",),
+            required_any=("thinking", "context_management"),
+        )
+    if (
+        case.client_name == "gemini"
+        and case.fixture.requires_tool_loop
+        and upstream_format not in GEMINI_NATIVE_UPSTREAM_FORMATS
+    ):
+        return ExpectedFailClosed(
+            category="gemini_provider_thought_signature",
+            reason=(
+                "Gemini tool-loop provider thought-signature state requires native "
+                "Gemini upstream format"
+            ),
+            required_all=(),
+            required_any=("thoughtSignature", "provider thought-signature state"),
+        )
+    return None
+
+
+def _contains_casefold(text: str, needle: str) -> bool:
+    return needle.casefold() in text.casefold()
+
+
+def expected_fail_closed_error_matches(
+    expectation: ExpectedFailClosed,
+    error_text: str,
+) -> bool:
+    if not all(
+        _contains_casefold(error_text, required)
+        for required in expectation.required_all
+    ):
+        return False
+    if not expectation.required_any:
+        return True
+    return any(
+        _contains_casefold(error_text, candidate)
+        for candidate in expectation.required_any
+    )
 
 
 def classify_lane_health(lane: Lane, probe_error: str | None) -> tuple[str, str | None]:
@@ -1892,6 +1984,23 @@ def build_codex_catalog_args(
         )
     ensure_no_public_internal_tool_artifacts(args, context="codex catalog args")
     return args
+
+
+def build_codex_proxy_provider_args(proxy_base: str) -> list[str]:
+    return [
+        "-c",
+        'model_provider="proxy"',
+        "-c",
+        'model_providers.proxy.name="Proxy"',
+        "-c",
+        f'model_providers.proxy.env_key="{CODEX_PROXY_PROVIDER_AUTH_ENV}"',
+        "-c",
+        f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
+        "-c",
+        'model_providers.proxy.wire_api="responses"',
+        "-c",
+        "model_providers.proxy.supports_websockets=false",
+    ]
 
 
 def build_gemini_settings_payload(
@@ -2123,6 +2232,7 @@ def render_summary_markdown(summary: dict[str, object], results: list[dict[str, 
         f"- Finished: {summary.get('finished_at', '')}",
         f"- Passed: {summary.get('pass', 0)}",
         f"- Failed: {summary.get('fail', 0)}",
+        f"- Expected Fail-Closed: {summary.get('expected_fail_closed', 0)}",
         f"- Skipped: {summary.get('skip', 0)}",
         "",
         "| Case | Status | Message |",
@@ -5164,6 +5274,8 @@ def build_case_diagnostics(
         "lane": case.lane.name,
         "upstream_name": case.lane.upstream_name,
     }
+    if case.lane.upstream_format is not None:
+        surface_snapshot["upstream_format"] = case.lane.upstream_format
     if case.lane.upstream_model is not None:
         surface_snapshot["upstream_model"] = case.lane.upstream_model
     surface_snapshot.update(_codex_metadata_snapshot(case.lane.codex_metadata))
@@ -5220,18 +5332,9 @@ def build_client_command(
             [
                 "-C",
                 str(workspace_dir),
-                "-c",
-                'model_provider="proxy"',
-                "-c",
-                'model_providers.proxy.name="Proxy"',
-                "-c",
-                f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
-                "-c",
-                'model_providers.proxy.wire_api="responses"',
-                "-c",
-                "model_providers.proxy.supports_websockets=false",
             ]
         )
+        command.extend(build_codex_proxy_provider_args(proxy_base))
         command.extend(
             build_codex_catalog_args(
                 client_home,
@@ -5335,6 +5438,7 @@ def run_matrix_case(
     trace_entries: list[dict[str, object]] = []
     workspace_diff_summary = _workspace_diff_empty_summary()
     diagnostics: dict[str, object] | None = None
+    expected_fail_closed = expected_fail_closed_for_case(case)
 
     try:
         run_kwargs: dict[str, object] = {
@@ -5374,29 +5478,52 @@ def run_matrix_case(
             workspace_diff_summary,
         )
         if completed.returncode == 0:
-            ok, verifier_message = verify_fixture_output(
-                case.fixture,
-                stdout_text,
-                workspace_dir if case.fixture.workspace_template is not None else None,
-                context=VerifierContext(
-                    client_name=case.client_name,
-                    case_id=case.case_id,
-                    command=tuple(command),
-                    home_dir=home_dir,
-                    workspace_dir=workspace_dir,
-                    trace_entries=tuple(trace_entries),
-                    diagnostics=diagnostics,
-                    workspace_diff=workspace_diff_summary,
-                ),
-            )
-            if ok:
-                status = "passed"
-                message = "verifier passed"
+            if expected_fail_closed is not None:
+                status = UNEXPECTED_SUCCESS_STATUS
+                message = (
+                    f"expected fail-closed ({expected_fail_closed.reason}) "
+                    "but command exited 0"
+                )
             else:
-                status = "failed"
-                message = verifier_message
+                ok, verifier_message = verify_fixture_output(
+                    case.fixture,
+                    stdout_text,
+                    workspace_dir if case.fixture.workspace_template is not None else None,
+                    context=VerifierContext(
+                        client_name=case.client_name,
+                        case_id=case.case_id,
+                        command=tuple(command),
+                        home_dir=home_dir,
+                        workspace_dir=workspace_dir,
+                        trace_entries=tuple(trace_entries),
+                        diagnostics=diagnostics,
+                        workspace_diff=workspace_diff_summary,
+                    ),
+                )
+                if ok:
+                    status = "passed"
+                    message = "verifier passed"
+                else:
+                    status = "failed"
+                    message = verifier_message
         else:
             message = f"exit code {completed.returncode}"
+            if expected_fail_closed is not None:
+                error_text = "\n".join((stdout_text, stderr_text, message))
+                if expected_fail_closed_error_matches(
+                    expected_fail_closed,
+                    error_text,
+                ):
+                    status = EXPECTED_FAIL_CLOSED_STATUS
+                    message = (
+                        f"expected fail-closed: {expected_fail_closed.reason}; "
+                        f"exit code {completed.returncode}"
+                    )
+                else:
+                    message = (
+                        f"exit code {completed.returncode}; expected fail-closed "
+                        f"markers missing for {expected_fail_closed.category}"
+                    )
     except subprocess.TimeoutExpired as error:
         stdout_text = error.stdout or ""
         stderr_text = error.stderr or ""
@@ -5424,7 +5551,7 @@ def run_matrix_case(
     stdout_path.write_text(stdout_text, encoding="utf-8")
     stderr_path.write_text(stderr_text, encoding="utf-8")
 
-    return {
+    result = {
         "case_id": case.case_id,
         "client": case.client_name,
         "lane": case.lane.name,
@@ -5440,6 +5567,9 @@ def run_matrix_case(
         "diagnostics": diagnostics
         or build_case_diagnostics(case, trace_entries, workspace_diff_summary),
     }
+    if expected_fail_closed is not None:
+        result["expected_fail_closed"] = expected_fail_closed.category
+    return result
 
 
 def print_case_list(cases: list[MatrixCase]) -> None:
@@ -5517,11 +5647,18 @@ def stop_proxy(
             return
 
 
-def summarize_results(results: list[dict[str, object]]) -> tuple[int, int, int]:
+def summarize_results(results: list[dict[str, object]]) -> tuple[int, int, int, int]:
     passed = sum(1 for item in results if item["status"] == "passed")
-    failed = sum(1 for item in results if item["status"] == "failed")
+    failed = sum(
+        1
+        for item in results
+        if item["status"] in {"failed", UNEXPECTED_SUCCESS_STATUS}
+    )
     skipped = sum(1 for item in results if item["status"] == "skipped")
-    return passed, failed, skipped
+    expected_fail_closed = sum(
+        1 for item in results if item["status"] == EXPECTED_FAIL_CLOSED_STATUS
+    )
+    return passed, failed, skipped, expected_fail_closed
 
 
 def selected_clients(cases: Iterable[MatrixCase]) -> list[str]:
@@ -5705,7 +5842,7 @@ def run(argv: list[str] | None = None) -> int:
         stop_proxy(process, terminate_grace_secs=timeout_policy.process_terminate_grace_secs)
 
     finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    passed, failed, skipped = summarize_results(results)
+    passed, failed, skipped, expected_fail_closed = summarize_results(results)
     _write_reports_to_dir(
         report_dir,
         {
@@ -5714,13 +5851,17 @@ def run(argv: list[str] | None = None) -> int:
             "pass": passed,
             "fail": failed,
             "skip": skipped,
+            "expected_fail_closed": expected_fail_closed,
             "phase": args.test,
             "report_dir": str(report_dir),
         },
         results,
     )
     print(f"Report: {report_dir}")
-    print(f"Passed: {passed}  Failed: {failed}  Skipped: {skipped}")
+    print(
+        f"Passed: {passed}  Failed: {failed}  "
+        f"Expected Fail-Closed: {expected_fail_closed}  Skipped: {skipped}"
+    )
     return 1 if failed else 0
 
 

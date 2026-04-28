@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.2.23 - 2026-04-28
+
+- Bumped the release identity past the occupied `v0.2.22` tag without moving, deleting, or reusing the existing tag, keeping GA governance on the next patch version.
+
 ## v0.2.22 - 2026-04-27
 
 - Documented provider-neutral preset naming as the portable GA path, keeping named official and compatible providers as operator examples rather than release-blocking dependencies.

@@ -206,6 +206,8 @@ class InteractiveCliTests(unittest.TestCase):
                 "-c",
                 'model_providers.proxy.name="Proxy"',
                 "-c",
+                'model_providers.proxy.env_key="OPENAI_API_KEY"',
+                "-c",
                 f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
                 "-c",
                 'model_providers.proxy.wire_api="responses"',
@@ -386,6 +388,10 @@ class InteractiveCliTests(unittest.TestCase):
         self.assertEqual(
             codex_proxy_configs(interactive_command),
             codex_proxy_configs(matrix_command),
+        )
+        self.assertIn(
+            'model_providers.proxy.env_key="OPENAI_API_KEY"',
+            codex_proxy_configs(interactive_command),
         )
         self.assertIn(
             "model_providers.proxy.supports_websockets=false",
@@ -597,6 +603,10 @@ if __name__ == "__main__":
             self.assertIn('model_providers.proxy.wire_api="responses"', record["configs"])
             self.assertIn(
                 "model_providers.proxy.supports_websockets=false",
+                record["configs"],
+            )
+            self.assertIn(
+                'model_providers.proxy.env_key="OPENAI_API_KEY"',
                 record["configs"],
             )
             self.assertIn(

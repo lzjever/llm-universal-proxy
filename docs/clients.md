@@ -147,6 +147,15 @@ Set:
 - `OPENAI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY`
 - `OPENAI_BASE_URL=<proxy>/openai/v1`
 
+If you configure Codex's custom provider manually with `-c`, bind that provider to the same key:
+
+- `model_provider="proxy"`
+- `model_providers.proxy.name="Proxy"`
+- `model_providers.proxy.env_key="OPENAI_API_KEY"`
+- `model_providers.proxy.base_url="<proxy>/openai/v1"`
+- `model_providers.proxy.wire_api="responses"`
+- `model_providers.proxy.supports_websockets=false`
+
 Codex then calls the OpenAI-style surface, typically `POST /openai/v1/responses`.
 
 ### Claude Code

@@ -1,6 +1,6 @@
 services:
   llmup:
-    image: ${LLMUP_IMAGE:-ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.22}
+    image: ${LLMUP_IMAGE:-ghcr.io/agentsmith-project/llm-universal-proxy:v0.2.23}
     restart: unless-stopped
     ports:
       - "127.0.0.1:8080:8080"

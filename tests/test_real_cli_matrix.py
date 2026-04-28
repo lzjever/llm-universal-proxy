@@ -156,6 +156,7 @@ def make_lane(
     enabled=True,
     proxy_model=None,
     upstream_name="MINIMAX-ANTHROPIC",
+    upstream_format="anthropic",
 ):
     return module.Lane(
         name=name,
@@ -163,6 +164,7 @@ def make_lane(
         enabled=enabled,
         proxy_model=proxy_model or name,
         upstream_name=upstream_name,
+        upstream_format=upstream_format,
         skip_reason=None,
     )
 
@@ -175,6 +177,7 @@ def make_fixture(
     prompt_template=None,
     verifier=None,
     timeout_secs=5,
+    requires_tool_loop=False,
 ):
     return module.TaskFixture(
         fixture_id=fixture_id,
@@ -184,6 +187,7 @@ def make_fixture(
         verifier=verifier or {"type": "contains", "value": "PONG"},
         timeout_secs=timeout_secs,
         workspace_template=None,
+        requires_tool_loop=requires_tool_loop,
     )
 
 
@@ -310,6 +314,22 @@ class RealCliMatrixTests(unittest.TestCase):
             rendered,
             "Current client: claude. Reply with only the exact public editing tool names visible here.",
         )
+
+    def test_load_fixtures_marks_only_tool_loop_workspace_edit_fixture(self):
+        module = load_module()
+
+        fixtures = {
+            fixture.fixture_id: fixture
+            for fixture in module.load_fixtures(DEFAULT_CONFIG_PATH.parent)
+        }
+
+        self.assertTrue(
+            fixtures[
+                "public_editing_tool_workspace_edit_contract"
+            ].requires_tool_loop
+        )
+        self.assertFalse(fixtures["smoke_pong"].requires_tool_loop)
+        self.assertFalse(fixtures["tool_identity_public_contract"].requires_tool_loop)
 
     def test_default_proxy_binary_path_prefers_newer_debug_build(self):
         module = load_module()
@@ -582,6 +602,40 @@ class RealCliMatrixTests(unittest.TestCase):
             lanes["preset-anthropic-compatible"].upstream_model,
             "provider-live-model",
         )
+
+    def test_resolve_lanes_exposes_upstream_format_from_config(self):
+        module = load_module()
+        parsed = module.parse_proxy_source(
+            DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+        )
+
+        lanes = {
+            lane.name: lane
+            for lane in module.resolve_lanes(parsed, preset_endpoint_env())
+        }
+
+        self.assertEqual(
+            lanes["preset-anthropic-compatible"].upstream_format,
+            "anthropic",
+        )
+        self.assertEqual(
+            lanes["preset-openai-compatible"].upstream_format,
+            "openai-completion",
+        )
+
+        qwen_lanes = {
+            lane.name: lane
+            for lane in module.resolve_lanes(
+                parsed,
+                preset_endpoint_env(
+                    LOCAL_QWEN_BASE_URL="http://127.0.0.1:9997/v1",
+                    LOCAL_QWEN_MODEL="qwen3.5-9b-awq",
+                    LOCAL_QWEN_API_KEY="not-needed",
+                ),
+            )
+        }
+
+        self.assertEqual(qwen_lanes["qwen-local"].upstream_format, "openai-completion")
 
     def test_preset_trace_filter_keeps_real_provider_model_after_lane_resolution(self):
         module = load_module()
@@ -1936,6 +1990,24 @@ class RealCliMatrixTests(unittest.TestCase):
                     sandbox_index = command.index("--sandbox")
                     self.assertEqual(command[sandbox_index + 1], "workspace-write")
 
+    def test_build_client_command_binds_codex_proxy_provider_to_proxy_key_env(self):
+        module = load_module()
+        fixture = make_fixture(module)
+
+        command = module.build_client_command(
+            "codex",
+            "http://127.0.0.1:18888",
+            make_lane(module, name="preset-chat", proxy_model="preset-chat"),
+            fixture,
+            pathlib.Path("/tmp/workspace").resolve(),
+            client_home=pathlib.Path("/tmp/codex-home").resolve(),
+        )
+
+        self.assertIn(
+            'model_providers.proxy.env_key="OPENAI_API_KEY"',
+            " ".join(command),
+        )
+
     def test_build_client_command_allows_explicit_dangerous_harness(self):
         module = load_module()
         fixture = make_fixture(module)
@@ -2293,6 +2365,94 @@ class RealCliMatrixTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "unknown matrix case"):
             module.filter_matrix_cases(cases, selected_case_ids=["missing-case"])
+
+    def test_expected_fail_closed_classifies_claude_by_upstream_format(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(
+                module,
+                name="preset-openai-compatible",
+                upstream_name="PRESET-OPENAI-COMPATIBLE",
+                upstream_format="openai-completion",
+            ),
+        )
+
+        expectation = module.expected_fail_closed_for_case(case)
+
+        self.assertIsNotNone(expectation)
+        self.assertEqual(expectation.category, "anthropic_native_controls")
+        self.assertTrue(
+            module.expected_fail_closed_error_matches(
+                expectation,
+                "Anthropic request controls thinking, context_management require native provider semantics",
+            )
+        )
+        self.assertFalse(
+            module.expected_fail_closed_error_matches(
+                expectation,
+                "HTTP 500 from upstream",
+            )
+        )
+
+        native_case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(module, upstream_format="anthropic"),
+        )
+        self.assertIsNone(module.expected_fail_closed_for_case(native_case))
+
+    def test_expected_fail_closed_classifies_gemini_tool_loop_by_upstream_format(self):
+        module = load_module()
+        tool_loop_fixture = make_fixture(
+            module,
+            fixture_id="public_editing_tool_workspace_edit_contract",
+            requires_tool_loop=True,
+        )
+        case = make_case(
+            module,
+            client_name="gemini",
+            lane=make_lane(
+                module,
+                name="preset-openai-compatible",
+                upstream_name="PRESET-OPENAI-COMPATIBLE",
+                upstream_format="openai-completion",
+            ),
+            fixture=tool_loop_fixture,
+        )
+
+        expectation = module.expected_fail_closed_for_case(case)
+
+        self.assertIsNotNone(expectation)
+        self.assertEqual(expectation.category, "gemini_provider_thought_signature")
+        self.assertTrue(
+            module.expected_fail_closed_error_matches(
+                expectation,
+                "thoughtSignature carries provider thought-signature state and cannot be faithfully translated",
+            )
+        )
+        self.assertTrue(
+            module.expected_fail_closed_error_matches(
+                expectation,
+                "provider thought-signature state cannot be faithfully translated",
+            )
+        )
+
+        native_case = make_case(
+            module,
+            client_name="gemini",
+            lane=make_lane(module, upstream_format="google"),
+            fixture=tool_loop_fixture,
+        )
+        smoke_case = make_case(
+            module,
+            client_name="gemini",
+            lane=make_lane(module, upstream_format="openai-completion"),
+            fixture=make_fixture(module),
+        )
+        self.assertIsNone(module.expected_fail_closed_for_case(native_case))
+        self.assertIsNone(module.expected_fail_closed_for_case(smoke_case))
 
     def test_classify_lane_health_skips_optional_qwen_probe_failures(self):
         module = load_module()
@@ -3768,6 +3928,121 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["message"], "exit code 7")
 
+    def test_run_matrix_case_classifies_expected_fail_closed_nonzero_without_failure(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(
+                module,
+                name="preset-openai-compatible",
+                upstream_name="PRESET-OPENAI-COMPATIBLE",
+                upstream_format="openai-completion",
+            ),
+            fixture=make_fixture(module),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = pathlib.Path(temp_dir)
+            with mock.patch.object(
+                module.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    ["claude"],
+                    1,
+                    stdout="",
+                    stderr=(
+                        "Anthropic request controls thinking, context_management "
+                        "require native provider semantics and cannot be faithfully translated"
+                    ),
+                ),
+            ):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "expected_fail_closed")
+        self.assertEqual(result["expected_fail_closed"], "anthropic_native_controls")
+        self.assertIn("exit code 1", result["message"])
+        self.assertEqual(module.summarize_results([result]), (0, 0, 0, 1))
+
+    def test_run_matrix_case_expected_fail_closed_success_counts_as_failure(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="claude",
+            lane=make_lane(
+                module,
+                name="preset-openai-compatible",
+                upstream_name="PRESET-OPENAI-COMPATIBLE",
+                upstream_format="openai-completion",
+            ),
+            fixture=make_fixture(module),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = pathlib.Path(temp_dir)
+            with mock.patch.object(
+                module.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    ["claude"],
+                    0,
+                    stdout="PONG\n",
+                    stderr="",
+                ),
+            ):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "unexpected_success")
+        self.assertEqual(result["expected_fail_closed"], "anthropic_native_controls")
+        self.assertIn("expected fail-closed", result["message"])
+        self.assertEqual(module.summarize_results([result]), (0, 1, 0, 0))
+
+    def test_run_matrix_case_keeps_plain_gemini_smoke_nonzero_as_failure(self):
+        module = load_module()
+        case = make_case(
+            module,
+            client_name="gemini",
+            lane=make_lane(
+                module,
+                name="preset-openai-compatible",
+                upstream_name="PRESET-OPENAI-COMPATIBLE",
+                upstream_format="openai-completion",
+            ),
+            fixture=make_fixture(module),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = pathlib.Path(temp_dir)
+            with mock.patch.object(
+                module.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    ["gemini"],
+                    1,
+                    stdout="",
+                    stderr="thoughtSignature should not classify a plain smoke fixture",
+                ),
+            ):
+                result = module.run_matrix_case(
+                    case,
+                    "http://127.0.0.1:18888",
+                    report_dir,
+                    {"PATH": os.environ.get("PATH", "")},
+                )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertNotIn("expected_fail_closed", result)
+
     def test_wait_for_health_rejects_old_proxy_health_without_owned_listening_proof(self):
         module = load_module()
 
@@ -4194,6 +4469,7 @@ class RealCliMatrixTests(unittest.TestCase):
                     "pass": 1,
                     "fail": 0,
                     "skip": 1,
+                    "expected_fail_closed": 1,
                 },
                 [
                     {
@@ -4212,6 +4488,15 @@ class RealCliMatrixTests(unittest.TestCase):
                         "status": "skipped",
                         "message": "optional lane unavailable",
                     },
+                    {
+                        "case_id": "claude__preset-openai-compatible__smoke_pong",
+                        "client": "claude",
+                        "lane": "preset-openai-compatible",
+                        "fixture": "smoke_pong",
+                        "status": "expected_fail_closed",
+                        "message": "expected fail-closed",
+                        "expected_fail_closed": "anthropic_native_controls",
+                    },
                 ],
                 timestamp="20260417T000000Z",
             )
@@ -4225,6 +4510,11 @@ class RealCliMatrixTests(unittest.TestCase):
 
             summary = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["pass"], 1)
+            self.assertEqual(summary["expected_fail_closed"], 1)
+            self.assertIn(
+                "- Expected Fail-Closed: 1",
+                (run_dir / "report.md").read_text(encoding="utf-8"),
+            )
             self.assertIn(
                 "codex__minimax-anth__smoke_pong",
                 (run_dir / "results.jsonl").read_text(encoding="utf-8"),

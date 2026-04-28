@@ -27,6 +27,7 @@ from real_cli_matrix import (  # noqa: E402
     add_timeout_policy_args,
     build_client_env,
     build_codex_catalog_args,
+    build_codex_proxy_provider_args,
     build_runtime_config_text,
     default_proxy_binary_path,
     ensure_no_public_internal_tool_artifacts,
@@ -126,20 +127,7 @@ def build_interactive_command(
             command.append("--dangerously-bypass-approvals-and-sandbox")
         else:
             command.extend(["--sandbox", "workspace-write"])
-        command.extend(
-            [
-                "-c",
-                'model_provider="proxy"',
-                "-c",
-                'model_providers.proxy.name="Proxy"',
-                "-c",
-                f'model_providers.proxy.base_url="{proxy_base}/openai/v1"',
-                "-c",
-                'model_providers.proxy.wire_api="responses"',
-                "-c",
-                "model_providers.proxy.supports_websockets=false",
-            ]
-        )
+        command.extend(build_codex_proxy_provider_args(proxy_base))
         command.extend(
             build_codex_catalog_args(
                 client_home, model, model_limits, codex_metadata

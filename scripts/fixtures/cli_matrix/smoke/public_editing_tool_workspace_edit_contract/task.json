@@ -10,6 +10,7 @@
     "claude",
     "gemini"
   ],
+  "requires_tool_loop": true,
   "unsupported_lanes": [
     "qwen-local"
   ],

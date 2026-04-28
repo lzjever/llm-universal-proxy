@@ -5,8 +5,8 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 IMAGE_REPO = "ghcr.io/agentsmith-project/llm-universal-proxy"
-CURRENT_RELEASE_TAG = "v0.2.22"
-CURRENT_VERSION_TAG = "0.2.22"
+CURRENT_RELEASE_TAG = "v0.2.23"
+CURRENT_VERSION_TAG = "0.2.23"
 CURRENT_IMAGE_DIGEST = (
     "ghcr.io/agentsmith-project/llm-universal-proxy@"
     "sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89"
@@ -161,8 +161,8 @@ class GaDocsContractTests(unittest.TestCase):
             'check_contains "docs/container.md" "GITHUB_USERNAME"',
             'check_contains "docs/container.md" "If the package is public"',
             'check_contains "docs/container.md" "unauthorized, 403, or package page appears 404"',
-            'check_contains "README.md" "v0.2.22"',
-            'check_contains "README_CN.md" "v0.2.22"',
+            'check_contains "README.md" "v0.2.23"',
+            'check_contains "README_CN.md" "v0.2.23"',
             'check_absent "docs/container.md" "fine-grained personal access token"',
             'check_absent "docs/container.md" \'$GITHUB_ACTOR\'',
             f'check_contains "examples/docker-compose.yaml" "{IMAGE_REPO}:{CURRENT_RELEASE_TAG}"',
@@ -477,15 +477,15 @@ class GaDocsContractTests(unittest.TestCase):
                 self.assertNotIn("OpenAI-compatible completions surface", text)
                 self.assertNotIn("OpenAI-compatible completions and", text)
 
-    def test_changelog_latest_release_records_recent_user_visible_changes(self):
+    def test_changelog_latest_release_records_current_release_metadata(self):
         changelog = read_doc("CHANGELOG.md")
-        latest_release = markdown_section(changelog, "v0.2.22 - 2026-04-27")
+        latest_release = markdown_section(changelog, "v0.2.23 - 2026-04-28")
 
         for snippet in (
-            "provider-neutral preset naming",
-            "Responses reasoning/compaction continuity degradation",
-            "hermetic Codex wrapper interaction gate",
-            "GA docs alignment",
+            "release identity",
+            "occupied `v0.2.22` tag",
+            "reusing the existing tag",
+            "next patch version",
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, latest_release)
