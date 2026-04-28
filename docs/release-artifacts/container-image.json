@@ -2,14 +2,19 @@
   "schema": 1,
   "image": "ghcr.io/agentsmith-project/llm-universal-proxy",
   "published": {
-    "release_tag": "v0.2.22",
-    "version_tag": "0.2.22",
-    "digest": "sha256:9dd52969dd30fad3a6472eb97ef5e6b231f9c51469e13e19f906c99f75ba8c89",
-    "published_at": "2026-04-27"
+    "release_tag": "v0.2.23",
+    "version_tag": "0.2.23",
+    "digest": "sha256:81c277bcbdbec4645b3e4edce5efa4d1b2253539214ba944f0712798c9a28f22",
+    "cargo_package_version": "0.2.23",
+    "git_sha": "79534a9527778dc81788a33aefa56ef69f4d5798",
+    "status": "published",
+    "published_at": "2026-04-28T10:18:16Z",
+    "run_url": "https://github.com/agentsmith-project/llm-universal-proxy/actions/runs/25045312825"
   },
   "next_release": {
-    "cargo_package_version": "0.2.23",
-    "release_tag": "v0.2.23",
-    "status": "not_published"
+    "cargo_package_version": "0.2.24",
+    "release_tag": "v0.2.24",
+    "status": "not_published",
+    "main_branch_action": "After publishing v0.2.23, advance main to Cargo package version 0.2.24 before the next release."
   }
 }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.2.24 - 2026-04-28
+
+- Advanced the main-branch release identity to Cargo package version `0.2.24`, the next patch version after the occupied `v0.2.23` tag, without moving, deleting, or reusing the existing tag, so the published `v0.2.23` container tag remains immutable.
+- Refreshed the checked-in container publication manifest and docs around the actual published `v0.2.23` image digest while keeping `0.2.24` / `v0.2.24` as the next release identity, not a published container tag yet.
+
 ## v0.2.23 - 2026-04-28
 
 - Kept the release identity on Cargo package version `0.2.23`, the next patch version after the occupied `v0.2.22` tag, without moving, deleting, or reusing the existing tag and without jumping to `0.2.24` while `v0.2.23` remains available.
