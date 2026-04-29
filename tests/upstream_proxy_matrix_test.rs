@@ -105,6 +105,7 @@ fn openai_auto_discovery_config(upstream_base: &str) -> Config {
             api_root: upstream_api_root(upstream_base, UpstreamFormat::OpenAiCompletion),
             fixed_upstream_format: None,
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -114,6 +115,7 @@ fn openai_auto_discovery_config(upstream_base: &str) -> Config {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     }
 }
 

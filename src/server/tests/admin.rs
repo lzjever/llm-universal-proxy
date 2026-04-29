@@ -142,6 +142,30 @@ fn admin_access_from_env_var_result_treats_non_unicode_as_misconfigured() {
     ));
 }
 
+#[test]
+fn debug_formatting_redacts_runtime_data_auth_proxy_key() {
+    let sentinel = "sentinel-runtime-data-auth-debug-secret";
+
+    for rendered in [
+        format!("{:?}", DataAuthConfig::proxy_key(sentinel)),
+        format!(
+            "{:?}",
+            data_auth::RuntimeDataAuthState::from_access(data_auth::DataAccess::ProxyKey {
+                key: sentinel.to_string(),
+            })
+        ),
+    ] {
+        assert!(
+            !rendered.contains(sentinel),
+            "Debug output must not contain runtime data auth secret: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "Debug output should show redaction intent: {rendered}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
     let config = crate::config::Config {
@@ -156,6 +180,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
             api_root: "https://user:pass@api.openai.com/v1?api_key=inline-secret#frag".to_string(),
             fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: vec![
                 ("x-tenant".to_string(), "demo".to_string()),
                 (
@@ -180,6 +205,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
         },
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let mut upstreams = BTreeMap::new();
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
@@ -223,6 +249,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
 
     let state = Arc::new(AppState {
         runtime: Arc::new(RwLock::new(runtime)),
+        admin_update_lock: Arc::new(Mutex::new(())),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),
@@ -315,6 +342,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
             api_root: "https://api.openai.com/v1".to_string(),
             fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -324,6 +352,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let mut upstreams = BTreeMap::new();
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
@@ -367,6 +396,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
 
     let state = Arc::new(AppState {
         runtime: Arc::new(RwLock::new(runtime)),
+        admin_update_lock: Arc::new(Mutex::new(())),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),
@@ -407,6 +437,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
             api_root: "https://api.openai.com/v1".to_string(),
             fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -416,6 +447,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let mut upstreams = BTreeMap::new();
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
@@ -459,6 +491,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
 
     let state = Arc::new(AppState {
         runtime: Arc::new(RwLock::new(runtime)),
+        admin_update_lock: Arc::new(Mutex::new(())),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),

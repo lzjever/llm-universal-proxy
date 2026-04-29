@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use reqwest::Client;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::config::{Config, ProxyConfig, UpstreamConfig};
@@ -19,6 +19,7 @@ pub(super) const TEST_FORCE_UNAVAILABLE_UPSTREAMS_ENV: &str =
 #[derive(Clone)]
 pub(super) struct AppState {
     pub(super) runtime: Arc<RwLock<RuntimeState>>,
+    pub(super) admin_update_lock: Arc<Mutex<()>>,
     pub(super) metrics: Arc<RuntimeMetrics>,
     pub(super) admin_access: AdminAccess,
     pub(super) data_auth_policy: super::data_auth::RuntimeConfigValidationPolicy,
@@ -67,7 +68,7 @@ pub(super) struct RuntimeNamespaceState {
     pub(super) debug_trace: Option<DebugTraceRecorder>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct RuntimeState {
     pub(super) namespaces: BTreeMap<String, RuntimeNamespaceState>,
 }

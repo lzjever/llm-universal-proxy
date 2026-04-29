@@ -8,6 +8,7 @@ Use admin-driven dynamic config when you need to:
 - confirm what upstreams are currently available
 - check how upstream proxy routing was resolved
 - update a namespace config in place
+- inspect or update the global data-plane auth config
 
 For the basic YAML shape, start with [Configuration Guide](./configuration.md).
 For direct binary startup, use `llm-universal-proxy --config <config.yaml>` when
@@ -42,7 +43,14 @@ In other words:
 - local development can often use loopback admin access directly, without forwarding headers such as `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, or `X-Real-IP`
 - shared or remote deployments should normally set a non-empty admin bearer token
 
-Provider/model/resource routes use `LLM_UNIVERSAL_PROXY_AUTH_MODE` and do not accept the admin token. That data-plane auth mode is process-wide across namespaces. In `proxy_key` mode, dynamic namespace config can add upstream `provider_key_env` entries, and clients authenticate with `LLM_UNIVERSAL_PROXY_KEY` through their normal SDK API key or bearer token.
+Provider/model/resource routes use the current global `data_auth` state and do
+not accept the admin token. That data-plane auth mode is process-wide across
+namespaces. Static config can define `data_auth`; if it is omitted, the proxy
+uses the `LLM_UNIVERSAL_PROXY_AUTH_MODE` and `LLM_UNIVERSAL_PROXY_KEY`
+environment fallback. In `proxy_key` mode, dynamic namespace config can add
+upstream `provider_key.inline`, `provider_key.env`, or legacy
+`provider_key_env` entries. Clients authenticate with the proxy key through
+their normal SDK API key or bearer token.
 
 ## Admin Dashboard Boundary
 
@@ -64,16 +72,45 @@ For container-specific runtime notes, see [Container Image and GHCR Release](./c
 The current admin endpoints are:
 
 - `GET /admin/state`
+- `GET /admin/data-auth`
+- `PUT /admin/data-auth`
 - `GET /admin/namespaces/:namespace/state`
 - `POST /admin/namespaces/:namespace/config`
 
 What each one is for:
 
 - `GET /admin/state`: list namespaces currently loaded in the runtime
+- `GET /admin/data-auth`: inspect the redacted global data-plane auth config
+- `PUT /admin/data-auth`: replace the global data-plane auth config with CAS
 - `GET /admin/namespaces/:namespace/state`: inspect one namespace, including redacted config and resolved upstream state
 - `POST /admin/namespaces/:namespace/config`: replace the namespace config with a new runtime payload
 
 ## Inspect Runtime State
+
+### Inspect data auth
+
+```bash
+curl -fsS http://127.0.0.1:8080/admin/data-auth
+```
+
+Typical response:
+
+```json
+{
+  "revision": "a-server-generated-revision",
+  "config": {
+    "mode": "proxy_key",
+    "proxy_key": {
+      "source": "env",
+      "configured": true,
+      "redacted": true,
+      "env_name": "LLM_UNIVERSAL_PROXY_KEY"
+    }
+  }
+}
+```
+
+The response is a redacted snapshot. Inline key values are never returned.
 
 ### List namespaces
 
@@ -147,6 +184,7 @@ Admin read responses are designed for runtime inspection, not for secret export.
 The redacted view does not expose sensitive values such as:
 
 - inline upstream credentials
+- inline `data_auth.proxy_key` values
 - hook authorization tokens
 - raw environment-derived proxy URLs
 - userinfo, query strings, or fragments inside URLs
@@ -154,6 +192,8 @@ The redacted view does not expose sensitive values such as:
 What you get instead is enough operational information to understand the runtime safely, for example:
 
 - whether a provider key is configured through provider_key_env presence
+- the `provider_key` view reports `source`, `configured`, `redacted`, and `env_name` when applicable
+- whether the global `data_auth.proxy_key` source is inline or env, without the key value
 - whether hook authorization is configured
 - a sanitized `proxy` or `proxy_url` where that is safe to show
 
@@ -163,10 +203,21 @@ What you get instead is enough operational information to understand the runtime
 
 The write flow supports revision checks so a client does not accidentally overwrite a newer config.
 
-The payload is validated against the current process-wide data-plane auth mode. `LLM_UNIVERSAL_PROXY_AUTH_MODE` applies to all namespaces and is not set through the namespace payload.
+The payload is validated against the current process-wide `data_auth` state.
+Static `data_auth` or the environment fallback applies to all namespaces and is
+not set through the namespace payload.
 
-- In `proxy_key` mode, every upstream that can receive traffic must include a resolvable `provider_key_env`; the named environment variable must exist in the proxy process environment.
-- In `client_provider_key` mode, the payload does not require `provider_key_env`, and it is normally omitted; a non-empty field is not rejected just because this mode is active, but clients still send the real provider key through their normal SDK API key or bearer-token path.
+- In `proxy_key` mode, every upstream that can receive traffic must include a
+  provider credential source: `provider_key.inline`, `provider_key.env`, or
+  legacy `provider_key_env`. Env sources must resolve in the proxy process
+  environment.
+- In `client_provider_key` mode, the payload does not require `provider_key_env`,
+  and it is normally omitted. `provider_key.env` and `provider_key_env` are not
+  rejected just because this mode is active, but they are not used. Clients still
+  send the real provider key through their normal SDK API key or bearer-token
+  path. `provider_key.inline` is rejected.
+
+In `client_provider_key` mode, `provider_key.env` and `provider_key_env` are not rejected if present, but they are not used.
 
 Runtime writes use the same client-visible surface contract as static YAML. Raw HTTP tests can omit `surface_defaults`, but Codex, Claude Code, and Gemini wrapper/live-profile flows should provide at least the conservative text-only surface shown below, or an accurate alias-level `surface`.
 
@@ -272,6 +323,50 @@ JSON
 
 Successful writes return the new namespace revision.
 
+## Update Data Auth Without Restarting
+
+`GET /admin/data-auth` and `PUT /admin/data-auth` are admin-plane endpoints and
+use the same `Authorization: Bearer <admin-token>` rule as the other
+`/admin/*` APIs when `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` is set.
+
+`PUT /admin/data-auth` accepts:
+
+```json
+{
+  "if_revision": "current-data-auth-revision",
+  "config": {
+    "mode": "proxy_key",
+    "proxy_key": {
+      "inline": "DEMO_PROXY_KEY_DO_NOT_USE"
+    }
+  }
+}
+```
+
+The write is compare-and-swap:
+
+- read the current `revision` from `GET /admin/data-auth`
+- send it as `if_revision`
+- a stale `if_revision` returns `412 Precondition Failed`
+- a successful write returns a new redacted snapshot
+
+For `mode: proxy_key`, `proxy_key.inline` or `proxy_key.env` is required. For
+`mode: client_provider_key`, omit `proxy_key`.
+
+Successful updates take effect for new requests immediately. After rotating the
+proxy key with `PUT /admin/data-auth`, new requests immediately use the new proxy key; the old proxy key is rejected.
+
+Each mode switch write is validated against all currently loaded namespaces before
+the commit is made. Switching to `proxy_key` rebuilds the already-loaded namespaces and requires each upstream to have a usable provider credential
+source. Switching to `client_provider_key` rebuilds the already-loaded namespaces and fails if any loaded upstream still has `provider_key.inline`.
+When validation or rebuild fails, the failure is not committed: the previous
+data-auth revision, mode, and loaded namespaces remain active.
+
+The admin API does not persist plaintext keys. Inline values are accepted only
+in the request payload and the in-memory runtime state; GET responses redact
+them. Containers and controllers that manage data auth through the Admin API
+must keep their own source of truth and replay the write after restart.
+
 ## Static YAML vs Runtime Payload
 
 The runtime payload is close to the static YAML structure, but not identical. Dynamic config is best treated as an operational API, not as a direct copy-paste replacement for your YAML file.
@@ -282,8 +377,10 @@ The runtime payload is close to the static YAML structure, but not identical. Dy
 | Upstream format | `format` is the normal static field name | `fixed_upstream_format` |
 | Alias shorthand | alias string such as `"UPSTREAM:MODEL"` is accepted | alias object with `upstream_name` and `upstream_model` |
 | Structured alias metadata | object with `target`, plus optional `limits` and `surface` | object with `upstream_name`, `upstream_model`, plus optional `limits` and `surface` |
-| Data-plane auth mode | `LLM_UNIVERSAL_PROXY_AUTH_MODE` in the process environment | same process environment; not in namespace payload |
-| Provider key reference | `provider_key_env` names a proxy-side env var in `proxy_key` mode | same mode split; `client_provider_key` mode does not require `provider_key_env` and normally omits it, but non-empty values are not forbidden |
+| Data-plane auth mode | top-level `data_auth`, or `LLM_UNIVERSAL_PROXY_AUTH_MODE` environment fallback when `data_auth` is omitted | managed through `GET /admin/data-auth` and `PUT /admin/data-auth`; not in namespace payload |
+| Provider key reference | `provider_key` object with `inline` or `env`, or the `provider_key_env` legacy field | same provider credential source fields inside each upstream item |
+
+The global data auth resource is `/admin/data-auth`; namespace payloads never carry `data_auth`.
 
 For provider-neutral wrapper sources, hydrate URL and model placeholders before sending an admin write:
 

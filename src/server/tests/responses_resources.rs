@@ -1,5 +1,8 @@
 use super::*;
-use crate::server::responses_resources::handle_openai_responses_resource;
+use crate::server::responses_resources::{
+    handle_openai_responses_resource, handle_openai_responses_resource_with_auth_context,
+    TestOpenAiResponsesResourceRequest,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type RecordedStreamRequests = Arc<Mutex<Vec<(String, Option<String>)>>>;
@@ -301,6 +304,115 @@ async fn response_body_text(response: Response<Body>) -> String {
     String::from_utf8(body.to_vec()).expect("response body utf8")
 }
 
+async fn responses_resource_redaction_state(api_root: &str) -> Arc<AppState> {
+    app_state_for_redaction_upstreams(
+        vec![redaction_upstream_config(
+            "responses",
+            api_root,
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            None,
+            Some(crate::config::SecretSourceConfig {
+                inline: Some(PROVIDER_INLINE_REDACTION_SECRET.to_string()),
+                env: None,
+            }),
+        )],
+        data_auth::DataAccess::ProxyKey {
+            key: PROXY_INLINE_REDACTION_SECRET.to_string(),
+        },
+    )
+    .await
+}
+
+fn responses_resource_error_body_with_secrets() -> String {
+    serde_json::json!({
+        "error": {
+            "message": format!(
+                "responses resource upstream echoed provider {PROVIDER_INLINE_REDACTION_SECRET} and proxy {PROXY_INLINE_REDACTION_SECRET}"
+            )
+        }
+    })
+    .to_string()
+}
+
+fn assert_resource_response_redacted(body_text: &str, context: &str) {
+    for secret in [
+        PROVIDER_INLINE_REDACTION_SECRET,
+        PROXY_INLINE_REDACTION_SECRET,
+    ] {
+        assert!(
+            !body_text.contains(secret),
+            "{context} leaked {secret}: {body_text}"
+        );
+    }
+    assert!(
+        body_text.contains("[REDACTED]"),
+        "{context} should show redacted placeholder: {body_text}"
+    );
+}
+
+async fn assert_resource_metrics_redacted(state: &Arc<AppState>, secrets: &[&str], context: &str) {
+    let config = state
+        .runtime
+        .read()
+        .await
+        .namespaces
+        .get(DEFAULT_NAMESPACE)
+        .expect("default namespace")
+        .config
+        .clone();
+    let metrics_text = format!("{:?}", state.metrics.snapshot(&config));
+    for secret in secrets {
+        assert!(
+            !metrics_text.contains(secret),
+            "{context} metrics leaked {secret}: {metrics_text}"
+        );
+    }
+    assert!(
+        metrics_text.contains("[REDACTED]"),
+        "{context} metrics should show redacted placeholder: {metrics_text}"
+    );
+}
+
+async fn responses_resource_redaction_state_with(
+    api_root: &str,
+    provider_secret: Option<&str>,
+    data_access: data_auth::DataAccess,
+) -> Arc<AppState> {
+    app_state_for_redaction_upstreams(
+        vec![redaction_upstream_config(
+            "responses",
+            api_root,
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            None,
+            provider_secret.map(|secret| crate::config::SecretSourceConfig {
+                inline: Some(secret.to_string()),
+                env: None,
+            }),
+        )],
+        data_access,
+    )
+    .await
+}
+
+fn responses_resource_success_body_with_text(text: String) -> String {
+    serde_json::json!({
+        "id": "resp_success_redaction",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_success_redaction",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": text,
+                "annotations": []
+            }]
+        }]
+    })
+    .to_string()
+}
+
 async fn send_raw_proxy_resource_request(
     proxy_addr: std::net::SocketAddr,
     method: &reqwest::Method,
@@ -432,9 +544,7 @@ async fn openai_responses_resource_post_body_limit_rejects_all_json_body_handler
         .await
         .expect("bind proxy listener");
     let proxy_addr = listener.local_addr().expect("proxy addr");
-    let proxy_server = tokio::spawn(async move {
-        run_server(state, listener, data_auth::DataAccess::ClientProviderKey).await
-    });
+    let proxy_server = tokio::spawn(async move { run_server(state, listener).await });
     let proxy_base = format!("http://{proxy_addr}");
     let client = reqwest::Client::new();
 
@@ -731,9 +841,7 @@ async fn openai_responses_state_resource_routes_preserve_method_path_query_body_
         .await
         .expect("bind proxy listener");
     let proxy_addr = listener.local_addr().expect("proxy addr");
-    let proxy_server = tokio::spawn(async move {
-        run_server(state, listener, data_auth::DataAccess::ClientProviderKey).await
-    });
+    let proxy_server = tokio::spawn(async move { run_server(state, listener).await });
     let proxy_base = format!("http://{proxy_addr}");
     let client = reqwest::Client::new();
 
@@ -989,6 +1097,89 @@ async fn openai_responses_state_resource_routes_preserve_method_path_query_body_
 }
 
 #[tokio::test]
+async fn openai_responses_resource_uses_request_snapshot_after_auth_runtime_race() {
+    let client_key = "old-responses-client-key";
+    let new_server_key = "new-responses-server-key";
+    let (mock_base, recorded, upstream_server) = spawn_recording_responses_resource_mock().await;
+    let state = app_state_for_redaction_upstreams(
+        vec![redaction_upstream_config(
+            "primary",
+            &mock_base,
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            None,
+            None,
+        )],
+        data_auth::DataAccess::ClientProviderKey,
+    )
+    .await;
+    let old_runtime = state.runtime.read().await.clone();
+    let auth_context = request_auth_context_for_runtime(
+        old_runtime,
+        data_auth::DataAccess::ClientProviderKey,
+        data_auth::RequestAuthorization::ClientProviderKey {
+            provider_key: client_key.to_string(),
+        },
+    );
+    let replacement_config = crate::config::Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: std::time::Duration::from_secs(30),
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
+        proxy: Some(crate::config::ProxyConfig::Direct),
+        upstreams: vec![redaction_upstream_config(
+            "primary",
+            &mock_base,
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            None,
+            Some(crate::config::SecretSourceConfig {
+                inline: Some(new_server_key.to_string()),
+                env: None,
+            }),
+        )],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
+        data_auth: None,
+    };
+    replace_runtime_and_data_auth(
+        &state,
+        replacement_config,
+        data_auth::DataAccess::ProxyKey {
+            key: "new-responses-proxy-key".to_string(),
+        },
+    )
+    .await;
+
+    let response = handle_openai_responses_resource_with_auth_context(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        TestOpenAiResponsesResourceRequest {
+            method: reqwest::Method::GET,
+            resource_path: "responses/resp_snapshot".to_string(),
+            body: None,
+            query: None,
+        },
+        auth_context,
+    )
+    .await;
+
+    assert!(
+        response.status().is_success(),
+        "Responses resource snapshot response status={}",
+        response.status()
+    );
+    let requests = recorded.lock().await;
+    assert_eq!(requests.len(), 1, "requests = {requests:?}");
+    let expected_auth = format!("Bearer {client_key}");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some(expected_auth.as_str())
+    );
+    upstream_server.abort();
+}
+
+#[tokio::test]
 async fn openai_responses_state_resource_routes_fail_closed_without_unique_available_native_upstream(
 ) {
     let cases = [
@@ -1033,6 +1224,7 @@ async fn openai_responses_state_resource_routes_fail_closed_without_unique_avail
             runtime: Arc::new(RwLock::new(RuntimeState {
                 namespaces: BTreeMap::from([(DEFAULT_NAMESPACE.to_string(), namespace_state)]),
             })),
+            admin_update_lock: Arc::new(Mutex::new(())),
             metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
             admin_access: AdminAccess::LoopbackOnly,
             data_auth_policy: test_data_auth_policy_for_tests(),
@@ -1153,6 +1345,7 @@ fn resolve_native_responses_stateful_route_or_error_rejects_multi_upstream_auto_
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (responses_client, responses_streaming_client, responses_resolved_proxy) =
         crate::upstream::build_upstream_clients(
@@ -1271,6 +1464,7 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
         api_root: format!("http://{addr}"),
         fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiResponses),
         provider_key_env: None,
+        provider_key: None,
         upstream_headers: Vec::new(),
         proxy: None,
         limits: None,
@@ -1286,6 +1480,7 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
         &config,
@@ -1326,6 +1521,7 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
                 namespace_state,
             )]),
         })),
+        admin_update_lock: Arc::new(Mutex::new(())),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),
@@ -1347,6 +1543,380 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
     assert_eq!(recorded.len(), 1, "bodies = {recorded:?}");
     assert_eq!(recorded[0]["reasoning"]["effort"], "medium");
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_non_stream_error_redacts_runtime_secrets() {
+    let (mock_base, server) = spawn_raw_responses_resource_mock(
+        StatusCode::BAD_REQUEST,
+        responses_resource_error_body_with_secrets(),
+    )
+    .await;
+    let state = responses_resource_redaction_state(&mock_base).await;
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_redaction_error".to_string(),
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body_text = response_body_text(response).await;
+    assert_resource_response_redacted(&body_text, "Responses resource non-stream error");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_public_metadata_errors_redact_active_credentials() {
+    let provider_secret = PROVIDER_INLINE_REDACTION_SECRET;
+    let proxy_secret = PROXY_INLINE_REDACTION_SECRET;
+    let secrets = [provider_secret, proxy_secret];
+    let (mock_base, server) = spawn_raw_responses_resource_mock(
+        StatusCode::OK,
+        responses_resource_success_body_with_text("ok".to_string()),
+    )
+    .await;
+    let state = responses_resource_redaction_state_with(
+        &mock_base,
+        Some(provider_secret),
+        data_auth::DataAccess::ProxyKey {
+            key: proxy_secret.to_string(),
+        },
+    )
+    .await;
+
+    let response = handle_openai_responses_resource(
+        state.clone(),
+        format!("tenant-{proxy_secret}"),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        format!("responses/resp-{provider_secret}-{proxy_secret}"),
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body_text = response_body_text(response).await;
+    assert_resource_response_redacted(&body_text, "Responses resource namespace error");
+    assert_resource_metrics_redacted(&state, &secrets, "Responses resource namespace error").await;
+    server.abort();
+
+    let upstream_name = format!("responses-{provider_secret}-{proxy_secret}");
+    let (mock_base, server) = spawn_raw_responses_resource_mock(
+        StatusCode::OK,
+        responses_resource_success_body_with_text("ok".to_string()),
+    )
+    .await;
+    let state = app_state_for_redaction_upstreams(
+        vec![redaction_upstream_config(
+            &upstream_name,
+            &mock_base,
+            crate::formats::UpstreamFormat::OpenAiResponses,
+            None,
+            Some(crate::config::SecretSourceConfig {
+                inline: Some(provider_secret.to_string()),
+                env: None,
+            }),
+        )],
+        data_auth::DataAccess::ProxyKey {
+            key: proxy_secret.to_string(),
+        },
+    )
+    .await;
+    state
+        .runtime
+        .write()
+        .await
+        .namespaces
+        .get_mut(DEFAULT_NAMESPACE)
+        .expect("default namespace")
+        .upstreams
+        .get_mut(&upstream_name)
+        .expect("redaction upstream")
+        .availability = crate::discovery::UpstreamAvailability::unavailable(format!(
+        "outage-{provider_secret}-{proxy_secret}"
+    ));
+
+    let response = handle_openai_responses_resource(
+        state.clone(),
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        format!("responses/resp-upstream-{provider_secret}-{proxy_secret}"),
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body_text = response_body_text(response).await;
+    assert_resource_response_redacted(&body_text, "Responses resource upstream error");
+    assert_resource_metrics_redacted(&state, &secrets, "Responses resource upstream error").await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_stream_error_redacts_runtime_secrets() {
+    let (mock_base, _seen_requests, server) = spawn_recorded_responses_resource_stream_mock(
+        StatusCode::UNAUTHORIZED,
+        "application/json",
+        responses_resource_error_body_with_secrets(),
+    )
+    .await;
+    let state = responses_resource_redaction_state(&mock_base).await;
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_redaction_stream".to_string(),
+        None,
+        Some("stream=true".to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response_body_text(response).await;
+    assert!(body_text.contains("response.failed"), "{body_text}");
+    assert_resource_response_redacted(&body_text, "Responses resource stream error");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_streaming_error_metrics_redact_resource_path_credentials()
+{
+    let provider_secret = PROVIDER_INLINE_REDACTION_SECRET;
+    let proxy_secret = PROXY_INLINE_REDACTION_SECRET;
+    let secrets = [provider_secret, proxy_secret];
+    let (mock_base, _seen_requests, server) = spawn_recorded_responses_resource_stream_mock(
+        StatusCode::UNAUTHORIZED,
+        "application/json",
+        responses_resource_error_body_with_secrets(),
+    )
+    .await;
+    let state = responses_resource_redaction_state(&mock_base).await;
+
+    let response = handle_openai_responses_resource(
+        state.clone(),
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        format!("responses/resp-stream-{provider_secret}-{proxy_secret}"),
+        None,
+        Some("stream=true".to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response_body_text(response).await;
+    assert!(body_text.contains("response.failed"), "{body_text}");
+    assert_resource_response_redacted(&body_text, "Responses resource streaming error");
+    assert_resource_metrics_redacted(&state, &secrets, "Responses resource streaming error").await;
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_non_stream_success_redacts_known_credentials() {
+    let provider_secret = "rrs";
+    let proxy_secret = "rrp";
+    let (mock_base, server) = spawn_raw_responses_resource_mock(
+        StatusCode::OK,
+        responses_resource_success_body_with_text(format!(
+            "resource echoed provider {provider_secret} and proxy {proxy_secret}"
+        )),
+    )
+    .await;
+    let state = responses_resource_redaction_state_with(
+        &mock_base,
+        Some(provider_secret),
+        data_auth::DataAccess::ProxyKey {
+            key: proxy_secret.to_string(),
+        },
+    )
+    .await;
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_success_redaction".to_string(),
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response_body_text(response).await;
+    let server_secrets = [provider_secret, proxy_secret];
+    for secret in server_secrets {
+        assert!(
+            !body_text.contains(secret),
+            "Responses resource success JSON leaked {secret}: {body_text}"
+        );
+    }
+    assert!(
+        body_text.contains("[REDACTED]"),
+        "Responses resource success JSON should show redaction placeholder: {body_text}"
+    );
+    server.abort();
+
+    let client_secret = "rrc";
+    let (mock_base, server) = spawn_raw_responses_resource_mock(
+        StatusCode::OK,
+        responses_resource_success_body_with_text(format!(
+            "resource echoed client credential {client_secret}"
+        )),
+    )
+    .await;
+    let state = responses_resource_redaction_state_with(
+        &mock_base,
+        None,
+        data_auth::DataAccess::ClientProviderKey,
+    )
+    .await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {client_secret}")).expect("client credential"),
+    );
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        headers,
+        reqwest::Method::GET,
+        "responses/resp_client_success_redaction".to_string(),
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response_body_text(response).await;
+    assert!(
+        !body_text.contains(client_secret),
+        "Responses resource client success JSON leaked {client_secret}: {body_text}"
+    );
+    assert!(
+        body_text.contains("[REDACTED]"),
+        "Responses resource client success JSON should show redaction placeholder: {body_text}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn handle_openai_responses_resource_stream_success_redacts_known_credentials() {
+    let provider_secret = "rss";
+    let proxy_secret = "rsp";
+    let stream_event = serde_json::json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 0,
+        "response_id": "resp_stream_success_redaction",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": format!("resource stream echoed {provider_secret} and {proxy_secret}")
+    });
+    let (mock_base, _seen_requests, server) = spawn_recorded_responses_resource_stream_mock(
+        StatusCode::OK,
+        "text/event-stream",
+        format_sse_event("response.output_text.delta", &stream_event),
+    )
+    .await;
+    let state = responses_resource_redaction_state_with(
+        &mock_base,
+        Some(provider_secret),
+        data_auth::DataAccess::ProxyKey {
+            key: proxy_secret.to_string(),
+        },
+    )
+    .await;
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        HeaderMap::new(),
+        reqwest::Method::GET,
+        "responses/resp_stream_success_redaction".to_string(),
+        None,
+        Some("stream=true".to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response_body_text(response).await;
+    let server_secrets = [provider_secret, proxy_secret];
+    for secret in server_secrets {
+        assert!(
+            !body_text.contains(secret),
+            "Responses resource success SSE leaked {secret}: {body_text}"
+        );
+    }
+    assert!(
+        body_text.contains("[REDACTED]"),
+        "Responses resource success SSE should show redaction placeholder: {body_text}"
+    );
+    server.abort();
+
+    let client_secret = "rsc";
+    let stream_event = serde_json::json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 0,
+        "response_id": "resp_client_stream_success_redaction",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": format!("resource stream echoed client credential {client_secret}")
+    });
+    let (mock_base, _seen_requests, server) = spawn_recorded_responses_resource_stream_mock(
+        StatusCode::OK,
+        "text/event-stream",
+        format_sse_event("response.output_text.delta", &stream_event),
+    )
+    .await;
+    let state = responses_resource_redaction_state_with(
+        &mock_base,
+        None,
+        data_auth::DataAccess::ClientProviderKey,
+    )
+    .await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {client_secret}")).expect("client credential"),
+    );
+
+    let response = handle_openai_responses_resource(
+        state,
+        DEFAULT_NAMESPACE.to_string(),
+        headers,
+        reqwest::Method::GET,
+        "responses/resp_client_stream_success_redaction".to_string(),
+        None,
+        Some("stream=true".to_string()),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response_body_text(response).await;
+    assert!(
+        !body_text.contains(client_secret),
+        "Responses resource client success SSE leaked {client_secret}: {body_text}"
+    );
+    assert!(
+        body_text.contains("[REDACTED]"),
+        "Responses resource client success SSE should show redaction placeholder: {body_text}"
+    );
     server.abort();
 }
 

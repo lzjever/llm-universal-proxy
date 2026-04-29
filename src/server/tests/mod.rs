@@ -18,6 +18,7 @@ pub(super) use super::*;
 mod admin;
 mod errors;
 mod headers;
+mod models;
 mod proxy;
 mod responses_resources;
 mod state;
@@ -25,6 +26,22 @@ mod web_dashboard;
 
 pub(super) static UPSTREAM_PROXY_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+pub(super) static SECRET_REDACTION_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+pub(super) const PROVIDER_INLINE_REDACTION_SECRET: &str = "provider-inline-redaction-secret-value";
+pub(super) const PROVIDER_ENV_REDACTION_ENV: &str = "LLMUP_TEST_PROVIDER_REDACTION_ENV_SECRET";
+pub(super) const PROVIDER_ENV_REDACTION_SECRET: &str = "provider-env-redaction-secret-value";
+pub(super) const PROVIDER_LEGACY_REDACTION_ENV: &str =
+    "LLMUP_TEST_PROVIDER_LEGACY_REDACTION_ENV_SECRET";
+pub(super) const PROVIDER_LEGACY_REDACTION_SECRET: &str = "provider-legacy-redaction-secret-value";
+pub(super) const PROXY_INLINE_REDACTION_SECRET: &str = "proxy-inline-redaction-secret-value";
+pub(super) const PROXY_ENV_REDACTION_ENV: &str = "LLMUP_TEST_PROXY_REDACTION_ENV_SECRET";
+pub(super) const PROXY_ENV_REDACTION_SECRET: &str = "proxy-env-redaction-secret-value";
+pub(super) const PROXY_DEFAULT_ENV_REDACTION_SECRET: &str =
+    "proxy-default-env-redaction-secret-value";
+pub(super) const CLIENT_PROVIDER_REDACTION_SECRET: &str =
+    "client-provider-request-redaction-secret-value";
 
 pub(super) struct ScopedEnvVar {
     key: &'static str,
@@ -78,11 +95,101 @@ pub(super) fn test_upstream_config_with_fixed_format(
         api_root: format!("https://{name}.example/v1"),
         fixed_upstream_format,
         provider_key_env: None,
+        provider_key: None,
         upstream_headers: Vec::new(),
         proxy: None,
         limits: None,
         surface_defaults: None,
     }
+}
+
+pub(super) fn redaction_upstream_config(
+    name: &str,
+    api_root: &str,
+    format: crate::formats::UpstreamFormat,
+    provider_key_env: Option<&str>,
+    provider_key: Option<crate::config::SecretSourceConfig>,
+) -> crate::config::UpstreamConfig {
+    crate::config::UpstreamConfig {
+        name: name.to_string(),
+        api_root: api_root.to_string(),
+        fixed_upstream_format: Some(format),
+        provider_key_env: provider_key_env.map(ToString::to_string),
+        provider_key,
+        upstream_headers: Vec::new(),
+        proxy: None,
+        limits: None,
+        surface_defaults: None,
+    }
+}
+
+pub(super) async fn app_state_for_redaction_upstreams(
+    upstreams: Vec<crate::config::UpstreamConfig>,
+    data_access: data_auth::DataAccess,
+) -> Arc<AppState> {
+    let config = crate::config::Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: std::time::Duration::from_secs(30),
+        compatibility_mode: crate::config::CompatibilityMode::Balanced,
+        proxy: Some(crate::config::ProxyConfig::Direct),
+        upstreams,
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: crate::config::DebugTraceConfig::default(),
+        resource_limits: Default::default(),
+        data_auth: None,
+    };
+    let runtime = super::state::build_runtime_state(config.clone(), &data_access)
+        .await
+        .expect("build redaction test runtime");
+
+    Arc::new(AppState {
+        runtime: Arc::new(RwLock::new(runtime)),
+        admin_update_lock: Arc::new(Mutex::new(())),
+        metrics: crate::telemetry::RuntimeMetrics::new(&config),
+        admin_access: AdminAccess::LoopbackOnly,
+        data_auth_policy: data_auth::RuntimeConfigValidationPolicy::new(
+            "127.0.0.1:0".parse().expect("loopback socket addr"),
+            data_access,
+        ),
+    })
+}
+
+pub(super) fn request_auth_context_for_runtime(
+    runtime: RuntimeState,
+    access: data_auth::DataAccess,
+    authorization: data_auth::RequestAuthorization,
+) -> data_auth::RequestAuthContext {
+    let mode = match &access {
+        data_auth::DataAccess::Unconfigured => crate::config::DataAuthMode::ClientProviderKey,
+        data_auth::DataAccess::ClientProviderKey => crate::config::DataAuthMode::ClientProviderKey,
+        data_auth::DataAccess::ProxyKey { .. } => crate::config::DataAuthMode::ProxyKey,
+        data_auth::DataAccess::Misconfigured(_) => crate::config::DataAuthMode::ClientProviderKey,
+    };
+    data_auth::RequestAuthContext::for_test("snapshot-test", mode, access, authorization, runtime)
+}
+
+pub(super) async fn insert_request_auth_context_from_headers<B>(
+    state: &Arc<AppState>,
+    request: &mut axum::http::Request<B>,
+) {
+    let auth_context = data_auth::request_auth_context_for_headers(state, request.headers())
+        .await
+        .expect("test request auth context");
+    request.extensions_mut().insert(auth_context);
+}
+
+pub(super) async fn replace_runtime_and_data_auth(
+    state: &Arc<AppState>,
+    config: crate::config::Config,
+    access: data_auth::DataAccess,
+) {
+    let runtime = super::state::build_runtime_state(config, &access)
+        .await
+        .expect("build replacement runtime");
+    *state.runtime.write().await = runtime;
+    let manager = state.data_auth_policy.manager();
+    *manager.write().await = data_auth::RuntimeDataAuthState::from_access(access);
 }
 
 pub(super) fn runtime_namespace_state_for_tests(
@@ -101,6 +208,7 @@ pub(super) fn runtime_namespace_state_for_tests(
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let upstream_states = upstreams
         .iter()
@@ -312,6 +420,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         api_root,
         fixed_upstream_format: Some(upstream_format),
         provider_key_env: None,
+        provider_key: None,
         upstream_headers: Vec::new(),
         proxy: None,
         limits: None,
@@ -327,6 +436,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
         &config,
@@ -368,6 +478,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
 
     Arc::new(AppState {
         runtime: Arc::new(RwLock::new(runtime)),
+        admin_update_lock: Arc::new(Mutex::new(())),
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),

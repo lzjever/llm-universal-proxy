@@ -94,11 +94,13 @@ What those variables do:
 | `PRESET_OPENAI_ENDPOINT_BASE_URL` | API root for the OpenAI-compatible upstream, including its version segment such as `/v1` |
 | `PRESET_ANTHROPIC_ENDPOINT_BASE_URL` | API root for the Anthropic-compatible upstream |
 | `PRESET_ENDPOINT_MODEL` | Provider model ID hydrated into both preset aliases |
-| `PRESET_ENDPOINT_API_KEY` | Server-side provider credential used by both preset upstreams |
-| `LLM_UNIVERSAL_PROXY_AUTH_MODE` | Required proxy auth mode; use `proxy_key` when the proxy holds provider keys |
-| `LLM_UNIVERSAL_PROXY_KEY` | Required in `proxy_key` mode; client SDK API keys must use this value |
+| `PRESET_ENDPOINT_API_KEY` | Env-sourced server-side provider credential used by both preset upstreams |
+| `LLM_UNIVERSAL_PROXY_AUTH_MODE` | Compatibility fallback for data-plane auth when static `data_auth` is omitted; use `proxy_key` when the proxy holds provider keys |
+| `LLM_UNIVERSAL_PROXY_KEY` | Proxy API key for clients in `proxy_key` mode; also used by the env fallback or by `data_auth.proxy_key.env` when configured |
 
 The `PRESET_*` values are a wrapper/config-source contract. The wrappers hydrate them into a concrete runtime config before starting the proxy. If you run `llm-universal-proxy --config` directly, replace the placeholders with concrete URLs and model names first.
+
+Prefer static `data_auth` in YAML for data-plane auth; `LLM_UNIVERSAL_PROXY_AUTH_MODE` and `LLM_UNIVERSAL_PROXY_KEY` are the environment fallback when `data_auth` is omitted. In `proxy_key` mode, each upstream provider credential can come from `provider_key.inline`, `provider_key.env`, or legacy `provider_key_env`; the preset source above uses the legacy env-name form so wrappers can hydrate it from `PRESET_ENDPOINT_API_KEY`.
 
 Reasoning effort such as `xhigh` is a client/request-side setting, not part of the model name. Keep the alias stable and set reasoning in the request or client config.
 
@@ -177,6 +179,7 @@ The static YAML story is intentionally small:
 | --- | --- |
 | `listen` | Proxy listen address |
 | `upstream_timeout_secs` | Upstream request timeout |
+| `data_auth` | Process-wide data-plane auth mode; if omitted, the proxy uses the environment fallback |
 | `upstreams` | Named upstream API roots, formats, and credential policy |
 | `model_aliases` | Stable local names mapped to `UPSTREAM:MODEL` |
 | `surface_defaults` / `surface` | Optional client-visible capability metadata for wrappers and model catalogs |
@@ -191,7 +194,8 @@ Practical rules:
 - aliases such as `preset-openai-compatible` and `preset-anthropic-compatible` are local names; they do not need to equal the upstream model ID
 - use structured aliases only when you want extra `limits` or `surface` metadata on top of `target: UPSTREAM:MODEL`
 - the provider-neutral `PRESET_*` placeholders are for wrapper-rendered config sources; direct static YAML should contain concrete URLs and model IDs
-- `LLM_UNIVERSAL_PROXY_AUTH_MODE` is a process-wide setting for all data-plane routes, not a per-upstream YAML or API field; see the static examples in [docs/configuration.md](./docs/configuration.md) and the runtime payload mapping in [docs/admin-dynamic-config.md](./docs/admin-dynamic-config.md)
+- `data_auth` is a process-wide setting for all data-plane routes, not a per-upstream field; `provider_key.inline`, `provider_key.env`, and legacy `provider_key_env` choose per-upstream provider credential sources in `proxy_key` mode
+- if `data_auth` is omitted, `LLM_UNIVERSAL_PROXY_AUTH_MODE` and `LLM_UNIVERSAL_PROXY_KEY` provide the compatibility environment fallback
 
 For the full YAML reference and more examples, see [docs/configuration.md](./docs/configuration.md).
 
@@ -208,11 +212,13 @@ GHCR access for authenticated or public pulls are documented in
 
 ## Dynamic Configuration Overview
 
-Static YAML is the default. If you need live updates, the proxy also exposes admin endpoints for reading runtime state and replacing namespace config without restarting the whole process. Admin payloads use a runtime shape, and the data-plane auth mode still comes from the process environment.
+Static YAML is the default. If you need live updates, the proxy also exposes admin endpoints for reading runtime state, replacing namespace config, and rotating the global data-plane auth config without restarting the whole process. Namespace payloads use a runtime shape. Global `data_auth` is either static YAML, the environment fallback, or the Admin API `/admin/data-auth` state.
 
 Current admin endpoints:
 
 - `GET /admin/state`
+- `GET /admin/data-auth`
+- `PUT /admin/data-auth`
 - `GET /admin/namespaces/:namespace/state`
 - `POST /admin/namespaces/:namespace/config`
 

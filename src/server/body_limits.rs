@@ -9,16 +9,18 @@ use serde_json::Value;
 
 use crate::formats::UpstreamFormat;
 
+use super::data_auth::RequestAuthContext;
 use super::errors::error_response;
 use super::state::AppState;
 
 pub(super) async fn read_limited_json_request(
-    state: &Arc<AppState>,
+    _state: &Arc<AppState>,
     namespace: &str,
     client_format: UpstreamFormat,
+    auth_context: &RequestAuthContext,
     request: Request,
 ) -> Result<(HeaderMap, Value), Response<Body>> {
-    let max_request_body_bytes = request_body_limit_for_namespace(state, namespace).await;
+    let max_request_body_bytes = request_body_limit_for_namespace(namespace, auth_context);
     let headers = request.headers().clone();
     let body = match to_bytes(request.into_body(), max_request_body_bytes).await {
         Ok(bytes) => bytes,
@@ -40,9 +42,9 @@ pub(super) async fn read_limited_json_request(
     Ok((headers, body))
 }
 
-async fn request_body_limit_for_namespace(state: &Arc<AppState>, namespace: &str) -> usize {
-    let runtime = state.runtime.read().await;
-    runtime
+fn request_body_limit_for_namespace(namespace: &str, auth_context: &RequestAuthContext) -> usize {
+    auth_context
+        .runtime()
         .namespaces
         .get(namespace)
         .map(|namespace_state| {

@@ -117,6 +117,13 @@ impl CapturedHookPayloads {
     }
 }
 
+fn assert_no_secret_leak(text: &str, secret: &str, context: &str) {
+    assert!(
+        !text.contains(secret),
+        "{context} leaked secret `{secret}`: {text}"
+    );
+}
+
 struct ScheduledChunk {
     delay: Duration,
     bytes: Bytes,
@@ -886,6 +893,268 @@ async fn spawn_failed_responses_stream_mock() -> (String, tokio::task::JoinHandl
     (base, handle)
 }
 
+async fn spawn_openai_completion_secret_echo_mock(
+    secret: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(State(secret): State<&'static str>, Json(body): Json<Value>) -> Response {
+        let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        if !stream {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "id": "chatcmpl_secret_echo",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gpt-4",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": format!("upstream echoed {secret}")
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2
+                    }
+                })),
+            )
+                .into_response();
+        }
+
+        let chunk = json!({
+            "id": "chatcmpl_secret_echo",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": format!("stream echoed {secret}") },
+                "finish_reason": null
+            }]
+        });
+        let terminal = json!({
+            "id": "chatcmpl_secret_echo",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2
+            }
+        });
+        let body = format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n");
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handler))
+        .route("/chat/completions", post(handler))
+        .with_state(secret);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn spawn_openai_completion_response_header_echo_mock(
+    secret: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(State(secret): State<&'static str>) -> Response {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("request-id", format!("req-{secret}"))
+            .header("retry-after", "2")
+            .header("ratelimit-limit", format!("limit-{secret}"))
+            .header("x-ratelimit-remaining", "99")
+            .body(Body::from(
+                json!({
+                    "id": "chatcmpl_header_echo",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gpt-4",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "ok" },
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handler))
+        .route("/chat/completions", post(handler))
+        .with_state(secret);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn spawn_responses_stream_secret_event_mock(
+    secret: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(State(secret): State<&'static str>, Json(body): Json<Value>) -> Response {
+        assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
+        let delta = json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Hello"
+        });
+        let completed = json!({
+            "type": "response.completed",
+            "sequence_number": 2,
+            "response": {
+                "id": "resp_secret_event",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "output": [{
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Hello"
+                    }]
+                }],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2
+                }
+            }
+        });
+        let body = format!(
+            "event: response.output_text.delta.{secret}\n\
+             data: {delta}\n\n\
+             event: response.completed\n\
+             data: {completed}\n\n"
+        );
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/responses", post(handler))
+        .route("/responses", post(handler))
+        .with_state(secret);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
+async fn spawn_responses_stream_secret_metadata_mock(
+    secret: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(State(secret): State<&'static str>, Json(body): Json<Value>) -> Response {
+        assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
+        let safe_delta = json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 1,
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Hello"
+        });
+        let secret_delta = json!({
+            "type": "response.output_text.delta",
+            "sequence_number": 2,
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": format!(" secret {secret}")
+        });
+        let completed = json!({
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": {
+                "id": "resp_secret_metadata",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "output": [{
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": format!("Hello secret {secret}")
+                    }]
+                }],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "total_tokens": 3
+                }
+            }
+        });
+        let body = format!(
+            ": comment-{secret}\n\
+             id: id-{secret}\n\
+             retry: 1000-{secret}\n\
+             event: response.output_text.delta\n\
+             data: {safe_delta}\n\n\
+             : safe-comment\n\
+             id: safe-id\n\
+             retry: 2000\n\
+             event: response.output_text.delta\n\
+             data: {secret_delta}\n\n\
+             event: response.completed\n\
+             data: {completed}\n\n"
+        );
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/responses", post(handler))
+        .route("/responses", post(handler))
+        .with_state(secret);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
 async fn spawn_large_openai_stream_mock(
     text_len: usize,
     terminal_delay: Duration,
@@ -974,6 +1243,7 @@ fn runtime_namespace_config(
             api_root: upstream_api_root(upstream_base, format),
             fixed_upstream_format: Some(format),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: vec![("x-namespace-tag".to_string(), namespace_tag.to_string())],
             proxy: None,
             limits: None,
@@ -1000,6 +1270,291 @@ async fn apply_namespace_config(
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     response.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn exchange_hook_non_stream_redacts_request_body_and_plain_header_metadata() {
+    let (mock_base, _mock) = spawn_openai_completion_secret_echo_mock(TEST_PROVIDER_KEY).await;
+    let (hook_base, _hook_mock, exchange, _usage) = spawn_hook_capture_mock().await;
+
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    config.hooks = HookConfig {
+        max_pending_bytes: 4 * 1024 * 1024,
+        timeout: Duration::from_secs(5),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(1),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{hook_base}/exchange"),
+            authorization: None,
+        }),
+        usage: None,
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("x-client-note", format!("plain-header-{TEST_PROVIDER_KEY}"))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{
+                "role": "user",
+                "content": format!("request-body-{TEST_PROVIDER_KEY}")
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.text().await.unwrap();
+    assert_no_secret_leak(&body, TEST_PROVIDER_KEY, "public non-stream response");
+    assert!(body.contains("[REDACTED]"), "body = {body}");
+
+    let exchange_payloads = wait_for_payloads(&exchange, 1).await;
+    let payload_text = serde_json::to_string(exchange_payloads.last().unwrap()).unwrap();
+    assert_no_secret_leak(
+        &payload_text,
+        TEST_PROVIDER_KEY,
+        "non-stream exchange hook payload",
+    );
+    assert!(
+        payload_text.contains("[REDACTED]"),
+        "payload = {payload_text}"
+    );
+}
+
+#[tokio::test]
+async fn exchange_hook_streaming_redacts_request_body_and_plain_header_metadata() {
+    let (mock_base, _mock) = spawn_openai_completion_secret_echo_mock(TEST_PROVIDER_KEY).await;
+    let (hook_base, _hook_mock, exchange, _usage) = spawn_hook_capture_mock().await;
+
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    config.hooks = HookConfig {
+        max_pending_bytes: 4 * 1024 * 1024,
+        timeout: Duration::from_secs(5),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(1),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{hook_base}/exchange"),
+            authorization: None,
+        }),
+        usage: None,
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("x-client-note", format!("plain-header-{TEST_PROVIDER_KEY}"))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{
+                "role": "user",
+                "content": format!("request-body-{TEST_PROVIDER_KEY}")
+            }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.text().await.unwrap();
+    assert!(body.contains("data: [DONE]"), "body = {body}");
+    assert_no_secret_leak(&body, TEST_PROVIDER_KEY, "public streaming response");
+    assert!(body.contains("[REDACTED]"), "body = {body}");
+
+    let exchange_payloads = wait_for_payloads(&exchange, 1).await;
+    let payload_text = serde_json::to_string(exchange_payloads.last().unwrap()).unwrap();
+    assert_no_secret_leak(
+        &payload_text,
+        TEST_PROVIDER_KEY,
+        "streaming exchange hook payload",
+    );
+    assert!(
+        payload_text.contains("[REDACTED]"),
+        "payload = {payload_text}"
+    );
+}
+
+#[tokio::test]
+async fn allowed_upstream_response_headers_redact_known_secret_values_and_keep_safe_values() {
+    let (mock_base, _mock) =
+        spawn_openai_completion_response_header_echo_mock(TEST_PROVIDER_KEY).await;
+    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let headers = response.headers();
+    let request_id = headers
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("request-id should be forwarded");
+    assert_eq!(request_id, "req-[REDACTED]");
+    let ratelimit_limit = headers
+        .get("ratelimit-limit")
+        .and_then(|value| value.to_str().ok())
+        .expect("ratelimit-limit should be forwarded");
+    assert_eq!(ratelimit_limit, "limit-[REDACTED]");
+    assert_eq!(
+        headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+    assert_eq!(
+        headers
+            .get("x-ratelimit-remaining")
+            .and_then(|value| value.to_str().ok()),
+        Some("99")
+    );
+    assert_no_secret_leak(request_id, TEST_PROVIDER_KEY, "request-id header");
+    assert_no_secret_leak(ratelimit_limit, TEST_PROVIDER_KEY, "ratelimit-limit header");
+}
+
+#[tokio::test]
+async fn sse_event_field_redacts_known_secret_without_breaking_public_hook_or_debug_streams() {
+    let (mock_base, _mock) = spawn_responses_stream_secret_event_mock(TEST_PROVIDER_KEY).await;
+    let (hook_base, _hook_mock, exchange, _usage) = spawn_hook_capture_mock().await;
+    let trace_path = unique_temp_path("sse-event-redaction-trace", "jsonl");
+
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    config.hooks = HookConfig {
+        max_pending_bytes: 4 * 1024 * 1024,
+        timeout: Duration::from_secs(5),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(1),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{hook_base}/exchange"),
+            authorization: None,
+        }),
+        usage: None,
+    };
+    config.debug_trace = DebugTraceConfig {
+        path: Some(trace_path.to_string_lossy().to_string()),
+        max_text_chars: 8_192,
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4.1",
+            "input": "Hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.text().await.unwrap();
+    assert!(body.contains("event: response.output_text.delta.[REDACTED]"));
+    assert!(body.contains("\"delta\":\"Hello\""), "body = {body}");
+    assert_no_secret_leak(&body, TEST_PROVIDER_KEY, "public SSE body");
+
+    let mut parse_buffer = body.as_bytes().to_vec();
+    let first_event = llm_universal_proxy::streaming::take_one_sse_event(&mut parse_buffer)
+        .expect("redacted SSE should remain parseable");
+    assert_eq!(
+        first_event.get("delta").and_then(Value::as_str),
+        Some("Hello")
+    );
+
+    let exchange_payloads = wait_for_payloads(&exchange, 1).await;
+    let payload_text = serde_json::to_string(exchange_payloads.last().unwrap()).unwrap();
+    assert_no_secret_leak(&payload_text, TEST_PROVIDER_KEY, "SSE exchange hook");
+
+    let trace_payload = wait_for_debug_trace_response(&trace_path).await;
+    let trace_text = serde_json::to_string(&trace_payload).unwrap();
+    assert_no_secret_leak(&trace_text, TEST_PROVIDER_KEY, "SSE debug trace");
+
+    let _ = std::fs::remove_file(&trace_path);
+}
+
+#[tokio::test]
+async fn sse_id_comment_retry_metadata_redacts_without_dropping_safe_metadata() {
+    let (mock_base, _mock) = spawn_responses_stream_secret_metadata_mock(TEST_PROVIDER_KEY).await;
+    let (hook_base, _hook_mock, exchange, _usage) = spawn_hook_capture_mock().await;
+    let trace_path = unique_temp_path("sse-metadata-redaction-trace", "jsonl");
+
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiResponses);
+    config.hooks = HookConfig {
+        max_pending_bytes: 4 * 1024 * 1024,
+        timeout: Duration::from_secs(5),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(1),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{hook_base}/exchange"),
+            authorization: None,
+        }),
+        usage: None,
+    };
+    config.debug_trace = DebugTraceConfig {
+        path: Some(trace_path.to_string_lossy().to_string()),
+        max_text_chars: 8_192,
+    };
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let response = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4.1",
+            "input": "Hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.text().await.unwrap();
+    assert_no_secret_leak(&body, TEST_PROVIDER_KEY, "public SSE metadata body");
+    assert!(body.contains(": comment-[REDACTED]"), "body = {body}");
+    assert!(body.contains("id: id-[REDACTED]"), "body = {body}");
+    assert!(body.contains("retry: 1000-[REDACTED]"), "body = {body}");
+    assert!(body.contains(": safe-comment"), "body = {body}");
+    assert!(body.contains("id: safe-id"), "body = {body}");
+    assert!(body.contains("retry: 2000"), "body = {body}");
+    assert!(
+        body.contains("event: response.output_text.delta"),
+        "body = {body}"
+    );
+    assert!(
+        body.contains("\"delta\":\" secret [REDACTED]\""),
+        "body = {body}"
+    );
+
+    let mut parse_buffer = body.as_bytes().to_vec();
+    let mut parsed_events = Vec::new();
+    while let Some(event) = llm_universal_proxy::streaming::take_one_sse_event(&mut parse_buffer) {
+        parsed_events.push(event);
+    }
+    let parsed_text = serde_json::to_string(&parsed_events).unwrap();
+    assert_no_secret_leak(&parsed_text, TEST_PROVIDER_KEY, "public SSE parsed events");
+    assert!(
+        parsed_text.contains("[REDACTED]"),
+        "parsed events = {parsed_text}"
+    );
+
+    let exchange_payloads = wait_for_payloads(&exchange, 1).await;
+    let payload_text = serde_json::to_string(exchange_payloads.last().unwrap()).unwrap();
+    assert_no_secret_leak(&payload_text, TEST_PROVIDER_KEY, "SSE metadata hook");
+
+    let trace_payload = wait_for_debug_trace_response(&trace_path).await;
+    let trace_text = serde_json::to_string(&trace_payload).unwrap();
+    assert_no_secret_leak(&trace_text, TEST_PROVIDER_KEY, "SSE metadata debug trace");
+
+    let _ = std::fs::remove_file(&trace_path);
 }
 
 #[tokio::test]

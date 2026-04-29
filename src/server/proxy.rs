@@ -19,7 +19,7 @@ use crate::downstream::DownstreamCancellation;
 use crate::formats::UpstreamFormat;
 use crate::hooks::{
     capture_headers, json_response_headers, new_request_id, now_timestamp_ms, sse_response_headers,
-    HookRequestContext,
+    HeaderEntry, HookRequestContext,
 };
 use crate::streaming::{needs_stream_translation, GuardedSseStream, TranslateSseStream};
 use crate::translate::{
@@ -30,6 +30,7 @@ use crate::translate::{
 use crate::upstream;
 
 use super::body_limits::read_limited_json_request;
+use super::data_auth::{self, RequestAuthContext};
 use super::errors::{
     append_compatibility_warning_headers, classify_post_translation_non_stream_status,
     client_closed_response, error_response, format_upstream_unavailable_message,
@@ -44,6 +45,7 @@ use super::public_boundary::{
 use super::responses_resources::{
     resolve_native_responses_stateful_route_or_error, responses_stateful_request_controls,
 };
+use super::secret_redaction::{redactor_for_request, RedactingSseStream, SecretRedactor};
 use super::state::{AppState, RuntimeNamespaceState, DEFAULT_NAMESPACE};
 use super::tracked_body::TrackedBodyStream;
 
@@ -188,10 +190,14 @@ pub(super) async fn handle_openai_chat_completions(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiCompletion);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         DEFAULT_NAMESPACE,
         UpstreamFormat::OpenAiCompletion,
+        &auth_context,
         request,
     )
     .await
@@ -207,6 +213,7 @@ pub(super) async fn handle_openai_chat_completions(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -217,10 +224,14 @@ pub(super) async fn handle_openai_chat_completions_namespaced(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiCompletion);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         &namespace,
         UpstreamFormat::OpenAiCompletion,
+        &auth_context,
         request,
     )
     .await
@@ -236,6 +247,7 @@ pub(super) async fn handle_openai_chat_completions_namespaced(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -245,10 +257,14 @@ pub(super) async fn handle_openai_responses(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         DEFAULT_NAMESPACE,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -264,6 +280,7 @@ pub(super) async fn handle_openai_responses(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -274,10 +291,14 @@ pub(super) async fn handle_openai_responses_namespaced(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         &namespace,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -293,6 +314,7 @@ pub(super) async fn handle_openai_responses_namespaced(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -302,10 +324,14 @@ pub(super) async fn handle_anthropic_messages(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Anthropic);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         DEFAULT_NAMESPACE,
         UpstreamFormat::Anthropic,
+        &auth_context,
         request,
     )
     .await
@@ -321,6 +347,7 @@ pub(super) async fn handle_anthropic_messages(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -331,13 +358,21 @@ pub(super) async fn handle_anthropic_messages_namespaced(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
-    let (headers, body) =
-        match read_limited_json_request(&state, &namespace, UpstreamFormat::Anthropic, request)
-            .await
-        {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Anthropic);
+    };
+    let (headers, body) = match read_limited_json_request(
+        &state,
+        &namespace,
+        UpstreamFormat::Anthropic,
+        &auth_context,
+        request,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     handle_anthropic_messages_inner(
         state,
         namespace,
@@ -346,6 +381,7 @@ pub(super) async fn handle_anthropic_messages_namespaced(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -356,13 +392,21 @@ pub(super) async fn handle_google_model_action(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
-    let (headers, body) =
-        match read_limited_json_request(&state, DEFAULT_NAMESPACE, UpstreamFormat::Google, request)
-            .await
-        {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Google);
+    };
+    let (headers, body) = match read_limited_json_request(
+        &state,
+        DEFAULT_NAMESPACE,
+        UpstreamFormat::Google,
+        &auth_context,
+        request,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     handle_google_model_action_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -372,6 +416,7 @@ pub(super) async fn handle_google_model_action(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -382,10 +427,14 @@ pub(super) async fn handle_google_model_action_namespaced(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Google);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         &namespace,
         UpstreamFormat::Google,
+        &auth_context,
         request,
     )
     .await
@@ -402,6 +451,7 @@ pub(super) async fn handle_google_model_action_namespaced(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -412,6 +462,7 @@ async fn handle_openai_chat_completions_inner(
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     let requested_model = body
         .get("model")
@@ -428,6 +479,7 @@ async fn handle_openai_chat_completions_inner(
         requested_model,
         UpstreamFormat::OpenAiCompletion,
         None,
+        auth_context,
     )
     .await
 }
@@ -438,6 +490,7 @@ async fn handle_openai_responses_inner(
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     let requested_model = body
         .get("model")
@@ -454,6 +507,7 @@ async fn handle_openai_responses_inner(
         requested_model,
         UpstreamFormat::OpenAiResponses,
         None,
+        auth_context,
     )
     .await
 }
@@ -464,6 +518,7 @@ async fn handle_anthropic_messages_inner(
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     let requested_model = body
         .get("model")
@@ -480,6 +535,7 @@ async fn handle_anthropic_messages_inner(
         requested_model,
         UpstreamFormat::Anthropic,
         None,
+        auth_context,
     )
     .await
 }
@@ -491,6 +547,7 @@ async fn handle_google_model_action_inner(
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     let Some((requested_model, action)) = id.split_once(':') else {
         return error_response(
@@ -520,6 +577,7 @@ async fn handle_google_model_action_inner(
         requested_model.to_string(),
         UpstreamFormat::Google,
         Some(forced_stream),
+        auth_context,
     )
     .await
 }
@@ -536,18 +594,171 @@ pub(super) async fn handle_request_core(
     client_format: UpstreamFormat,
     forced_stream: Option<bool>,
 ) -> Response<Body> {
-    handle_request_core_with_downstream_cancellation(
+    let auth_context = trusted_test_request_auth_context(&state, &headers).await;
+    handle_request_core_with_auth_context(
         state,
-        namespace,
-        DownstreamCancellation::disabled(),
-        headers,
-        path,
-        body,
-        requested_model,
-        client_format,
-        forced_stream,
+        TestRequestCoreRequest {
+            namespace,
+            headers,
+            path,
+            body,
+            requested_model,
+            client_format,
+            forced_stream,
+            auth_context,
+        },
     )
     .await
+}
+
+#[cfg(test)]
+pub(super) struct TestRequestCoreRequest {
+    pub(super) namespace: String,
+    pub(super) headers: HeaderMap,
+    pub(super) path: String,
+    pub(super) body: Value,
+    pub(super) requested_model: String,
+    pub(super) client_format: UpstreamFormat,
+    pub(super) forced_stream: Option<bool>,
+    pub(super) auth_context: RequestAuthContext,
+}
+
+#[cfg(test)]
+pub(super) async fn handle_request_core_with_auth_context(
+    state: Arc<AppState>,
+    request: TestRequestCoreRequest,
+) -> Response<Body> {
+    handle_request_core_with_downstream_cancellation(
+        state,
+        request.namespace,
+        DownstreamCancellation::disabled(),
+        request.headers,
+        request.path,
+        request.body,
+        request.requested_model,
+        request.client_format,
+        request.forced_stream,
+        request.auth_context,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn trusted_test_request_auth_context(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> RequestAuthContext {
+    let runtime = state.runtime.read().await.clone();
+    let access = state.data_auth_policy.current_access().await;
+    let (mode, authorization) = match &access {
+        data_auth::DataAccess::ClientProviderKey => (
+            crate::config::DataAuthMode::ClientProviderKey,
+            data_auth::RequestAuthorization::ClientProviderKey {
+                provider_key: test_client_provider_key_from_headers(headers)
+                    .unwrap_or_else(|| "test-client-provider-key".to_string()),
+            },
+        ),
+        data_auth::DataAccess::ProxyKey { .. } => (
+            crate::config::DataAuthMode::ProxyKey,
+            data_auth::RequestAuthorization::ProxyKey,
+        ),
+        data_auth::DataAccess::Unconfigured => (
+            crate::config::DataAuthMode::ClientProviderKey,
+            data_auth::RequestAuthorization::ClientProviderKey {
+                provider_key: "test-client-provider-key".to_string(),
+            },
+        ),
+        data_auth::DataAccess::Misconfigured(_) => (
+            crate::config::DataAuthMode::ClientProviderKey,
+            data_auth::RequestAuthorization::ClientProviderKey {
+                provider_key: "test-client-provider-key".to_string(),
+            },
+        ),
+    };
+    RequestAuthContext::for_test("test-generation", mode, access, authorization, runtime)
+}
+
+#[cfg(test)]
+fn test_client_provider_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .get(..7)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("Bearer "))
+                .map(|_| value[7..].to_string())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            [
+                "x-api-key",
+                "api-key",
+                "openai-api-key",
+                "x-goog-api-key",
+                "anthropic-api-key",
+            ]
+            .into_iter()
+            .find_map(|name| {
+                headers
+                    .get(axum::http::HeaderName::from_static(name))
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToString::to_string)
+            })
+        })
+}
+
+fn redact_header_entries(redactor: &SecretRedactor, headers: Vec<HeaderEntry>) -> Vec<HeaderEntry> {
+    headers
+        .into_iter()
+        .map(|entry| HeaderEntry {
+            name: entry.name,
+            value: redactor.redact_text(&entry.value),
+        })
+        .collect()
+}
+
+struct RedactedRequestMetadata {
+    path: String,
+    client_model: String,
+    upstream_name: String,
+    upstream_model: String,
+}
+
+impl RedactedRequestMetadata {
+    fn new(
+        redactor: &SecretRedactor,
+        path: &str,
+        client_model: &str,
+        upstream_name: &str,
+        upstream_model: &str,
+    ) -> Self {
+        Self {
+            path: redactor.redact_text(path),
+            client_model: redactor.redact_text(client_model),
+            upstream_name: redactor.redact_text(upstream_name),
+            upstream_model: redactor.redact_text(upstream_model),
+        }
+    }
+}
+
+fn redacted_error_response(
+    format: UpstreamFormat,
+    status: StatusCode,
+    message: &str,
+    redactor: &SecretRedactor,
+) -> Response<Body> {
+    error_response(format, status, &redactor.redact_text(message))
+}
+
+fn redacted_streaming_error_response(
+    format: UpstreamFormat,
+    status: StatusCode,
+    message: &str,
+    redactor: &SecretRedactor,
+) -> Response<Body> {
+    streaming_error_response(format, status, &redactor.redact_text(message))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -561,41 +772,55 @@ async fn handle_request_core_with_downstream_cancellation(
     requested_model: String,
     client_format: UpstreamFormat,
     forced_stream: Option<bool>,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     let request_id = new_request_id();
     let request_timestamp = now_timestamp_ms();
     let original_body = body.clone();
     let stateful_responses_controls = responses_stateful_request_controls(&original_body);
     let original_headers = capture_headers(&headers);
+    let request_redactor = redactor_for_request(&auth_context, &headers);
+    let redacted_original_body = request_redactor.redact_value(&original_body);
+    let redacted_original_headers = redact_header_entries(&request_redactor, original_headers);
+    let redacted_path = request_redactor.redact_text(&path);
+    let redacted_requested_model = request_redactor.redact_text(&requested_model);
     let stream = forced_stream
         .unwrap_or_else(|| body.get("stream").and_then(Value::as_bool).unwrap_or(false));
 
-    debug!("Request path: {}", path);
+    debug!("Request path: {}", redacted_path);
     debug!(
         "Request body: {}",
-        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
+        request_redactor
+            .redact_text(&serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()))
     );
 
     let namespace_state = {
-        let runtime = state.runtime.read().await;
-        match runtime.namespaces.get(&namespace) {
+        match auth_context.runtime().namespaces.get(&namespace) {
             Some(item) => item.clone(),
             None => {
-                return error_response(
+                return redacted_error_response(
                     client_format,
                     StatusCode::NOT_FOUND,
                     &format!("namespace `{namespace}` is not configured"),
+                    &request_redactor,
                 );
             }
         }
     };
 
-    let mut tracker = state
-        .metrics
-        .start_request(path.as_str(), requested_model.clone(), stream);
+    let mut tracker = state.metrics.start_request(
+        redacted_path.clone(),
+        redacted_requested_model.clone(),
+        stream,
+    );
     if let Some(message) = reject_internal_request_scoped_tool_bridge_context(&original_body) {
         tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-        return error_response(client_format, StatusCode::BAD_REQUEST, &message);
+        return redacted_error_response(
+            client_format,
+            StatusCode::BAD_REQUEST,
+            &message,
+            &request_redactor,
+        );
     }
     let resolved_model = match resolve_request_model_or_error(
         &namespace_state,
@@ -606,50 +831,65 @@ async fn handle_request_core_with_downstream_cancellation(
         Ok(v) => v,
         Err(e) => {
             tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-            return error_response(client_format, StatusCode::BAD_REQUEST, &e);
+            return redacted_error_response(
+                client_format,
+                StatusCode::BAD_REQUEST,
+                &e,
+                &request_redactor,
+            );
         }
     };
     let upstream_state = match namespace_state.upstreams.get(&resolved_model.upstream_name) {
         Some(v) => v,
         None => {
             tracker.finish_error(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
-            return error_response(
+            return redacted_error_response(
                 client_format,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!(
                     "resolved upstream `{}` is not configured",
                     resolved_model.upstream_name
                 ),
+                &request_redactor,
             );
         }
     };
+    let redacted_metadata = RedactedRequestMetadata::new(
+        &request_redactor,
+        &path,
+        &requested_model,
+        &resolved_model.upstream_name,
+        &resolved_model.upstream_model,
+    );
     tracker.set_upstream(
-        resolved_model.upstream_name.clone(),
-        resolved_model.upstream_model.clone(),
+        redacted_metadata.upstream_name.clone(),
+        redacted_metadata.upstream_model.clone(),
     );
     let request_translation_policy =
         request_translation_policy(&namespace_state.config, &requested_model, &resolved_model);
     if !upstream_state.availability.is_available() {
         tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
-        return error_response(
+        return redacted_error_response(
             client_format,
             StatusCode::SERVICE_UNAVAILABLE,
             &format_upstream_unavailable_message(
                 &resolved_model.upstream_name,
                 &upstream_state.availability,
             ),
+            &request_redactor,
         );
     }
 
     let Some(capability) = upstream_state.capability.as_ref() else {
         tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
-        return error_response(
+        return redacted_error_response(
             client_format,
             StatusCode::SERVICE_UNAVAILABLE,
             &format_upstream_unavailable_message(
                 &resolved_model.upstream_name,
                 &upstream_state.availability,
             ),
+            &request_redactor,
         );
     };
     let upstream_format = capability.upstream_format_for_request(client_format);
@@ -670,10 +910,18 @@ async fn handle_request_core_with_downstream_cancellation(
         &request_translation_policy,
     ) {
         RequestBoundaryDecision::Allow => Vec::new(),
-        RequestBoundaryDecision::AllowWithWarnings(warnings) => warnings,
+        RequestBoundaryDecision::AllowWithWarnings(warnings) => warnings
+            .into_iter()
+            .map(|warning| request_redactor.redact_text(&warning))
+            .collect(),
         RequestBoundaryDecision::Reject(message) => {
             tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-            return error_response(client_format, StatusCode::BAD_REQUEST, &message);
+            return redacted_error_response(
+                client_format,
+                StatusCode::BAD_REQUEST,
+                &message,
+                &request_redactor,
+            );
         }
     };
     for warning in &compatibility_warnings {
@@ -691,9 +939,10 @@ async fn handle_request_core_with_downstream_cancellation(
         request_translation_policy,
         stream,
     ) {
-        error!("Translation failed: {}", e);
+        let redacted_error = request_redactor.redact_text(&e);
+        error!("Translation failed: {}", redacted_error);
         tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-        return error_response(client_format, StatusCode::BAD_REQUEST, &e);
+        return error_response(client_format, StatusCode::BAD_REQUEST, &redacted_error);
     }
 
     if let Some(obj) = body.as_object_mut() {
@@ -723,12 +972,25 @@ async fn handle_request_core_with_downstream_cancellation(
 
     debug!(
         "Translated body for upstream: {}",
-        serde_json::to_string_pretty(&upstream_request_body)
-            .unwrap_or_else(|_| upstream_request_body.to_string())
+        request_redactor.redact_text(
+            &serde_json::to_string_pretty(&upstream_request_body)
+                .unwrap_or_else(|_| upstream_request_body.to_string())
+        )
     );
 
     let (mut auth_headers, effective_credential) =
-        build_auth_headers(&headers, upstream_state, upstream_format);
+        match build_auth_headers(&headers, &auth_context, upstream_state, upstream_format) {
+            Ok(value) => value,
+            Err(message) => {
+                tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                return redacted_error_response(
+                    client_format,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &message,
+                    &request_redactor,
+                );
+            }
+        };
     apply_upstream_headers(
         &mut auth_headers,
         &upstream_state.config.upstream_headers,
@@ -737,18 +999,18 @@ async fn handle_request_core_with_downstream_cancellation(
     let hook_ctx = namespace_state.hooks.as_ref().map(|_| HookRequestContext {
         request_id: request_id.clone(),
         timestamp_ms: request_timestamp,
-        path: path.clone(),
+        path: redacted_metadata.path.clone(),
         method: "POST".to_string(),
         stream,
-        client_model: requested_model.clone(),
-        upstream_name: resolved_model.upstream_name.clone(),
-        upstream_model: resolved_model.upstream_model.clone(),
+        client_model: redacted_metadata.client_model.clone(),
+        upstream_name: redacted_metadata.upstream_name.clone(),
+        upstream_model: redacted_metadata.upstream_model.clone(),
         client_format,
         upstream_format,
         credential_source: effective_credential.source,
         credential_fingerprint: effective_credential.fingerprint.clone(),
-        client_request_headers: original_headers,
-        client_request_body: original_body.clone(),
+        client_request_headers: redacted_original_headers,
+        client_request_body: redacted_original_body.clone(),
     });
     let debug_ctx = namespace_state
         .debug_trace
@@ -756,17 +1018,21 @@ async fn handle_request_core_with_downstream_cancellation(
         .map(|_| DebugTraceContext {
             request_id: request_id.clone(),
             timestamp_ms: request_timestamp,
-            path: path.clone(),
+            path: redacted_metadata.path.clone(),
             stream,
-            client_model: requested_model.clone(),
-            upstream_name: resolved_model.upstream_name.clone(),
-            upstream_model: resolved_model.upstream_model.clone(),
+            client_model: redacted_metadata.client_model.clone(),
+            upstream_name: redacted_metadata.upstream_name.clone(),
+            upstream_model: redacted_metadata.upstream_model.clone(),
             client_format,
             upstream_format,
         });
     if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref())
     {
-        recorder.record_request_with_upstream(ctx, &original_body, &upstream_request_body);
+        recorder.record_request_with_upstream(
+            ctx,
+            &redacted_original_body,
+            &request_redactor.redact_value(&upstream_request_body),
+        );
     }
 
     let url = upstream::upstream_url(
@@ -780,7 +1046,10 @@ async fn handle_request_core_with_downstream_cancellation(
         },
         stream,
     );
-    debug!("Calling upstream URL: {}", url);
+    debug!(
+        "Calling upstream URL: {}",
+        request_redactor.redact_text(&url)
+    );
     let upstream_client = if stream {
         upstream_state.streaming_client.clone()
     } else {
@@ -800,10 +1069,11 @@ async fn handle_request_core_with_downstream_cancellation(
         Ok(r) => r,
         Err(upstream::DownstreamAwareError::Inner(e)) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
+            let message = request_redactor.redact_text(&e.to_string());
             return if stream {
-                streaming_error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
+                streaming_error_response(client_format, StatusCode::BAD_GATEWAY, &message)
             } else {
-                error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string())
+                error_response(client_format, StatusCode::BAD_GATEWAY, &message)
             };
         }
         Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
@@ -833,10 +1103,11 @@ async fn handle_request_core_with_downstream_cancellation(
                     upstream::ResponseBodyLimitError::LimitExceeded { limit },
                 )) => {
                     tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-                    return streaming_error_response(
+                    return redacted_streaming_error_response(
                         client_format,
                         StatusCode::BAD_GATEWAY,
                         &format!("upstream error body exceeded resource limit of {limit} bytes"),
+                        &request_redactor,
                     );
                 }
                 Err(upstream::DownstreamAwareError::Inner(
@@ -847,9 +1118,10 @@ async fn handle_request_core_with_downstream_cancellation(
                     return client_closed_response(client_format);
                 }
             };
+            let redacted_error_body = request_redactor.redact_text(&error_body);
             error!(
                 "Upstream returned error for streaming request: {} - {}",
-                status, error_body
+                status, redacted_error_body
             );
             tracker.finish_error(status.as_u16());
             let public_error_body = if serde_json::from_str::<Value>(&error_body).is_ok() {
@@ -857,6 +1129,7 @@ async fn handle_request_core_with_downstream_cancellation(
             } else {
                 format!("upstream streaming error body: {error_body}")
             };
+            let public_error_body = request_redactor.redact_text(&public_error_body);
             let mut response = streaming_error_response(
                 client_format,
                 StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -866,16 +1139,18 @@ async fn handle_request_core_with_downstream_cancellation(
                 append_upstream_protocol_response_headers(
                     &mut response,
                     &upstream_response_headers,
+                    &request_redactor,
                 );
             }
             return response;
         }
         if !response_is_event_stream(&upstream_response_headers) {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return streaming_error_response(
+            return redacted_streaming_error_response(
                 client_format,
                 StatusCode::BAD_GATEWAY,
                 "upstream returned non-SSE response for streaming request",
+                &request_redactor,
             );
         }
         let upstream_stream = res.bytes_stream();
@@ -896,6 +1171,10 @@ async fn handle_request_core_with_downstream_cancellation(
                 .with_resource_limits(namespace_state.config.resource_limits.clone());
             Box::pin(guarded.map(|r| r.map_err(std::io::Error::other)))
         };
+        body_stream = Box::pin(RedactingSseStream::new(
+            body_stream,
+            request_redactor.clone(),
+        ));
         if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.clone(), hook_ctx.clone()) {
             body_stream = Box::pin(dispatcher.wrap_stream(
                 body_stream,
@@ -921,7 +1200,11 @@ async fn handle_request_core_with_downstream_cancellation(
             .header("Connection", "keep-alive")
             .body(body)
             .unwrap();
-        append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+        append_upstream_protocol_response_headers(
+            &mut response,
+            &upstream_response_headers,
+            &request_redactor,
+        );
         append_compatibility_warning_headers(&mut response, &compatibility_warnings);
         return response;
     }
@@ -956,11 +1239,21 @@ async fn handle_request_core_with_downstream_cancellation(
             } else {
                 format!("upstream error body exceeded resource limit of {limit} bytes")
             };
-            return error_response(client_format, StatusCode::BAD_GATEWAY, &message);
+            return redacted_error_response(
+                client_format,
+                StatusCode::BAD_GATEWAY,
+                &message,
+                &request_redactor,
+            );
         }
         Err(upstream::DownstreamAwareError::Inner(upstream::ResponseBodyLimitError::Inner(e))) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(client_format, StatusCode::BAD_GATEWAY, &e.to_string());
+            return redacted_error_response(
+                client_format,
+                StatusCode::BAD_GATEWAY,
+                &e.to_string(),
+                &request_redactor,
+            );
         }
         Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
             tracker.finish_cancelled();
@@ -969,10 +1262,8 @@ async fn handle_request_core_with_downstream_cancellation(
     };
     if !status.is_success() {
         error!("Upstream returned non-success status: {}", status);
-        error!(
-            "Upstream response body: {}",
-            String::from_utf8_lossy(&bytes)
-        );
+        let redacted_upstream_body = request_redactor.redact_text(&String::from_utf8_lossy(&bytes));
+        error!("Upstream response body: {}", redacted_upstream_body);
         tracker.finish_error(status.as_u16());
         let upstream_error_body = String::from_utf8_lossy(&bytes);
         let public_error_body = if serde_json::from_str::<Value>(&upstream_error_body).is_ok() {
@@ -980,28 +1271,36 @@ async fn handle_request_core_with_downstream_cancellation(
         } else {
             format!("upstream error body: {upstream_error_body}")
         };
+        let public_error_body = request_redactor.redact_text(&public_error_body);
         let mut response = error_response(
             client_format,
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             &public_error_body,
         );
         if preserve_native_upstream_protocol_headers {
-            append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+            append_upstream_protocol_response_headers(
+                &mut response,
+                &upstream_response_headers,
+                &request_redactor,
+            );
         }
         return response;
     }
     let upstream_body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(_) => {
+            let redacted_upstream_body =
+                request_redactor.redact_text(&String::from_utf8_lossy(&bytes));
             error!(
                 "Upstream returned invalid JSON body: {}",
-                String::from_utf8_lossy(&bytes)
+                redacted_upstream_body
             );
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(
+            return redacted_error_response(
                 client_format,
                 StatusCode::BAD_GATEWAY,
                 "upstream returned invalid JSON",
+                &request_redactor,
             );
         }
     };
@@ -1009,9 +1308,14 @@ async fn handle_request_core_with_downstream_cancellation(
         normalized_non_stream_upstream_error(upstream_format, client_format, &upstream_body)
     {
         tracker.finish_error(status.as_u16());
-        let mut response = error_response(client_format, status, &message);
+        let mut response =
+            redacted_error_response(client_format, status, &message, &request_redactor);
         if preserve_native_upstream_protocol_headers {
-            append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+            append_upstream_protocol_response_headers(
+                &mut response,
+                &upstream_response_headers,
+                &request_redactor,
+            );
         }
         return response;
     }
@@ -1030,21 +1334,27 @@ async fn handle_request_core_with_downstream_cancellation(
         Ok(v) => v,
         Err(e) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(client_format, StatusCode::BAD_GATEWAY, &e);
+            return redacted_error_response(
+                client_format,
+                StatusCode::BAD_GATEWAY,
+                &e,
+                &request_redactor,
+            );
         }
     };
     let response_status = classify_post_translation_non_stream_status(client_format, &out);
+    let public_out = request_redactor.redact_value(&out);
     if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.as_ref(), hook_ctx) {
         dispatcher.emit_non_stream(
             ctx,
             response_status.as_u16(),
             json_response_headers(),
-            out.clone(),
+            public_out.clone(),
         );
     }
     if let (Some(recorder), Some(ctx)) = (namespace_state.debug_trace.as_ref(), debug_ctx.as_ref())
     {
-        recorder.record_non_stream_response(ctx, response_status.as_u16(), &out);
+        recorder.record_non_stream_response(ctx, response_status.as_u16(), &public_out);
     }
     if response_status.is_success() {
         tracker.finish_success(response_status.as_u16());
@@ -1055,11 +1365,15 @@ async fn handle_request_core_with_downstream_cancellation(
         .status(response_status)
         .header("Content-Type", "application/json")
         .body(Body::from(
-            serde_json::to_vec(&out).unwrap_or_else(|_| b"{}".to_vec()),
+            serde_json::to_vec(&public_out).unwrap_or_else(|_| b"{}".to_vec()),
         ))
         .unwrap();
     if preserve_native_upstream_protocol_headers {
-        append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+        append_upstream_protocol_response_headers(
+            &mut response,
+            &upstream_response_headers,
+            &request_redactor,
+        );
     }
     append_compatibility_warning_headers(&mut response, &compatibility_warnings);
     response

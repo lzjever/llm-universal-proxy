@@ -18,6 +18,7 @@ pub fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
             api_root: upstream_api_root(upstream_base, format),
             fixed_upstream_format: Some(format),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -27,5 +28,6 @@ pub fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     }
 }

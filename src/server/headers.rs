@@ -1,13 +1,16 @@
 use axum::{
     body::Body,
-    http::{HeaderMap, Response},
+    http::{HeaderMap, HeaderValue, Response},
 };
 use tracing::debug;
 
 use crate::formats::UpstreamFormat;
 use crate::hooks::{fingerprint_credential, CredentialSource};
 
+use super::data_auth::{DataAccess, RequestAuthContext, RequestAuthorization};
+use super::secret_redaction::SecretRedactor;
 use super::state::UpstreamState;
+use crate::config::DataAuthMode;
 
 #[derive(Clone)]
 pub(super) struct EffectiveCredential {
@@ -35,52 +38,81 @@ pub(super) fn apply_upstream_headers(
 
 pub(super) fn build_auth_headers(
     request_headers: &HeaderMap,
+    auth_context: &RequestAuthContext,
     upstream_state: &UpstreamState,
     upstream_format: UpstreamFormat,
-) -> (Vec<(String, String)>, EffectiveCredential) {
+) -> Result<(Vec<(String, String)>, EffectiveCredential), String> {
     let mut headers = extract_forwardable_headers(request_headers);
-    if let Some(provider_key) = upstream_state.provider_key.as_ref() {
-        strip_auth_headers(&mut headers);
-        headers.push(auth_header_for_format(upstream_format, provider_key));
-        return (
-            headers,
-            EffectiveCredential {
-                source: CredentialSource::Server,
-                fingerprint: Some(fingerprint_credential(provider_key)),
-            },
-        );
-    }
-
-    let client_key = extract_api_key_from_headers(&headers);
-    if let Some(client_key) = client_key {
-        normalize_auth_headers(&mut headers, upstream_format);
+    strip_auth_headers(&mut headers);
+    match (
+        auth_context.mode(),
+        auth_context.access(),
+        auth_context.authorization(),
+    ) {
         (
-            headers,
-            EffectiveCredential {
-                source: CredentialSource::Client,
-                fingerprint: Some(fingerprint_credential(&client_key)),
-            },
-        )
-    } else {
-        (
-            headers,
-            EffectiveCredential {
-                source: CredentialSource::Client,
-                fingerprint: None,
-            },
-        )
+            DataAuthMode::ClientProviderKey,
+            DataAccess::ClientProviderKey,
+            RequestAuthorization::ClientProviderKey { provider_key },
+        ) => {
+            if upstream_state.provider_key.is_some() {
+                return Err(format!(
+                    "request auth snapshot mismatch at generation {}: client_provider_key mode has server provider key",
+                    auth_context.generation()
+                ));
+            }
+            headers.push(auth_header_for_format(upstream_format, provider_key));
+            Ok((
+                headers,
+                EffectiveCredential {
+                    source: CredentialSource::Client,
+                    fingerprint: Some(fingerprint_credential(provider_key)),
+                },
+            ))
+        }
+        (DataAuthMode::ProxyKey, DataAccess::ProxyKey { .. }, RequestAuthorization::ProxyKey) => {
+            let Some(provider_key) = upstream_state.provider_key.as_ref() else {
+                return Err(format!(
+                    "request auth snapshot mismatch at generation {}: proxy_key mode missing server provider key",
+                    auth_context.generation()
+                ));
+            };
+            headers.push(auth_header_for_format(upstream_format, provider_key));
+            Ok((
+                headers,
+                EffectiveCredential {
+                    source: CredentialSource::Server,
+                    fingerprint: Some(fingerprint_credential(provider_key)),
+                },
+            ))
+        }
+        (_, DataAccess::Unconfigured, _) => Err("data auth is not configured".to_string()),
+        (_, DataAccess::Misconfigured(message), _) => {
+            Err(format!("data auth misconfigured: {message}"))
+        }
+        _ => Err(format!(
+            "request auth snapshot authorization does not match data auth mode at generation {}",
+            auth_context.generation()
+        )),
     }
 }
 
 pub(super) fn append_upstream_protocol_response_headers(
     response: &mut Response<Body>,
     upstream_headers: &reqwest::header::HeaderMap,
+    redactor: &SecretRedactor,
 ) {
     for (name, value) in upstream_headers.iter() {
         if is_forwardable_upstream_protocol_response_header(name.as_str())
             && !response.headers().contains_key(name)
         {
-            response.headers_mut().append(name, value.clone());
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            let redacted_value = redactor.redact_text(value);
+            let Ok(redacted_value) = HeaderValue::from_str(&redacted_value) else {
+                continue;
+            };
+            response.headers_mut().append(name, redacted_value);
         }
     }
 }
@@ -109,15 +141,7 @@ pub(super) fn extract_forwardable_headers(headers: &HeaderMap) -> Vec<(String, S
         let name_str = name.as_str().to_lowercase();
         if FORWARDABLE.contains(&name_str.as_str()) {
             if let Ok(v) = value.to_str() {
-                let display_value = if name_str.contains("key")
-                    || name_str.contains("auth")
-                    || name_str.contains("token")
-                {
-                    "***"
-                } else {
-                    v
-                };
-                debug!("Forwarding header: {} = {}", name_str, display_value);
+                debug!("Forwarding header: {}", name_str);
                 result.push((name_str, v.to_string()));
             }
         } else {
@@ -161,19 +185,6 @@ fn auth_header_for_format(format: UpstreamFormat, api_key: &str) -> (String, Str
     }
 }
 
-/// Normalize auth headers for the target upstream format.
-/// Converts client-provided auth to the format expected by upstream.
-fn normalize_auth_headers(headers: &mut Vec<(String, String)>, target_format: UpstreamFormat) {
-    let extracted_key = extract_api_key_from_headers(headers);
-
-    if let Some(key) = extracted_key {
-        strip_auth_headers(headers);
-
-        let auth_header = auth_header_for_format(target_format, &key);
-        headers.push(auth_header);
-    }
-}
-
 fn strip_auth_headers(headers: &mut Vec<(String, String)>) {
     headers.retain(|(k, _)| {
         let k = k.to_lowercase();
@@ -189,35 +200,22 @@ fn strip_auth_headers(headers: &mut Vec<(String, String)>) {
     });
 }
 
-/// Extract API key from various auth header formats.
-fn extract_api_key_from_headers(headers: &[(String, String)]) -> Option<String> {
-    for (name, value) in headers {
-        let name_lower = name.to_lowercase();
-        match name_lower.as_str() {
-            "authorization" => {
-                if let Some(key) = value
-                    .strip_prefix("Bearer ")
-                    .or_else(|| value.strip_prefix("bearer "))
-                {
-                    return Some(key.to_string());
-                }
-            }
-            "x-api-key" | "api-key" | "openai-api-key" | "x-goog-api-key" | "anthropic-api-key" => {
-                if !value.is_empty() {
-                    return Some(value.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 fn is_forwardable_upstream_protocol_response_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("request-id")
-        || name.eq_ignore_ascii_case("x-request-id")
-        || name.starts_with("anthropic-")
-        || name.starts_with("openai-")
-        || name.starts_with("ratelimit-")
+    let name = name.to_ascii_lowercase();
+    if matches!(name.as_str(), "authorization" | "cookie" | "set-cookie")
+        || name.contains("api-key")
+        || name.contains("token")
+        || name.contains("secret")
+        || name.contains("credential")
+    {
+        return false;
+    }
+
+    matches!(
+        name.as_str(),
+        "request-id" | "x-request-id" | "retry-after" | "rate-limit" | "openai-processing-ms"
+    ) || name.starts_with("ratelimit-")
         || name.starts_with("x-ratelimit-")
+        || name.starts_with("rate-limit-")
+        || name.starts_with("anthropic-ratelimit-")
 }

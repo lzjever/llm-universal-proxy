@@ -822,6 +822,58 @@ os.execv(real_git, [real_git, *args])
         self.assertIn("whether a provider key is configured", admin_doc)
         self.assertIn("provider_key_env presence", admin_doc)
 
+    def test_docs_cover_static_data_auth_and_admin_data_auth_contract(self):
+        config_doc = (REPO_ROOT / "docs" / "configuration.md").read_text(
+            encoding="utf-8"
+        )
+        admin_doc = (REPO_ROOT / "docs" / "admin-dynamic-config.md").read_text(
+            encoding="utf-8"
+        )
+        container_doc = (REPO_ROOT / "docs" / "container.md").read_text(
+            encoding="utf-8"
+        )
+
+        for snippet in (
+            "`data_auth`",
+            "`provider_key.inline`",
+            "`provider_key.env`",
+            "`provider_key_env`",
+            "`provider_key.inline`, `provider_key.env`, and `provider_key_env` are mutually exclusive",
+            "Inline and env source values must be non-empty",
+            "Admin read views never return inline secret values",
+            "If `data_auth` is omitted",
+            "environment fallback",
+        ):
+            with self.subTest(doc="configuration", snippet=snippet):
+                self.assertIn(snippet, config_doc)
+
+        for snippet in (
+            "`GET /admin/data-auth`",
+            "`PUT /admin/data-auth`",
+            "`if_revision`",
+            "`412 Precondition Failed`",
+            "new requests immediately use the new proxy key",
+            "failure is not committed",
+            "does not persist plaintext keys",
+            "replay the write after restart",
+        ):
+            with self.subTest(doc="admin", snippet=snippet):
+                self.assertIn(snippet, admin_doc)
+
+        for snippet in (
+            "`GET /admin/data-auth`",
+            "`PUT /admin/data-auth`",
+            "not persisted by the proxy",
+            "replay",
+        ):
+            with self.subTest(doc="container", snippet=snippet):
+                self.assertIn(snippet, container_doc)
+
+        self.assertNotRegex(
+            config_doc + admin_doc + container_doc,
+            r"sk-(?:cp|ant|proj|live|test)-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{32,}",
+        )
+
     def test_container_examples_and_docs_do_not_bake_secrets(self):
         container_config = (REPO_ROOT / "examples" / "container-config.yaml").read_text(
             encoding="utf-8"

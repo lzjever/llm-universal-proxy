@@ -303,7 +303,7 @@ class GaDocsContractTests(unittest.TestCase):
     def test_prd_metadata_and_section_numbers_are_current_for_ga(self):
         prd = read_doc("docs/PRD.md")
 
-        self.assertIn("**Last Updated**: 2026-04-27", prd)
+        self.assertIn("**Last Updated**: 2026-04-28", prd)
 
         headings = re.findall(r"^### 2\.(\d+) ", prd, flags=re.MULTILINE)
         numbers = [int(value) for value in headings]
@@ -322,6 +322,17 @@ class GaDocsContractTests(unittest.TestCase):
         ):
             with self.subTest(heading=heading):
                 self.assertIn(heading, prd)
+
+        for snippet in (
+            "`provider_key: { inline: \"...\" }`",
+            "`provider_key: { env: \"ENV\" }`",
+            "`provider_key_env: ENV`",
+            "`data_auth`",
+            "`GET /admin/data-auth`",
+            "`PUT /admin/data-auth`",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, prd)
 
     def test_prd_dashboard_scope_is_web_static_ui_with_admin_api_boundary(self):
         prd = read_doc("docs/PRD.md")
@@ -482,6 +493,10 @@ class GaDocsContractTests(unittest.TestCase):
             "`proxy_key`",
             "`LLM_UNIVERSAL_PROXY_KEY`",
             "`provider_key_env`",
+            "`data_auth`",
+            "`provider_key.env`",
+            "`provider_key.inline`",
+            "`/admin/data-auth`",
             "admin-token boundary",
         ):
             with self.subTest(snippet=snippet):
@@ -510,6 +525,53 @@ class GaDocsContractTests(unittest.TestCase):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, manual)
 
+    def test_user_entry_auth_docs_do_not_describe_env_only_auth_or_provider_keys(self):
+        docs = {
+            "README.md": read_doc("README.md"),
+            "README_CN.md": read_doc("README_CN.md"),
+            "docs/clients.md": read_doc("docs/clients.md"),
+            "docs/CONSTITUTION.md": read_doc("docs/CONSTITUTION.md"),
+        }
+
+        forbidden = (
+            "Required proxy auth mode",
+            "必填的 proxy auth mode",
+            "Provider/model/resource routes require `LLM_UNIVERSAL_PROXY_AUTH_MODE`",
+            "the proxy reads the real upstream provider key from `provider_key_env`",
+            "the proxy reads upstream provider keys from `provider_key_env`",
+        )
+        for relative_path, text in docs.items():
+            for snippet in forbidden:
+                with self.subTest(path=relative_path, forbidden=snippet):
+                    self.assertNotIn(snippet, text)
+
+        expectations = {
+            "README.md": (
+                "Prefer static `data_auth`",
+                "environment fallback when `data_auth` is omitted",
+                "`provider_key.inline`, `provider_key.env`, or legacy `provider_key_env`",
+            ),
+            "README_CN.md": (
+                "优先使用静态 `data_auth`",
+                "省略 `data_auth` 时的环境变量兼容 fallback",
+                "`provider_key.inline`、`provider_key.env` 或 legacy `provider_key_env`",
+            ),
+            "docs/clients.md": (
+                "Prefer static `data_auth`",
+                "compatibility environment fallback when `data_auth` is omitted",
+                "`provider_key.inline`, `provider_key.env`, or legacy `provider_key_env`",
+            ),
+            "docs/CONSTITUTION.md": (
+                "Prefer static `data_auth`",
+                "compatibility environment fallback",
+                "`provider_key.inline`, `provider_key.env`, or legacy `provider_key_env`",
+            ),
+        }
+        for relative_path, snippets in expectations.items():
+            for snippet in snippets:
+                with self.subTest(path=relative_path, snippet=snippet):
+                    self.assertIn(snippet, docs[relative_path])
+
     def test_configuration_doc_covers_global_auth_and_static_yaml_examples(self):
         config_doc = read_doc("docs/configuration.md")
         security = markdown_section(config_doc, "Data Plane Security")
@@ -522,14 +584,23 @@ class GaDocsContractTests(unittest.TestCase):
             "all provider/model/resource routes",
             "not a per-upstream setting",
             "run separate proxy instances",
+            "`data_auth`",
+            "If `data_auth` is omitted",
+            "environment fallback",
             "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
             "`LLM_UNIVERSAL_PROXY_KEY`",
-            "environment variables",
-            "Do not put them in YAML",
+            "`proxy_key.inline`",
+            "`proxy_key.env`",
+            "`provider_key.inline`",
+            "`provider_key.env`",
             "`provider_key_env` is a per-upstream environment variable name",
+            "`provider_key.inline`, `provider_key.env`, and `provider_key_env` are mutually exclusive",
+            "Inline and env source values must be non-empty",
+            "Admin read views never return inline secret values",
             "`provider_key_env` is not required",
             "normally omitted",
             "not rejected",
+            "not used",
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, security)
@@ -538,20 +609,23 @@ class GaDocsContractTests(unittest.TestCase):
             (
                 block
                 for block in yaml_blocks
-                if "provider_key_env: OPENAI_COMPATIBLE_API_KEY" in block
+                if "data_auth:" in block
+                and "mode: proxy_key" in block
+                and "provider_key:" in block
+                and "env: OPENAI_COMPATIBLE_API_KEY" in block
                 and "provider_key_env: ANTHROPIC_COMPATIBLE_API_KEY" in block
             ),
             None,
         )
         self.assertIsNotNone(
             proxy_key_block,
-            "proxy_key static YAML example must show per-upstream provider_key_env",
+            "proxy_key static YAML example must show data_auth plus structured and legacy provider key sources",
         )
         self.assertIn("#", proxy_key_block)
         self.assertIn("format: openai-completion", proxy_key_block)
         self.assertIn("format: anthropic", proxy_key_block)
         self.assertNotIn("LLM_UNIVERSAL_PROXY_AUTH_MODE", proxy_key_block)
-        self.assertNotIn("LLM_UNIVERSAL_PROXY_KEY", proxy_key_block)
+        self.assertIn("env: LLM_UNIVERSAL_PROXY_KEY", proxy_key_block)
 
         client_provider_key_block = next(
             (
@@ -559,6 +633,7 @@ class GaDocsContractTests(unittest.TestCase):
                 for block in yaml_blocks
                 if "CLIENT-KEY-OPENAI-COMPATIBLE" in block
                 and "CLIENT-KEY-ANTHROPIC-COMPATIBLE" in block
+                and "mode: client_provider_key" in block
             ),
             None,
         )
@@ -571,24 +646,44 @@ class GaDocsContractTests(unittest.TestCase):
         self.assertNotIn("LLM_UNIVERSAL_PROXY_AUTH_MODE", client_provider_key_block)
         self.assertNotIn("LLM_UNIVERSAL_PROXY_KEY", client_provider_key_block)
 
+        inline_example = next(
+            (
+                block
+                for block in yaml_blocks
+                if 'inline: "DEMO_PROVIDER_KEY_DO_NOT_USE"' in block
+            ),
+            None,
+        )
+        self.assertIsNotNone(
+            inline_example,
+            "docs must show inline provider_key only with an obvious fake value",
+        )
+
     def test_admin_dynamic_config_doc_covers_runtime_payload_and_field_mapping(self):
         admin_doc = read_doc("docs/admin-dynamic-config.md")
         write_section = markdown_section(admin_doc, "Update a Namespace Without Restarting")
         api_examples = markdown_subsection(write_section, "API Configuration Examples")
         mapping = markdown_section(admin_doc, "Static YAML vs Runtime Payload")
+        data_auth_section = markdown_section(admin_doc, "Update Data Auth Without Restarting")
+        redaction = markdown_section(admin_doc, "What the Admin Read View Redacts")
 
         for snippet in (
             "process-wide",
-            "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
+            "`data_auth`",
+            "environment fallback",
             "all namespaces",
             "not set through the namespace payload",
             "`proxy_key` mode",
             "every upstream",
-            "resolvable `provider_key_env`",
+            "provider credential source",
+            "`provider_key.inline`",
+            "`provider_key.env`",
+            "`provider_key_env`",
             "`client_provider_key` mode",
             "does not require `provider_key_env`",
             "normally omitted",
             "not rejected",
+            "not used",
         ):
             with self.subTest(section="write", snippet=snippet):
                 self.assertIn(snippet, write_section)
@@ -645,12 +740,42 @@ class GaDocsContractTests(unittest.TestCase):
             "`fixed_upstream_format`",
             "alias string",
             "`upstream_name` and `upstream_model`",
-            "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
-            "process environment",
+            "`data_auth`",
+            "`/admin/data-auth`",
             "not in namespace payload",
+            "`provider_key` object",
+            "`provider_key_env` legacy field",
         ):
             with self.subTest(section="mapping", snippet=snippet):
                 self.assertIn(snippet, mapping)
+
+        for snippet in (
+            "`GET /admin/data-auth`",
+            "`PUT /admin/data-auth`",
+            "`Authorization: Bearer <admin-token>`",
+            "`if_revision`",
+            "`412 Precondition Failed`",
+            "redacted snapshot",
+            "`proxy_key.inline`",
+            "`proxy_key.env`",
+            "new requests immediately use the new proxy key",
+            "mode switch",
+            "rebuilds the already-loaded namespaces",
+            "failure is not committed",
+            "does not persist plaintext keys",
+            "replay the write after restart",
+        ):
+            with self.subTest(section="data_auth", snippet=snippet):
+                self.assertIn(snippet, data_auth_section)
+
+        for snippet in (
+            "inline upstream credentials",
+            "inline `data_auth.proxy_key` values",
+            "`provider_key` view reports `source`, `configured`, `redacted`, and `env_name` when applicable",
+            "provider_key_env presence",
+        ):
+            with self.subTest(section="redaction", snippet=snippet):
+                self.assertIn(snippet, redaction)
 
     def test_constitution_separates_public_dashboard_from_admin_api_auth(self):
         constitution = read_doc("docs/CONSTITUTION.md")

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -12,10 +13,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{sanitize_url_for_admin, AdminConfigView, Config, RuntimeConfigPayload};
+use crate::config::{
+    sanitize_url_for_admin, AdminConfigView, Config, DataAuthConfig as StaticDataAuthConfig,
+    RuntimeConfigPayload,
+};
 use crate::discovery::UpstreamAvailability;
 use crate::formats::UpstreamFormat;
 
+use super::data_auth::RuntimeDataAuthState;
 use super::errors::error_response;
 use super::state::{build_runtime_namespace_state, generate_admin_revision, AdminAccess, AppState};
 
@@ -103,6 +108,14 @@ struct AdminConfigCasRequest {
     #[serde(default)]
     if_revision: Option<String>,
     config: RuntimeConfigPayload,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminDataAuthCasRequest {
+    #[serde(default)]
+    if_revision: Option<String>,
+    config: StaticDataAuthConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +293,104 @@ pub(super) async fn handle_admin_state(State(state): State<Arc<AppState>>) -> im
     (StatusCode::OK, Json(RuntimeStateResponse { namespaces })).into_response()
 }
 
+pub(super) async fn handle_admin_data_auth_state(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let snapshot = state.data_auth_policy.manager().snapshot().await;
+    (StatusCode::OK, Json(snapshot)).into_response()
+}
+
+pub(super) async fn handle_admin_data_auth_config(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let request: AdminDataAuthCasRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                UpstreamFormat::OpenAiCompletion,
+                StatusCode::BAD_REQUEST,
+                &format!("invalid admin data auth request: {error}"),
+            );
+        }
+    };
+    let next_data_auth = match RuntimeDataAuthState::from_admin_config(request.config) {
+        Ok(state) => state,
+        Err(error) => {
+            return error_response(
+                UpstreamFormat::OpenAiCompletion,
+                StatusCode::BAD_REQUEST,
+                &format!("invalid data_auth config: {error}"),
+            );
+        }
+    };
+    let _admin_update = state.admin_update_lock.lock().await;
+    let manager = state.data_auth_policy.manager();
+    let current_snapshot = manager.snapshot().await;
+    if let Err(response) = validate_admin_cas_precondition(
+        Some(&current_snapshot.revision),
+        request.if_revision.as_deref(),
+    ) {
+        return admin_write_error_response(response);
+    }
+
+    let namespace_inputs = {
+        let runtime = state.runtime.read().await;
+        runtime
+            .namespaces
+            .iter()
+            .map(|(namespace, item)| {
+                (
+                    namespace.clone(),
+                    item.revision.clone(),
+                    item.config.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut rebuilt = BTreeMap::new();
+    for (namespace, revision, config) in namespace_inputs {
+        if let Err(error) =
+            super::data_auth::validate_runtime_config(&config, next_data_auth.access())
+        {
+            return error_response(
+                UpstreamFormat::OpenAiCompletion,
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "failed to validate namespace `{namespace}` under data_auth config: {error}"
+                ),
+            );
+        }
+        let namespace_state =
+            match build_runtime_namespace_state(revision, config, next_data_auth.access()).await {
+                Ok(state) => state,
+                Err(error) => {
+                    return error_response(
+                        UpstreamFormat::OpenAiCompletion,
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                        "failed to rebuild namespace `{namespace}` under data_auth config: {error}"
+                    ),
+                    );
+                }
+            };
+        rebuilt.insert(namespace, namespace_state);
+    }
+
+    // Take both commit locks before mutating either state; keep data-auth write guard out of awaits.
+    let mut runtime = state.runtime.write().await;
+    let mut data_auth = manager.write().await;
+    if let Err(response) =
+        validate_admin_cas_precondition(Some(data_auth.revision()), request.if_revision.as_deref())
+    {
+        return admin_write_error_response(response);
+    }
+    runtime.namespaces = rebuilt;
+    let response = next_data_auth.clone().into_admin_response();
+    *data_auth = next_data_auth;
+    (StatusCode::OK, Json(response)).into_response()
+}
+
 pub(super) async fn handle_admin_namespace_state(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
@@ -348,7 +459,9 @@ pub(super) async fn handle_admin_namespace_config(
             );
         }
     };
-    if let Err(error) = state.data_auth_policy.validate(&config) {
+    let _admin_update = state.admin_update_lock.lock().await;
+    let data_access = state.data_auth_policy.current_access().await;
+    if let Err(error) = super::data_auth::validate_runtime_config(&config, &data_access) {
         return error_response(
             UpstreamFormat::OpenAiCompletion,
             StatusCode::BAD_REQUEST,
@@ -368,22 +481,17 @@ pub(super) async fn handle_admin_namespace_config(
         return admin_write_error_response(response);
     }
     let revision = generate_admin_revision();
-    let namespace_state = match build_runtime_namespace_state(
-        revision.clone(),
-        config,
-        &state.data_auth_policy.access,
-    )
-    .await
-    {
-        Ok(state) => state,
-        Err(error) => {
-            return error_response(
-                UpstreamFormat::OpenAiCompletion,
-                StatusCode::BAD_REQUEST,
-                &format!("failed to resolve namespace config: {error}"),
-            );
-        }
-    };
+    let namespace_state =
+        match build_runtime_namespace_state(revision.clone(), config, &data_access).await {
+            Ok(state) => state,
+            Err(error) => {
+                return error_response(
+                    UpstreamFormat::OpenAiCompletion,
+                    StatusCode::BAD_REQUEST,
+                    &format!("failed to resolve namespace config: {error}"),
+                );
+            }
+        };
     let mut runtime = state.runtime.write().await;
     if let Err(response) = validate_admin_cas_precondition(
         runtime

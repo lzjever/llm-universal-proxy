@@ -3,199 +3,310 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{Response, StatusCode},
+    http::{HeaderMap, Response, StatusCode},
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::formats::UpstreamFormat;
 
+use super::data_auth::{self, RequestAuthContext};
 use super::errors::error_response;
+use super::secret_redaction::{redactor_for_request, SecretRedactor};
 use super::state::{AppState, DEFAULT_NAMESPACE};
 
 const PUBLIC_MODEL_NAMESPACE: &str = "llmup";
 
-pub(super) async fn handle_openai_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    handle_openai_models_inner(state, DEFAULT_NAMESPACE.to_string()).await
+pub(super) async fn handle_openai_models(
+    State(_state): State<Arc<AppState>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
+) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiCompletion);
+    };
+    handle_openai_models_inner(&auth_context, DEFAULT_NAMESPACE).await
 }
 
 pub(super) async fn handle_openai_models_namespaced(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_openai_models_inner(state, namespace).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiCompletion);
+    };
+    handle_openai_models_inner(&auth_context, &namespace).await
 }
 
 pub(super) async fn handle_openai_model(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_openai_model_inner(state, DEFAULT_NAMESPACE.to_string(), id).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiCompletion);
+    };
+    handle_openai_model_inner(&auth_context, DEFAULT_NAMESPACE, &id).await
 }
 
 pub(super) async fn handle_openai_model_namespaced(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path((namespace, id)): Path<(String, String)>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_openai_model_inner(state, namespace, id).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiCompletion);
+    };
+    handle_openai_model_inner(&auth_context, &namespace, &id).await
 }
 
 pub(super) async fn handle_anthropic_models(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_anthropic_models_inner(state, DEFAULT_NAMESPACE.to_string()).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Anthropic);
+    };
+    handle_anthropic_models_inner(&auth_context, DEFAULT_NAMESPACE).await
 }
 
 pub(super) async fn handle_anthropic_models_namespaced(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_anthropic_models_inner(state, namespace).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Anthropic);
+    };
+    handle_anthropic_models_inner(&auth_context, &namespace).await
 }
 
 pub(super) async fn handle_anthropic_model(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_anthropic_model_inner(state, DEFAULT_NAMESPACE.to_string(), id).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Anthropic);
+    };
+    handle_anthropic_model_inner(&auth_context, DEFAULT_NAMESPACE, &id).await
 }
 
 pub(super) async fn handle_anthropic_model_namespaced(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path((namespace, id)): Path<(String, String)>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_anthropic_model_inner(state, namespace, id).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Anthropic);
+    };
+    handle_anthropic_model_inner(&auth_context, &namespace, &id).await
 }
 
-pub(super) async fn handle_google_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    handle_google_models_inner(state, DEFAULT_NAMESPACE.to_string()).await
+pub(super) async fn handle_google_models(
+    State(_state): State<Arc<AppState>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
+) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Google);
+    };
+    handle_google_models_inner(&auth_context, DEFAULT_NAMESPACE).await
 }
 
 pub(super) async fn handle_google_models_namespaced(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_google_models_inner(state, namespace).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Google);
+    };
+    handle_google_models_inner(&auth_context, &namespace).await
 }
 
 pub(super) async fn handle_google_model(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_google_model_inner(state, DEFAULT_NAMESPACE.to_string(), id).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Google);
+    };
+    handle_google_model_inner(&auth_context, DEFAULT_NAMESPACE, &id).await
 }
 
 pub(super) async fn handle_google_model_namespaced(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path((namespace, id)): Path<(String, String)>,
+    auth_context: Option<Extension<RequestAuthContext>>,
 ) -> impl IntoResponse {
-    handle_google_model_inner(state, namespace, id).await
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::Google);
+    };
+    handle_google_model_inner(&auth_context, &namespace, &id).await
 }
 
-async fn handle_openai_models_inner(state: Arc<AppState>, namespace: String) -> Response<Body> {
-    match namespace_config(&state, &namespace).await {
-        Some(config) => (StatusCode::OK, Json(openai_model_list(&config))).into_response(),
-        None => error_response(
+async fn handle_openai_models_inner(
+    auth_context: &RequestAuthContext,
+    namespace: &str,
+) -> Response<Body> {
+    let request_redactor = redactor_for_model_request(auth_context);
+    match namespace_config(auth_context, namespace) {
+        Some(config) => redacted_json_response(
+            StatusCode::OK,
+            openai_model_list(&config),
+            &request_redactor,
+        ),
+        None => redacted_error_response(
             UpstreamFormat::OpenAiCompletion,
             StatusCode::NOT_FOUND,
             "namespace not found",
+            &request_redactor,
         ),
     }
 }
 
 async fn handle_openai_model_inner(
-    state: Arc<AppState>,
-    namespace: String,
-    id: String,
+    auth_context: &RequestAuthContext,
+    namespace: &str,
+    id: &str,
 ) -> Response<Body> {
-    let Some(config) = namespace_config(&state, &namespace).await else {
-        return error_response(
+    let request_redactor = redactor_for_model_request(auth_context);
+    let Some(config) = namespace_config(auth_context, namespace) else {
+        return redacted_error_response(
             UpstreamFormat::OpenAiCompletion,
             StatusCode::NOT_FOUND,
             "namespace not found",
+            &request_redactor,
         );
     };
-    match openai_model_object(&config, &id) {
-        Some(model) => (StatusCode::OK, Json(model)).into_response(),
-        None => error_response(
+    match openai_model_object(&config, id) {
+        Some(model) => redacted_json_response(StatusCode::OK, model, &request_redactor),
+        None => redacted_error_response(
             UpstreamFormat::OpenAiCompletion,
             StatusCode::NOT_FOUND,
             &format!("model `{id}` not found"),
+            &request_redactor,
         ),
     }
 }
 
-async fn handle_anthropic_models_inner(state: Arc<AppState>, namespace: String) -> Response<Body> {
-    match namespace_config(&state, &namespace).await {
-        Some(config) => (StatusCode::OK, Json(anthropic_model_list(&config))).into_response(),
-        None => error_response(
+async fn handle_anthropic_models_inner(
+    auth_context: &RequestAuthContext,
+    namespace: &str,
+) -> Response<Body> {
+    let request_redactor = redactor_for_model_request(auth_context);
+    match namespace_config(auth_context, namespace) {
+        Some(config) => redacted_json_response(
+            StatusCode::OK,
+            anthropic_model_list(&config),
+            &request_redactor,
+        ),
+        None => redacted_error_response(
             UpstreamFormat::Anthropic,
             StatusCode::NOT_FOUND,
             "namespace not found",
+            &request_redactor,
         ),
     }
 }
 
 async fn handle_anthropic_model_inner(
-    state: Arc<AppState>,
-    namespace: String,
-    id: String,
+    auth_context: &RequestAuthContext,
+    namespace: &str,
+    id: &str,
 ) -> Response<Body> {
-    let Some(config) = namespace_config(&state, &namespace).await else {
-        return error_response(
+    let request_redactor = redactor_for_model_request(auth_context);
+    let Some(config) = namespace_config(auth_context, namespace) else {
+        return redacted_error_response(
             UpstreamFormat::Anthropic,
             StatusCode::NOT_FOUND,
             "namespace not found",
+            &request_redactor,
         );
     };
-    match anthropic_model_object(&config, &id) {
-        Some(model) => (StatusCode::OK, Json(model)).into_response(),
-        None => error_response(
+    match anthropic_model_object(&config, id) {
+        Some(model) => redacted_json_response(StatusCode::OK, model, &request_redactor),
+        None => redacted_error_response(
             UpstreamFormat::Anthropic,
             StatusCode::NOT_FOUND,
             &format!("model `{id}` not found"),
+            &request_redactor,
         ),
     }
 }
 
-async fn handle_google_models_inner(state: Arc<AppState>, namespace: String) -> Response<Body> {
-    match namespace_config(&state, &namespace).await {
-        Some(config) => (StatusCode::OK, Json(google_model_list(&config))).into_response(),
-        None => error_response(
+async fn handle_google_models_inner(
+    auth_context: &RequestAuthContext,
+    namespace: &str,
+) -> Response<Body> {
+    let request_redactor = redactor_for_model_request(auth_context);
+    match namespace_config(auth_context, namespace) {
+        Some(config) => redacted_json_response(
+            StatusCode::OK,
+            google_model_list(&config),
+            &request_redactor,
+        ),
+        None => redacted_error_response(
             UpstreamFormat::Google,
             StatusCode::NOT_FOUND,
             "namespace not found",
+            &request_redactor,
         ),
     }
 }
 
 async fn handle_google_model_inner(
-    state: Arc<AppState>,
-    namespace: String,
-    id: String,
+    auth_context: &RequestAuthContext,
+    namespace: &str,
+    id: &str,
 ) -> Response<Body> {
-    let Some(config) = namespace_config(&state, &namespace).await else {
-        return error_response(
+    let request_redactor = redactor_for_model_request(auth_context);
+    let Some(config) = namespace_config(auth_context, namespace) else {
+        return redacted_error_response(
             UpstreamFormat::Google,
             StatusCode::NOT_FOUND,
             "namespace not found",
+            &request_redactor,
         );
     };
-    match google_model_object(&config, &id) {
-        Some(model) => (StatusCode::OK, Json(model)).into_response(),
-        None => error_response(
+    match google_model_object(&config, id) {
+        Some(model) => redacted_json_response(StatusCode::OK, model, &request_redactor),
+        None => redacted_error_response(
             UpstreamFormat::Google,
             StatusCode::NOT_FOUND,
             &format!("model `{id}` not found"),
+            &request_redactor,
         ),
     }
 }
 
-async fn namespace_config(state: &Arc<AppState>, namespace: &str) -> Option<Config> {
-    let runtime = state.runtime.read().await;
-    runtime
+fn redactor_for_model_request(auth_context: &RequestAuthContext) -> SecretRedactor {
+    redactor_for_request(auth_context, &HeaderMap::new())
+}
+
+fn redacted_json_response(
+    status: StatusCode,
+    body: Value,
+    redactor: &SecretRedactor,
+) -> Response<Body> {
+    (status, Json(redactor.redact_value(&body))).into_response()
+}
+
+fn redacted_error_response(
+    format: UpstreamFormat,
+    status: StatusCode,
+    message: &str,
+    redactor: &SecretRedactor,
+) -> Response<Body> {
+    error_response(format, status, &redactor.redact_text(message))
+}
+
+fn namespace_config(auth_context: &RequestAuthContext, namespace: &str) -> Option<Config> {
+    auth_context
+        .runtime()
         .namespaces
         .get(namespace)
         .map(|item| item.config.clone())

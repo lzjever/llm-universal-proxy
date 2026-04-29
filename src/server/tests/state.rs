@@ -34,6 +34,7 @@ async fn build_runtime_namespace_state_exposes_resolved_per_upstream_clients() {
             api_root: api_root.clone(),
             fixed_upstream_format: Some(crate::formats::UpstreamFormat::OpenAiCompletion),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -43,6 +44,7 @@ async fn build_runtime_namespace_state_exposes_resolved_per_upstream_clients() {
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
 
     let namespace_state = crate::server::state::build_runtime_namespace_state(
@@ -118,6 +120,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
             api_root: "https://example.com/v1".to_string(),
             fixed_upstream_format: None,
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -133,6 +136,7 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
         },
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     config.model_aliases.insert(
         "alias-1".to_string(),

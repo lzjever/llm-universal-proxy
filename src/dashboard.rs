@@ -15,7 +15,7 @@ use ratatui::{
     Terminal,
 };
 
-use crate::config::Config;
+use crate::config::{Config, UpstreamConfig, UpstreamProviderKeySourceRef};
 use crate::dashboard_logs::DashboardLogSnapshot;
 use crate::hooks::HookSnapshot;
 use crate::server::{DashboardNamespaceSnapshot, DashboardRuntimeHandle, DashboardUpstreamStatus};
@@ -318,7 +318,7 @@ fn render_config(
         .upstreams
         .iter()
         .map(|upstream| {
-            let provider_key = upstream.provider_key_env.as_deref().unwrap_or("client");
+            let provider_key = provider_key_source_label(upstream);
             let format = upstream
                 .fixed_upstream_format
                 .map(|value| format!("{value:?}"))
@@ -329,7 +329,7 @@ fn render_config(
                 .map(format_dashboard_availability)
                 .unwrap_or_else(|| "status unknown".to_string());
             format!(
-                "{}  [{format}]  provider_key_env={provider_key}  {availability}",
+                "{}  [{format}]  {provider_key}  {availability}",
                 upstream.name
             )
         })
@@ -359,6 +359,18 @@ fn render_config(
             .wrap(Wrap { trim: false }),
         chunks[2],
     );
+}
+
+fn provider_key_source_label(upstream: &UpstreamConfig) -> &'static str {
+    match upstream.provider_key_source() {
+        Ok(Some(UpstreamProviderKeySourceRef::Inline(_))) => "provider_key=inline",
+        Ok(Some(UpstreamProviderKeySourceRef::Env { legacy: false, .. })) => "provider_key=env",
+        Ok(Some(UpstreamProviderKeySourceRef::Env { legacy: true, .. })) => {
+            "provider_key=legacy-env"
+        }
+        Ok(None) => "provider_key=client",
+        Err(_) => "provider_key=invalid",
+    }
 }
 
 fn format_dashboard_availability(status: &DashboardUpstreamStatus) -> String {
@@ -667,6 +679,7 @@ fn log_style(line: &str) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{SecretSourceConfig, UpstreamConfig};
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -703,5 +716,87 @@ mod tests {
             rendered.contains(DASHBOARD_TITLE),
             "rendered = {rendered:?}"
         );
+    }
+
+    #[test]
+    fn render_config_reports_redacted_provider_key_source_labels() {
+        let backend = TestBackend::new(160, 10);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let config = Config {
+            upstreams: vec![
+                upstream_with_provider_key(
+                    "inline-provider",
+                    None,
+                    Some(SecretSourceConfig {
+                        inline: Some("inline-provider-secret".to_string()),
+                        env: None,
+                    }),
+                ),
+                upstream_with_provider_key(
+                    "env-provider",
+                    None,
+                    Some(SecretSourceConfig {
+                        inline: None,
+                        env: Some("STRUCTURED_PROVIDER_KEY_ENV".to_string()),
+                    }),
+                ),
+                upstream_with_provider_key(
+                    "legacy-provider",
+                    Some("LEGACY_PROVIDER_KEY_ENV"),
+                    None,
+                ),
+                upstream_with_provider_key("client-provider", None, None),
+            ],
+            ..Config::default()
+        };
+
+        terminal
+            .draw(|frame| render_config(frame, frame.area(), &config, &[], None))
+            .expect("draw config");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("provider_key=inline"),
+            "rendered = {rendered:?}"
+        );
+        assert!(
+            rendered.contains("provider_key=env"),
+            "rendered = {rendered:?}"
+        );
+        assert!(
+            rendered.contains("provider_key=legacy-env"),
+            "rendered = {rendered:?}"
+        );
+        assert!(
+            rendered.contains("provider_key=client"),
+            "rendered = {rendered:?}"
+        );
+        assert!(!rendered.contains("inline-provider-secret"));
+        assert!(!rendered.contains("STRUCTURED_PROVIDER_KEY_ENV"));
+        assert!(!rendered.contains("LEGACY_PROVIDER_KEY_ENV"));
+    }
+
+    fn upstream_with_provider_key(
+        name: &str,
+        provider_key_env: Option<&str>,
+        provider_key: Option<SecretSourceConfig>,
+    ) -> UpstreamConfig {
+        UpstreamConfig {
+            name: name.to_string(),
+            api_root: "https://example.test/v1".to_string(),
+            fixed_upstream_format: None,
+            provider_key_env: provider_key_env.map(str::to_string),
+            provider_key,
+            upstream_headers: Vec::new(),
+            proxy: None,
+            limits: None,
+            surface_defaults: None,
+        }
     }
 }

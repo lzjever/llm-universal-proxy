@@ -90,25 +90,74 @@ Reasoning effort such as `xhigh` stays on the client request; it is not part of 
 
 ## Data Plane Security
 
-Client-facing provider/model/resource routes use a required global auth mode that is separate from the admin token. The mode is process-wide: one running proxy process uses one `LLM_UNIVERSAL_PROXY_AUTH_MODE` for all namespaces and all provider/model/resource routes. It is not a per-upstream setting, and it is not configured inside YAML. If you need a mixed deployment where some clients use a local proxy key and other clients pass provider keys directly, run separate proxy instances with different process environments.
+Client-facing provider/model/resource routes use a required global auth mode
+that is separate from the admin token. The mode is process-wide: one running
+proxy process uses one `data_auth` state for all namespaces and all
+provider/model/resource routes. It is not a per-upstream setting. If you need a
+mixed deployment where some clients use a local proxy key and other clients pass
+provider keys directly, run separate proxy instances.
+That one state applies to all provider/model/resource routes.
 
-Set `LLM_UNIVERSAL_PROXY_AUTH_MODE` to exactly one of:
+The preferred static configuration is the top-level `data_auth` object:
 
-- `proxy_key`: clients send the proxy key as their normal SDK API key or as `Authorization: Bearer <proxy-key>`. The proxy uses each upstream's `provider_key_env` value to read the real provider key from its own environment.
-- `client_provider_key`: clients send the real provider key as their normal SDK API key or bearer token. The proxy does not need provider key env vars for those upstream calls.
+- `mode: proxy_key`: clients send the proxy key as their normal SDK API key or
+  as `Authorization: Bearer <proxy-key>`. The proxy uses each selected
+  upstream's configured provider credential source for the real provider call.
+- `mode: client_provider_key`: clients send the real provider key as their
+  normal SDK API key or bearer token. The proxy forwards the client credential
+  upstream.
 
-`LLM_UNIVERSAL_PROXY_AUTH_MODE` and `LLM_UNIVERSAL_PROXY_KEY` are environment variables. Do not put them in YAML. `LLM_UNIVERSAL_PROXY_KEY` is required only in `proxy_key` mode. `/health` remains unauthenticated. Provider/model/resource routes reject missing client keys in both modes. Admin API routes still use `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` and `Authorization: Bearer <admin-token>`.
+In `proxy_key` mode, `data_auth.proxy_key` is required and must contain exactly
+one secret source: `proxy_key.inline` or `proxy_key.env`. `proxy_key.inline`
+stores the proxy key in the loaded config and is mainly useful for local tests
+or tightly controlled generated config. `proxy_key.env` names an environment
+variable that must resolve to the proxy key at startup or when an admin update is
+applied.
 
-`provider_key_env` is a per-upstream environment variable name. It is not the provider key itself. In `proxy_key` mode, every upstream that can receive traffic must set `provider_key_env`, and that named variable must resolve in the proxy process environment. In `client_provider_key` mode, `provider_key_env` is not required and is normally omitted; a non-empty value is not rejected just because this mode is active, but it is not used to choose the upstream credential for those requests.
+If `data_auth` is omitted, the proxy keeps the backward-compatible environment
+fallback: `LLM_UNIVERSAL_PROXY_AUTH_MODE` selects `proxy_key` or
+`client_provider_key`, and `LLM_UNIVERSAL_PROXY_KEY` is required when that
+fallback selects `proxy_key`. New deployments can still use the environment
+fallback, but static `data_auth` is clearer for checked-in or controller-rendered
+configuration.
+That path is the environment fallback.
+
+Provider/model/resource routes reject missing client keys in both modes.
+`/health` remains unauthenticated. Admin API routes use
+`LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` and `Authorization: Bearer <admin-token>`.
+
+Upstream provider credentials are configured per upstream and are used only when
+the global mode is `proxy_key`. Supported provider credential sources are:
+
+- `provider_key: { inline: "..." }`: inline provider key value.
+- `provider_key: { env: "ENV" }`: structured environment variable source.
+- `provider_key_env: ENV`: legacy environment variable source kept for
+  compatibility.
+
+`provider_key_env` is a per-upstream environment variable name. It is not the
+provider key itself. `provider_key.inline`, `provider_key.env`, and
+`provider_key_env` are mutually exclusive on one upstream. Inline and env source
+values must be non-empty. In `proxy_key` mode, every upstream that can receive
+traffic must have one provider credential source, and env sources must resolve in
+the proxy process environment. Admin read views never return inline secret
+values.
+`provider_key.inline`, `provider_key.env`, and `provider_key_env` are mutually exclusive. Inline and env source values must be non-empty.
+Admin read views never return inline secret values.
+
+In `client_provider_key` mode, `provider_key.inline` is rejected because it would
+embed a server-held provider key that the mode will never use. `provider_key.env`
+and the legacy `provider_key_env` are accepted for config compatibility, but
+they are not used for request auth in this mode. They are normally omitted.
+In this mode, `provider_key_env` is not required, is normally omitted, and `provider_key.env` or `provider_key_env` are not rejected if present, but are not used.
 
 ### Static YAML Auth Examples
 
-In `proxy_key` mode, the proxy owns provider credentials. Clients only see the local proxy key.
+In `proxy_key` mode, the proxy owns provider credentials. Clients only see the
+local proxy key.
 
 Set process environment before starting `llmup`:
 
 ```bash
-export LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key
 export LLM_UNIVERSAL_PROXY_KEY="local-proxy-key"
 export OPENAI_COMPATIBLE_API_KEY="real-openai-compatible-provider-key"
 export ANTHROPIC_COMPATIBLE_API_KEY="real-anthropic-compatible-provider-key"
@@ -117,21 +166,28 @@ export ANTHROPIC_COMPATIBLE_API_KEY="real-anthropic-compatible-provider-key"
 Static YAML:
 
 ```yaml
-# Auth mode and proxy key are process environment, not YAML fields.
 listen: 127.0.0.1:8080
 upstream_timeout_secs: 120
+
+data_auth:
+  mode: proxy_key
+  proxy_key:
+    # The value of this env var is the client-facing proxy key.
+    env: LLM_UNIVERSAL_PROXY_KEY
 
 upstreams:
   PROXY-KEY-OPENAI-COMPATIBLE:
     # Provider API root; include the provider's version segment.
     api_root: https://openai-compatible.example/v1
     format: openai-completion
-    # Name of the env var the proxy reads for this upstream's provider key.
-    provider_key_env: OPENAI_COMPATIBLE_API_KEY
+    # Structured env source for this upstream's provider key.
+    provider_key:
+      env: OPENAI_COMPATIBLE_API_KEY
 
   PROXY-KEY-ANTHROPIC-COMPATIBLE:
     api_root: https://anthropic-compatible.example/v1
     format: anthropic
+    # Legacy env source remains supported for compatibility.
     provider_key_env: ANTHROPIC_COMPATIBLE_API_KEY
 
 model_aliases:
@@ -139,31 +195,50 @@ model_aliases:
   coding-anthropic: "PROXY-KEY-ANTHROPIC-COMPATIBLE:provider-anthropic-model"
 ```
 
-In `client_provider_key` mode, clients send the real provider key through their normal SDK API key or bearer-token path. The proxy does not need server-side provider key env vars for these upstream calls, so static YAML normally leaves `provider_key_env` out.
+Inline provider keys are accepted but should be reserved for generated local
+fixtures or similarly controlled environments. Use an obvious fake value in
+examples:
 
-Set process environment before starting `llmup`:
+```yaml
+listen: 127.0.0.1:8080
 
-```bash
-export LLM_UNIVERSAL_PROXY_AUTH_MODE=client_provider_key
+data_auth:
+  mode: proxy_key
+  proxy_key:
+    inline: "DEMO_PROXY_KEY_DO_NOT_USE"
+
+upstreams:
+  INLINE-DEMO:
+    api_root: https://openai-compatible.example/v1
+    format: openai-completion
+    provider_key:
+      inline: "DEMO_PROVIDER_KEY_DO_NOT_USE"
+
+model_aliases:
+  inline-demo: "INLINE-DEMO:provider-model-id"
 ```
+
+In `client_provider_key` mode, clients send the real provider key through their normal SDK API key or bearer-token path. The proxy does not need server-side provider key env vars for these upstream calls, so static YAML normally leaves `provider_key_env` out.
 
 Static YAML:
 
 ```yaml
-# Auth mode is process environment. Clients provide real provider keys.
 listen: 127.0.0.1:8080
 upstream_timeout_secs: 120
+
+data_auth:
+  mode: client_provider_key
 
 upstreams:
   CLIENT-KEY-OPENAI-COMPATIBLE:
     api_root: https://openai-compatible.example/v1
     format: openai-completion
-    # provider_key_env is normally omitted; the client key is forwarded upstream.
+    # provider_key / provider_key_env are normally omitted.
 
   CLIENT-KEY-ANTHROPIC-COMPATIBLE:
     api_root: https://anthropic-compatible.example/v1
     format: anthropic
-    # provider_key_env is normally omitted here too.
+    # The client key is forwarded upstream.
 
 model_aliases:
   bring-your-openai-key: "CLIENT-KEY-OPENAI-COMPATIBLE:provider-openai-model"
@@ -213,15 +288,19 @@ Each upstream usually needs:
 
 - `api_root`: the provider API root, including its version segment
 - `format`: the expected upstream protocol when you want to pin it
-- `provider_key_env`: the environment variable that contains the provider key in `proxy_key` mode
+- a provider credential source in `proxy_key` mode, usually `provider_key.env`
+  or the legacy `provider_key_env`
 
 Practical rules:
 
 - `api_root` should point at the provider API root, not a model-specific path
 - include the version segment such as `/v1` or `/v1beta`
 - `upstream_headers` may add non-secret routing or tenant headers, but cannot override auth/secret headers such as `authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `openai-api-key`, `x-goog-api-key`, or `anthropic-api-key`
-- use `provider_key_env` when `LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key`
-- normally omit `provider_key_env` when `LLM_UNIVERSAL_PROXY_AUTH_MODE=client_provider_key` and clients provide provider keys directly; a non-empty value is accepted but unnecessary
+- use exactly one of `provider_key.inline`, `provider_key.env`, or
+  `provider_key_env` when the global mode is `proxy_key`
+- normally omit provider credential sources when the global mode is
+  `client_provider_key`; `provider_key.env` and `provider_key_env` are accepted
+  but ignored, while `provider_key.inline` is rejected
 
 Provider-specific static headers belong inside the upstream's `headers` field.
 

@@ -23,13 +23,18 @@ upstream calls, and low-risk degradation must be visible rather than silent.
 - Admin and data-plane boundaries are documented and covered by local
   governance checks.
 - Provider/model/resource routes require `LLM_UNIVERSAL_PROXY_AUTH_MODE` for
-  non-loopback production use: in `proxy_key` mode clients authenticate with
-  `LLM_UNIVERSAL_PROXY_KEY` and upstream credentials come from each upstream's
+  non-loopback production use when static `data_auth` is omitted. Static
+  `data_auth` is the preferred process-wide config: in `proxy_key` mode clients
+  authenticate with the configured proxy key, commonly
+  `LLM_UNIVERSAL_PROXY_KEY` through `proxy_key.env`, and upstream credentials
+  come from `provider_key.env`, `provider_key.inline`, or legacy
   `provider_key_env`; in `client_provider_key` mode clients send provider keys
-  directly. Admin routes remain behind the admin-token boundary.
+  directly and `provider_key.inline` is rejected. Admin routes remain behind the
+  admin-token boundary, including `/admin/data-auth`.
 - CORS is opt-in by exact origin rather than broadly emitted by default.
 - Server-held provider-key forwarding is explicit through configured
-  `provider_key_env` in `proxy_key` mode.
+  `provider_key.env`, `provider_key.inline`, or `provider_key_env` in
+  `proxy_key` mode, and admin reads redact inline values.
 - Local limit work is represented in the gate set and compatibility contracts:
   request, response, stream, hook, and trace paths must fail predictably when
   they exceed supported bounds.

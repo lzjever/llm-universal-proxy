@@ -255,6 +255,29 @@ class DocsHomepageContractTests(unittest.TestCase):
             with self.subTest(path=relative_path):
                 self.assertIn("docs/ga-readiness-review.md", self.read_text(relative_path))
 
+    def test_readmes_and_docs_index_surface_data_auth_admin_entrypoint(self):
+        expectations = {
+            "README.md": (
+                "`data_auth`",
+                "`GET /admin/data-auth`",
+                "`PUT /admin/data-auth`",
+            ),
+            "README_CN.md": (
+                "`data_auth`",
+                "`GET /admin/data-auth`",
+                "`PUT /admin/data-auth`",
+            ),
+            "docs/README.md": (
+                "static `data_auth`",
+                "`/admin/data-auth`",
+            ),
+        }
+        for relative_path, snippets in expectations.items():
+            text = self.read_text(relative_path)
+            for snippet in snippets:
+                with self.subTest(path=relative_path, snippet=snippet):
+                    self.assertIn(snippet, text)
+
     def test_clients_guide_matches_wrapper_base_urls_and_proxy_endpoints(self):
         text = self.read_text("docs/clients.md")
 

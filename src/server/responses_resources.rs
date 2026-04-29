@@ -19,10 +19,8 @@ use crate::streaming::GuardedSseStream;
 use crate::upstream;
 
 use super::body_limits::read_limited_json_request;
-use super::errors::{
-    client_closed_response, error_response, format_upstream_unavailable_message,
-    streaming_error_response,
-};
+use super::data_auth::{self, RequestAuthContext};
+use super::errors::{client_closed_response, error_response, streaming_error_response};
 use super::headers::{
     append_upstream_protocol_response_headers, apply_upstream_headers, build_auth_headers,
 };
@@ -30,6 +28,7 @@ use super::public_boundary::{
     validate_openai_responses_resource_request_body,
     validate_openai_responses_resource_response_body,
 };
+use super::secret_redaction::{redactor_for_request, RedactingSseStream, SecretRedactor};
 use super::state::{AppState, RuntimeNamespaceState, UpstreamState, DEFAULT_NAMESPACE};
 use super::tracked_body::TrackedBodyStream;
 
@@ -38,6 +37,11 @@ struct OpenAiResponsesResourceRequest {
     resource_path: String,
     body: Option<Value>,
     query: Option<String>,
+}
+
+struct ResponsesResourceRequestAuth {
+    headers: HeaderMap,
+    auth_context: RequestAuthContext,
 }
 
 impl OpenAiResponsesResourceRequest {
@@ -56,6 +60,81 @@ impl OpenAiResponsesResourceRequest {
     }
 }
 
+impl ResponsesResourceRequestAuth {
+    fn new(headers: HeaderMap, auth_context: RequestAuthContext) -> Self {
+        Self {
+            headers,
+            auth_context,
+        }
+    }
+}
+
+struct RedactedResponsesResourceRequestMetadata {
+    path: String,
+    namespace: String,
+}
+
+struct RedactedResponsesResourceUpstreamMetadata {
+    name: String,
+    model: String,
+}
+
+impl RedactedResponsesResourceRequestMetadata {
+    fn new(redactor: &SecretRedactor, namespace: &str, resource_path: &str) -> Self {
+        let resource_path = redactor.redact_text(resource_path);
+        Self {
+            path: format!("/openai/v1/{resource_path}"),
+            namespace: redactor.redact_text(namespace),
+        }
+    }
+}
+
+impl RedactedResponsesResourceUpstreamMetadata {
+    fn new(redactor: &SecretRedactor, upstream_name: &str) -> Self {
+        Self {
+            name: redactor.redact_text(upstream_name),
+            model: String::new(),
+        }
+    }
+}
+
+fn redacted_error_response(
+    format: UpstreamFormat,
+    status: StatusCode,
+    message: &str,
+    redactor: &SecretRedactor,
+) -> Response<Body> {
+    error_response(format, status, &redactor.redact_text(message))
+}
+
+fn redacted_streaming_error_response(
+    format: UpstreamFormat,
+    status: StatusCode,
+    message: &str,
+    redactor: &SecretRedactor,
+) -> Response<Body> {
+    streaming_error_response(format, status, &redactor.redact_text(message))
+}
+
+fn redacted_upstream_unavailable_message(
+    redactor: &SecretRedactor,
+    upstream: &RedactedResponsesResourceUpstreamMetadata,
+    availability: &crate::discovery::UpstreamAvailability,
+) -> String {
+    match availability {
+        crate::discovery::UpstreamAvailability::Available => {
+            format!("resolved upstream `{}` is unavailable", upstream.name)
+        }
+        crate::discovery::UpstreamAvailability::Unavailable { reason } => {
+            let reason = redactor.redact_text(reason);
+            format!(
+                "resolved upstream `{}` is unavailable: {reason}",
+                upstream.name
+            )
+        }
+    }
+}
+
 fn downstream_cancellation_or_disabled(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
 ) -> DownstreamCancellation {
@@ -69,10 +148,14 @@ pub(super) async fn handle_openai_responses_compact(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         DEFAULT_NAMESPACE,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -88,6 +171,7 @@ pub(super) async fn handle_openai_responses_compact(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -98,10 +182,14 @@ pub(super) async fn handle_openai_responses_compact_namespaced(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         &namespace,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -117,6 +205,7 @@ pub(super) async fn handle_openai_responses_compact_namespaced(
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -126,8 +215,12 @@ pub(super) async fn handle_openai_response_get(
     OriginalUri(uri): OriginalUri,
     Path(response_id): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_response_get_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -137,6 +230,7 @@ pub(super) async fn handle_openai_response_get(
             .map(|Extension(cancellation)| cancellation)
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
+        auth_context,
     )
     .await
 }
@@ -146,8 +240,12 @@ pub(super) async fn handle_openai_response_get_namespaced(
     OriginalUri(uri): OriginalUri,
     Path((namespace, response_id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_response_get_inner(
         state,
         namespace,
@@ -157,6 +255,7 @@ pub(super) async fn handle_openai_response_get_namespaced(
             .map(|Extension(cancellation)| cancellation)
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
+        auth_context,
     )
     .await
 }
@@ -166,8 +265,12 @@ pub(super) async fn handle_openai_response_input_items(
     OriginalUri(uri): OriginalUri,
     Path(response_id): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_response_input_items_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -175,6 +278,7 @@ pub(super) async fn handle_openai_response_input_items(
         response_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
+        auth_context,
     )
     .await
 }
@@ -184,8 +288,12 @@ pub(super) async fn handle_openai_response_input_items_namespaced(
     OriginalUri(uri): OriginalUri,
     Path((namespace, response_id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_response_input_items_inner(
         state,
         namespace,
@@ -193,6 +301,7 @@ pub(super) async fn handle_openai_response_input_items_namespaced(
         response_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
+        auth_context,
     )
     .await
 }
@@ -203,10 +312,14 @@ pub(super) async fn handle_openai_responses_input_tokens(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         DEFAULT_NAMESPACE,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -221,6 +334,7 @@ pub(super) async fn handle_openai_responses_input_tokens(
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -232,10 +346,14 @@ pub(super) async fn handle_openai_responses_input_tokens_namespaced(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         &namespace,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -250,6 +368,7 @@ pub(super) async fn handle_openai_responses_input_tokens_namespaced(
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -258,8 +377,12 @@ pub(super) async fn handle_openai_response_delete(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_response_delete_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -268,6 +391,7 @@ pub(super) async fn handle_openai_response_delete(
             .map(|Extension(cancellation)| cancellation)
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
+        auth_context,
     )
     .await
 }
@@ -276,8 +400,12 @@ pub(super) async fn handle_openai_response_delete_namespaced(
     State(state): State<Arc<AppState>>,
     Path((namespace, response_id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_response_delete_inner(
         state,
         namespace,
@@ -286,6 +414,7 @@ pub(super) async fn handle_openai_response_delete_namespaced(
             .map(|Extension(cancellation)| cancellation)
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
+        auth_context,
     )
     .await
 }
@@ -294,8 +423,12 @@ pub(super) async fn handle_openai_response_cancel(
     State(state): State<Arc<AppState>>,
     Path(response_id): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_response_cancel_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -304,6 +437,7 @@ pub(super) async fn handle_openai_response_cancel(
             .map(|Extension(cancellation)| cancellation)
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
+        auth_context,
     )
     .await
 }
@@ -312,8 +446,12 @@ pub(super) async fn handle_openai_response_cancel_namespaced(
     State(state): State<Arc<AppState>>,
     Path((namespace, response_id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_response_cancel_inner(
         state,
         namespace,
@@ -322,6 +460,7 @@ pub(super) async fn handle_openai_response_cancel_namespaced(
             .map(|Extension(cancellation)| cancellation)
             .unwrap_or_else(DownstreamCancellation::disabled),
         headers,
+        auth_context,
     )
     .await
 }
@@ -332,10 +471,14 @@ pub(super) async fn handle_openai_conversations_create(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         DEFAULT_NAMESPACE,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -350,6 +493,7 @@ pub(super) async fn handle_openai_conversations_create(
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -361,10 +505,14 @@ pub(super) async fn handle_openai_conversations_create_namespaced(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         &namespace,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -379,6 +527,7 @@ pub(super) async fn handle_openai_conversations_create_namespaced(
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
         body,
+        auth_context,
     )
     .await
 }
@@ -388,8 +537,12 @@ pub(super) async fn handle_openai_conversation_get(
     OriginalUri(uri): OriginalUri,
     Path(conversation_id): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_get_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -397,6 +550,7 @@ pub(super) async fn handle_openai_conversation_get(
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
+        auth_context,
     )
     .await
 }
@@ -406,8 +560,12 @@ pub(super) async fn handle_openai_conversation_get_namespaced(
     OriginalUri(uri): OriginalUri,
     Path((namespace, conversation_id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_get_inner(
         state,
         namespace,
@@ -415,6 +573,7 @@ pub(super) async fn handle_openai_conversation_get_namespaced(
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
+        auth_context,
     )
     .await
 }
@@ -426,10 +585,14 @@ pub(super) async fn handle_openai_conversation_update(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         DEFAULT_NAMESPACE,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -443,7 +606,7 @@ pub(super) async fn handle_openai_conversation_update(
         uri,
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
-        headers,
+        ResponsesResourceRequestAuth::new(headers, auth_context),
         body,
     )
     .await
@@ -456,10 +619,14 @@ pub(super) async fn handle_openai_conversation_update_namespaced(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         &namespace,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -473,7 +640,7 @@ pub(super) async fn handle_openai_conversation_update_namespaced(
         uri,
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
-        headers,
+        ResponsesResourceRequestAuth::new(headers, auth_context),
         body,
     )
     .await
@@ -484,8 +651,12 @@ pub(super) async fn handle_openai_conversation_delete(
     OriginalUri(uri): OriginalUri,
     Path(conversation_id): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_delete_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -493,6 +664,7 @@ pub(super) async fn handle_openai_conversation_delete(
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
+        auth_context,
     )
     .await
 }
@@ -502,8 +674,12 @@ pub(super) async fn handle_openai_conversation_delete_namespaced(
     OriginalUri(uri): OriginalUri,
     Path((namespace, conversation_id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_delete_inner(
         state,
         namespace,
@@ -511,6 +687,7 @@ pub(super) async fn handle_openai_conversation_delete_namespaced(
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
+        auth_context,
     )
     .await
 }
@@ -520,8 +697,12 @@ pub(super) async fn handle_openai_conversation_items(
     OriginalUri(uri): OriginalUri,
     Path(conversation_id): Path<String>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_items_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -529,6 +710,7 @@ pub(super) async fn handle_openai_conversation_items(
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
+        auth_context,
     )
     .await
 }
@@ -538,8 +720,12 @@ pub(super) async fn handle_openai_conversation_items_namespaced(
     OriginalUri(uri): OriginalUri,
     Path((namespace, conversation_id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_items_inner(
         state,
         namespace,
@@ -547,6 +733,7 @@ pub(super) async fn handle_openai_conversation_items_namespaced(
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
         headers,
+        auth_context,
     )
     .await
 }
@@ -558,10 +745,14 @@ pub(super) async fn handle_openai_conversation_item_create(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         DEFAULT_NAMESPACE,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -575,7 +766,7 @@ pub(super) async fn handle_openai_conversation_item_create(
         uri,
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
-        headers,
+        ResponsesResourceRequestAuth::new(headers, auth_context),
         body,
     )
     .await
@@ -588,10 +779,14 @@ pub(super) async fn handle_openai_conversation_item_create_namespaced(
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
     request: Request,
 ) -> Response<Body> {
+    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     let (headers, body) = match read_limited_json_request(
         &state,
         &namespace,
         UpstreamFormat::OpenAiResponses,
+        &auth_context,
         request,
     )
     .await
@@ -605,7 +800,7 @@ pub(super) async fn handle_openai_conversation_item_create_namespaced(
         uri,
         conversation_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
-        headers,
+        ResponsesResourceRequestAuth::new(headers, auth_context),
         body,
     )
     .await
@@ -616,8 +811,12 @@ pub(super) async fn handle_openai_conversation_item_get(
     OriginalUri(uri): OriginalUri,
     Path((conversation_id, item_id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_item_get_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -625,7 +824,7 @@ pub(super) async fn handle_openai_conversation_item_get(
         conversation_id,
         item_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
-        headers,
+        ResponsesResourceRequestAuth::new(headers, auth_context),
     )
     .await
 }
@@ -635,8 +834,12 @@ pub(super) async fn handle_openai_conversation_item_get_namespaced(
     OriginalUri(uri): OriginalUri,
     Path((namespace, conversation_id, item_id)): Path<(String, String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_item_get_inner(
         state,
         namespace,
@@ -644,7 +847,7 @@ pub(super) async fn handle_openai_conversation_item_get_namespaced(
         conversation_id,
         item_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
-        headers,
+        ResponsesResourceRequestAuth::new(headers, auth_context),
     )
     .await
 }
@@ -654,8 +857,12 @@ pub(super) async fn handle_openai_conversation_item_delete(
     OriginalUri(uri): OriginalUri,
     Path((conversation_id, item_id)): Path<(String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_item_delete_inner(
         state,
         DEFAULT_NAMESPACE.to_string(),
@@ -663,7 +870,7 @@ pub(super) async fn handle_openai_conversation_item_delete(
         conversation_id,
         item_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
-        headers,
+        ResponsesResourceRequestAuth::new(headers, auth_context),
     )
     .await
 }
@@ -673,8 +880,12 @@ pub(super) async fn handle_openai_conversation_item_delete_namespaced(
     OriginalUri(uri): OriginalUri,
     Path((namespace, conversation_id, item_id)): Path<(String, String, String)>,
     downstream_cancellation: Option<Extension<DownstreamCancellation>>,
+    auth_context: Option<Extension<RequestAuthContext>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(auth_context) = data_auth::request_auth_context_from_extension(auth_context) else {
+        return data_auth::missing_request_auth_context_response(UpstreamFormat::OpenAiResponses);
+    };
     handle_openai_conversation_item_delete_inner(
         state,
         namespace,
@@ -682,7 +893,7 @@ pub(super) async fn handle_openai_conversation_item_delete_namespaced(
         conversation_id,
         item_id,
         downstream_cancellation_or_disabled(downstream_cancellation),
-        headers,
+        ResponsesResourceRequestAuth::new(headers, auth_context),
     )
     .await
 }
@@ -693,6 +904,7 @@ async fn handle_openai_responses_compact_inner(
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -705,6 +917,7 @@ async fn handle_openai_responses_compact_inner(
             Some(body),
             None,
         ),
+        auth_context,
     )
     .await
 }
@@ -716,6 +929,7 @@ async fn handle_openai_response_get_inner(
     response_id: String,
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -728,6 +942,7 @@ async fn handle_openai_response_get_inner(
             None,
             uri.query().map(ToString::to_string),
         ),
+        auth_context,
     )
     .await
 }
@@ -739,6 +954,7 @@ async fn handle_openai_response_input_items_inner(
     response_id: String,
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -754,6 +970,7 @@ async fn handle_openai_response_input_items_inner(
             None,
             uri.query().map(ToString::to_string),
         ),
+        auth_context,
     )
     .await
 }
@@ -765,6 +982,7 @@ async fn handle_openai_responses_input_tokens_inner(
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -777,6 +995,7 @@ async fn handle_openai_responses_input_tokens_inner(
             Some(body),
             uri.query().map(ToString::to_string),
         ),
+        auth_context,
     )
     .await
 }
@@ -787,6 +1006,7 @@ async fn handle_openai_response_delete_inner(
     response_id: String,
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -799,6 +1019,7 @@ async fn handle_openai_response_delete_inner(
             None,
             None,
         ),
+        auth_context,
     )
     .await
 }
@@ -809,6 +1030,7 @@ async fn handle_openai_response_cancel_inner(
     response_id: String,
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -824,6 +1046,7 @@ async fn handle_openai_response_cancel_inner(
             None,
             None,
         ),
+        auth_context,
     )
     .await
 }
@@ -835,6 +1058,7 @@ async fn handle_openai_conversations_create_inner(
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     body: Value,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -847,6 +1071,7 @@ async fn handle_openai_conversations_create_inner(
             Some(body),
             uri.query().map(ToString::to_string),
         ),
+        auth_context,
     )
     .await
 }
@@ -858,6 +1083,7 @@ async fn handle_openai_conversation_get_inner(
     conversation_id: String,
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -873,6 +1099,7 @@ async fn handle_openai_conversation_get_inner(
             None,
             uri.query().map(ToString::to_string),
         ),
+        auth_context,
     )
     .await
 }
@@ -883,14 +1110,14 @@ async fn handle_openai_conversation_update_inner(
     uri: axum::http::Uri,
     conversation_id: String,
     downstream_cancellation: DownstreamCancellation,
-    headers: HeaderMap,
+    request_auth: ResponsesResourceRequestAuth,
     body: Value,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
         namespace,
         downstream_cancellation,
-        headers,
+        request_auth.headers,
         OpenAiResponsesResourceRequest::new(
             reqwest::Method::POST,
             format!(
@@ -900,6 +1127,7 @@ async fn handle_openai_conversation_update_inner(
             Some(body),
             uri.query().map(ToString::to_string),
         ),
+        request_auth.auth_context,
     )
     .await
 }
@@ -911,6 +1139,7 @@ async fn handle_openai_conversation_delete_inner(
     conversation_id: String,
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -926,6 +1155,7 @@ async fn handle_openai_conversation_delete_inner(
             None,
             uri.query().map(ToString::to_string),
         ),
+        auth_context,
     )
     .await
 }
@@ -937,6 +1167,7 @@ async fn handle_openai_conversation_items_inner(
     conversation_id: String,
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
@@ -952,6 +1183,7 @@ async fn handle_openai_conversation_items_inner(
             None,
             uri.query().map(ToString::to_string),
         ),
+        auth_context,
     )
     .await
 }
@@ -962,14 +1194,14 @@ async fn handle_openai_conversation_item_create_inner(
     uri: axum::http::Uri,
     conversation_id: String,
     downstream_cancellation: DownstreamCancellation,
-    headers: HeaderMap,
+    request_auth: ResponsesResourceRequestAuth,
     body: Value,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
         namespace,
         downstream_cancellation,
-        headers,
+        request_auth.headers,
         OpenAiResponsesResourceRequest::new(
             reqwest::Method::POST,
             format!(
@@ -979,6 +1211,7 @@ async fn handle_openai_conversation_item_create_inner(
             Some(body),
             uri.query().map(ToString::to_string),
         ),
+        request_auth.auth_context,
     )
     .await
 }
@@ -990,13 +1223,13 @@ async fn handle_openai_conversation_item_get_inner(
     conversation_id: String,
     item_id: String,
     downstream_cancellation: DownstreamCancellation,
-    headers: HeaderMap,
+    request_auth: ResponsesResourceRequestAuth,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
         namespace,
         downstream_cancellation,
-        headers,
+        request_auth.headers,
         OpenAiResponsesResourceRequest::new(
             reqwest::Method::GET,
             format!(
@@ -1007,6 +1240,7 @@ async fn handle_openai_conversation_item_get_inner(
             None,
             uri.query().map(ToString::to_string),
         ),
+        request_auth.auth_context,
     )
     .await
 }
@@ -1018,13 +1252,13 @@ async fn handle_openai_conversation_item_delete_inner(
     conversation_id: String,
     item_id: String,
     downstream_cancellation: DownstreamCancellation,
-    headers: HeaderMap,
+    request_auth: ResponsesResourceRequestAuth,
 ) -> Response<Body> {
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
         namespace,
         downstream_cancellation,
-        headers,
+        request_auth.headers,
         OpenAiResponsesResourceRequest::new(
             reqwest::Method::DELETE,
             format!(
@@ -1035,6 +1269,7 @@ async fn handle_openai_conversation_item_delete_inner(
             None,
             uri.query().map(ToString::to_string),
         ),
+        request_auth.auth_context,
     )
     .await
 }
@@ -1049,14 +1284,114 @@ pub(super) async fn handle_openai_responses_resource(
     body: Option<Value>,
     query: Option<String>,
 ) -> Response<Body> {
+    let auth_context = trusted_test_request_auth_context(&state, &headers).await;
     handle_openai_responses_resource_with_downstream_cancellation(
         state,
         namespace,
         DownstreamCancellation::disabled(),
         headers,
         OpenAiResponsesResourceRequest::new(method, resource_path, body, query),
+        auth_context,
     )
     .await
+}
+
+#[cfg(test)]
+pub(super) struct TestOpenAiResponsesResourceRequest {
+    pub(super) method: reqwest::Method,
+    pub(super) resource_path: String,
+    pub(super) body: Option<Value>,
+    pub(super) query: Option<String>,
+}
+
+#[cfg(test)]
+pub(super) async fn handle_openai_responses_resource_with_auth_context(
+    state: Arc<AppState>,
+    namespace: String,
+    headers: HeaderMap,
+    request: TestOpenAiResponsesResourceRequest,
+    auth_context: RequestAuthContext,
+) -> Response<Body> {
+    handle_openai_responses_resource_with_downstream_cancellation(
+        state,
+        namespace,
+        DownstreamCancellation::disabled(),
+        headers,
+        OpenAiResponsesResourceRequest::new(
+            request.method,
+            request.resource_path,
+            request.body,
+            request.query,
+        ),
+        auth_context,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn trusted_test_request_auth_context(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> RequestAuthContext {
+    let runtime = state.runtime.read().await.clone();
+    let access = state.data_auth_policy.current_access().await;
+    let (mode, authorization) = match &access {
+        data_auth::DataAccess::ClientProviderKey => (
+            crate::config::DataAuthMode::ClientProviderKey,
+            data_auth::RequestAuthorization::ClientProviderKey {
+                provider_key: test_client_provider_key_from_headers(headers)
+                    .unwrap_or_else(|| "test-client-provider-key".to_string()),
+            },
+        ),
+        data_auth::DataAccess::ProxyKey { .. } => (
+            crate::config::DataAuthMode::ProxyKey,
+            data_auth::RequestAuthorization::ProxyKey,
+        ),
+        data_auth::DataAccess::Unconfigured => (
+            crate::config::DataAuthMode::ClientProviderKey,
+            data_auth::RequestAuthorization::ClientProviderKey {
+                provider_key: "test-client-provider-key".to_string(),
+            },
+        ),
+        data_auth::DataAccess::Misconfigured(_) => (
+            crate::config::DataAuthMode::ClientProviderKey,
+            data_auth::RequestAuthorization::ClientProviderKey {
+                provider_key: "test-client-provider-key".to_string(),
+            },
+        ),
+    };
+    RequestAuthContext::for_test("test-generation", mode, access, authorization, runtime)
+}
+
+#[cfg(test)]
+fn test_client_provider_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .get(..7)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("Bearer "))
+                .map(|_| value[7..].to_string())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            [
+                "x-api-key",
+                "api-key",
+                "openai-api-key",
+                "x-goog-api-key",
+                "anthropic-api-key",
+            ]
+            .into_iter()
+            .find_map(|name| {
+                headers
+                    .get(axum::http::HeaderName::from_static(name))
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToString::to_string)
+            })
+        })
 }
 
 async fn handle_openai_responses_resource_with_downstream_cancellation(
@@ -1065,6 +1400,7 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
     downstream_cancellation: DownstreamCancellation,
     headers: HeaderMap,
     request: OpenAiResponsesResourceRequest,
+    auth_context: RequestAuthContext,
 ) -> Response<Body> {
     let OpenAiResponsesResourceRequest {
         method,
@@ -1073,30 +1409,41 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
         query,
     } = request;
     let stream_resource = is_streamed_responses_retrieve(&method, &resource_path, query.as_deref());
-    let request_path = format!("/openai/v1/{resource_path}");
-    let mut tracker = state
-        .metrics
-        .start_request(&request_path, String::new(), stream_resource);
+    let request_redactor = redactor_for_request(&auth_context, &headers);
+    let redacted_request_metadata = RedactedResponsesResourceRequestMetadata::new(
+        &request_redactor,
+        &namespace,
+        &resource_path,
+    );
+    let mut tracker = state.metrics.start_request(
+        redacted_request_metadata.path.clone(),
+        String::new(),
+        stream_resource,
+    );
     if let Some(body) = body.as_ref() {
         if let Err(message) = validate_openai_responses_resource_request_body(body) {
             tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-            return error_response(
+            return redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_REQUEST,
                 &message,
+                &request_redactor,
             );
         }
     }
     let namespace_state = {
-        let runtime = state.runtime.read().await;
-        match runtime.namespaces.get(&namespace) {
+        match auth_context.runtime().namespaces.get(&namespace) {
             Some(item) => item.clone(),
             None => {
                 tracker.finish_error(StatusCode::NOT_FOUND.as_u16());
-                return error_response(
+                return redacted_error_response(
                     UpstreamFormat::OpenAiResponses,
                     StatusCode::NOT_FOUND,
-                    &format!("namespace `{namespace}` is not configured"),
+                    &format!(
+                        "namespace `{}` is not configured",
+                        redacted_request_metadata.namespace
+                    ),
+                    &request_redactor,
                 );
             }
         }
@@ -1104,10 +1451,11 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
 
     if responses_owner_provenance_is_ambiguous(&namespace_state) {
         tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-        return error_response(
+        return redacted_error_response(
             UpstreamFormat::OpenAiResponses,
             StatusCode::BAD_REQUEST,
             &responses_auto_discovery_ambiguity_message("Responses lifecycle endpoints"),
+            &request_redactor,
         );
     }
 
@@ -1117,36 +1465,62 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
         [upstream] => *upstream,
         [] => {
             tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
-            return error_response(
+            return redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Responses lifecycle endpoints require an available upstream that natively supports OpenAI Responses",
+                &request_redactor,
             );
         }
         _ => {
             tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-            return error_response(
+            return redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_REQUEST,
                 "Responses lifecycle endpoint is ambiguous across multiple Responses-capable upstreams in this namespace",
+                &request_redactor,
             );
         }
     };
 
-    tracker.set_upstream(upstream_state.config.name.clone(), String::new());
+    let redacted_upstream_metadata = RedactedResponsesResourceUpstreamMetadata::new(
+        &request_redactor,
+        &upstream_state.config.name,
+    );
+    tracker.set_upstream(
+        redacted_upstream_metadata.name.clone(),
+        redacted_upstream_metadata.model.clone(),
+    );
     if !upstream_state.availability.is_available() {
         tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
-        return error_response(
+        return redacted_error_response(
             UpstreamFormat::OpenAiResponses,
             StatusCode::SERVICE_UNAVAILABLE,
-            &format_upstream_unavailable_message(
-                &upstream_state.config.name,
+            &redacted_upstream_unavailable_message(
+                &request_redactor,
+                &redacted_upstream_metadata,
                 &upstream_state.availability,
             ),
+            &request_redactor,
         );
     }
-    let (mut auth_headers, _effective_credential) =
-        build_auth_headers(&headers, upstream_state, UpstreamFormat::OpenAiResponses);
+    let (mut auth_headers, _effective_credential) = match build_auth_headers(
+        &headers,
+        &auth_context,
+        upstream_state,
+        UpstreamFormat::OpenAiResponses,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            tracker.finish_error(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+            return redacted_error_response(
+                UpstreamFormat::OpenAiResponses,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &message,
+                &request_redactor,
+            );
+        }
+    };
     apply_upstream_headers(
         &mut auth_headers,
         &upstream_state.config.upstream_headers,
@@ -1161,10 +1535,11 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
         Ok(target) => target,
         Err(message) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(
+            return redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
                 &message,
+                &request_redactor,
             );
         }
     };
@@ -1192,10 +1567,11 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
             Ok(response) => response,
             Err(upstream::DownstreamAwareError::Inner(error)) => {
                 tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-                return error_response(
+                return redacted_error_response(
                     UpstreamFormat::OpenAiResponses,
                     StatusCode::BAD_GATEWAY,
                     &error.to_string(),
+                    &request_redactor,
                 );
             }
             Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
@@ -1212,6 +1588,7 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
             status,
             upstream_response_headers,
             namespace_state.config.resource_limits.clone(),
+            request_redactor,
             tracker,
             downstream_cancellation,
         )
@@ -1221,10 +1598,11 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
         && no_content_response_framing_is_invalid(&upstream_response_headers)
     {
         tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-        return error_response(
+        return redacted_error_response(
             UpstreamFormat::OpenAiResponses,
             StatusCode::BAD_GATEWAY,
             "upstream returned invalid no-content response framing",
+            &request_redactor,
         );
     }
     let response_body_limit = if status.is_success() {
@@ -1255,20 +1633,22 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
             } else {
                 format!("upstream error body exceeded resource limit of {limit} bytes")
             };
-            return error_response(
+            return redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
                 &message,
+                &request_redactor,
             );
         }
         Err(upstream::DownstreamAwareError::Inner(upstream::ResponseBodyLimitError::Inner(
             error,
         ))) => {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(
+            return redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
                 &error.to_string(),
+                &request_redactor,
             );
         }
         Err(upstream::DownstreamAwareError::DownstreamCancelled) => {
@@ -1286,33 +1666,37 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
                     .status(status)
                     .body(Body::empty())
                     .unwrap_or_else(|_| {
-                        error_response(
+                        redacted_error_response(
                             UpstreamFormat::OpenAiResponses,
                             StatusCode::BAD_GATEWAY,
                             "failed to build upstream resource response",
+                            &request_redactor,
                         )
                     });
                 append_upstream_protocol_response_headers(
                     &mut response,
                     &upstream_response_headers,
+                    &request_redactor,
                 );
                 return response;
             }
 
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(
+            return redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
                 "upstream returned empty response body",
+                &request_redactor,
             );
         }
 
         if status_allows_empty_success_body(status) {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(
+            return redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
                 "upstream returned unexpected body for no-content response",
+                &request_redactor,
             );
         }
 
@@ -1320,22 +1704,25 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
             Ok(value) => value,
             Err(_) => {
                 tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-                return error_response(
+                return redacted_error_response(
                     UpstreamFormat::OpenAiResponses,
                     StatusCode::BAD_GATEWAY,
                     "upstream returned invalid JSON",
+                    &request_redactor,
                 );
             }
         };
         if let Err(message) = validate_openai_responses_resource_response_body(&upstream_body) {
             tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-            return error_response(
+            return redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
                 &message,
+                &request_redactor,
             );
         }
-        response_body_bytes = serde_json::to_vec(&upstream_body).unwrap_or_else(|_| b"{}".to_vec());
+        let public_body = request_redactor.redact_value(&upstream_body);
+        response_body_bytes = serde_json::to_vec(&public_body).unwrap_or_else(|_| b"{}".to_vec());
         tracker.finish_success(status.as_u16());
     } else {
         tracker.finish_error(status.as_u16());
@@ -1345,10 +1732,12 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
         } else {
             format!("upstream resource error body: {upstream_error_body}")
         };
-        return error_response(
+        let public_error_body = request_redactor.redact_text(&public_error_body);
+        return redacted_error_response(
             UpstreamFormat::OpenAiResponses,
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             &public_error_body,
+            &request_redactor,
         );
     }
 
@@ -1357,13 +1746,18 @@ async fn handle_openai_responses_resource_with_downstream_cancellation(
         .header("Content-Type", "application/json")
         .body(Body::from(response_body_bytes))
         .unwrap_or_else(|_| {
-            error_response(
+            redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
                 "failed to build upstream resource response",
+                &request_redactor,
             )
         });
-    append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+    append_upstream_protocol_response_headers(
+        &mut response,
+        &upstream_response_headers,
+        &request_redactor,
+    );
     response
 }
 
@@ -1372,6 +1766,7 @@ async fn handle_openai_responses_resource_stream_response(
     status: StatusCode,
     upstream_response_headers: reqwest::header::HeaderMap,
     resource_limits: ResourceLimits,
+    request_redactor: SecretRedactor,
     mut tracker: crate::telemetry::RequestTracker,
     downstream_cancellation: DownstreamCancellation,
 ) -> Response<Body> {
@@ -1388,14 +1783,16 @@ async fn handle_openai_responses_resource_stream_response(
                 upstream::ResponseBodyLimitError::LimitExceeded { limit },
             )) => {
                 tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-                let mut response = streaming_error_response(
+                let mut response = redacted_streaming_error_response(
                     UpstreamFormat::OpenAiResponses,
                     StatusCode::BAD_GATEWAY,
                     &format!("upstream error body exceeded resource limit of {limit} bytes"),
+                    &request_redactor,
                 );
                 append_upstream_protocol_response_headers(
                     &mut response,
                     &upstream_response_headers,
+                    &request_redactor,
                 );
                 return response;
             }
@@ -1413,21 +1810,28 @@ async fn handle_openai_responses_resource_stream_response(
         } else {
             format!("upstream streaming resource error body: {error_body}")
         };
-        let mut response = streaming_error_response(
+        let public_error_body = request_redactor.redact_text(&public_error_body);
+        let mut response = redacted_streaming_error_response(
             UpstreamFormat::OpenAiResponses,
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             &public_error_body,
+            &request_redactor,
         );
-        append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+        append_upstream_protocol_response_headers(
+            &mut response,
+            &upstream_response_headers,
+            &request_redactor,
+        );
         return response;
     }
 
     if !response_is_event_stream(&upstream_response_headers) {
         tracker.finish_error(StatusCode::BAD_GATEWAY.as_u16());
-        return streaming_error_response(
+        return redacted_streaming_error_response(
             UpstreamFormat::OpenAiResponses,
             StatusCode::BAD_GATEWAY,
             "upstream returned non-SSE response for streamed Responses resource",
+            &request_redactor,
         );
     }
 
@@ -1438,7 +1842,10 @@ async fn handle_openai_responses_resource_stream_response(
     .with_resource_limits(resource_limits);
     let body_stream: Pin<
         Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>,
-    > = Box::pin(guarded);
+    > = Box::pin(RedactingSseStream::new(
+        Box::pin(guarded),
+        request_redactor.clone(),
+    ));
     let body = Body::from_stream(TrackedBodyStream::new(
         body_stream,
         tracker,
@@ -1451,13 +1858,18 @@ async fn handle_openai_responses_resource_stream_response(
         .header(header::CONNECTION, "keep-alive")
         .body(body)
         .unwrap_or_else(|_| {
-            error_response(
+            redacted_error_response(
                 UpstreamFormat::OpenAiResponses,
                 StatusCode::BAD_GATEWAY,
                 "failed to build upstream resource stream response",
+                &request_redactor,
             )
         });
-    append_upstream_protocol_response_headers(&mut response, &upstream_response_headers);
+    append_upstream_protocol_response_headers(
+        &mut response,
+        &upstream_response_headers,
+        &request_redactor,
+    );
     response
 }
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Documented static `data_auth`, structured upstream provider credential
+  sources, and the redacted CAS-based `/admin/data-auth` control-plane endpoint,
+  including container replay requirements for runtime-only Admin API writes.
+
 ## v0.2.25 - 2026-04-28
 
 - Advanced the main-branch release identity to Cargo package version `0.2.25`, the next patch version after the occupied `v0.2.24` tag, without moving, deleting, or reusing the existing tag.

@@ -2,7 +2,7 @@
 
 **Version**: 1.0
 **Status**: Active
-**Last Updated**: 2026-04-27
+**Last Updated**: 2026-04-28
 
 ---
 
@@ -154,8 +154,14 @@ The proxy MUST support:
 - **Model aliases** — map local model names to `upstream:real_model` pairs
 - **Auto-discovery** — probe upstream to detect supported protocols when format is not explicitly set
 - **Credential policies**:
-  - `client_provider_key` — clients send provider keys directly; missing keys fail closed
-  - `proxy_key` — clients send `LLM_UNIVERSAL_PROXY_KEY`; upstream calls use `provider_key_env`
+  - `data_auth` — a process-wide static/global auth config that applies to all namespaces and all provider/model/resource routes; when omitted, `LLM_UNIVERSAL_PROXY_AUTH_MODE` and `LLM_UNIVERSAL_PROXY_KEY` remain the environment fallback
+  - `client_provider_key` — clients send provider keys directly; missing keys fail closed; upstream `provider_key.inline` is rejected, while upstream `provider_key.env` and `provider_key_env` are accepted for compatibility but not used
+  - `proxy_key` — clients send the configured proxy key; upstream calls require exactly one provider credential source on each routable upstream
+- **Provider credential sources**:
+  - `provider_key: { inline: "..." }` — inline provider key, accepted for controlled generated/local config and redacted from admin reads
+  - `provider_key: { env: "ENV" }` — structured env var source
+  - `provider_key_env: ENV` — legacy env var source kept for compatibility
+  - `provider_key.inline`, `provider_key.env`, and `provider_key_env` MUST be mutually exclusive and non-empty
 - **Discovery availability split**:
   - fixed-format upstreams are immediately available
   - auto-discovered upstreams are available only when discovery returns at least one supported protocol
@@ -192,6 +198,8 @@ Runtime configuration per namespace via admin API:
 - `POST /admin/namespaces/:namespace/config`
 - `GET /admin/state`
 - `GET /admin/namespaces/:namespace/state`
+- `GET /admin/data-auth`
+- `PUT /admin/data-auth`
 
 OpenAI Responses lifecycle routes MUST select only upstreams that are both:
 
@@ -220,6 +228,9 @@ The proxy MUST expose a separate admin control plane with these properties:
 - Admin read endpoints MUST use a dedicated read/view model rather than serializing the internal runtime `Config`.
 - Admin state responses MUST redact secrets and MUST NOT return provider keys or hook `authorization` values in plaintext.
 - Admin state responses SHOULD expose non-secret presence signals instead, such as whether a provider key or hook authorization is configured.
+- Admin namespace read responses MUST NOT return inline upstream provider keys; they should return non-secret provider-key source, configured, redacted, and env-name state where applicable.
+- `GET /admin/data-auth` MUST return a redacted data-auth snapshot and MUST NOT return inline proxy key values.
+- `PUT /admin/data-auth` MUST update the global data-plane auth config with CAS, must take effect for new requests immediately after commit, and must not persist plaintext keys.
 - Admin state responses MUST sanitize URLs before returning them and MUST NOT return userinfo.
 - Admin state URLs are sanitized display values and MUST NOT include userinfo, query, or fragment components.
 - Config validation MUST reject upstream `api_root` values or hook URLs that contain userinfo.
@@ -240,6 +251,10 @@ Admin namespace writes MUST use server-owned revisions with exact compare-and-sw
 - The legacy write body `{ "revision": string, "config": ... }` is no longer supported and MUST return `400 Bad Request`.
 - Requests that contain a `revision` field in the write body, whether alone or alongside `if_revision`, MUST return `400 Bad Request`.
 - Startup-created namespaces, including `default`, MUST also participate in server-owned revision/CAS behavior; the implementation MUST NOT rely on string ordering special cases such as `startup`.
+- Data-auth writes use the same CAS request shape on `PUT /admin/data-auth`: `{ "if_revision"?: string | null, "config": { "mode": ..., "proxy_key"?: ... } }`.
+- Data-auth CAS failures MUST return `412 Precondition Failed` and leave the previous data-auth revision active.
+- Data-auth mode switches MUST validate and rebuild all already-loaded namespaces before commit. If validation or rebuild fails, the write MUST fail without committing either the new data-auth config or partial namespace state.
+- Admin API data-auth writes are runtime-only; containers and controllers MUST replay them after restart when they are the source of truth.
 
 ---
 

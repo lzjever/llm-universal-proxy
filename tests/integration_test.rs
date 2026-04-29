@@ -20,7 +20,7 @@ use llm_universal_proxy::config::{
     ApplyPatchTransport, CompatibilityMode, Config, DebugTraceConfig, HookConfig,
     HookEndpointConfig, ModelAlias, ModelLimits, ModelModalities, ModelModality, ModelSurface,
     ModelSurfacePatch, ModelToolSurface, ProxyConfig, RuntimeConfigPayload, RuntimeHookConfig,
-    RuntimeUpstreamConfig, UpstreamConfig,
+    RuntimeUpstreamConfig, SecretSourceConfig, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::{
@@ -30,9 +30,11 @@ use reqwest::{Client as ReqwestClient, IntoUrl, RequestBuilder as ReqwestRequest
 use serde_json::json;
 use serde_json::Value;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 static ADMIN_TOKEN_ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -184,6 +186,7 @@ fn named_upstream(
         api_root: upstream_api_root(upstream_base, format),
         fixed_upstream_format: Some(format),
         provider_key_env: None,
+        provider_key: None,
         upstream_headers: Vec::new(),
         proxy: None,
         limits: None,
@@ -236,6 +239,7 @@ fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
             api_root: upstream_api_root(mock_base, UpstreamFormat::OpenAiCompletion),
             fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -580,6 +584,7 @@ fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -
             api_root: upstream_api_root(upstream_base, api_root_format),
             fixed_upstream_format: None,
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -589,6 +594,7 @@ fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     }
 }
 
@@ -819,6 +825,50 @@ async fn spawn_discovery_empty_mock() -> (
     (base, handle, captured)
 }
 
+async fn spawn_discovery_mock_that_blocks_after_startup() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    #[derive(Clone)]
+    struct BlockingDiscoveryState {
+        count: Arc<AtomicUsize>,
+        blocked_tx: Arc<AsyncMutex<Option<oneshot::Sender<()>>>>,
+        release_rx: Arc<AsyncMutex<Option<oneshot::Receiver<()>>>>,
+    }
+
+    async fn handler(State(state): State<BlockingDiscoveryState>) -> impl IntoResponse {
+        let count = state.count.fetch_add(1, Ordering::SeqCst) + 1;
+        if count > 4 {
+            if let Some(tx) = state.blocked_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = state.release_rx.lock().await.take() {
+                let _ = rx.await;
+            }
+        }
+        StatusCode::BAD_REQUEST
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let (blocked_tx, blocked_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let app = Router::new()
+        .fallback(any(handler))
+        .with_state(BlockingDiscoveryState {
+            count: Arc::new(AtomicUsize::new(0)),
+            blocked_tx: Arc::new(AsyncMutex::new(Some(blocked_tx))),
+            release_rx: Arc::new(AsyncMutex::new(Some(release_rx))),
+        });
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle, blocked_rx, release_tx)
+}
+
 async fn spawn_openai_completion_terminal_mock(
     finish_reason: &'static str,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -904,6 +954,7 @@ fn multi_native_responses_config(first_base: &str, second_base: &str) -> Config 
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     }
 }
 
@@ -928,6 +979,7 @@ fn pinned_responses_plus_auto_discovery_config(
                 api_root: auto_discovery_base.to_string(),
                 fixed_upstream_format: None,
                 provider_key_env: None,
+                provider_key: None,
                 upstream_headers: Vec::new(),
                 proxy: None,
                 limits: None,
@@ -938,6 +990,7 @@ fn pinned_responses_plus_auto_discovery_config(
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     }
 }
 
@@ -1116,6 +1169,145 @@ async fn empty_startup_config_keeps_health_route_available() {
 }
 
 #[tokio::test]
+async fn admin_bootstrap_empty_config_starts_without_data_auth_then_admin_config_enables_data_plane(
+) {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _admin_env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _auth_mode = ScopedEnvVar::remove(AUTH_MODE_ENV);
+    let _proxy_key = ScopedEnvVar::remove(PROXY_KEY_ENV);
+    let _admin_token = ScopedEnvVar::set("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN", "bootstrap-admin");
+
+    let (mock_base, _mock, captured) = spawn_auth_capture_anthropic_mock().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy_base = format!("http://127.0.0.1:{port}");
+    let _proxy = tokio::spawn(run_with_listener(Config::default(), listener));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = Client::raw();
+    let health = client
+        .get(format!("{proxy_base}/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let admin_state = client
+        .get(format!("{proxy_base}/admin/state"))
+        .header("authorization", "Bearer bootstrap-admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_state.status(), StatusCode::OK);
+
+    let fail_closed = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", "Bearer bootstrap-proxy-key")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fail_closed.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let data_auth_state: Value = client
+        .get(format!("{proxy_base}/admin/data-auth"))
+        .header("authorization", "Bearer bootstrap-admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data_auth_revision = data_auth_state["revision"].as_str().unwrap().to_string();
+    let data_auth_update = client
+        .put(format!("{proxy_base}/admin/data-auth"))
+        .header("authorization", "Bearer bootstrap-admin")
+        .json(&json!({
+            "if_revision": data_auth_revision,
+            "config": {
+                "mode": "proxy_key",
+                "proxy_key": { "inline": "bootstrap-proxy-key" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(data_auth_update.status(), StatusCode::OK);
+
+    let namespace_update = client
+        .post(format!("{proxy_base}/admin/namespaces/bootstrap/config"))
+        .header("authorization", "Bearer bootstrap-admin")
+        .json(&json!({
+            "if_revision": null,
+            "config": {
+                "listen": "127.0.0.1:0",
+                "upstream_timeout_secs": 30,
+                "compatibility_mode": "balanced",
+                "proxy": "direct",
+                "upstreams": [{
+                    "name": "default",
+                    "api_root": upstream_api_root(&mock_base, UpstreamFormat::Anthropic),
+                    "fixed_upstream_format": "anthropic",
+                    "provider_key": { "inline": "bootstrap-provider-secret" }
+                }],
+                "model_aliases": {}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(namespace_update.status(), StatusCode::OK);
+
+    let ok = client
+        .post(format!(
+            "{proxy_base}/namespaces/bootstrap/openai/v1/chat/completions"
+        ))
+        .header("authorization", "Bearer bootstrap-proxy-key")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let body: Value = ok.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "Hi");
+
+    let requests = captured.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let api_key = requests[0]
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(api_key, Some("bootstrap-provider-secret"));
+}
+
+#[tokio::test]
+async fn non_empty_static_config_without_data_auth_or_env_rejects_startup() {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _auth_mode = ScopedEnvVar::remove(AUTH_MODE_ENV);
+    let _proxy_key = ScopedEnvVar::remove(PROXY_KEY_ENV);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = proxy_config("https://example.com", UpstreamFormat::OpenAiCompletion);
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        run_with_listener(config, listener),
+    )
+    .await
+    .expect("server should reject missing data_auth before serving");
+    let error = result.expect_err("non-empty static config must require data_auth or env fallback");
+    assert!(error.to_string().contains("data auth"));
+}
+
+#[tokio::test]
 async fn readiness_reports_not_ready_until_namespace_config_exists() {
     let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
     let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
@@ -1248,6 +1440,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
             api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
             fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: vec![
                 ("x-tenant".to_string(), "demo".to_string()),
                 ("cookie".to_string(), "session=secret".to_string()),
@@ -1754,6 +1947,698 @@ async fn admin_dynamic_config_allows_proxy_key_mode_with_provider_key_env() {
 }
 
 #[tokio::test]
+async fn admin_namespace_provider_key_inline_hot_swaps_and_state_redacts_secret() {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _admin_env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+
+    let (mock_base, _mock, captured) = spawn_auth_capture_anthropic_mock().await;
+    let (proxy_base, _proxy) =
+        start_proxy_with_data_auth(Config::default(), DataAuthConfig::proxy_key("proxy-secret"))
+            .await;
+    let client = Client::raw();
+
+    let namespace_config = |provider_key: &str| {
+        json!({
+            "listen": "127.0.0.1:0",
+            "upstream_timeout_secs": 30,
+            "compatibility_mode": "balanced",
+            "proxy": "direct",
+            "upstreams": [{
+                "name": "default",
+                "api_root": upstream_api_root(&mock_base, UpstreamFormat::Anthropic),
+                "fixed_upstream_format": "anthropic",
+                "provider_key": { "inline": provider_key }
+            }],
+            "model_aliases": {}
+        })
+    };
+
+    let create = client
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
+        .json(&json!({
+            "if_revision": null,
+            "config": namespace_config("old-provider-secret"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let create_body: Value = create.json().await.unwrap();
+    let first_revision = create_body["revision"].as_str().unwrap().to_string();
+
+    let first = client
+        .post(format!(
+            "{proxy_base}/namespaces/demo/openai/v1/chat/completions"
+        ))
+        .header("authorization", "Bearer proxy-secret")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success(), "status: {}", first.status());
+
+    let state: Value = client
+        .get(format!("{proxy_base}/admin/namespaces/demo/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        state["config"]["upstreams"][0]["provider_key"]["source"],
+        "inline"
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["provider_key"]["configured"],
+        true
+    );
+    assert_eq!(
+        state["config"]["upstreams"][0]["provider_key"]["redacted"],
+        true
+    );
+    assert!(!serde_json::to_string(&state)
+        .unwrap()
+        .contains("old-provider-secret"));
+
+    let update = client
+        .post(format!("{proxy_base}/admin/namespaces/demo/config"))
+        .json(&json!({
+            "if_revision": first_revision,
+            "config": namespace_config("new-provider-secret"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let second = client
+        .post(format!(
+            "{proxy_base}/namespaces/demo/openai/v1/chat/completions"
+        ))
+        .header("authorization", "Bearer proxy-secret")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(second.status().is_success(), "status: {}", second.status());
+
+    let requests = captured.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let first_key = requests[0]
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+        .map(|(_, value)| value.as_str());
+    let second_key = requests[1]
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(first_key, Some("old-provider-secret"));
+    assert_eq!(second_key, Some("new-provider-secret"));
+}
+
+#[tokio::test]
+async fn static_data_auth_inline_and_admin_put_hot_swaps_proxy_key() {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _admin_env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let _auth_mode = ScopedEnvVar::remove(AUTH_MODE_ENV);
+    let _proxy_key = ScopedEnvVar::remove(PROXY_KEY_ENV);
+
+    let (mock_base, _mock, captured) = spawn_auth_capture_anthropic_mock().await;
+    let config = Config::from_yaml_str(&format!(
+        r#"
+listen: 127.0.0.1:0
+data_auth:
+  mode: proxy_key
+  proxy_key:
+    inline: old-proxy-key
+proxy: direct
+upstreams:
+  default:
+    api_root: {}
+    format: anthropic
+    provider_key:
+      inline: static-provider-secret
+"#,
+        upstream_api_root(&mock_base, UpstreamFormat::Anthropic)
+    ))
+    .expect("static data_auth and inline provider key should parse");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy_base = format!("http://127.0.0.1:{port}");
+    let _proxy = tokio::spawn(run_with_listener(config, listener));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = Client::raw();
+    let old_ok = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", "Bearer old-proxy-key")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(old_ok.status().is_success(), "status: {}", old_ok.status());
+
+    let data_auth_state: Value = client
+        .get(format!("{proxy_base}/admin/data-auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let revision = data_auth_state["revision"].as_str().unwrap().to_string();
+    assert_eq!(data_auth_state["config"]["mode"], "proxy_key");
+    assert_eq!(data_auth_state["config"]["proxy_key"]["source"], "inline");
+    assert_eq!(data_auth_state["config"]["proxy_key"]["redacted"], true);
+    assert!(!data_auth_state.to_string().contains("old-proxy-key"));
+
+    let update = client
+        .put(format!("{proxy_base}/admin/data-auth"))
+        .json(&json!({
+            "if_revision": revision,
+            "config": {
+                "mode": "proxy_key",
+                "proxy_key": { "inline": "new-proxy-key" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let update_body: Value = update.json().await.unwrap();
+    assert_ne!(update_body["revision"], data_auth_state["revision"]);
+    assert!(!update_body.to_string().contains("new-proxy-key"));
+
+    let old_rejected = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", "Bearer old-proxy-key")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old_rejected.status(), StatusCode::FORBIDDEN);
+
+    let new_ok = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", "Bearer new-proxy-key")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(new_ok.status().is_success(), "status: {}", new_ok.status());
+
+    let requests = captured.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        let api_key = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(api_key, Some("static-provider-secret"));
+    }
+}
+
+#[tokio::test]
+async fn admin_put_data_auth_wrong_shape_does_not_echo_inline_secret() {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _admin_env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+
+    let sentinel = "sentinel-data-auth-wrong-shape-secret";
+    let (proxy_base, _proxy) =
+        start_proxy_with_data_auth(Config::default(), DataAuthConfig::client_provider_key()).await;
+
+    let response = Client::raw()
+        .put(format!("{proxy_base}/admin/data-auth"))
+        .json(&json!({
+            "config": {
+                "mode": "proxy_key",
+                "proxy_key": sentinel
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        !body.contains(sentinel),
+        "wrong-shaped data-auth errors must not echo inline secrets: {body}"
+    );
+}
+
+#[tokio::test]
+async fn admin_put_data_auth_does_not_overwrite_concurrent_namespace_cas_update() {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _admin_env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let _provider_key = ScopedEnvVar::set(PROVIDER_KEY_ENV, "server-provider-secret");
+
+    let (discovery_base, _discovery, blocked_rx, release_tx) =
+        spawn_discovery_mock_that_blocks_after_startup().await;
+    let config = Config {
+        listen: "127.0.0.1:0".to_string(),
+        upstream_timeout: Duration::from_secs(30),
+        compatibility_mode: CompatibilityMode::Balanced,
+        proxy: Some(ProxyConfig::Direct),
+        upstreams: vec![UpstreamConfig {
+            name: "AUTO".to_string(),
+            api_root: discovery_base,
+            fixed_upstream_format: None,
+            provider_key_env: Some(PROVIDER_KEY_ENV.to_string()),
+            provider_key: None,
+            upstream_headers: Vec::new(),
+            proxy: None,
+            limits: None,
+            surface_defaults: None,
+        }],
+        model_aliases: Default::default(),
+        hooks: Default::default(),
+        debug_trace: DebugTraceConfig::default(),
+        resource_limits: Default::default(),
+        data_auth: None,
+    };
+    let (proxy_base, _proxy) =
+        start_proxy_with_data_auth(config, DataAuthConfig::client_provider_key()).await;
+    let client = Client::raw();
+
+    let namespace_state = default_namespace_state(&proxy_base).await;
+    let namespace_revision = namespace_state["revision"].as_str().unwrap().to_string();
+    let data_auth_state: Value = client
+        .get(format!("{proxy_base}/admin/data-auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data_auth_revision = data_auth_state["revision"].as_str().unwrap().to_string();
+
+    let data_auth_update = {
+        let proxy_base = proxy_base.clone();
+        let client = Client::raw();
+        tokio::spawn(async move {
+            client
+                .put(format!("{proxy_base}/admin/data-auth"))
+                .json(&json!({
+                    "if_revision": data_auth_revision,
+                    "config": {
+                        "mode": "proxy_key",
+                        "proxy_key": { "inline": "new-proxy-key" }
+                    }
+                }))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+
+    blocked_rx
+        .await
+        .expect("data-auth rebuild should block inside discovery");
+
+    let (new_mock_base, _new_mock) = spawn_openai_completion_mock().await;
+    let expected_api_root = upstream_api_root(&new_mock_base, UpstreamFormat::OpenAiCompletion);
+    let mut namespace_payload = demo_runtime_config(&new_mock_base);
+    namespace_payload.upstreams[0].provider_key_env = Some(PROVIDER_KEY_ENV.to_string());
+    let mut namespace_update = {
+        let proxy_base = proxy_base.clone();
+        let client = Client::new();
+        tokio::spawn(async move {
+            client
+                .post(format!("{proxy_base}/admin/namespaces/default/config"))
+                .json(&json!({
+                    "if_revision": namespace_revision,
+                    "config": namespace_payload
+                }))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    let namespace_result_before_release =
+        tokio::time::timeout(Duration::from_millis(250), &mut namespace_update).await;
+    let namespace_finished_before_release = match namespace_result_before_release {
+        Ok(result) => {
+            assert_eq!(result.unwrap().status(), StatusCode::OK);
+            true
+        }
+        Err(_) => false,
+    };
+
+    let _ = release_tx.send(());
+    let data_auth_response = data_auth_update.await.unwrap();
+    assert_eq!(data_auth_response.status(), StatusCode::OK);
+    if !namespace_finished_before_release {
+        let namespace_response = namespace_update.await.unwrap();
+        assert_eq!(namespace_response.status(), StatusCode::OK);
+    }
+
+    let final_data_auth: Value = client
+        .get(format!("{proxy_base}/admin/data-auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(final_data_auth["config"]["mode"], "proxy_key");
+
+    let final_namespace = default_namespace_state(&proxy_base).await;
+    assert_eq!(
+        final_namespace["config"]["upstreams"][0]["api_root"],
+        expected_api_root
+    );
+}
+
+#[tokio::test]
+async fn static_data_auth_env_starts_with_proxy_key_from_named_env() {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _admin_env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let _auth_mode = ScopedEnvVar::remove(AUTH_MODE_ENV);
+    let _proxy_key = ScopedEnvVar::set(PROXY_KEY_ENV, "env-proxy-key");
+
+    let (mock_base, _mock, captured) = spawn_auth_capture_anthropic_mock().await;
+    let config = Config::from_yaml_str(&format!(
+        r#"
+listen: 127.0.0.1:0
+data_auth:
+  mode: proxy_key
+  proxy_key:
+    env: {}
+proxy: direct
+upstreams:
+  default:
+    api_root: {}
+    format: anthropic
+    provider_key:
+      inline: env-mode-provider-secret
+"#,
+        PROXY_KEY_ENV,
+        upstream_api_root(&mock_base, UpstreamFormat::Anthropic)
+    ))
+    .expect("static data_auth env should parse");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy_base = format!("http://127.0.0.1:{port}");
+    let _proxy = tokio::spawn(run_with_listener(config, listener));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let response = Client::raw()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", "Bearer env-proxy-key")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "status: {}",
+        response.status()
+    );
+
+    let state: Value = Client::raw()
+        .get(format!("{proxy_base}/admin/data-auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["config"]["proxy_key"]["source"], "env");
+    assert_eq!(state["config"]["proxy_key"]["env_name"], PROXY_KEY_ENV);
+    assert!(!state.to_string().contains("env-proxy-key"));
+
+    let requests = captured.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let api_key = requests[0]
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(api_key, Some("env-mode-provider-secret"));
+}
+
+#[tokio::test]
+async fn admin_put_data_auth_rejects_mode_switch_that_invalidates_loaded_namespace_without_partial_commit(
+) {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _admin_env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let _auth_mode = ScopedEnvVar::remove(AUTH_MODE_ENV);
+    let _proxy_key = ScopedEnvVar::remove(PROXY_KEY_ENV);
+
+    let (mock_base, _mock, captured) = spawn_auth_capture_anthropic_mock().await;
+    let config = Config::from_yaml_str(&format!(
+        r#"
+listen: 127.0.0.1:0
+data_auth:
+  mode: proxy_key
+  proxy_key:
+    inline: old-proxy-key
+proxy: direct
+upstreams:
+  default:
+    api_root: {}
+    format: anthropic
+    provider_key:
+      inline: server-provider-secret
+"#,
+        upstream_api_root(&mock_base, UpstreamFormat::Anthropic)
+    ))
+    .expect("static proxy_key config should parse");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy_base = format!("http://127.0.0.1:{port}");
+    let _proxy = tokio::spawn(run_with_listener(config, listener));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = Client::raw();
+    let state: Value = client
+        .get(format!("{proxy_base}/admin/data-auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let revision = state["revision"].as_str().unwrap().to_string();
+
+    let rejected = client
+        .put(format!("{proxy_base}/admin/data-auth"))
+        .json(&json!({
+            "if_revision": revision,
+            "config": { "mode": "client_provider_key" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body = rejected.text().await.unwrap();
+    assert!(body.contains("provider_key.inline"), "{body}");
+    assert!(!body.contains("server-provider-secret"));
+
+    let unchanged: Value = client
+        .get(format!("{proxy_base}/admin/data-auth"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(unchanged["revision"], state["revision"]);
+    assert_eq!(unchanged["config"]["mode"], "proxy_key");
+    assert!(!unchanged.to_string().contains("old-proxy-key"));
+
+    let ok = client
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", "Bearer old-proxy-key")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success(), "status: {}", ok.status());
+    assert_eq!(captured.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn static_data_auth_client_provider_key_forwards_client_credential_and_ignores_env_source() {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _admin_env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let _auth_mode = ScopedEnvVar::remove(AUTH_MODE_ENV);
+    let _proxy_key = ScopedEnvVar::remove(PROXY_KEY_ENV);
+    let _provider_key = ScopedEnvVar::set(PROVIDER_KEY_ENV, "server-env-secret");
+
+    let (mock_base, _mock, captured) = spawn_auth_capture_anthropic_mock().await;
+    let config = Config::from_yaml_str(&format!(
+        r#"
+listen: 127.0.0.1:0
+data_auth:
+  mode: client_provider_key
+proxy: direct
+upstreams:
+  default:
+    api_root: {}
+    format: anthropic
+    provider_key:
+      env: {}
+"#,
+        upstream_api_root(&mock_base, UpstreamFormat::Anthropic),
+        PROVIDER_KEY_ENV
+    ))
+    .expect("static client_provider_key data_auth should parse");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy_base = format!("http://127.0.0.1:{port}");
+    let _proxy = tokio::spawn(run_with_listener(config, listener));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let response = Client::raw()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", "Bearer client-provider-secret")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "status: {}",
+        response.status()
+    );
+
+    let requests = captured.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let api_key = requests[0]
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+        .map(|(_, value)| value.as_str());
+    assert_eq!(api_key, Some("client-provider-secret"));
+}
+
+#[tokio::test]
+async fn client_provider_key_mode_ignores_env_provider_source_and_rejects_inline_provider_key() {
+    let _data_env_guard = DATA_SECURITY_ENV_LOCK.lock().await;
+    let _provider_key = ScopedEnvVar::set(PROVIDER_KEY_ENV, "server-env-secret");
+
+    let (mock_base, _mock, captured) = spawn_auth_capture_anthropic_mock().await;
+    let env_config = Config::from_yaml_str(&format!(
+        r#"
+listen: 127.0.0.1:0
+proxy: direct
+upstreams:
+  default:
+    api_root: {}
+    format: anthropic
+    provider_key:
+      env: {}
+"#,
+        upstream_api_root(&mock_base, UpstreamFormat::Anthropic),
+        PROVIDER_KEY_ENV
+    ))
+    .expect("env provider source should parse");
+    let (proxy_base, _proxy) =
+        start_proxy_with_data_auth(env_config, DataAuthConfig::client_provider_key()).await;
+
+    let ok = Client::raw()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", "Bearer client-provider-secret")
+        .json(&json!({
+            "model": "claude-3",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success(), "status: {}", ok.status());
+    {
+        let requests = captured.requests.lock().unwrap();
+        let api_key = requests[0]
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-api-key"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(api_key, Some("client-provider-secret"));
+    }
+
+    let inline_config = Config::from_yaml_str(&format!(
+        r#"
+listen: 127.0.0.1:0
+proxy: direct
+upstreams:
+  default:
+    api_root: {}
+    format: anthropic
+    provider_key:
+      inline: unused-server-secret
+"#,
+        upstream_api_root(&mock_base, UpstreamFormat::Anthropic)
+    ))
+    .expect("inline provider source should parse");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        run_with_listener_with_data_auth(
+            inline_config,
+            listener,
+            DataAuthConfig::client_provider_key(),
+        ),
+    )
+    .await
+    .expect("server should reject inline provider key before serving");
+    let error = result.expect_err("client_provider_key must reject inline provider key");
+    assert!(!error.to_string().contains("unused-server-secret"));
+    assert!(error.to_string().contains("provider_key.inline"));
+}
+
+#[tokio::test]
 async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization() {
     let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
     let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
@@ -1779,6 +2664,7 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
                     api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
                     provider_key_env: Some("DEMO_KEY".to_string()),
+                    provider_key: None,
                     upstream_headers: vec![
                         ("x-tenant".to_string(), "demo".to_string()),
                         ("cookie".to_string(), "session=secret".to_string()),
@@ -1974,6 +2860,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source_over_http() {
                     api_root: upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
                     provider_key_env: None,
+                    provider_key: None,
                     upstream_headers: Vec::new(),
                     proxy: None,
                     limits: None,
@@ -2337,6 +3224,7 @@ async fn proxy_key_auth_uses_provider_key_env_and_does_not_forward_or_hook_proxy
             api_root: upstream_api_root(&mock_base, UpstreamFormat::Anthropic),
             fixed_upstream_format: Some(UpstreamFormat::Anthropic),
             provider_key_env: Some(PROVIDER_KEY_ENV.to_string()),
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -2359,6 +3247,7 @@ async fn proxy_key_auth_uses_provider_key_env_and_does_not_forward_or_hook_proxy
         },
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) =
         start_proxy_with_data_auth(config, DataAuthConfig::proxy_key("proxy-secret")).await;
@@ -2430,6 +3319,7 @@ async fn proxy_key_mode_without_provider_key_env_fails_closed_at_startup() {
             api_root: "https://example.com/v1".to_string(),
             fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -2439,6 +3329,7 @@ async fn proxy_key_mode_without_provider_key_env_fails_closed_at_startup() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
 
     let result = tokio::time::timeout(
@@ -2462,6 +3353,7 @@ fn config_with_upstream_header(header_name: &str) -> Config {
             api_root: "https://example.com/v1".to_string(),
             fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: vec![(header_name.to_string(), "server-held-value".to_string())],
             proxy: None,
             limits: None,
@@ -2471,6 +3363,7 @@ fn config_with_upstream_header(header_name: &str) -> Config {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     }
 }
 
@@ -3201,6 +4094,7 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
             api_root: mock_base.clone(),
             fixed_upstream_format: None,
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -3210,6 +4104,7 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -3346,6 +4241,7 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
             api_root: mock_base,
             fixed_upstream_format: None,
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -3355,6 +4251,7 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -3416,6 +4313,7 @@ async fn openai_responses_create_with_alias_routes_to_configured_upstream() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -3719,6 +4617,7 @@ async fn responses_stateful_request_without_model_routes_to_unique_native_respon
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -3761,6 +4660,7 @@ async fn stateful_model_less_create_returns_503_when_unique_configured_native_ow
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -5252,6 +6152,12 @@ struct CapturedHookPayloads {
     payloads: Arc<Mutex<Vec<Value>>>,
 }
 
+impl CapturedHookPayloads {
+    fn snapshot(&self) -> Vec<Value> {
+        self.payloads.lock().unwrap().clone()
+    }
+}
+
 async fn spawn_auth_capture_anthropic_mock(
 ) -> (String, tokio::task::JoinHandle<()>, CapturedAuthRequests) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5435,6 +6341,74 @@ async fn capture_hook_handler(
     (axum::http::StatusCode::OK, Json(json!({"ok": true})))
 }
 
+async fn wait_for_hook_payloads(captured: &CapturedHookPayloads, count: usize) -> Vec<Value> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let payloads = captured.snapshot();
+            if payloads.len() >= count {
+                return payloads;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("expected hook payloads to arrive")
+}
+
+async fn spawn_secret_openai_completion_mock(
+    content: String,
+) -> (String, tokio::task::JoinHandle<()>) {
+    async fn handler(State(content): State<Arc<String>>, Json(body): Json<Value>) -> Response {
+        let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        if stream {
+            let escaped_content = serde_json::to_string(&*content).unwrap();
+            let body = format!(
+                concat!(
+                    "data: {{\"id\":\"chatcmpl_hook_redaction\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n",
+                    "data: {{\"id\":\"chatcmpl_hook_redaction\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":null}}]}}\n\n",
+                    "data: {{\"id\":\"chatcmpl_hook_redaction\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                escaped_content
+            );
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/event-stream")
+                .body(Body::from(body))
+                .unwrap();
+        }
+
+        (
+            StatusCode::OK,
+            Json(json!({
+                "id": "chatcmpl_hook_redaction",
+                "object": "chat.completion",
+                "created": 1,
+                "model": body.get("model").cloned().unwrap_or_else(|| json!("gpt-4")),
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": &*content },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            })),
+        )
+            .into_response()
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handler))
+        .route("/chat/completions", post(handler))
+        .with_state(Arc::new(content));
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (base, handle)
+}
+
 async fn spawn_slow_openai_completion_mock() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -5546,6 +6520,7 @@ async fn multi_upstream_supports_explicit_upstream_model_selector() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -5598,6 +6573,7 @@ async fn multi_upstream_supports_local_model_alias() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -5640,6 +6616,7 @@ async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -5677,6 +6654,7 @@ async fn multi_upstream_uses_client_provider_key() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
@@ -5719,6 +6697,7 @@ async fn proxy_key_auth_ignores_raw_client_provider_key() {
             api_root: upstream_api_root(&glm_base, UpstreamFormat::Anthropic),
             fixed_upstream_format: Some(UpstreamFormat::Anthropic),
             provider_key_env: Some(PROVIDER_KEY_ENV.to_string()),
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -5728,6 +6707,7 @@ async fn proxy_key_auth_ignores_raw_client_provider_key() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) =
         start_proxy_with_data_auth(config, DataAuthConfig::proxy_key("proxy-secret")).await;
@@ -5812,6 +6792,125 @@ async fn usage_and_exchange_hooks_fire_for_non_streaming_requests() {
         .unwrap();
     assert_eq!(usage["usage"]["input_tokens"], 1);
     assert_eq!(usage["usage"]["output_tokens"], 1);
+}
+
+#[tokio::test]
+async fn exchange_hook_non_stream_success_uses_public_redacted_response_body() {
+    let provider_secret = "hook-non-stream-provider-secret";
+    let proxy_secret = "hook-non-stream-proxy-client-secret";
+    let content =
+        format!("provider={provider_secret}; client={proxy_secret}; proxy={proxy_secret}");
+    let (mock_base, _mock) = spawn_secret_openai_completion_mock(content).await;
+    let (hook_base, _hook, captured) = spawn_hook_capture_server().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    config.upstreams[0].provider_key = Some(SecretSourceConfig {
+        inline: Some(provider_secret.to_string()),
+        env: None,
+    });
+    config.hooks = HookConfig {
+        max_pending_bytes: 100 * 1024 * 1024,
+        timeout: Duration::from_secs(3),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(300),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{hook_base}/hook"),
+            authorization: None,
+        }),
+        usage: None,
+    };
+    let (proxy_base, _proxy) =
+        start_proxy_with_data_auth(config, DataAuthConfig::proxy_key(proxy_secret)).await;
+
+    let response = Client::raw()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", format!("Bearer {proxy_secret}"))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let public_body: Value = response.json().await.unwrap();
+    let public_text = serde_json::to_string(&public_body).unwrap();
+    assert!(!public_text.contains(provider_secret), "{public_text}");
+    assert!(!public_text.contains(proxy_secret), "{public_text}");
+    assert!(public_text.contains("[REDACTED]"), "{public_text}");
+
+    let payloads = wait_for_hook_payloads(&captured, 1).await;
+    let exchange = payloads
+        .iter()
+        .find(|payload| payload.get("request").is_some())
+        .unwrap();
+    let hook_body = &exchange["response"]["body"];
+    assert_eq!(hook_body, &public_body);
+    let hook_text = serde_json::to_string(exchange).unwrap();
+    assert!(!hook_text.contains(provider_secret), "{hook_text}");
+    assert!(!hook_text.contains(proxy_secret), "{hook_text}");
+    assert!(hook_text.contains("[REDACTED]"), "{hook_text}");
+}
+
+#[tokio::test]
+async fn exchange_hook_stream_success_uses_redacted_sse_capture() {
+    let provider_secret = "hook-stream-provider-secret";
+    let proxy_secret = "hook-stream-proxy-client-secret";
+    let content =
+        format!("provider={provider_secret}; client={proxy_secret}; proxy={proxy_secret}");
+    let (mock_base, _mock) = spawn_secret_openai_completion_mock(content).await;
+    let (hook_base, _hook, captured) = spawn_hook_capture_server().await;
+    let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
+    config.upstreams[0].provider_key = Some(SecretSourceConfig {
+        inline: Some(provider_secret.to_string()),
+        env: None,
+    });
+    config.hooks = HookConfig {
+        max_pending_bytes: 100 * 1024 * 1024,
+        timeout: Duration::from_secs(3),
+        failure_threshold: 3,
+        cooldown: Duration::from_secs(300),
+        exchange: Some(HookEndpointConfig {
+            url: format!("{hook_base}/hook"),
+            authorization: None,
+        }),
+        usage: None,
+    };
+    let (proxy_base, _proxy) =
+        start_proxy_with_data_auth(config, DataAuthConfig::proxy_key(proxy_secret)).await;
+
+    let response = Client::raw()
+        .post(format!("{proxy_base}/openai/v1/chat/completions"))
+        .header("authorization", format!("Bearer {proxy_secret}"))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let public_sse = response.text().await.unwrap();
+    assert!(public_sse.contains("data:"), "{public_sse}");
+    assert!(public_sse.contains("[DONE]"), "{public_sse}");
+    assert!(!public_sse.contains(provider_secret), "{public_sse}");
+    assert!(!public_sse.contains(proxy_secret), "{public_sse}");
+    assert!(public_sse.contains("[REDACTED]"), "{public_sse}");
+
+    let payloads = wait_for_hook_payloads(&captured, 1).await;
+    let exchange = payloads
+        .iter()
+        .find(|payload| payload.get("request").is_some())
+        .unwrap();
+    let hook_text = serde_json::to_string(exchange).unwrap();
+    assert!(!hook_text.contains(provider_secret), "{hook_text}");
+    assert!(!hook_text.contains(proxy_secret), "{hook_text}");
+    assert!(hook_text.contains("[REDACTED]"), "{hook_text}");
+    assert_eq!(
+        exchange["response"]["body"]["choices"][0]["message"]["content"],
+        "provider=[REDACTED]; client=[REDACTED]; proxy=[REDACTED]"
+    );
 }
 
 #[tokio::test]
@@ -6705,6 +7804,7 @@ async fn upstream_unreachable_returns_502() {
             api_root: "http://127.0.0.1:31999/v1".to_string(),
             fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
             provider_key_env: None,
+            provider_key: None,
             upstream_headers: Vec::new(),
             proxy: None,
             limits: None,
@@ -6714,6 +7814,7 @@ async fn upstream_unreachable_returns_502() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
 

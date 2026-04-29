@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::config::{HookConfig, HookEndpointConfig};
+use crate::config::{sanitize_url_for_admin, HookConfig, HookEndpointConfig};
 use crate::formats::UpstreamFormat;
 use crate::streaming::take_one_sse_event;
 
@@ -919,6 +919,7 @@ impl HookSender {
     }
 
     async fn send(self, payload: Vec<u8>, payload_len: usize) {
+        let log_url = sanitize_url_for_admin(&self.config.url);
         let mut req = self
             .client
             .post(&self.config.url)
@@ -938,15 +939,16 @@ impl HookSender {
                 warn!(
                     "hook delivery failed: kind={:?} url={} status={}",
                     self.kind,
-                    self.config.url,
+                    log_url,
                     resp.status()
                 );
             }
             Err(err) => {
                 self.runtime.record_failure(self.kind);
+                let err = err.without_url();
                 warn!(
                     "hook delivery error: kind={:?} url={} error={}",
-                    self.kind, self.config.url, err
+                    self.kind, log_url, err
                 );
             }
         }
@@ -1988,6 +1990,89 @@ mod tests {
     use std::task::Context;
     use std::task::Poll;
 
+    #[derive(Clone, Default)]
+    struct CapturedTraceWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CapturedTraceWriter {
+        fn contents(&self) -> String {
+            let bytes = self.buffer.lock().expect("trace buffer lock").clone();
+            String::from_utf8(bytes).expect("trace logs utf8")
+        }
+    }
+
+    struct CapturedTraceSink {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for CapturedTraceSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("trace buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedTraceWriter {
+        type Writer = CapturedTraceSink;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedTraceSink {
+                buffer: self.buffer.clone(),
+            }
+        }
+    }
+
+    async fn capture_warn_logs<F, T>(future: F) -> (T, String)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let writer = CapturedTraceWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        let output = future.await;
+        drop(guard);
+        (output, writer.contents())
+    }
+
+    fn assert_hook_delivery_log_uses_sanitized_url(logs: &str, raw_url: &str, event: &str) {
+        let sanitized_url = crate::config::sanitize_url_for_admin(raw_url);
+        assert!(
+            logs.contains(event),
+            "expected {event} log, logs = {logs:?}"
+        );
+        assert!(
+            logs.contains(&sanitized_url),
+            "expected sanitized URL {sanitized_url:?}, logs = {logs:?}"
+        );
+        for secret in [
+            "user:pass",
+            "pass@",
+            "token=secret",
+            "secret",
+            "#frag",
+            "frag",
+        ] {
+            assert!(
+                !logs.contains(secret),
+                "hook delivery log leaked {secret:?}: {logs:?}"
+            );
+        }
+    }
+
     fn runtime(
         max_pending_bytes: usize,
         failure_threshold: usize,
@@ -2026,6 +2111,69 @@ mod tests {
         assert!(runtime.can_attempt(HookKind::Usage));
         runtime.record_success(HookKind::Usage);
         assert!(runtime.can_attempt(HookKind::Usage));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hook_delivery_error_log_sanitizes_url_secret() {
+        let raw_url = "https://user:pass@example.test/hook?token=secret#frag";
+        let runtime = Arc::new(runtime(1024, 3, 100));
+        let sender = HookSender {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .expect("hook client"),
+            config: HookEndpointConfig {
+                url: raw_url.to_string(),
+                authorization: None,
+            },
+            kind: HookKind::Usage,
+            runtime: runtime.clone(),
+        };
+
+        let (_, logs) = capture_warn_logs(sender.send(b"{}".to_vec(), 2)).await;
+
+        assert_hook_delivery_log_uses_sanitized_url(&logs, raw_url, "hook delivery error");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hook_delivery_status_log_sanitizes_url_secret() {
+        async fn fail_hook() -> axum::http::StatusCode {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let app = axum::Router::new().route("/hook", axum::routing::post(fail_hook));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hook status mock");
+        let addr = listener.local_addr().expect("hook status mock addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("hook status mock server");
+        });
+        let raw_url = format!("http://user:pass@{addr}/hook?token=secret#frag");
+        let runtime = Arc::new(runtime(1024, 3, 100));
+        let sender = HookSender {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .expect("hook client"),
+            config: HookEndpointConfig {
+                url: raw_url.clone(),
+                authorization: None,
+            },
+            kind: HookKind::Usage,
+            runtime: runtime.clone(),
+        };
+
+        let (_, logs) = capture_warn_logs(sender.send(b"{}".to_vec(), 2)).await;
+        server.abort();
+
+        assert_hook_delivery_log_uses_sanitized_url(&logs, &raw_url, "hook delivery failed");
+        assert!(
+            logs.contains("500 Internal Server Error"),
+            "expected failure status in logs, logs = {logs:?}"
+        );
     }
 
     #[test]

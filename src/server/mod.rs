@@ -9,6 +9,7 @@ mod models;
 mod proxy;
 mod public_boundary;
 mod responses_resources;
+mod secret_redaction;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -31,7 +32,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 use tracing::info;
 
@@ -147,12 +148,12 @@ fn init_tracing(dashboard_enabled: bool) -> Result<(), Box<dyn std::error::Error
 }
 
 /// Run the proxy on an already-bound listener. Used by integration tests to bind to port 0 and get the port.
-pub fn run_with_listener(
+pub async fn run_with_listener(
     config: Config,
     listener: tokio::net::TcpListener,
-) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-    let data_access = data_auth::DataAccess::from_env();
-    async move { run_with_listener_internal(config, listener, data_access).await }
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let data_auth = data_auth::RuntimeDataAuthState::from_static_config(config.data_auth.as_ref());
+    run_with_listener_internal(config, listener, data_auth).await
 }
 
 #[doc(hidden)]
@@ -161,48 +162,70 @@ pub async fn run_with_listener_with_data_auth(
     listener: tokio::net::TcpListener,
     data_auth: DataAuthConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_listener_internal(config, listener, data_auth.access).await
+    run_with_listener_internal(
+        config,
+        listener,
+        data_auth::RuntimeDataAuthState::from_access(data_auth.access),
+    )
+    .await
 }
 
 async fn run_with_listener_internal(
-    config: Config,
+    mut config: Config,
     listener: tokio::net::TcpListener,
-    data_access: data_auth::DataAccess,
+    data_auth: data_auth::RuntimeDataAuthState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(data_auth) = &config.data_auth {
+        data_auth
+            .validate_static()
+            .map_err(|e| format!("invalid config: {e}"))?;
+    }
     if !config.upstreams.is_empty() {
         config
             .validate()
             .map_err(|e| format!("invalid config: {e}"))?;
     }
     let listener_addr = listener.local_addr()?;
+    let data_access = data_auth.access().clone();
     data_auth::validate_startup(&config, listener_addr, &data_access).map_err(io::Error::other)?;
+    config.data_auth = None;
+    let data_auth_manager = data_auth::DataAuthManager::new(data_auth);
     let data_auth_policy =
-        data_auth::RuntimeConfigValidationPolicy::new(listener_addr, data_access.clone());
+        data_auth::RuntimeConfigValidationPolicy::from_manager(listener_addr, data_auth_manager);
     let metrics = RuntimeMetrics::new(&config);
     let runtime = build_runtime_state(config, &data_access).await?;
     let state = Arc::new(AppState {
         runtime: Arc::new(RwLock::new(runtime)),
+        admin_update_lock: Arc::new(Mutex::new(())),
         metrics,
         admin_access: AdminAccess::from_env(),
         data_auth_policy,
     });
-    run_server(state, listener, data_access).await
+    run_server(state, listener).await
 }
 
 pub async fn run_with_listener_and_dashboard(
-    config: Config,
+    mut config: Config,
     listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(data_auth) = &config.data_auth {
+        data_auth
+            .validate_static()
+            .map_err(|e| format!("invalid config: {e}"))?;
+    }
     if !config.upstreams.is_empty() {
         config
             .validate()
             .map_err(|e| format!("invalid config: {e}"))?;
     }
-    let data_access = data_auth::DataAccess::from_env();
+    let data_auth = data_auth::RuntimeDataAuthState::from_static_config(config.data_auth.as_ref());
     let listener_addr = listener.local_addr()?;
+    let data_access = data_auth.access().clone();
     data_auth::validate_startup(&config, listener_addr, &data_access).map_err(io::Error::other)?;
+    config.data_auth = None;
+    let data_auth_manager = data_auth::DataAuthManager::new(data_auth);
     let data_auth_policy =
-        data_auth::RuntimeConfigValidationPolicy::new(listener_addr, data_access.clone());
+        data_auth::RuntimeConfigValidationPolicy::from_manager(listener_addr, data_auth_manager);
     let metrics = RuntimeMetrics::new(&config);
     let runtime = Arc::new(RwLock::new(
         build_runtime_state(config.clone(), &data_access).await?,
@@ -210,13 +233,13 @@ pub async fn run_with_listener_and_dashboard(
     let dashboard_runtime = DashboardRuntimeHandle::new(runtime.clone());
     let state = Arc::new(AppState {
         runtime,
+        admin_update_lock: Arc::new(Mutex::new(())),
         metrics: metrics.clone(),
         admin_access: AdminAccess::from_env(),
         data_auth_policy,
     });
     let server_state = state.clone();
-    let mut server =
-        tokio::spawn(async move { run_server(server_state, listener, data_access).await });
+    let mut server = tokio::spawn(async move { run_server(server_state, listener).await });
     tokio::select! {
         server_result = &mut server => {
             server_result.map_err(|e| std::io::Error::other(e.to_string()))?
@@ -232,12 +255,15 @@ pub async fn run_with_listener_and_dashboard(
 async fn run_server(
     state: Arc<AppState>,
     listener: tokio::net::TcpListener,
-    data_access: data_auth::DataAccess,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cors = data_cors_layer_from_env().map_err(io::Error::other)?;
 
     let admin_router = Router::new()
         .route("/admin/state", get(admin::handle_admin_state))
+        .route(
+            "/admin/data-auth",
+            get(admin::handle_admin_data_auth_state).put(admin::handle_admin_data_auth_config),
+        )
         .route(
             "/admin/namespaces/:namespace/config",
             post(admin::handle_admin_namespace_config),
@@ -405,7 +431,7 @@ async fn run_server(
                 .post(proxy::handle_google_model_action_namespaced),
         )
         .route_layer(middleware::from_fn_with_state(
-            data_auth::DataAuthState::new(data_access),
+            state.clone(),
             data_auth::require_data_access,
         ));
 
@@ -571,8 +597,8 @@ use errors::{
 use headers::extract_forwardable_headers;
 #[cfg(test)]
 use proxy::{
-    classify_request_boundary, handle_request_core, resolve_requested_model_or_error,
-    RequestBoundaryDecision,
+    classify_request_boundary, handle_request_core, handle_request_core_with_auth_context,
+    resolve_requested_model_or_error, RequestBoundaryDecision, TestRequestCoreRequest,
 };
 #[cfg(test)]
 use responses_resources::{

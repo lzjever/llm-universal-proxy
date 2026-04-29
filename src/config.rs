@@ -153,6 +153,249 @@ impl ResourceLimits {
     }
 }
 
+/// A secret source accepted by static YAML and Admin runtime payloads.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct SecretSourceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+}
+
+impl std::fmt::Debug for SecretSourceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretSourceConfig")
+            .field("inline", &self.inline.as_ref().map(|_| "<redacted>"))
+            .field("env", &self.env)
+            .finish()
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretSourceConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SecretSourceConfigVisitor)
+    }
+}
+
+struct SecretSourceConfigVisitor;
+
+impl<'de> Visitor<'de> for SecretSourceConfigVisitor {
+    type Value = SecretSourceConfig;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("secret source object with optional `inline` or `env` fields")
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "secret source must be an object with `inline` or `env`",
+        ))
+    }
+
+    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "secret source must be an object with `inline` or `env`",
+        ))
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut inline = None;
+        let mut env = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "inline" => {
+                    if inline.is_some() {
+                        return Err(de::Error::duplicate_field("inline"));
+                    }
+                    inline = Some(map.next_value::<String>().map_err(|_| {
+                        de::Error::custom("secret source field `inline` must be a string")
+                    })?);
+                }
+                "env" => {
+                    if env.is_some() {
+                        return Err(de::Error::duplicate_field("env"));
+                    }
+                    env = Some(map.next_value::<String>().map_err(|_| {
+                        de::Error::custom("secret source field `env` must be a string")
+                    })?);
+                }
+                other => {
+                    let _ = map.next_value::<de::IgnoredAny>()?;
+                    return Err(de::Error::unknown_field(other, &["inline", "env"]));
+                }
+            }
+        }
+        Ok(SecretSourceConfig { inline, env })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretSourceRef<'a> {
+    Inline(&'a str),
+    Env(&'a str),
+}
+
+impl std::fmt::Debug for SecretSourceRef<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inline(_) => formatter
+                .debug_tuple("Inline")
+                .field(&"<redacted>")
+                .finish(),
+            Self::Env(name) => formatter.debug_tuple("Env").field(name).finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamProviderKeySourceRef<'a> {
+    Inline(&'a str),
+    Env { name: &'a str, legacy: bool },
+}
+
+impl std::fmt::Debug for UpstreamProviderKeySourceRef<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inline(_) => formatter
+                .debug_tuple("Inline")
+                .field(&"<redacted>")
+                .finish(),
+            Self::Env { name, legacy } => formatter
+                .debug_struct("Env")
+                .field("name", name)
+                .field("legacy", legacy)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataAuthMode {
+    ProxyKey,
+    ClientProviderKey,
+}
+
+impl Default for DataAuthMode {
+    fn default() -> Self {
+        Self::ClientProviderKey
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataAuthConfig {
+    #[serde(default)]
+    pub mode: DataAuthMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_key: Option<SecretSourceConfig>,
+}
+
+impl Default for DataAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: DataAuthMode::ClientProviderKey,
+            proxy_key: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AdminCredentialSourceView {
+    pub source: &'static str,
+    pub configured: bool,
+    pub redacted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_name: Option<String>,
+}
+
+impl SecretSourceConfig {
+    pub(crate) fn source(&self, owner: &str) -> Result<SecretSourceRef<'_>, String> {
+        let mut sources = Vec::new();
+        if let Some(value) = self.inline.as_deref() {
+            if value.trim().is_empty() {
+                return Err(format!("{owner}.inline must not be empty"));
+            }
+            sources.push(SecretSourceRef::Inline(value));
+        }
+        if let Some(value) = self.env.as_deref() {
+            if value.trim().is_empty() {
+                return Err(format!("{owner}.env must not be empty"));
+            }
+            sources.push(SecretSourceRef::Env(value));
+        }
+
+        match sources.as_slice() {
+            [source] => Ok(*source),
+            [] => Err(format!("{owner} must include exactly one of inline or env")),
+            _ => Err(format!(
+                "{owner}.inline and {owner}.env are mutually exclusive"
+            )),
+        }
+    }
+
+    fn admin_view(&self) -> Option<AdminCredentialSourceView> {
+        match (self.inline.as_ref(), self.env.as_ref()) {
+            (Some(_), None) => Some(AdminCredentialSourceView {
+                source: "inline",
+                configured: true,
+                redacted: true,
+                env_name: None,
+            }),
+            (None, Some(env_name)) => Some(AdminCredentialSourceView {
+                source: "env",
+                configured: true,
+                redacted: true,
+                env_name: Some(env_name.clone()),
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl DataAuthConfig {
+    pub(crate) fn validate_static(&self) -> Result<(), String> {
+        self.validate("data_auth")
+    }
+
+    pub(crate) fn validate_admin_payload(&self) -> Result<(), String> {
+        self.validate("data_auth config")
+    }
+
+    fn validate(&self, owner: &str) -> Result<(), String> {
+        match self.mode {
+            DataAuthMode::ProxyKey => {
+                let proxy_key = self
+                    .proxy_key
+                    .as_ref()
+                    .ok_or_else(|| format!("{owner}.proxy_key is required when mode=proxy_key"))?;
+                proxy_key.source(&format!("{owner}.proxy_key"))?;
+            }
+            DataAuthMode::ClientProviderKey => {
+                if self.proxy_key.is_some() {
+                    return Err(format!(
+                        "{owner}.proxy_key must be omitted when mode=client_provider_key"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookEndpointConfig {
     pub url: String,
@@ -337,6 +580,9 @@ pub struct UpstreamConfig {
     /// Provider credential env var name used when the proxy owns upstream credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_key_env: Option<String>,
+    /// Provider credential source used when the proxy owns upstream credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_key: Option<SecretSourceConfig>,
     /// Optional static headers to inject into every upstream request.
     pub upstream_headers: Vec<(String, String)>,
     /// Optional per-upstream proxy override. When unset, the namespace default is used.
@@ -390,6 +636,8 @@ pub struct Config {
     pub debug_trace: DebugTraceConfig,
     /// Resource boundaries for request bodies, upstream bodies, and streaming state.
     pub resource_limits: ResourceLimits,
+    /// Optional static global data-plane auth. Runtime namespace payloads manage this separately.
+    pub data_auth: Option<DataAuthConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -439,6 +687,8 @@ pub struct RuntimeUpstreamConfig {
     pub fixed_upstream_format: Option<UpstreamFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_key: Option<SecretSourceConfig>,
     #[serde(default)]
     pub upstream_headers: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -526,6 +776,8 @@ pub struct AdminUpstreamConfigView {
     pub fixed_upstream_format: Option<UpstreamFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_key: Option<AdminCredentialSourceView>,
     pub upstream_headers: Vec<AdminHeaderValueView>,
     pub proxy: Option<ProxyConfig>,
     pub limits: Option<ModelLimits>,
@@ -567,6 +819,8 @@ struct FileConfig {
     debug_trace: DebugTraceConfig,
     #[serde(default)]
     resource_limits: ResourceLimits,
+    #[serde(default)]
+    data_auth: Option<DataAuthConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -578,6 +832,8 @@ struct UpstreamConfigFile {
     fixed_upstream_format: Option<UpstreamFormat>,
     #[serde(default)]
     provider_key_env: Option<String>,
+    #[serde(default)]
+    provider_key: Option<SecretSourceConfig>,
     #[serde(default, alias = "headers", alias = "upstream_headers")]
     upstream_headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -682,6 +938,49 @@ impl Default for Config {
             hooks: HookConfig::default(),
             debug_trace: DebugTraceConfig::default(),
             resource_limits: ResourceLimits::default(),
+            data_auth: None,
+        }
+    }
+}
+
+impl UpstreamConfig {
+    pub(crate) fn provider_key_source(
+        &self,
+    ) -> Result<Option<UpstreamProviderKeySourceRef<'_>>, String> {
+        let mut sources = Vec::new();
+        if let Some(provider_key) = &self.provider_key {
+            match provider_key.source(&format!("upstream `{}` provider_key", self.name))? {
+                SecretSourceRef::Inline(value) => {
+                    sources.push(UpstreamProviderKeySourceRef::Inline(value));
+                }
+                SecretSourceRef::Env(value) => {
+                    sources.push(UpstreamProviderKeySourceRef::Env {
+                        name: value,
+                        legacy: false,
+                    });
+                }
+            }
+        }
+        if let Some(value) = self.provider_key_env.as_deref() {
+            if value.trim().is_empty() {
+                return Err(format!(
+                    "upstream `{}` provider_key_env must not be empty",
+                    self.name
+                ));
+            }
+            sources.push(UpstreamProviderKeySourceRef::Env {
+                name: value,
+                legacy: true,
+            });
+        }
+
+        match sources.as_slice() {
+            [] => Ok(None),
+            [source] => Ok(Some(*source)),
+            _ => Err(format!(
+                "upstream `{}` provider_key.inline, provider_key.env, and provider_key_env are mutually exclusive",
+                self.name
+            )),
         }
     }
 }
@@ -709,6 +1008,7 @@ impl Config {
                 api_root: item.api_root,
                 fixed_upstream_format: item.fixed_upstream_format,
                 provider_key_env: item.provider_key_env,
+                provider_key: item.provider_key,
                 upstream_headers: item.upstream_headers.into_iter().collect(),
                 proxy: item.proxy,
                 limits: item.limits,
@@ -760,6 +1060,7 @@ impl Config {
             },
             debug_trace: parsed.debug_trace,
             resource_limits: parsed.resource_limits,
+            data_auth: parsed.data_auth,
         })
     }
 
@@ -769,6 +1070,9 @@ impl Config {
             return Err("at least one upstream must be configured".to_string());
         }
         self.resource_limits.validate()?;
+        if let Some(data_auth) = &self.data_auth {
+            data_auth.validate_static()?;
+        }
         if let Some(proxy) = &self.proxy {
             proxy.validate("proxy")?;
         }
@@ -811,16 +1115,7 @@ impl Config {
                     upstream.name
                 ));
             }
-            if upstream
-                .provider_key_env
-                .as_deref()
-                .is_some_and(|value| value.trim().is_empty())
-            {
-                return Err(format!(
-                    "upstream `{}` provider_key_env must not be empty",
-                    upstream.name
-                ));
-            }
+            upstream.provider_key_source()?;
             for (header_name, _) in &upstream.upstream_headers {
                 if is_forbidden_upstream_header_name(header_name) {
                     return Err(format!(
@@ -996,6 +1291,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
                 api_root: item.api_root,
                 fixed_upstream_format: item.fixed_upstream_format,
                 provider_key_env: item.provider_key_env,
+                provider_key: item.provider_key,
                 upstream_headers: item.upstream_headers,
                 proxy: item.proxy,
                 limits: item.limits,
@@ -1026,6 +1322,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
             },
             debug_trace: value.debug_trace,
             resource_limits: value.resource_limits,
+            data_auth: None,
         };
         config.validate()?;
         Ok(config)
@@ -1047,6 +1344,7 @@ impl From<&Config> for RuntimeConfigPayload {
                     api_root: item.api_root.clone(),
                     fixed_upstream_format: item.fixed_upstream_format,
                     provider_key_env: item.provider_key_env.clone(),
+                    provider_key: item.provider_key.clone(),
                     upstream_headers: item.upstream_headers.clone(),
                     proxy: item.proxy.clone(),
                     limits: item.limits.clone(),
@@ -1097,6 +1395,7 @@ impl From<&Config> for AdminConfigView {
                     api_root: sanitize_url_for_admin(&item.api_root),
                     fixed_upstream_format: item.fixed_upstream_format,
                     provider_key_env: item.provider_key_env.clone(),
+                    provider_key: admin_provider_key_view(item),
                     upstream_headers: item
                         .upstream_headers
                         .iter()
@@ -1160,6 +1459,25 @@ fn sanitize_proxy_config_for_admin(value: &ProxyConfig) -> ProxyConfig {
             url: sanitize_url_for_admin(url),
         },
     }
+}
+
+fn admin_provider_key_view(upstream: &UpstreamConfig) -> Option<AdminCredentialSourceView> {
+    if let Some(view) = upstream
+        .provider_key
+        .as_ref()
+        .and_then(SecretSourceConfig::admin_view)
+    {
+        return Some(view);
+    }
+    upstream
+        .provider_key_env
+        .as_ref()
+        .map(|env_name| AdminCredentialSourceView {
+            source: "env",
+            configured: true,
+            redacted: true,
+            env_name: Some(env_name.clone()),
+        })
 }
 
 pub(crate) fn sanitize_url_for_admin(value: &str) -> String {
@@ -1546,6 +1864,7 @@ upstreams:
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
                 provider_key_env: None,
+                provider_key: None,
                 upstream_headers: Vec::new(),
                 proxy: Some(ProxyConfig::Proxy {
                     url: "http://regional-proxy.example:8080".to_string(),
@@ -1830,6 +2149,7 @@ upstreams:
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                 provider_key_env: None,
+                provider_key: None,
                 upstream_headers: Vec::new(),
                 proxy: None,
                 limits: None,
@@ -1863,6 +2183,7 @@ upstreams:
                     api_root: "https://example.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::Anthropic),
                     provider_key_env: None,
+                    provider_key: None,
                     upstream_headers: Vec::new(),
                     proxy: None,
                     limits: None,
@@ -1873,6 +2194,7 @@ upstreams:
                     api_root: "https://api.openai.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                     provider_key_env: None,
+                    provider_key: None,
                     upstream_headers: Vec::new(),
                     proxy: None,
                     limits: None,
@@ -1894,6 +2216,7 @@ upstreams:
                 api_root: "https://example.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::Anthropic),
                 provider_key_env: None,
+                provider_key: None,
                 upstream_headers: Vec::new(),
                 proxy: None,
                 limits: None,
@@ -1923,6 +2246,7 @@ upstreams:
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                 provider_key_env: None,
+                provider_key: None,
                 upstream_headers: Vec::new(),
                 proxy: None,
                 limits: None,
@@ -1944,6 +2268,7 @@ upstreams:
                     api_root: "https://a.example.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::Anthropic),
                     provider_key_env: None,
+                    provider_key: None,
                     upstream_headers: Vec::new(),
                     proxy: None,
                     limits: None,
@@ -1954,6 +2279,7 @@ upstreams:
                     api_root: "https://b.example.com/v1".to_string(),
                     fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
                     provider_key_env: None,
+                    provider_key: None,
                     upstream_headers: Vec::new(),
                     proxy: None,
                     limits: None,
@@ -2018,6 +2344,198 @@ upstreams:
     }
 
     #[test]
+    fn config_from_yaml_str_accepts_provider_key_sources_and_static_data_auth() {
+        let config = Config::from_yaml_str(
+            r#"
+data_auth:
+  mode: proxy_key
+  proxy_key:
+    inline: local-proxy-secret
+upstreams:
+  inline:
+    api_root: https://api.inline.example/v1
+    format: openai-completion
+    provider_key:
+      inline: inline-provider-secret
+  env:
+    api_root: https://api.env.example/v1
+    format: anthropic
+    provider_key:
+      env: ENV_PROVIDER_KEY
+  legacy:
+    api_root: https://api.legacy.example/v1
+    format: openai-responses
+    provider_key_env: LEGACY_PROVIDER_KEY
+"#,
+        )
+        .expect("provider_key sources and static data_auth should parse");
+
+        config.validate().expect("provider key sources are valid");
+        let view = serde_json::to_value(AdminConfigView::from(&config)).unwrap();
+        let upstream = |name: &str| {
+            view["upstreams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap()
+        };
+        assert_eq!(upstream("inline")["provider_key"]["source"], "inline");
+        assert_eq!(upstream("inline")["provider_key"]["configured"], true);
+        assert_eq!(upstream("inline")["provider_key"]["redacted"], true);
+        assert!(upstream("inline")["provider_key"].get("env_name").is_none());
+        assert_eq!(upstream("env")["provider_key"]["source"], "env");
+        assert_eq!(
+            upstream("env")["provider_key"]["env_name"],
+            "ENV_PROVIDER_KEY"
+        );
+        assert_eq!(upstream("legacy")["provider_key"]["source"], "env");
+        assert_eq!(
+            upstream("legacy")["provider_key"]["env_name"],
+            "LEGACY_PROVIDER_KEY"
+        );
+
+        let serialized = view.to_string();
+        assert!(!serialized.contains("inline-provider-secret"));
+        assert!(!serialized.contains("local-proxy-secret"));
+    }
+
+    #[test]
+    fn debug_formatting_redacts_inline_secret_sources() {
+        let sentinel = "sentinel-inline-secret-for-debug";
+        let source = SecretSourceConfig {
+            inline: Some(sentinel.to_string()),
+            env: None,
+        };
+        let data_auth = DataAuthConfig {
+            mode: DataAuthMode::ProxyKey,
+            proxy_key: Some(source.clone()),
+        };
+        let upstream = UpstreamConfig {
+            name: "inline".to_string(),
+            api_root: "https://api.inline.example/v1".to_string(),
+            fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+            provider_key_env: None,
+            provider_key: Some(source.clone()),
+            upstream_headers: Vec::new(),
+            proxy: None,
+            limits: None,
+            surface_defaults: None,
+        };
+
+        for rendered in [
+            format!("{source:?}"),
+            format!("{data_auth:?}"),
+            format!("{upstream:?}"),
+        ] {
+            assert!(
+                !rendered.contains(sentinel),
+                "Debug output must not contain inline secret: {rendered}"
+            );
+            assert!(
+                rendered.contains("redacted"),
+                "Debug output should show redaction intent: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_config_payload_accepts_provider_key_inline_and_env() {
+        let payload: RuntimeConfigPayload = serde_json::from_value(serde_json::json!({
+            "listen": "127.0.0.1:0",
+            "upstreams": [
+                {
+                    "name": "inline",
+                    "api_root": "https://api.inline.example/v1",
+                    "fixed_upstream_format": "openai-completion",
+                    "provider_key": { "inline": "runtime-provider-secret" }
+                },
+                {
+                    "name": "env",
+                    "api_root": "https://api.env.example/v1",
+                    "fixed_upstream_format": "anthropic",
+                    "provider_key": { "env": "RUNTIME_PROVIDER_KEY" }
+                }
+            ],
+            "model_aliases": {}
+        }))
+        .expect("runtime payload should accept provider_key");
+
+        let config = Config::try_from(payload).expect("runtime provider_key config is valid");
+        let view = serde_json::to_value(AdminConfigView::from(&config)).unwrap();
+        assert_eq!(view["upstreams"][0]["provider_key"]["source"], "inline");
+        assert_eq!(view["upstreams"][0]["provider_key"]["redacted"], true);
+        assert_eq!(
+            view["upstreams"][1]["provider_key"]["env_name"],
+            "RUNTIME_PROVIDER_KEY"
+        );
+        assert!(!view.to_string().contains("runtime-provider-secret"));
+    }
+
+    #[test]
+    fn validate_rejects_provider_key_conflicts_and_blank_sources_without_echoing_inline_secret() {
+        for (case, yaml) in [
+            (
+                "conflicting inline and env",
+                r#"
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+    provider_key:
+      inline: super-secret-inline-value
+      env: DEMO_PROVIDER_KEY
+"#,
+            ),
+            (
+                "conflicting provider_key and provider_key_env",
+                r#"
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+    provider_key:
+      inline: super-secret-inline-value
+    provider_key_env: DEMO_PROVIDER_KEY
+"#,
+            ),
+            (
+                "blank inline",
+                r#"
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+    provider_key:
+      inline: "   "
+"#,
+            ),
+            (
+                "blank env",
+                r#"
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+    provider_key:
+      env: "   "
+"#,
+            ),
+        ] {
+            let config = Config::from_yaml_str(yaml)
+                .unwrap_or_else(|error| panic!("{case} should parse before validation: {error}"));
+            let error = match config.validate() {
+                Ok(()) => panic!("{case} should be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                !error.contains("super-secret-inline-value"),
+                "{case} error must not echo inline secret: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_rejects_empty_provider_key_env() {
         let c = Config::from_yaml_str(
             r#"
@@ -2077,6 +2595,7 @@ upstreams:
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
                 provider_key_env: None,
+                provider_key: None,
                 upstream_headers: vec![("openai-api-key".to_string(), "secret".to_string())],
                 proxy: None,
                 limits: None,
@@ -2137,6 +2656,7 @@ upstreams:
                 api_root: "https://api.openai.com/v1".to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
                 provider_key_env: None,
+                provider_key: None,
                 upstream_headers: Vec::new(),
                 proxy: None,
                 limits: None,
@@ -2248,6 +2768,7 @@ upstreams:
                     .to_string(),
                 fixed_upstream_format: Some(UpstreamFormat::OpenAiResponses),
                 provider_key_env: Some("DEMO_KEY".to_string()),
+                provider_key: None,
                 upstream_headers: vec![
                     ("x-tenant".to_string(), "demo".to_string()),
                     (
@@ -2292,6 +2813,7 @@ upstreams:
                 max_request_body_bytes: 12_345,
                 ..ResourceLimits::default()
             },
+            data_auth: None,
         };
 
         let view = AdminConfigView::from(&config);

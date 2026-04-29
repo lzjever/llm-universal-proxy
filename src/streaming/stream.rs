@@ -736,6 +736,7 @@ impl<S, E> GuardedSseStream<S, E> {
                 continue;
             }
 
+            let original_event = event.clone();
             sanitize_public_stream_error_event(&mut event);
             if event.get("_done").and_then(Value::as_bool) != Some(true) {
                 if let Err(message) =
@@ -750,8 +751,12 @@ impl<S, E> GuardedSseStream<S, E> {
                     break;
                 }
             }
-            self.output_queue
-                .push(canonical_sse_frame(event_type.as_deref(), &event));
+            if !raw_has_internal_artifact && event == original_event {
+                self.output_queue.push(frame);
+            } else {
+                self.output_queue
+                    .push(canonical_sse_frame(event_type.as_deref(), &event));
+            }
             if self.reject_if_state_too_large() {
                 break;
             }

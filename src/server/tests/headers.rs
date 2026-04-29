@@ -41,3 +41,114 @@ fn extract_forwardable_headers_keeps_only_protocol_headers() {
         .iter()
         .any(|(k, _)| k == data_auth::LEGACY_DATA_TOKEN_HEADER));
 }
+
+#[test]
+fn upstream_response_headers_drop_sensitive_vendor_headers_and_keep_safe_protocol_headers() {
+    let mut upstream_headers = reqwest::header::HeaderMap::new();
+    for name in [
+        "openai-api-key",
+        "anthropic-api-key",
+        "openai-session-token",
+        "anthropic-credential",
+        "authorization",
+        "set-cookie",
+    ] {
+        upstream_headers.insert(
+            reqwest::header::HeaderName::from_static(name),
+            reqwest::header::HeaderValue::from_static("sensitive"),
+        );
+    }
+    for (name, value) in [
+        ("request-id", "req_123"),
+        ("x-request-id", "xreq_123"),
+        ("retry-after", "2"),
+        ("ratelimit-limit", "100"),
+        ("x-ratelimit-remaining", "99"),
+        ("rate-limit", "100"),
+        ("openai-processing-ms", "42"),
+        ("anthropic-ratelimit-requests-limit", "99"),
+    ] {
+        upstream_headers.insert(
+            reqwest::header::HeaderName::from_static(name),
+            reqwest::header::HeaderValue::from_static(value),
+        );
+    }
+
+    let mut response = Response::builder()
+        .body(Body::empty())
+        .expect("test response");
+    crate::server::headers::append_upstream_protocol_response_headers(
+        &mut response,
+        &upstream_headers,
+        &crate::server::secret_redaction::SecretRedactor::default(),
+    );
+
+    for name in [
+        "openai-api-key",
+        "anthropic-api-key",
+        "openai-session-token",
+        "anthropic-credential",
+        "authorization",
+        "set-cookie",
+    ] {
+        assert!(
+            !response.headers().contains_key(name),
+            "{name} must not be forwarded"
+        );
+    }
+    for (name, value) in [
+        ("request-id", "req_123"),
+        ("x-request-id", "xreq_123"),
+        ("retry-after", "2"),
+        ("ratelimit-limit", "100"),
+        ("x-ratelimit-remaining", "99"),
+        ("rate-limit", "100"),
+        ("openai-processing-ms", "42"),
+        ("anthropic-ratelimit-requests-limit", "99"),
+    ] {
+        assert_eq!(
+            response.headers().get(name).and_then(|v| v.to_str().ok()),
+            Some(value),
+            "{name} should be forwarded"
+        );
+    }
+}
+
+#[test]
+fn upstream_response_headers_redact_allowed_header_values_and_keep_safe_values() {
+    let secret = "secret-value";
+    let mut upstream_headers = reqwest::header::HeaderMap::new();
+    upstream_headers.insert(
+        reqwest::header::HeaderName::from_static("request-id"),
+        reqwest::header::HeaderValue::from_str(&format!("req-{secret}"))
+            .expect("secret request id"),
+    );
+    upstream_headers.insert(
+        reqwest::header::HeaderName::from_static("retry-after"),
+        reqwest::header::HeaderValue::from_static("2"),
+    );
+
+    let mut response = Response::builder()
+        .body(Body::empty())
+        .expect("test response");
+    crate::server::headers::append_upstream_protocol_response_headers(
+        &mut response,
+        &upstream_headers,
+        &crate::server::secret_redaction::SecretRedactor::new([secret]),
+    );
+
+    assert_eq!(
+        response
+            .headers()
+            .get("request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("req-[REDACTED]")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+}

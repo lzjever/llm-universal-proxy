@@ -28,6 +28,10 @@ class ProjectDocsContractTests(unittest.TestCase):
                 "`LLM_UNIVERSAL_PROXY_AUTH_MODE`",
                 "`LLM_UNIVERSAL_PROXY_KEY`",
                 "`provider_key_env`",
+                "`provider_key.inline`",
+                "`provider_key.env`",
+                "`data_auth`",
+                "`/admin/data-auth`",
                 "`max_request_body_bytes`",
             )
         )

@@ -138,7 +138,7 @@ Wrappers are still recommended, but the underlying client contracts are straight
 
 The release CLI wrapper matrix currently gates the wrapper surface in two deterministic parts: a structure gate that expands the tracked basic matrix for Codex CLI, Claude Code, and Gemini CLI, plus a hermetic scripted interactive Codex wrapper gate. That gate executes `scripts/run_codex_proxy.sh` with a fake Codex binary and fake local proxy for two stdin turns. This is not a full live multi-client/provider matrix; real live client evidence remains final GA/operator validation when those CLIs and provider credentials are available.
 
-In `proxy_key` mode, set each client SDK key below to `$LLM_UNIVERSAL_PROXY_KEY`; the proxy reads the real upstream provider key from `provider_key_env`. In `client_provider_key` mode, set these SDK keys to the real provider key for the selected upstream.
+Prefer static `data_auth` for the proxy key; `LLM_UNIVERSAL_PROXY_AUTH_MODE` and `LLM_UNIVERSAL_PROXY_KEY` remain the compatibility environment fallback when `data_auth` is omitted. In `proxy_key` mode, set each client SDK key below to `$LLM_UNIVERSAL_PROXY_KEY`; configure the upstream provider credential server-side with `provider_key.inline`, `provider_key.env`, or legacy `provider_key_env`. In `client_provider_key` mode, set these SDK keys to the real provider key for the selected upstream.
 
 ### Codex
 

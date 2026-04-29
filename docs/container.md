@@ -124,6 +124,11 @@ Important boundaries:
 - Admin API writes are not persisted by the proxy. Keep the source of truth in
   your controller, init job, or deployment system, and replay the Admin API
   write after every container restart.
+- Global data-plane auth is separate from namespace config. `GET /admin/data-auth`
+  returns a redacted snapshot, and `PUT /admin/data-auth`
+  rotates or switches `data_auth` with CAS. These writes are also not persisted
+  by the proxy, so controllers must replay them after restart when they manage
+  data auth through the Admin API.
 - `/health` is liveness: it only says the process is running.
 - `/ready` is readiness: it returns success only after at least one namespace
   has been loaded.
@@ -304,10 +309,18 @@ explicit port mapping.
 ## Provider Route Auth
 
 Container deployments should normally use `LLM_UNIVERSAL_PROXY_AUTH_MODE=proxy_key`.
-In this mode, `LLM_UNIVERSAL_PROXY_KEY` is the client-facing SDK key and each
-upstream's `provider_key_env` points at the provider key held by the container
-environment. `client_provider_key` mode is available for deployments where
-clients send provider keys directly and the proxy does not hold provider keys.
+In this environment fallback mode, `LLM_UNIVERSAL_PROXY_KEY` is the
+client-facing SDK key and each upstream's `provider_key_env` or
+`provider_key.env` points at the provider key held by the container environment.
+Mounted static config can instead use top-level `data_auth`, including
+`proxy_key.env`, for the same process-wide data-plane auth state.
+`client_provider_key` mode is available for deployments where clients send
+provider keys directly and the proxy does not hold provider keys.
+
+When a controller uses `PUT /admin/data-auth` for key rotation, the new proxy
+key applies to new requests immediately. The Admin API does not persist
+plaintext keys or runtime config, so the controller should replay both
+`/admin/data-auth` and namespace writes after every container restart.
 
 CORS response headers are not emitted by default. Set
 `LLM_UNIVERSAL_PROXY_CORS_ALLOWED_ORIGINS` to exact browser origins only when a

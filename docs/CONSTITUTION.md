@@ -104,7 +104,7 @@ Locked tool identity contract:
 Proxy authentication is in scope:
 
 - `/health` remains unauthenticated so process and container health checks can run without secrets.
-- Provider/model/resource routes require `LLM_UNIVERSAL_PROXY_AUTH_MODE`. In `proxy_key` mode, clients send `LLM_UNIVERSAL_PROXY_KEY` as the normal SDK API key or `Authorization: Bearer <proxy-key>`, and the proxy reads upstream provider keys from `provider_key_env`. In `client_provider_key` mode, clients send provider keys directly and the proxy does not need provider key env vars for those calls.
+- Provider/model/resource routes use process-wide data-plane auth. Prefer static `data_auth`; `LLM_UNIVERSAL_PROXY_AUTH_MODE` and `LLM_UNIVERSAL_PROXY_KEY` are the compatibility environment fallback when static data auth is omitted. In `proxy_key` mode, clients send the proxy key as the normal SDK API key or `Authorization: Bearer <proxy-key>`, and upstream provider credentials are configured per upstream with `provider_key.inline`, `provider_key.env`, or legacy `provider_key_env`. In `client_provider_key` mode, clients send provider keys directly and the proxy does not need provider key env vars for those calls.
 - `/dashboard` shell and static assets are public UI resources. Dashboard JavaScript sends `Authorization: Bearer <admin-token>` only when it calls existing `/admin/*` APIs.
 - Admin-plane routes use `LLM_UNIVERSAL_PROXY_ADMIN_TOKEN` when it is configured, sent as `Authorization: Bearer <admin-token>`. Empty or whitespace-only admin tokens are misconfiguration and fail closed.
 - Missing or invalid client keys fail closed on provider/model/resource routes. Admin auth remains separately governed by the admin token boundary.
