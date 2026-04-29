@@ -605,6 +605,24 @@ class GaDocsContractTests(unittest.TestCase):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, security)
 
+        for repeated_sentence in (
+            "That one state applies to all provider/model/resource routes.",
+            "That path is the environment fallback.",
+            "In this mode, `provider_key_env` is not required, is normally omitted, and `provider_key.env` or `provider_key_env` are not rejected if present, but are not used.",
+        ):
+            with self.subTest(repeated_sentence=repeated_sentence):
+                self.assertNotIn(repeated_sentence, security)
+
+        normalized_security = normalized_whitespace(security)
+        for repeated_snippet in (
+            "`provider_key.inline`, `provider_key.env`, and `provider_key_env` are mutually exclusive",
+            "Inline and env source values must be non-empty.",
+            "Admin read views never return inline secret values.",
+            "`provider_key_env` is not required",
+        ):
+            with self.subTest(repeated_snippet=repeated_snippet):
+                self.assertEqual(normalized_security.count(repeated_snippet), 1)
+
         proxy_key_block = next(
             (
                 block
@@ -666,6 +684,30 @@ class GaDocsContractTests(unittest.TestCase):
         mapping = markdown_section(admin_doc, "Static YAML vs Runtime Payload")
         data_auth_section = markdown_section(admin_doc, "Update Data Auth Without Restarting")
         redaction = markdown_section(admin_doc, "What the Admin Read View Redacts")
+        inspect_data_auth = markdown_subsection(
+            markdown_section(admin_doc, "Inspect Runtime State"),
+            "Inspect data auth",
+        )
+
+        typical_responses = markdown_code_blocks(inspect_data_auth, "json")
+        data_auth_response = next(
+            (
+                response
+                for response in (json.loads(block) for block in typical_responses)
+                if isinstance(response, dict)
+                and "revision" in response
+                and "config" in response
+            ),
+            None,
+        )
+        self.assertIsNotNone(
+            data_auth_response,
+            "Inspect data auth must include a data-auth snapshot JSON example",
+        )
+        data_auth_config = data_auth_response["config"]
+        self.assertIs(data_auth_config.get("configured"), True)
+        self.assertEqual(data_auth_config["mode"], "proxy_key")
+        self.assertIs(data_auth_config["proxy_key"]["configured"], True)
 
         for snippet in (
             "process-wide",

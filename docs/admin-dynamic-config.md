@@ -99,6 +99,7 @@ Typical response:
 {
   "revision": "a-server-generated-revision",
   "config": {
+    "configured": true,
     "mode": "proxy_key",
     "proxy_key": {
       "source": "env",

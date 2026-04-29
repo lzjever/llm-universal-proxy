@@ -51,6 +51,10 @@ def load_real_cli_matrix():
     return module
 
 
+def normalized_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
 class DocsHomepageContractTests(unittest.TestCase):
     def read_text(self, relative_path: str) -> str:
         return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
@@ -311,8 +315,11 @@ class DocsHomepageContractTests(unittest.TestCase):
             text,
         )
         self.assertIn(
-            "Reasoning effort such as `xhigh` stays on the client request; it is not part of the alias or upstream model name.",
-            text,
+            normalized_whitespace(
+                "Reasoning effort such as `xhigh` stays on the client request; "
+                "it is not part of the alias or upstream model name."
+            ),
+            normalized_whitespace(text),
         )
 
     def test_provider_neutral_quickstart_example_matches_cli_matrix_contract(self):

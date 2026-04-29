@@ -84,19 +84,22 @@ export LLM_UNIVERSAL_PROXY_KEY="local-proxy-key"
   --model preset-openai-compatible
 ```
 
-Reasoning effort such as `xhigh` stays on the client request; it is not part of the alias or upstream model name.
+Reasoning effort such as `xhigh` stays on the client request; it is not part
+of the alias or upstream model name.
 
-`PRESET_*` placeholders are not general Rust config interpolation. They are a provider-neutral config-source convention consumed by the wrappers and real CLI matrix. If you start `llm-universal-proxy --config` directly, use concrete `api_root` URLs and concrete `UPSTREAM:MODEL` alias targets.
+`PRESET_*` placeholders are not general Rust config interpolation. They are a
+provider-neutral config-source convention consumed by the wrappers and real CLI
+matrix. If you start `llm-universal-proxy --config` directly, use concrete
+`api_root` URLs and concrete `UPSTREAM:MODEL` alias targets.
 
 ## Data Plane Security
 
 Client-facing provider/model/resource routes use a required global auth mode
 that is separate from the admin token. The mode is process-wide: one running
-proxy process uses one `data_auth` state for all namespaces and all
-provider/model/resource routes. It is not a per-upstream setting. If you need a
-mixed deployment where some clients use a local proxy key and other clients pass
-provider keys directly, run separate proxy instances.
-That one state applies to all provider/model/resource routes.
+proxy process uses one `data_auth` state for all namespaces and
+all provider/model/resource routes. It is not a per-upstream setting. If you need
+a mixed deployment where some clients use a local proxy key and other clients
+pass provider keys directly, run separate proxy instances.
 
 The preferred static configuration is the top-level `data_auth` object:
 
@@ -114,13 +117,12 @@ or tightly controlled generated config. `proxy_key.env` names an environment
 variable that must resolve to the proxy key at startup or when an admin update is
 applied.
 
-If `data_auth` is omitted, the proxy keeps the backward-compatible environment
-fallback: `LLM_UNIVERSAL_PROXY_AUTH_MODE` selects `proxy_key` or
+If `data_auth` is omitted, the proxy keeps the backward-compatible
+environment fallback: `LLM_UNIVERSAL_PROXY_AUTH_MODE` selects `proxy_key` or
 `client_provider_key`, and `LLM_UNIVERSAL_PROXY_KEY` is required when that
 fallback selects `proxy_key`. New deployments can still use the environment
-fallback, but static `data_auth` is clearer for checked-in or controller-rendered
-configuration.
-That path is the environment fallback.
+fallback, but static `data_auth` is clearer for checked-in or
+controller-rendered configuration.
 
 Provider/model/resource routes reject missing client keys in both modes.
 `/health` remains unauthenticated. Admin API routes use
@@ -135,20 +137,18 @@ the global mode is `proxy_key`. Supported provider credential sources are:
   compatibility.
 
 `provider_key_env` is a per-upstream environment variable name. It is not the
-provider key itself. `provider_key.inline`, `provider_key.env`, and
-`provider_key_env` are mutually exclusive on one upstream. Inline and env source
-values must be non-empty. In `proxy_key` mode, every upstream that can receive
-traffic must have one provider credential source, and env sources must resolve in
-the proxy process environment. Admin read views never return inline secret
-values.
-`provider_key.inline`, `provider_key.env`, and `provider_key_env` are mutually exclusive. Inline and env source values must be non-empty.
+provider key itself.
+`provider_key.inline`, `provider_key.env`, and `provider_key_env` are mutually exclusive
+on one upstream. Inline and env source values must be non-empty. In `proxy_key`
+mode, every upstream that can receive traffic must have one provider credential
+source, and env sources must resolve in the proxy process environment.
 Admin read views never return inline secret values.
 
-In `client_provider_key` mode, `provider_key.inline` is rejected because it would
-embed a server-held provider key that the mode will never use. `provider_key.env`
-and the legacy `provider_key_env` are accepted for config compatibility, but
-they are not used for request auth in this mode. They are normally omitted.
-In this mode, `provider_key_env` is not required, is normally omitted, and `provider_key.env` or `provider_key_env` are not rejected if present, but are not used.
+In `client_provider_key` mode, `provider_key_env` is not required and provider
+credential sources are normally omitted. `provider_key.inline` is rejected
+because it would embed a server-held provider key that the mode will never use.
+`provider_key.env` and the legacy `provider_key_env` are not rejected for config
+compatibility, but they are not used for request auth in this mode.
 
 ### Static YAML Auth Examples
 
