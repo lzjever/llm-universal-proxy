@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.2.26 - 2026-04-29
+
+- Advanced the main-branch release identity to Cargo package version `0.2.26`, the next patch version after the published and occupied `v0.2.25` tag, without moving, deleting, or reusing the existing tag.
+- Refreshed the checked-in container publication manifest and docs around the actual published `v0.2.25` multi-arch image digest while keeping `0.2.26` / `v0.2.26` as the next release identity, not a published container tag yet.
+- Verified the `v0.2.25` release workflow, GHCR `v0.2.25` and `0.2.25` image tags, and tag-triggered CI after publication.
+
 ## v0.2.25 - 2026-04-28
 
 - Added static and Admin API support for structured `data_auth` and upstream

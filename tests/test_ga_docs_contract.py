@@ -918,9 +918,14 @@ class GaDocsContractTests(unittest.TestCase):
     def test_changelog_latest_release_records_current_release_metadata(self):
         refs = container_refs()
         changelog = read_doc("CHANGELOG.md")
-        latest_release = markdown_section(
-            changelog, f"v{cargo_package_version()} - 2026-04-28"
+        version = cargo_package_version()
+        heading_match = re.search(
+            rf"^## v{re.escape(version)} - \d{{4}}-\d{{2}}-\d{{2}}$",
+            changelog,
+            flags=re.MULTILINE,
         )
+        self.assertIsNotNone(heading_match)
+        latest_release = markdown_section(changelog, heading_match.group(0)[3:])
 
         for snippet in (
             "release identity",
