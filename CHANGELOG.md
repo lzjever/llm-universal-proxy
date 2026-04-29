@@ -2,12 +2,22 @@
 
 ## Unreleased
 
-- Documented static `data_auth`, structured upstream provider credential
-  sources, and the redacted CAS-based `/admin/data-auth` control-plane endpoint,
-  including container replay requirements for runtime-only Admin API writes.
-
 ## v0.2.25 - 2026-04-28
 
+- Added static and Admin API support for structured `data_auth` and upstream
+  provider credential sources, including inline/env proxy keys,
+  inline/env/legacy-env provider keys, and the CAS-based `/admin/data-auth`
+  control-plane endpoint.
+- Simplified data-plane auth to the two GA modes, `proxy_key` and
+  `client_provider_key`, with request-scoped auth/runtime snapshots so Admin
+  updates affect new requests without mixing old auth decisions with new
+  provider credentials.
+- Hardened known-credential redaction across public JSON and SSE responses,
+  error paths, debug traces, hooks, dashboard metrics/logs, model/resource
+  metadata, allowed upstream response headers, and hook delivery logs.
+- Documented static YAML and runtime Admin API configuration paths, including
+  container replay requirements for runtime-only Admin API writes, and expanded
+  docs contracts for the GA data-auth shape.
 - Advanced the main-branch release identity to Cargo package version `0.2.25`, the next patch version after the occupied `v0.2.24` tag, without moving, deleting, or reusing the existing tag.
 - Refreshed the checked-in container publication manifest and docs around the actual published `v0.2.24` multi-arch image digest while keeping `0.2.25` / `v0.2.25` as the next release identity, not a published container tag yet.
 - Updated the container guide and GA docs contract to treat API bootstrap, `/health`, `/ready`, and no-mount Admin API startup as current published `v0.2.24` image behavior.
