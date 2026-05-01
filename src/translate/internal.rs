@@ -87,10 +87,14 @@ pub fn translate_request_with_policy(
     validate_public_request_tool_names(client_format, body)?;
 
     if client_format == upstream_format {
-        if stream {
+        if stream
+            && !(client_format == UpstreamFormat::OpenAiCompletion
+                && policy.compatibility_mode == CompatibilityMode::MaxCompat)
+        {
             normalize_openai_roles_for_compatibility(client_format, body);
         }
         if client_format == UpstreamFormat::OpenAiCompletion {
+            apply_openai_completion_max_compat_role_repairs(policy.compatibility_mode, body);
             apply_openai_completion_compat_overrides(model, body);
         }
         apply_request_translation_policy_defaults(upstream_format, &policy, body);
@@ -117,9 +121,13 @@ pub fn translate_request_with_policy(
             }
         }
     } else {
-        if stream {
+        if stream
+            && !(upstream_format == UpstreamFormat::OpenAiCompletion
+                && policy.compatibility_mode == CompatibilityMode::MaxCompat)
+        {
             normalize_openai_roles_for_compatibility(upstream_format, body);
         }
+        apply_openai_completion_max_compat_role_repairs(policy.compatibility_mode, body);
         apply_openai_completion_compat_overrides(model, body);
     }
     apply_request_translation_policy_defaults(upstream_format, &policy, body);
@@ -524,6 +532,79 @@ fn normalize_openai_roles_for_compatibility(format: UpstreamFormat, body: &mut V
 fn normalize_openai_messages_for_compatibility(body: &mut Value) {
     normalize_openai_message_roles(body);
     coalesce_openai_string_messages(body);
+}
+
+fn apply_openai_completion_max_compat_role_repairs(
+    compatibility_mode: CompatibilityMode,
+    body: &mut Value,
+) {
+    if compatibility_mode != CompatibilityMode::MaxCompat {
+        return;
+    }
+    downgrade_openai_instruction_messages_to_user_for_max_compat(body);
+}
+
+fn downgrade_openai_instruction_messages_to_user_for_max_compat(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for message in messages.iter_mut() {
+        let Some(role) = message
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if !matches!(role.as_str(), "system" | "developer") {
+            continue;
+        }
+
+        annotate_openai_instruction_message_for_max_compat(message, &role);
+        message["role"] = Value::String("user".to_string());
+    }
+
+    coalesce_openai_string_messages(body);
+}
+
+fn annotate_openai_instruction_message_for_max_compat(message: &mut Value, role: &str) {
+    let Some(content) = message.get("content") else {
+        return;
+    };
+    let Some(text) = openai_instruction_content_as_text(content) else {
+        return;
+    };
+    let label = match role {
+        "developer" => "Developer instructions",
+        _ => "System instructions",
+    };
+    message["content"] = Value::String(if text.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}:\n{text}")
+    });
+}
+
+fn openai_instruction_content_as_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) if parts.iter().all(openai_instruction_part_is_text) => {
+            Some(extract_openai_content_text(Some(content)))
+        }
+        Value::Object(_) if openai_instruction_part_is_text(content) => {
+            Some(extract_openai_content_text(Some(&Value::Array(vec![
+                content.clone(),
+            ]))))
+        }
+        Value::Null => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn openai_instruction_part_is_text(part: &Value) -> bool {
+    part.get("type").and_then(Value::as_str) == Some("text")
+        && part.get("text").and_then(Value::as_str).is_some()
 }
 
 fn normalize_openai_message_roles(body: &mut Value) {

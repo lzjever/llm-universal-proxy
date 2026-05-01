@@ -1335,9 +1335,12 @@ fn responses_to_messages_via_translate() {
     assert!(body.get("messages").is_some());
     assert!(body.get("input").is_none());
     let messages = body["messages"].as_array().unwrap();
-    assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[0]["content"], "You are helpful.");
-    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(
+        messages[0]["content"],
+        "System instructions:\nYou are helpful.\n\nHi"
+    );
 }
 
 #[test]
@@ -1432,11 +1435,12 @@ fn openai_responses_round_trip_preserves_role_order_and_multimodal_parts() {
     assert_eq!(input[2]["role"], "developer");
     assert_eq!(input[3]["role"], "user");
 
-    translate_request(
+    translate_request_with_policy(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
+        request_translation_policy(crate::config::CompatibilityMode::Balanced, None),
         false,
     )
     .unwrap();
@@ -3846,7 +3850,7 @@ fn translate_request_gemini_same_format_rejects_reserved_names_despite_response_
 }
 
 #[test]
-fn translate_request_openai_same_format_normalizes_developer_role() {
+fn translate_request_openai_same_format_max_compat_downgrades_developer_role() {
     let mut body = json!({
         "model": "gpt-4o",
         "messages": [
@@ -3863,12 +3867,39 @@ fn translate_request_openai_same_format_normalizes_developer_role() {
     )
     .unwrap();
     let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(
+        messages[0]["content"],
+        "Developer instructions:\nFollow repo rules.\n\nHi"
+    );
+}
+
+#[test]
+fn translate_request_openai_same_format_balanced_normalizes_developer_role() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "messages": [
+            { "role": "developer", "content": "Follow repo rules." },
+            { "role": "user", "content": "Hi" }
+        ]
+    });
+    translate_request_with_policy(
+        UpstreamFormat::OpenAiCompletion,
+        UpstreamFormat::OpenAiCompletion,
+        "gpt-4o",
+        &mut body,
+        request_translation_policy(crate::config::CompatibilityMode::Balanced, None),
+        true,
+    )
+    .unwrap();
+    let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[1]["role"], "user");
 }
 
 #[test]
-fn translate_request_openai_same_format_minimax_normalizes_developer_role_and_keeps_compat_overrides(
+fn translate_request_openai_same_format_minimax_downgrades_developer_role_and_keeps_compat_overrides(
 ) {
     let mut body = json!({
         "model": "MiniMax-M2.7-highspeed",
@@ -3886,7 +3917,11 @@ fn translate_request_openai_same_format_minimax_normalizes_developer_role_and_ke
     )
     .unwrap();
     let messages = body["messages"].as_array().unwrap();
-    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(
+        messages[0]["content"],
+        "Developer instructions:\nFollow repo rules."
+    );
     assert_eq!(
         messages[1]["reasoning_details"][0]["text"],
         "internal thinking"
@@ -3915,11 +3950,12 @@ fn translate_request_openai_same_format_coalesces_adjacent_string_messages() {
     )
     .unwrap();
     let messages = body["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[0]["content"], "System A\n\nSystem B");
-    assert_eq!(messages[1]["role"], "user");
-    assert_eq!(messages[1]["content"], "User A\n\nUser B");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(
+        messages[0]["content"],
+        "System instructions:\nSystem A\n\nDeveloper instructions:\nSystem B\n\nUser A\n\nUser B"
+    );
 }
 
 #[test]
@@ -3941,6 +3977,31 @@ fn translate_request_responses_same_format_normalizes_developer_role() {
     .unwrap();
     let input = body["input"].as_array().unwrap();
     assert_eq!(input[0]["role"], "system");
+    assert_eq!(input[1]["role"], "user");
+}
+
+#[test]
+fn translate_request_responses_upstream_keeps_native_instruction_roles_in_max_compat() {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "instructions": "Use native Responses instructions.",
+        "input": [
+            { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "Keep developer role." }] },
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Hi" }] }
+        ]
+    });
+    translate_request(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiResponses,
+        "gpt-4o",
+        &mut body,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(body["instructions"], "Use native Responses instructions.");
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input[0]["role"], "developer");
     assert_eq!(input[1]["role"], "user");
 }
 
@@ -4017,11 +4078,12 @@ fn translate_request_responses_to_openai_coalesces_adjacent_string_messages() {
     )
     .unwrap();
     let messages = body["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[0]["content"], "System A\n\nSystem B");
-    assert_eq!(messages[1]["role"], "user");
-    assert_eq!(messages[1]["content"], "User A\n\nUser B");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(
+        messages[0]["content"],
+        "System instructions:\nSystem A\n\nDeveloper instructions:\nSystem B\n\nUser A\n\nUser B"
+    );
 }
 
 #[test]
@@ -4052,7 +4114,7 @@ fn translate_request_responses_to_openai_flattens_text_only_content_arrays() {
 }
 
 #[test]
-fn translate_request_responses_to_openai_maps_developer_role_to_system() {
+fn translate_request_responses_to_openai_max_compat_downgrades_developer_role_to_user() {
     let mut body = json!({
         "model": "gpt-4o",
         "input": [
@@ -4069,8 +4131,12 @@ fn translate_request_responses_to_openai_maps_developer_role_to_system() {
     )
     .unwrap();
     let messages = body["messages"].as_array().unwrap();
-    assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(
+        messages[0]["content"],
+        "Developer instructions:\nFollow repo rules.\n\nHello"
+    );
 }
 
 #[test]
@@ -4968,13 +5034,12 @@ fn translate_request_responses_to_openai_preserves_mid_thread_instruction_segmen
     )
     .unwrap();
     let messages = body["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 3);
+    assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["role"], "user");
-    assert_eq!(messages[0]["content"], "Earlier user message");
-    assert_eq!(messages[1]["role"], "system");
-    assert_eq!(messages[1]["content"], "Compacted thread summary");
-    assert_eq!(messages[2]["role"], "user");
-    assert_eq!(messages[2]["content"], "Continue");
+    assert_eq!(
+        messages[0]["content"],
+        "Earlier user message\n\nDeveloper instructions:\nCompacted thread summary\n\nContinue"
+    );
 }
 
 #[test]
@@ -6993,8 +7058,11 @@ fn translate_request_gemini_to_openai_maps_snake_case_request_fields_and_allowed
     )
     .unwrap();
 
-    assert_eq!(body["messages"][0]["role"], "system");
-    assert_eq!(body["messages"][0]["content"], "You are helpful.");
+    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(
+        body["messages"][0]["content"],
+        "System instructions:\nYou are helpful.\n\nHi"
+    );
     assert_eq!(body["max_tokens"], 222);
     assert_eq!(body["temperature"], 0.3);
     assert_eq!(body["top_p"], 0.9);
@@ -11096,7 +11164,8 @@ fn translate_request_claude_to_non_anthropic_rejects_user_turn_that_would_reorde
 }
 
 #[test]
-fn translate_request_claude_to_openai_preserves_multiblock_system_without_injected_newlines() {
+fn translate_request_claude_to_openai_max_compat_downgrades_multiblock_system_without_injected_newlines(
+) {
     let mut body = json!({
         "model": "claude-3",
         "system": [
@@ -11111,6 +11180,37 @@ fn translate_request_claude_to_openai_preserves_multiblock_system_without_inject
         UpstreamFormat::OpenAiCompletion,
         "claude-3",
         &mut body,
+        false,
+    )
+    .unwrap();
+
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(
+        messages[0]["content"],
+        "System instructions:\nSystem ASystem B\n\nHi"
+    );
+}
+
+#[test]
+fn translate_request_claude_to_openai_balanced_preserves_multiblock_system_without_injected_newlines(
+) {
+    let mut body = json!({
+        "model": "claude-3",
+        "system": [
+            { "type": "text", "text": "System A" },
+            { "type": "text", "text": "System B" }
+        ],
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+
+    translate_request_with_policy(
+        UpstreamFormat::Anthropic,
+        UpstreamFormat::OpenAiCompletion,
+        "claude-3",
+        &mut body,
+        request_translation_policy(crate::config::CompatibilityMode::Balanced, None),
         false,
     )
     .unwrap();

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.2.27 - 2026-05-01
+
+- Made `max_compat` repair OpenAI Chat Completions target requests by downgrading `system` and `developer` messages to annotated `user` turns, so narrow OpenAI-compatible chat providers that reject high-priority roles can still serve Codex, Claude Code, Gemini, and Responses clients.
+- Kept native OpenAI Responses-compatible upstreams on their own protocol surface: `instructions`, `system`, and `developer` roles remain intact when the target upstream format is `openai-responses`.
+- Expanded translation regression coverage for Responses-to-Chat compaction/instruction history, same-format OpenAI Chat max-compat handling, Gemini/Anthropic-to-Chat instruction lowering, and balanced-mode fidelity checks.
+- Advanced the main-branch release identity to Cargo package version `0.2.27`, the next patch version after the unpublished `0.2.26` development identity and the published, occupied `v0.2.25` tag, without moving, deleting, or reusing the existing tag.
+
 ## v0.2.26 - 2026-04-29
 
 - Advanced the main-branch release identity to Cargo package version `0.2.26`, the next patch version after the published and occupied `v0.2.25` tag, without moving, deleting, or reusing the existing tag.
