@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.2.28 - 2026-05-01
+
+- Advanced the main-branch release identity to Cargo package version `0.2.28`, the next patch version after the published and occupied `v0.2.27` tag, without moving, deleting, or reusing the existing tag.
+- Refreshed the checked-in container publication manifest and docs around the actual published `v0.2.27` multi-arch image digest while keeping `0.2.28` / `v0.2.28` as the next release identity, not a published container tag yet.
+- Verified the `v0.2.27` release workflow, GHCR `v0.2.27` and `0.2.27` image tags, and tag-triggered CI after publication.
+
 ## v0.2.27 - 2026-05-01
 
 - Made `max_compat` repair OpenAI Chat Completions target requests by downgrading `system` and `developer` messages to annotated `user` turns, so narrow OpenAI-compatible chat providers that reject high-priority roles can still serve Codex, Claude Code, Gemini, and Responses clients.
