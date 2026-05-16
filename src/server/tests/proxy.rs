@@ -479,6 +479,7 @@ fn snapshot_race_config(
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     }
 }
@@ -3444,6 +3445,7 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
 
@@ -3493,6 +3495,7 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
 

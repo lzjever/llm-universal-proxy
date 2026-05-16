@@ -28,6 +28,7 @@ pub fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     }
 }

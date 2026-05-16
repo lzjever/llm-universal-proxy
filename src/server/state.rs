@@ -23,6 +23,8 @@ pub(super) struct AppState {
     pub(super) metrics: Arc<RuntimeMetrics>,
     pub(super) admin_access: AdminAccess,
     pub(super) data_auth_policy: super::data_auth::RuntimeConfigValidationPolicy,
+    pub(super) conversation_state_bridge:
+        Arc<super::conversation_state_bridge::ConversationStateBridgeStore>,
 }
 
 #[derive(Clone)]

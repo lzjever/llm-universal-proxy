@@ -205,6 +205,7 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
         },
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let mut upstreams = BTreeMap::new();
@@ -253,6 +254,9 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),
+        conversation_state_bridge: Arc::new(
+            crate::server::conversation_state_bridge::ConversationStateBridgeStore::new(),
+        ),
     });
 
     let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))
@@ -352,6 +356,7 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let mut upstreams = BTreeMap::new();
@@ -400,6 +405,9 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),
+        conversation_state_bridge: Arc::new(
+            crate::server::conversation_state_bridge::ConversationStateBridgeStore::new(),
+        ),
     });
 
     let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))
@@ -447,6 +455,7 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let mut upstreams = BTreeMap::new();
@@ -495,6 +504,9 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),
+        conversation_state_bridge: Arc::new(
+            crate::server::conversation_state_bridge::ConversationStateBridgeStore::new(),
+        ),
     });
 
     let response = handle_admin_namespace_state(State(state), Path("demo".to_string()))

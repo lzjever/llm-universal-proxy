@@ -193,6 +193,32 @@ fn named_upstream(
     }
 }
 
+fn bridge_memory_proxy_config(
+    upstream_base: &str,
+    format: UpstreamFormat,
+    ttl_seconds: u64,
+    max_bytes: usize,
+) -> Config {
+    Config::from_yaml_str(&format!(
+        r#"
+listen: 127.0.0.1:0
+upstream_timeout_secs: 30
+compatibility_mode: balanced
+proxy: direct
+conversation_state_bridge:
+  mode: memory
+  ttl_seconds: {ttl_seconds}
+  max_bytes: {max_bytes}
+upstreams:
+  default:
+    api_root: "{}"
+    format: {format}
+"#,
+        upstream_api_root(upstream_base, format)
+    ))
+    .unwrap()
+}
+
 fn config_with_alias(
     upstream_base: &str,
     format: UpstreamFormat,
@@ -248,6 +274,7 @@ fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
         hooks: RuntimeHookConfig::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
     }
 }
 
@@ -593,6 +620,7 @@ fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     }
 }
@@ -953,6 +981,7 @@ fn multi_native_responses_config(first_base: &str, second_base: &str) -> Config 
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     }
 }
@@ -989,6 +1018,7 @@ fn pinned_responses_plus_auto_discovery_config(
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     }
 }
@@ -1335,6 +1365,7 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
         },
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
     };
 
     let client = Client::new();
@@ -2115,6 +2146,7 @@ async fn admin_put_data_auth_does_not_overwrite_concurrent_namespace_cas_update(
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) =
@@ -2566,7 +2598,8 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
                     ..RuntimeHookConfig::default()
                 },
                 debug_trace: DebugTraceConfig::default(),
-            resource_limits: Default::default(),
+                resource_limits: Default::default(),
+                conversation_state_bridge: Default::default(),
             },
         }))
         .send()
@@ -2739,7 +2772,8 @@ async fn admin_namespace_state_reports_namespace_proxy_source_over_http() {
                 model_aliases: std::collections::BTreeMap::new(),
                 hooks: RuntimeHookConfig::default(),
                 debug_trace: DebugTraceConfig::default(),
-            resource_limits: Default::default(),
+                resource_limits: Default::default(),
+                conversation_state_bridge: Default::default(),
             },
         }))
         .send()
@@ -3117,6 +3151,7 @@ async fn proxy_key_auth_uses_provider_key_env_and_does_not_forward_or_hook_proxy
         },
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) =
@@ -3199,6 +3234,7 @@ async fn proxy_key_mode_without_provider_key_env_fails_closed_at_startup() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
 
@@ -3233,6 +3269,7 @@ fn config_with_upstream_header(header_name: &str) -> Config {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     }
 }
@@ -3974,6 +4011,7 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -4129,6 +4167,7 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -4191,6 +4230,7 @@ async fn openai_responses_create_with_alias_routes_to_configured_upstream() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -4384,6 +4424,361 @@ async fn responses_translation_rejects_previous_response_id_without_warning_head
 }
 
 #[tokio::test]
+async fn conversation_state_bridge_replays_text_history_to_openai_chat_upstream() {
+    let (mock_base, _mock, captured) = spawn_asserting_openai_completion_mock(|_| Ok(())).await;
+    let config = bridge_memory_proxy_config(
+        &mock_base,
+        UpstreamFormat::OpenAiCompletion,
+        60,
+        1024 * 1024,
+    );
+    let (proxy_base, _proxy) = start_proxy(config).await;
+    let client = Client::new();
+
+    let first = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "First",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success(), "status: {}", first.status());
+    let first_body: Value = first.json().await.unwrap();
+    let local_id = first_body["id"].as_str().unwrap_or_default().to_string();
+    assert!(
+        local_id.starts_with("resp_llmup_"),
+        "bridge should return an llmup-owned response id, body = {first_body:?}"
+    );
+
+    let second = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "previous_response_id": local_id,
+            "input": "Second",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(second.status().is_success(), "status: {}", second.status());
+
+    let requests = captured.wait_for_count(2, Duration::from_secs(1)).await;
+    assert_eq!(requests.len(), 2, "captured = {requests:?}");
+    let replay = &requests[1].body;
+    let messages = replay["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3, "replay = {replay:?}");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "First");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "OK");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"], "Second");
+    assert!(replay.get("previous_response_id").is_none());
+}
+
+#[tokio::test]
+async fn conversation_state_bridge_replays_text_history_to_anthropic_upstream() {
+    let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(|_| Ok(())).await;
+    let config = bridge_memory_proxy_config(&mock_base, UpstreamFormat::Anthropic, 60, 1024 * 1024);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+    let client = Client::new();
+
+    let first = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "First",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success(), "status: {}", first.status());
+    let first_body: Value = first.json().await.unwrap();
+    let local_id = first_body["id"].as_str().unwrap_or_default().to_string();
+    assert!(
+        local_id.starts_with("resp_llmup_"),
+        "bridge should return an llmup-owned response id, body = {first_body:?}"
+    );
+
+    let second = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "previous_response_id": local_id,
+            "input": "Second",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(second.status().is_success(), "status: {}", second.status());
+
+    let requests = captured.wait_for_count(2, Duration::from_secs(1)).await;
+    assert_eq!(requests.len(), 2, "captured = {requests:?}");
+    let replay = &requests[1].body;
+    let messages = replay["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3, "replay = {replay:?}");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"][0]["text"], "First");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"][0]["text"], "OK");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["text"], "Second");
+    assert!(replay.get("previous_response_id").is_none());
+}
+
+#[tokio::test]
+async fn conversation_state_bridge_store_false_does_not_save_replay_state() {
+    let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(|_| Ok(())).await;
+    let config = bridge_memory_proxy_config(&mock_base, UpstreamFormat::Anthropic, 60, 1024 * 1024);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+    let client = Client::new();
+
+    let first = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "First",
+            "store": false,
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success(), "status: {}", first.status());
+    let first_body: Value = first.json().await.unwrap();
+    let response_id = first_body["id"].as_str().unwrap_or_default().to_string();
+
+    let second = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "previous_response_id": response_id,
+            "input": "Second",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+    let body: Value = second.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("previous_response_id"),
+        "message = {message}"
+    );
+    assert_eq!(
+        captured
+            .wait_for_count(2, Duration::from_millis(200))
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn conversation_state_bridge_unknown_and_expired_local_ids_fail_closed() {
+    let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(|_| Ok(())).await;
+    let config = bridge_memory_proxy_config(&mock_base, UpstreamFormat::Anthropic, 1, 1024 * 1024);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+    let client = Client::new();
+
+    let unknown = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "previous_response_id": "resp_llmup_missing",
+            "input": "Second",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+
+    let first = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "First",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success(), "status: {}", first.status());
+    let first_body: Value = first.json().await.unwrap();
+    let local_id = first_body["id"].as_str().unwrap_or_default().to_string();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let expired = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "GLM-5",
+            "previous_response_id": local_id,
+            "input": "Second",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::BAD_REQUEST);
+    let body: Value = expired.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("expired") || message.contains("unknown"),
+        "message = {message}"
+    );
+    assert_eq!(
+        captured
+            .wait_for_count(2, Duration::from_millis(200))
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn conversation_state_bridge_owner_mismatch_fails_closed() {
+    let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(|_| Ok(())).await;
+    let config = bridge_memory_proxy_config(&mock_base, UpstreamFormat::Anthropic, 60, 1024 * 1024);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+    let client = Client::new();
+
+    let first = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .header("authorization", "Bearer owner-one")
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "First",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success(), "status: {}", first.status());
+    let first_body: Value = first.json().await.unwrap();
+    let local_id = first_body["id"].as_str().unwrap_or_default().to_string();
+    assert!(local_id.starts_with("resp_llmup_"));
+
+    let second = client
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .header("authorization", "Bearer owner-two")
+        .json(&json!({
+            "model": "GLM-5",
+            "previous_response_id": local_id,
+            "input": "Second",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+    let body: Value = second.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("different local conversation_state_bridge owner"),
+        "message = {message}"
+    );
+    assert_eq!(
+        captured
+            .wait_for_count(2, Duration::from_millis(200))
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn conversation_state_bridge_proxy_key_auth_fails_closed_for_capture() {
+    let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(|_| Ok(())).await;
+    let mut config =
+        bridge_memory_proxy_config(&mock_base, UpstreamFormat::Anthropic, 60, 1024 * 1024);
+    config.upstreams[0].provider_key = Some(SecretSourceConfig {
+        inline: Some("provider-secret".to_string()),
+        env: None,
+    });
+    let (proxy_base, _proxy) =
+        start_proxy_with_data_auth(config, DataAuthConfig::proxy_key("proxy-secret")).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .header("authorization", "Bearer proxy-secret")
+        .json(&json!({
+            "model": "GLM-5",
+            "input": "First",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("client-provider-key data auth"),
+        "message = {message}"
+    );
+    assert_eq!(
+        captured
+            .wait_for_count(1, Duration::from_millis(200))
+            .await
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn conversation_state_bridge_does_not_intercept_native_responses_passthrough() {
+    let (mock_base, _mock, captured) = spawn_asserting_openai_responses_mock(|request| {
+        if request
+            .body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            != Some("resp_provider_123")
+        {
+            return Err(format!(
+                "native request should preserve previous_response_id: {:?}",
+                request.body
+            ));
+        }
+        Ok(())
+    })
+    .await;
+    let config =
+        bridge_memory_proxy_config(&mock_base, UpstreamFormat::OpenAiResponses, 60, 1024 * 1024);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4",
+            "previous_response_id": "resp_provider_123",
+            "input": "Continue",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res.status().is_success(), "status: {}", res.status());
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["id"], "resp_asserting_mock");
+    assert_eq!(
+        captured
+            .wait_for_count(1, Duration::from_secs(1))
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn responses_translation_rejects_conversation_and_background_stateful_controls() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
@@ -4490,6 +4885,7 @@ async fn responses_stateful_request_without_model_routes_to_unique_native_respon
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -4533,6 +4929,7 @@ async fn stateful_model_less_create_returns_503_when_unique_configured_native_ow
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -6249,6 +6646,7 @@ async fn multi_upstream_supports_explicit_upstream_model_selector() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -6302,6 +6700,7 @@ async fn multi_upstream_supports_local_model_alias() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -6345,6 +6744,7 @@ async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -6383,6 +6783,7 @@ async fn multi_upstream_uses_client_provider_key() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;
@@ -6436,6 +6837,7 @@ async fn proxy_key_auth_ignores_raw_client_provider_key() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) =
@@ -7394,6 +7796,7 @@ async fn upstream_unreachable_returns_502() {
         hooks: Default::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (proxy_base, _proxy) = start_proxy(config).await;

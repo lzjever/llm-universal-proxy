@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Body,
@@ -14,6 +15,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
+use crate::config::ResolvedModel;
 use crate::debug_trace::DebugTraceContext;
 use crate::downstream::DownstreamCancellation;
 use crate::formats::UpstreamFormat;
@@ -30,6 +32,9 @@ use crate::translate::{
 use crate::upstream;
 
 use super::body_limits::read_limited_json_request;
+use super::conversation_state_bridge::{
+    ConversationStateBridgeStore, StoredBridgeResponse, LOCAL_RESPONSE_ID_PREFIX,
+};
 use super::data_auth::{self, RequestAuthContext};
 use super::errors::{
     append_compatibility_warning_headers, classify_post_translation_non_stream_status,
@@ -156,6 +161,17 @@ pub(super) enum RequestBoundaryDecision {
     Allow,
     AllowWithWarnings(Vec<String>),
     Reject(String),
+}
+
+#[derive(Debug, Clone)]
+struct BridgeCaptureCandidate {
+    namespace: String,
+    owner_hash: String,
+    client_model: String,
+    resolved_model: ResolvedModel,
+    request_items: Vec<Value>,
+    ttl_seconds: u64,
+    max_bytes: usize,
 }
 
 pub(super) async fn health() -> impl IntoResponse {
@@ -657,18 +673,17 @@ async fn handle_request_core_with_downstream_cancellation(
     headers: HeaderMap,
     path: String,
     mut body: Value,
-    requested_model: String,
+    mut requested_model: String,
     client_format: UpstreamFormat,
     forced_stream: Option<bool>,
     auth_context: RequestAuthContext,
 ) -> Response<Body> {
     let request_id = new_request_id();
     let request_timestamp = now_timestamp_ms();
-    let original_body = body.clone();
-    let stateful_responses_controls = responses_stateful_request_controls(&original_body);
+    let downstream_body = body.clone();
     let original_headers = capture_headers(&headers);
     let request_redactor = redactor_for_request(&auth_context, &headers);
-    let redacted_original_body = request_redactor.redact_value(&original_body);
+    let redacted_original_body = request_redactor.redact_value(&downstream_body);
     let redacted_original_headers = redact_header_entries(&request_redactor, original_headers);
     let redacted_path = request_redactor.redact_text(&path);
     let redacted_requested_model = request_redactor.redact_text(&requested_model);
@@ -701,7 +716,7 @@ async fn handle_request_core_with_downstream_cancellation(
         redacted_requested_model.clone(),
         stream,
     );
-    if let Some(message) = reject_internal_request_scoped_tool_bridge_context(&original_body) {
+    if let Some(message) = reject_internal_request_scoped_tool_bridge_context(&downstream_body) {
         tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
         return redacted_error_response(
             client_format,
@@ -710,21 +725,83 @@ async fn handle_request_core_with_downstream_cancellation(
             &request_redactor,
         );
     }
-    let resolved_model = match resolve_request_model_or_error(
+
+    let bridge_owner_hash = ConversationStateBridgeStore::owner_hash(&namespace, &auth_context);
+    let preloaded_bridge_response = if conversation_state_bridge_can_preload(
         &namespace_state,
-        &requested_model,
         client_format,
-        &original_body,
+        &requested_model,
+        &body,
     ) {
-        Ok(v) => v,
-        Err(e) => {
-            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
-            return redacted_error_response(
-                client_format,
-                StatusCode::BAD_REQUEST,
-                &e,
-                &request_redactor,
-            );
+        match preload_local_bridge_response(
+            &state.conversation_state_bridge,
+            &body,
+            &namespace,
+            bridge_owner_hash.as_deref(),
+        )
+        .await
+        {
+            Ok(entry) => {
+                if requested_model.trim().is_empty() {
+                    requested_model = entry.client_model.clone();
+                } else {
+                    match namespace_state.config.resolve_model(&requested_model) {
+                        Ok(explicit) if explicit == entry.resolved_model => {}
+                        Ok(_) => {
+                            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+                            return redacted_error_response(
+                                client_format,
+                                StatusCode::BAD_REQUEST,
+                                "Responses `previous_response_id` was created for a different routed model",
+                                &request_redactor,
+                            );
+                        }
+                        Err(message) => {
+                            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+                            return redacted_error_response(
+                                client_format,
+                                StatusCode::BAD_REQUEST,
+                                &message,
+                                &request_redactor,
+                            );
+                        }
+                    }
+                }
+                Some(entry)
+            }
+            Err(message) => {
+                tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+                return redacted_error_response(
+                    client_format,
+                    StatusCode::BAD_REQUEST,
+                    &message,
+                    &request_redactor,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let resolved_model = if let Some(entry) = preloaded_bridge_response.as_ref() {
+        entry.resolved_model.clone()
+    } else {
+        match resolve_request_model_or_error(
+            &namespace_state,
+            &requested_model,
+            client_format,
+            &body,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+                return redacted_error_response(
+                    client_format,
+                    StatusCode::BAD_REQUEST,
+                    &e,
+                    &request_redactor,
+                );
+            }
         }
     };
     let upstream_state = match namespace_state.upstreams.get(&resolved_model.upstream_name) {
@@ -787,7 +864,36 @@ async fn handle_request_core_with_downstream_cancellation(
         }
     }
 
-    let compatibility_warnings = match classify_request_boundary_with_policy(
+    let bridge_capture_candidate = match prepare_conversation_state_bridge(
+        &namespace_state,
+        &namespace,
+        bridge_owner_hash.as_deref(),
+        client_format,
+        upstream_format,
+        stream,
+        &requested_model,
+        &resolved_model,
+        preloaded_bridge_response,
+        &mut body,
+    )
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(message) => {
+            tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+            return redacted_error_response(
+                client_format,
+                StatusCode::BAD_REQUEST,
+                &message,
+                &request_redactor,
+            );
+        }
+    };
+
+    let original_body = body.clone();
+    let stateful_responses_controls = responses_stateful_request_controls(&original_body);
+
+    let mut compatibility_warnings = match classify_request_boundary_with_policy(
         client_format,
         upstream_format,
         &original_body,
@@ -1202,7 +1308,7 @@ async fn handle_request_core_with_downstream_cancellation(
                 .as_ref()
                 .map(TrustedToolBridgeContext::to_value),
         );
-    let out = match translate_response_with_context(
+    let mut out = match translate_response_with_context(
         upstream_format,
         client_format,
         &upstream_body,
@@ -1220,6 +1326,26 @@ async fn handle_request_core_with_downstream_cancellation(
         }
     };
     let response_status = classify_post_translation_non_stream_status(client_format, &out);
+    if response_status.is_success() {
+        if let Some(candidate) = bridge_capture_candidate {
+            match commit_conversation_state_bridge_capture(
+                &state.conversation_state_bridge,
+                candidate,
+                &mut out,
+            )
+            .await
+            {
+                Ok(Some(local_id)) => {
+                    debug!("conversation_state_bridge captured local response id={local_id}");
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    warn!("conversation_state_bridge capture skipped: {message}");
+                    compatibility_warnings.push(message);
+                }
+            }
+        }
+    }
     let public_out = request_redactor.redact_value(&out);
     if let (Some(dispatcher), Some(ctx)) = (namespace_state.hooks.as_ref(), hook_ctx) {
         dispatcher.emit_non_stream(
@@ -1263,6 +1389,331 @@ fn response_is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
         .and_then(|value| value.split(';').next())
         .map(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
         .unwrap_or(false)
+}
+
+fn conversation_state_bridge_can_preload(
+    namespace_state: &RuntimeNamespaceState,
+    client_format: UpstreamFormat,
+    requested_model: &str,
+    body: &Value,
+) -> bool {
+    if client_format != UpstreamFormat::OpenAiResponses
+        || !namespace_state
+            .config
+            .conversation_state_bridge
+            .is_memory_enabled()
+    {
+        return false;
+    }
+    let Some(previous_response_id) = body.get("previous_response_id").and_then(Value::as_str)
+    else {
+        return false;
+    };
+    if !previous_response_id.starts_with(LOCAL_RESPONSE_ID_PREFIX) {
+        return false;
+    }
+    if requested_model.trim().is_empty() {
+        return true;
+    }
+
+    let Ok(resolved_model) = namespace_state.config.resolve_model(requested_model) else {
+        return true;
+    };
+    let Some(upstream) = namespace_state.upstreams.get(&resolved_model.upstream_name) else {
+        return true;
+    };
+    let fixed_native =
+        upstream.config.fixed_upstream_format == Some(UpstreamFormat::OpenAiResponses);
+    let discovered_native = upstream
+        .capability
+        .as_ref()
+        .map(|capability| {
+            capability.upstream_format_for_request(UpstreamFormat::OpenAiResponses)
+                == UpstreamFormat::OpenAiResponses
+        })
+        .unwrap_or(false);
+    !(fixed_native || discovered_native)
+}
+
+async fn preload_local_bridge_response(
+    store: &ConversationStateBridgeStore,
+    body: &Value,
+    namespace: &str,
+    owner_hash: Option<&str>,
+) -> Result<StoredBridgeResponse, String> {
+    let response_id = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "Responses `previous_response_id` is required for local replay".to_string()
+        })?;
+    if !response_id.starts_with(LOCAL_RESPONSE_ID_PREFIX) {
+        return Err(format!(
+            "Responses `previous_response_id` `{response_id}` is not an llmup local conversation_state_bridge id"
+        ));
+    }
+    let owner_hash = owner_hash.ok_or_else(conversation_state_bridge_owner_isolation_error)?;
+    store
+        .get(response_id, namespace, owner_hash)
+        .await
+        .map_err(|error| error.public_message(response_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_conversation_state_bridge(
+    namespace_state: &RuntimeNamespaceState,
+    namespace: &str,
+    owner_hash: Option<&str>,
+    client_format: UpstreamFormat,
+    upstream_format: UpstreamFormat,
+    stream: bool,
+    requested_model: &str,
+    resolved_model: &ResolvedModel,
+    preloaded_response: Option<StoredBridgeResponse>,
+    body: &mut Value,
+) -> Result<Option<BridgeCaptureCandidate>, String> {
+    if client_format != UpstreamFormat::OpenAiResponses
+        || upstream_format == UpstreamFormat::OpenAiResponses
+        || !namespace_state
+            .config
+            .conversation_state_bridge
+            .is_memory_enabled()
+    {
+        return Ok(None);
+    }
+
+    if stream {
+        if preloaded_response.is_some() {
+            return Err(
+                "conversation_state_bridge currently supports local `previous_response_id` replay only for non-streaming OpenAI Responses translation"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+
+    let store_false = body.get("store").and_then(Value::as_bool) == Some(false);
+    let store_true = body.get("store").and_then(Value::as_bool) == Some(true);
+    let has_previous_response_id = body.get("previous_response_id").is_some();
+
+    let request_items = if let Some(previous) = preloaded_response {
+        let current_items = responses_text_input_items_from_body(body)?;
+        let mut expanded = previous.transcript_items;
+        expanded.extend(current_items);
+        set_responses_input_items(body, expanded.clone())?;
+        remove_local_bridge_state_controls(body);
+        expanded
+    } else if has_previous_response_id {
+        return Ok(None);
+    } else {
+        match responses_text_input_items_from_body(body) {
+            Ok(items) => {
+                remove_local_bridge_state_controls(body);
+                items
+            }
+            Err(message) if store_true => return Err(message),
+            Err(_) => {
+                remove_local_bridge_state_controls(body);
+                return Ok(None);
+            }
+        }
+    };
+
+    if store_false {
+        return Ok(None);
+    }
+    let owner_hash = owner_hash.ok_or_else(conversation_state_bridge_owner_isolation_error)?;
+
+    Ok(Some(BridgeCaptureCandidate {
+        namespace: namespace.to_string(),
+        owner_hash: owner_hash.to_string(),
+        client_model: requested_model.to_string(),
+        resolved_model: resolved_model.clone(),
+        request_items,
+        ttl_seconds: namespace_state.config.conversation_state_bridge.ttl_seconds,
+        max_bytes: namespace_state.config.conversation_state_bridge.max_bytes,
+    }))
+}
+
+fn conversation_state_bridge_owner_isolation_error() -> String {
+    "conversation_state_bridge memory mode requires client-provider-key data auth to isolate local response owners"
+        .to_string()
+}
+
+fn remove_local_bridge_state_controls(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("previous_response_id");
+        obj.remove("store");
+    }
+}
+
+fn set_responses_input_items(body: &mut Value, items: Vec<Value>) -> Result<(), String> {
+    let Some(obj) = body.as_object_mut() else {
+        return Err("OpenAI Responses request body must be a JSON object".to_string());
+    };
+    obj.insert("input".to_string(), Value::Array(items));
+    Ok(())
+}
+
+fn responses_text_input_items_from_body(body: &Value) -> Result<Vec<Value>, String> {
+    let input = body.get("input").ok_or_else(|| {
+        "conversation_state_bridge replay requires OpenAI Responses `input`".to_string()
+    })?;
+    match input {
+        Value::String(text) => Ok(vec![responses_text_message_item(
+            "user",
+            "input_text",
+            text,
+        )]),
+        Value::Array(items) => items
+            .iter()
+            .map(responses_text_input_item)
+            .collect::<Result<Vec<_>, _>>(),
+        _ => Err(
+            "conversation_state_bridge MVP only supports text OpenAI Responses `input`".to_string(),
+        ),
+    }
+}
+
+fn responses_text_input_item(item: &Value) -> Result<Value, String> {
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("role").and_then(Value::as_str).map(|_| "message"));
+    if item_type != Some("message") {
+        return Err(
+            "conversation_state_bridge MVP only replays text message input items".to_string(),
+        );
+    }
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    if !matches!(role, "user" | "assistant") {
+        return Err(
+            "conversation_state_bridge MVP only replays user/assistant text messages".to_string(),
+        );
+    }
+    let text_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    let text = responses_text_content(item.get("content"))?;
+    Ok(responses_text_message_item(role, text_type, &text))
+}
+
+fn responses_text_content(content: Option<&Value>) -> Result<String, String> {
+    match content {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::Array(parts)) => {
+            let mut text = String::new();
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("input_text" | "output_text") => {
+                        if part
+                            .get("annotations")
+                            .and_then(Value::as_array)
+                            .is_some_and(|annotations| !annotations.is_empty())
+                        {
+                            return Err(
+                                "conversation_state_bridge MVP only supports plain text content"
+                                    .to_string(),
+                            );
+                        }
+                        text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+                    }
+                    Some("refusal") => {
+                        text.push_str(part.get("refusal").and_then(Value::as_str).unwrap_or(""));
+                    }
+                    _ => {
+                        return Err(
+                            "conversation_state_bridge MVP only supports text content".to_string()
+                        )
+                    }
+                }
+            }
+            Ok(text)
+        }
+        _ => Err("conversation_state_bridge MVP only supports text content".to_string()),
+    }
+}
+
+fn responses_text_message_item(role: &str, text_type: &str, text: &str) -> Value {
+    serde_json::json!({
+        "type": "message",
+        "role": role,
+        "content": [{ "type": text_type, "text": text }]
+    })
+}
+
+async fn commit_conversation_state_bridge_capture(
+    store: &ConversationStateBridgeStore,
+    candidate: BridgeCaptureCandidate,
+    response: &mut Value,
+) -> Result<Option<String>, String> {
+    if response.get("status").and_then(Value::as_str) != Some("completed") {
+        return Ok(None);
+    }
+    let output_items = responses_text_output_items_from_response(response)?;
+    if output_items.is_empty() {
+        return Ok(None);
+    }
+
+    let mut transcript_items = candidate.request_items;
+    transcript_items.extend(output_items);
+    let entry = StoredBridgeResponse::new(
+        candidate.namespace,
+        candidate.owner_hash,
+        candidate.client_model,
+        candidate.resolved_model,
+        transcript_items,
+    );
+    let local_id = store
+        .put(
+            entry,
+            Duration::from_secs(candidate.ttl_seconds),
+            candidate.max_bytes,
+        )
+        .await?;
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert("id".to_string(), Value::String(local_id.clone()));
+    }
+    Ok(Some(local_id))
+}
+
+fn responses_text_output_items_from_response(response: &Value) -> Result<Vec<Value>, String> {
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "conversation_state_bridge capture requires OpenAI Responses output array".to_string()
+        })?;
+    output
+        .iter()
+        .map(responses_text_output_item)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn responses_text_output_item(item: &Value) -> Result<Value, String> {
+    if item.get("type").and_then(Value::as_str) != Some("message") {
+        return Err(
+            "conversation_state_bridge MVP only captures assistant text message output".to_string(),
+        );
+    }
+    let role = item
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("assistant");
+    if role != "assistant" {
+        return Err(
+            "conversation_state_bridge MVP only captures assistant text message output".to_string(),
+        );
+    }
+    let text = responses_text_content(item.get("content"))?;
+    Ok(responses_text_message_item(
+        "assistant",
+        "output_text",
+        &text,
+    ))
 }
 
 #[cfg(test)]

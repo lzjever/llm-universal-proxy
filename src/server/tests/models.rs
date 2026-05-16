@@ -26,6 +26,7 @@ fn models_snapshot_config(alias: &str) -> crate::config::Config {
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     }
 }
@@ -65,6 +66,7 @@ fn models_catalog_config(
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     }
 }
@@ -104,6 +106,7 @@ fn models_not_found_config(
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     }
 }
@@ -124,6 +127,9 @@ async fn state_for_models_config(
         data_auth_policy: data_auth::RuntimeConfigValidationPolicy::new(
             "127.0.0.1:0".parse().expect("loopback socket addr"),
             access,
+        ),
+        conversation_state_bridge: Arc::new(
+            crate::server::conversation_state_bridge::ConversationStateBridgeStore::new(),
         ),
     })
 }

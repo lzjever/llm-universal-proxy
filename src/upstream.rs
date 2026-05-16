@@ -805,6 +805,7 @@ mod tests {
             hooks: Default::default(),
             debug_trace: crate::config::DebugTraceConfig::default(),
             resource_limits: Default::default(),
+            conversation_state_bridge: Default::default(),
             data_auth: None,
         }
     }

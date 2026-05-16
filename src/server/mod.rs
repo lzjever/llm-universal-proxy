@@ -2,6 +2,7 @@
 
 mod admin;
 mod body_limits;
+mod conversation_state_bridge;
 mod data_auth;
 mod errors;
 mod headers;
@@ -45,6 +46,7 @@ use crate::downstream::{
 };
 use crate::telemetry::RuntimeMetrics;
 
+use conversation_state_bridge::ConversationStateBridgeStore;
 use state::{build_runtime_state, AdminAccess, AppState};
 pub(crate) use state::{
     DashboardNamespaceSnapshot, DashboardRuntimeHandle, DashboardUpstreamStatus,
@@ -200,6 +202,7 @@ async fn run_with_listener_internal(
         metrics,
         admin_access: AdminAccess::from_env(),
         data_auth_policy,
+        conversation_state_bridge: Arc::new(ConversationStateBridgeStore::new()),
     });
     run_server(state, listener).await
 }
@@ -237,6 +240,7 @@ pub async fn run_with_listener_and_dashboard(
         metrics: metrics.clone(),
         admin_access: AdminAccess::from_env(),
         data_auth_policy,
+        conversation_state_bridge: Arc::new(ConversationStateBridgeStore::new()),
     });
     let server_state = state.clone();
     let mut server = tokio::spawn(async move { run_server(server_state, listener).await });

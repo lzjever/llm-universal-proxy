@@ -1253,6 +1253,7 @@ fn runtime_namespace_config(
         hooks: RuntimeHookConfig::default(),
         debug_trace: DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
     }
 }
 

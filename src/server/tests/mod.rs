@@ -137,6 +137,7 @@ pub(super) async fn app_state_for_redaction_upstreams(
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let runtime = super::state::build_runtime_state(config.clone(), &data_access)
@@ -151,6 +152,9 @@ pub(super) async fn app_state_for_redaction_upstreams(
         data_auth_policy: data_auth::RuntimeConfigValidationPolicy::new(
             "127.0.0.1:0".parse().expect("loopback socket addr"),
             data_access,
+        ),
+        conversation_state_bridge: Arc::new(
+            crate::server::conversation_state_bridge::ConversationStateBridgeStore::new(),
         ),
     })
 }
@@ -208,6 +212,7 @@ pub(super) fn runtime_namespace_state_for_tests(
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let upstream_states = upstreams
@@ -365,6 +370,7 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
@@ -411,6 +417,9 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),
+        conversation_state_bridge: Arc::new(
+            crate::server::conversation_state_bridge::ConversationStateBridgeStore::new(),
+        ),
     })
 }
 

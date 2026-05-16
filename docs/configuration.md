@@ -280,6 +280,27 @@ Controls how aggressively the proxy tries to preserve client-facing behavior on 
 
 Responses reasoning/compaction continuity has specific mode boundaries: default/max_compat may drop an opaque carrier only when visible summary text or visible transcript history remains; strict/balanced fail closed; opaque-only reasoning and opaque-only compaction fail closed; same-provider/native passthrough preserves provider-owned state.
 
+### `conversation_state_bridge`
+
+`conversation_state_bridge` is optional and defaults to off:
+
+```yaml
+conversation_state_bridge:
+  mode: off          # off | memory
+  ttl_seconds: 3600
+  max_bytes: 268435456
+```
+
+`mode: memory` enables a narrow local bridge for non-streaming OpenAI Responses requests translated to OpenAI Chat Completions or Anthropic Messages upstreams. It captures text-only request/output transcript items in process memory, returns local `resp_llmup_*` response IDs, and expands later local `previous_response_id` requests back into explicit Responses `input` before the normal translator runs.
+
+Boundaries:
+
+- default `off` preserves the existing fail-closed behavior for translated `previous_response_id` and `store: true`
+- `store: false` is honored and does not save replay state
+- unknown, expired, non-local, or owner-mismatched local IDs fail closed
+- native OpenAI Responses passthrough keeps provider IDs and provider-owned state unchanged
+- there is no persistence, streaming capture, conversation API bridge, background lifecycle emulation, tool/reasoning/compact replay, or Gemini-specific state bridge
+
 ### `upstreams`
 
 A map of named upstreams. Each upstream defines where the real provider lives and which protocol shape the proxy should use when talking to it.

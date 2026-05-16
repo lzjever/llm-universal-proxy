@@ -1139,6 +1139,7 @@ async fn openai_responses_resource_uses_request_snapshot_after_auth_runtime_race
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     replace_runtime_and_data_auth(
@@ -1228,6 +1229,9 @@ async fn openai_responses_state_resource_routes_fail_closed_without_unique_avail
             metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
             admin_access: AdminAccess::LoopbackOnly,
             data_auth_policy: test_data_auth_policy_for_tests(),
+            conversation_state_bridge: Arc::new(
+                crate::server::conversation_state_bridge::ConversationStateBridgeStore::new(),
+            ),
         });
 
         let response = handle_openai_responses_resource(
@@ -1345,6 +1349,7 @@ fn resolve_native_responses_stateful_route_or_error_rejects_multi_upstream_auto_
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (responses_client, responses_streaming_client, responses_resolved_proxy) =
@@ -1480,6 +1485,7 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
         hooks: Default::default(),
         debug_trace: crate::config::DebugTraceConfig::default(),
         resource_limits: Default::default(),
+        conversation_state_bridge: Default::default(),
         data_auth: None,
     };
     let (client, streaming_client, resolved_proxy) = crate::upstream::build_upstream_clients(
@@ -1525,6 +1531,9 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
         metrics: crate::telemetry::RuntimeMetrics::new(&crate::config::Config::default()),
         admin_access: AdminAccess::LoopbackOnly,
         data_auth_policy: test_data_auth_policy_for_tests(),
+        conversation_state_bridge: Arc::new(
+            crate::server::conversation_state_bridge::ConversationStateBridgeStore::new(),
+        ),
     });
 
     let response = handle_openai_responses_resource(

@@ -153,6 +153,56 @@ impl ResourceLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConversationStateBridgeMode {
+    #[default]
+    #[serde(rename = "off")]
+    Off,
+    #[serde(rename = "memory")]
+    Memory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationStateBridgeConfig {
+    #[serde(default)]
+    pub mode: ConversationStateBridgeMode,
+    #[serde(default = "default_conversation_state_bridge_ttl_seconds")]
+    pub ttl_seconds: u64,
+    #[serde(default = "default_conversation_state_bridge_max_bytes")]
+    pub max_bytes: usize,
+}
+
+impl Default for ConversationStateBridgeConfig {
+    fn default() -> Self {
+        Self {
+            mode: ConversationStateBridgeMode::Off,
+            ttl_seconds: default_conversation_state_bridge_ttl_seconds(),
+            max_bytes: default_conversation_state_bridge_max_bytes(),
+        }
+    }
+}
+
+impl ConversationStateBridgeConfig {
+    pub fn is_memory_enabled(&self) -> bool {
+        self.mode == ConversationStateBridgeMode::Memory
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.ttl_seconds == 0 {
+            return Err(
+                "conversation_state_bridge.ttl_seconds must be greater than zero".to_string(),
+            );
+        }
+        if self.max_bytes == 0 {
+            return Err(
+                "conversation_state_bridge.max_bytes must be greater than zero".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// A secret source accepted by static YAML and Admin runtime payloads.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct SecretSourceConfig {
@@ -636,6 +686,8 @@ pub struct Config {
     pub debug_trace: DebugTraceConfig,
     /// Resource boundaries for request bodies, upstream bodies, and streaming state.
     pub resource_limits: ResourceLimits,
+    /// Optional local memory bridge for translated OpenAI Responses conversation state.
+    pub conversation_state_bridge: ConversationStateBridgeConfig,
     /// Optional static global data-plane auth. Runtime namespace payloads manage this separately.
     pub data_auth: Option<DataAuthConfig>,
 }
@@ -724,6 +776,8 @@ pub struct RuntimeConfigPayload {
     pub debug_trace: DebugTraceConfig,
     #[serde(default)]
     pub resource_limits: ResourceLimits,
+    #[serde(default)]
+    pub conversation_state_bridge: ConversationStateBridgeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -796,6 +850,7 @@ pub struct AdminConfigView {
     pub hooks: AdminHookConfigView,
     pub debug_trace: AdminDebugTraceConfigView,
     pub resource_limits: ResourceLimits,
+    pub conversation_state_bridge: ConversationStateBridgeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -819,6 +874,8 @@ struct FileConfig {
     debug_trace: DebugTraceConfig,
     #[serde(default)]
     resource_limits: ResourceLimits,
+    #[serde(default)]
+    conversation_state_bridge: ConversationStateBridgeConfig,
     #[serde(default)]
     data_auth: Option<DataAuthConfig>,
 }
@@ -938,6 +995,7 @@ impl Default for Config {
             hooks: HookConfig::default(),
             debug_trace: DebugTraceConfig::default(),
             resource_limits: ResourceLimits::default(),
+            conversation_state_bridge: ConversationStateBridgeConfig::default(),
             data_auth: None,
         }
     }
@@ -1060,6 +1118,7 @@ impl Config {
             },
             debug_trace: parsed.debug_trace,
             resource_limits: parsed.resource_limits,
+            conversation_state_bridge: parsed.conversation_state_bridge,
             data_auth: parsed.data_auth,
         })
     }
@@ -1070,6 +1129,7 @@ impl Config {
             return Err("at least one upstream must be configured".to_string());
         }
         self.resource_limits.validate()?;
+        self.conversation_state_bridge.validate()?;
         if let Some(data_auth) = &self.data_auth {
             data_auth.validate_static()?;
         }
@@ -1322,6 +1382,7 @@ impl TryFrom<RuntimeConfigPayload> for Config {
             },
             debug_trace: value.debug_trace,
             resource_limits: value.resource_limits,
+            conversation_state_bridge: value.conversation_state_bridge,
             data_auth: None,
         };
         config.validate()?;
@@ -1376,6 +1437,7 @@ impl From<&Config> for RuntimeConfigPayload {
             },
             debug_trace: value.debug_trace.clone(),
             resource_limits: value.resource_limits.clone(),
+            conversation_state_bridge: value.conversation_state_bridge.clone(),
         }
     }
 }
@@ -1448,6 +1510,7 @@ impl From<&Config> for AdminConfigView {
                 max_text_chars: value.debug_trace.max_text_chars,
             },
             resource_limits: value.resource_limits.clone(),
+            conversation_state_bridge: value.conversation_state_bridge.clone(),
         }
     }
 }
@@ -1561,6 +1624,14 @@ fn default_listen() -> String {
 
 fn default_upstream_timeout_secs() -> u64 {
     120
+}
+
+fn default_conversation_state_bridge_ttl_seconds() -> u64 {
+    3600
+}
+
+fn default_conversation_state_bridge_max_bytes() -> usize {
+    256 * 1024 * 1024
 }
 
 fn default_hook_timeout_secs() -> u64 {
@@ -1868,6 +1939,7 @@ upstreams:
                 stream_max_events: 13,
                 max_accumulated_stream_state_bytes: 16384,
             },
+            conversation_state_bridge: ConversationStateBridgeConfig::default(),
         };
 
         let config = Config::try_from(payload).unwrap();
@@ -2580,6 +2652,7 @@ upstreams:
             hooks: RuntimeHookConfig::default(),
             debug_trace: DebugTraceConfig::default(),
             resource_limits: ResourceLimits::default(),
+            conversation_state_bridge: ConversationStateBridgeConfig::default(),
         };
 
         let error = Config::try_from(payload.clone())
@@ -2788,6 +2861,7 @@ upstreams:
                 max_request_body_bytes: 12_345,
                 ..ResourceLimits::default()
             },
+            conversation_state_bridge: ConversationStateBridgeConfig::default(),
             data_auth: None,
         };
 
