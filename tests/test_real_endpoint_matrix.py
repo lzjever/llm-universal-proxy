@@ -87,6 +87,16 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
 
         self.assertEqual(args.anthropic_model, "claude-sonnet-4-6")
 
+    def test_mock_tool_request_detection_ignores_removed_native_gemini_schema(self):
+        module = load_endpoint_matrix_module()
+
+        self.assertTrue(module._body_has_tool_request({"tools": [{"type": "function"}]}))
+        self.assertFalse(
+            module._body_has_tool_request(
+                {"tools": [{"functionDeclarations": [{"name": "legacy_gemini"}]}]}
+            )
+        )
+
     def test_compatible_provider_matrix_cases_cover_required_ga_tier(self):
         module = load_endpoint_matrix_module()
         cases = module.build_compatible_provider_matrix_cases(

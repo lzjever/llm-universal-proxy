@@ -12,19 +12,23 @@ Reasoning is no longer just a model trait. It now affects request policy, stream
 
 ## Provider comparison
 
-| Dimension | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Gemini `generateContent` | Proxy guidance |
-| --- | --- | --- | --- | --- | --- |
-| Request control | Native `reasoning` config on supported models; official docs also expose `include` values like `reasoning.encrypted_content` | Reasoning controls remain model-specific and Chat-oriented, not a typed reasoning object family | `thinking` is an explicit request object with token-budget semantics | `thinkingConfig` is part of generation config on supported models | Preserve vendor-native reasoning config only on passthrough paths. Cross-protocol translation should treat request knobs as non-portable. |
-| Response representation | Reasoning can appear as typed output items plus summary material | Usually flattened into assistant output or model-specific side channels | Returned as `thinking` content blocks | Returned through candidate content plus usage metadata for thought tokens | Treat summarized text as the portability floor. Do not promise structural round-trip fidelity. |
-| Encrypted / opaque reasoning state | Official docs now enumerate `reasoning.encrypted_content` in `include`; reasoning items can carry `encrypted_content` | No stable equivalent | No stable equivalent in the public Messages wire shape | No stable equivalent | Same-provider/native passthrough preserves the opaque carrier. For request-side continuity, default/max_compat cross-provider translation may warn/drop the carrier only when visible summary text or visible transcript/history remains; strict and balanced modes fail closed for request-side opaque/provenance continuity fields, and opaque-only reasoning fails closed. Do not synthesize fake encrypted state. Response-side reasoning encrypted_content has a separate Anthropic carrier recovery path. |
-| Usage accounting | `output_tokens_details.reasoning_tokens` | `completion_tokens_details.reasoning_tokens` on supported models | Thinking budget counts toward `max_tokens`, but token accounting is not isomorphic | `usageMetadata.thoughtsTokenCount` | Preserve provider-native counters, but document them as approximate when normalized. |
-| Streaming behavior | Rich reasoning-aware event family in Responses streaming | Chat streams deltas, not typed reasoning items | Thinking arrives through block events | Streaming shape is candidate-based, not item-based | Streaming adapters should preserve "reasoning happened" and token totals, not exact event taxonomy. |
+| Dimension | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Proxy guidance |
+| --- | --- | --- | --- | --- |
+| Request control | Native `reasoning` config on supported models; official docs also expose `include` values like `reasoning.encrypted_content` | Reasoning controls remain model-specific and Chat-oriented, not a typed reasoning object family | `thinking` is an explicit request object with token-budget semantics | Preserve vendor-native reasoning config only on passthrough paths. Cross-protocol translation should treat request knobs as non-portable. |
+| Response representation | Reasoning can appear as typed output items plus summary material | Usually flattened into assistant output or model-specific side channels | Returned as `thinking` content blocks | Treat summarized text as the portability floor. Do not promise structural round-trip fidelity. |
+| Encrypted / opaque reasoning state | Official docs now enumerate `reasoning.encrypted_content` in `include`; reasoning items can carry `encrypted_content` | No stable equivalent | No stable equivalent in the public Messages wire shape | Same-provider/native passthrough preserves the opaque carrier. For request-side continuity, default/max_compat cross-provider translation may warn/drop the carrier only when visible summary text or visible transcript/history remains; strict and balanced modes fail closed for request-side opaque/provenance continuity fields, and opaque-only reasoning fails closed. Do not synthesize fake encrypted state. Response-side reasoning encrypted_content has a separate Anthropic carrier recovery path. |
+| Usage accounting | `output_tokens_details.reasoning_tokens` | `completion_tokens_details.reasoning_tokens` on supported models | Thinking budget counts toward `max_tokens`, but token accounting is not isomorphic | Preserve provider-native counters, but document them as approximate when normalized. |
+| Streaming behavior | Rich reasoning-aware event family in Responses streaming | Chat streams deltas, not typed reasoning items | Thinking arrives through block events | Streaming adapters should preserve "reasoning happened" and token totals, not exact event taxonomy. |
+
+Google OpenAI-compatible Gemini follows OpenAI Chat-compatible behavior in the
+active proxy surface. Native Google/Gemini reasoning details are retired
+historical baseline context.
 
 ## Main portability boundaries
 
 | Boundary | Why it matters |
 | --- | --- |
-| Request policy is vendor-specific | OpenAI `reasoning`, Anthropic `thinking`, and Gemini `thinkingConfig` differ in both syntax and semantics. |
+| Request policy is vendor-specific | OpenAI `reasoning` and Anthropic `thinking` differ in both syntax and semantics. |
 | Opaque reasoning state is non-portable on request input | Encrypted or otherwise opaque reasoning content has no safe cross-provider request target shape. default/max_compat may keep visible summary text or visible transcript/history as ordinary context while dropping the opaque carrier; strict and balanced modes fail closed. |
 | Response carrier recovery is separate | Response-side reasoning encrypted_content can use a dedicated Anthropic carrier recovery path. Do not treat request-side continuity downgrade rules as the whole response translation policy. |
 | Token counters are similar but not identical | Developers often compare reasoning token counts operationally, but the providers do not guarantee the same accounting model. |

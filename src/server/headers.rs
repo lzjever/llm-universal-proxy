@@ -123,6 +123,7 @@ pub(super) fn extract_forwardable_headers(headers: &HeaderMap) -> Vec<(String, S
     const FORWARDABLE: &[&str] = &[
         "authorization",
         "x-api-key",
+        "x-goog-api-key",
         "api-key",
         "openai-api-key",
         "anthropic-api-key",
@@ -187,7 +188,12 @@ fn strip_auth_headers(headers: &mut Vec<(String, String)>) {
         let k = k.to_lowercase();
         !matches!(
             k.as_str(),
-            "authorization" | "x-api-key" | "api-key" | "openai-api-key" | "anthropic-api-key"
+            "authorization"
+                | "x-api-key"
+                | "x-goog-api-key"
+                | "api-key"
+                | "openai-api-key"
+                | "anthropic-api-key"
         )
     });
 }
@@ -210,4 +216,26 @@ fn is_forwardable_upstream_protocol_response_header(name: &str) -> bool {
         || name.starts_with("x-ratelimit-")
         || name.starts_with("rate-limit-")
         || name.starts_with("anthropic-ratelimit-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_auth_headers_removes_x_goog_api_key() {
+        let mut headers = vec![
+            ("x-goog-api-key".to_string(), "google-secret".to_string()),
+            ("openai-organization".to_string(), "org_123".to_string()),
+        ];
+
+        strip_auth_headers(&mut headers);
+
+        assert!(!headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-goog-api-key")));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "openai-organization" && value == "org_123"));
+    }
 }

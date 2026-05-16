@@ -135,6 +135,7 @@ fn is_test_credential_header(name: &str) -> bool {
     [
         "authorization",
         "x-api-key",
+        "x-goog-api-key",
         "api-key",
         "openai-api-key",
         "anthropic-api-key",
@@ -3995,7 +3996,15 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
     assert!(message.contains("no supported formats"));
 
     let captured = captured.lock().unwrap();
-    assert_eq!(captured.len(), 4, "only discovery probes should run");
+    assert_eq!(captured.len(), 3, "only discovery probes should run");
+    let probed_paths = captured
+        .iter()
+        .map(|(_, path, _)| path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        probed_paths,
+        std::collections::BTreeSet::from(["/chat/completions", "/responses", "/messages"])
+    );
     assert!(!captured
         .iter()
         .any(|(_, _, body)| body.contains("\"content\":\"Hi\"")));

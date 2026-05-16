@@ -247,6 +247,26 @@ class RealCliMatrixTests(unittest.TestCase):
         self.assertNotIn(case.lane.name, basename)
         self.assertNotIn(case.fixture.fixture_id, basename)
 
+    def test_trace_tool_name_helpers_ignore_removed_native_gemini_schema(self):
+        module = load_module()
+        trace_value = {
+            "tools": [{"functionDeclarations": [{"name": "legacy_gemini_tool"}]}],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "allowedFunctionNames": ["legacy_gemini_tool"]
+                }
+            },
+        }
+
+        self.assertEqual(module._tool_names_from_trace_value(trace_value), [])
+        self.assertEqual(module._tool_selector_names_from_trace_value(trace_value), [])
+        self.assertEqual(module._trace_summary_tool_selector_names(trace_value), [])
+
+        active_trace_value = {"tool_choice": {"allowed_tool_names": ["Edit"]}}
+        self.assertEqual(
+            module._trace_summary_tool_selector_names(active_trace_value), ["Edit"]
+        )
+
     def test_load_fixtures_rejects_prompt_template_with_unsupported_placeholder(self):
         module = load_module()
 

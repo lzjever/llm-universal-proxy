@@ -1219,6 +1219,7 @@ fn is_client_credential_header_name(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "authorization"
             | "x-api-key"
+            | "x-goog-api-key"
             | "api-key"
             | "openai-api-key"
             | "anthropic-api-key"
@@ -2132,6 +2133,10 @@ mod tests {
             axum::http::HeaderValue::from_static("provider-secret"),
         );
         headers.insert(
+            "x-goog-api-key",
+            axum::http::HeaderValue::from_static("provider-secret"),
+        );
+        headers.insert(
             "openai-api-key",
             axum::http::HeaderValue::from_static("provider-secret"),
         );
@@ -2152,6 +2157,7 @@ mod tests {
         for forbidden in [
             "authorization",
             "x-api-key",
+            "x-goog-api-key",
             "openai-api-key",
             "x-llmup-data-token",
         ] {

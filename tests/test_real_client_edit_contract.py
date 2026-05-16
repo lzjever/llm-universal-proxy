@@ -44,7 +44,7 @@ def make_fixture(module, verifier):
         verifier=verifier,
         timeout_secs=90,
         workspace_template=pathlib.Path("/tmp/workspace"),
-        supported_clients=("claude", "gemini"),
+        supported_clients=("claude",),
         unsupported_lanes=("qwen-local",),
     )
 
@@ -105,8 +105,8 @@ def public_editing_tool_workspace_edit_verifier():
             {
                 "type": "stdout_contract",
                 "contains_any_by_client": {
+                    "codex": ["apply_patch"],
                     "claude": ["Edit"],
-                    "gemini": ["replace"],
                 },
                 "contains_any_by_client_match_mode": "used_tool_name_mention",
                 "reject_other_client_contains_any_by_client": True,
@@ -173,9 +173,9 @@ class RealClientEditContractTests(unittest.TestCase):
 
             ok, message = module.verify_fixture_output(
                 fixture,
-                "The public editing tool used was `replace`.",
+                "The public editing tool used was `Edit`.",
                 workspace_dir,
-                context=make_context(module, "gemini"),
+                context=make_context(module, "claude"),
             )
 
         self.assertFalse(ok)
@@ -190,18 +190,6 @@ class RealClientEditContractTests(unittest.TestCase):
             (
                 "claude",
                 "**Public editing tool used:** The `Edit` tool.",
-            ),
-            (
-                "gemini",
-                "**Tool used:** `Replace` (workspace file editing tool)",
-            ),
-            (
-                "gemini",
-                "The tool I used was `replace`.",
-            ),
-            (
-                "gemini",
-                "I fixed the regression, validated the workspace, and used `replace`.",
             ),
         ):
             with self.subTest(client_name=client_name):
@@ -219,50 +207,6 @@ class RealClientEditContractTests(unittest.TestCase):
                 self.assertTrue(ok, message)
                 self.assertEqual(message, "")
 
-    def test_verify_fixture_output_all_of_accepts_real_gemini_used_tool_last_line(self):
-        module = load_module()
-        fixture = make_fixture(module, public_editing_tool_workspace_edit_verifier())
-        stdout_text = (
-            "Fixed `add` in `calc.py` and verified `main.py` runs correctly with "
-            "the expected outputs.\n\n"
-            "The exact public editing tool I actually used on the current client "
-            "surface is `replace`.\n"
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = pathlib.Path(temp_dir)
-            write_fixed_workspace(workspace_dir)
-
-            ok, message = module.verify_fixture_output(
-                fixture,
-                stdout_text,
-                workspace_dir,
-                context=make_context(module, "gemini"),
-            )
-
-        self.assertTrue(ok, message)
-        self.assertEqual(message, "")
-
-    def test_verify_fixture_output_all_of_accepts_real_gemini_passive_used_tool_stdout(
-        self,
-    ):
-        module = load_module()
-        fixture = make_fixture(module, public_editing_tool_workspace_edit_verifier())
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = pathlib.Path(temp_dir)
-            write_fixed_workspace(workspace_dir)
-
-            ok, message = module.verify_fixture_output(
-                fixture,
-                "The `replace` tool was used to fix the regression.\n",
-                workspace_dir,
-                context=make_context(module, "gemini"),
-            )
-
-        self.assertTrue(ok, message)
-        self.assertEqual(message, "")
-
     def test_verify_fixture_output_all_of_rejects_other_client_public_tool_names(self):
         module = load_module()
         fixture = make_fixture(module, public_editing_tool_workspace_edit_verifier())
@@ -273,14 +217,14 @@ class RealClientEditContractTests(unittest.TestCase):
 
             ok, message = module.verify_fixture_output(
                 fixture,
-                "I fixed the regression using `Edit` and `replace`.",
+                "I fixed the regression using `Edit` and `apply_patch`.",
                 workspace_dir,
                 context=make_context(module, "claude"),
             )
 
         self.assertFalse(ok)
         self.assertIn("other clients", message)
-        self.assertIn("replace", message)
+        self.assertIn("apply_patch", message)
 
     def test_public_editing_tool_workspace_fixture_declares_cross_client_contract(self):
         payload = json.loads(
@@ -299,8 +243,8 @@ class RealClientEditContractTests(unittest.TestCase):
         self.assertEqual(
             payload["verifier"]["verifiers"][0]["contains_any_by_client"],
             {
+                "codex": ["apply_patch"],
                 "claude": ["Edit"],
-                "gemini": ["replace"],
             },
         )
         self.assertEqual(
@@ -322,7 +266,7 @@ class RealClientEditContractTests(unittest.TestCase):
             payload["prompt_template"],
         )
         self.assertIn("Do not mention any other clients.", payload["prompt_template"])
-        self.assertEqual(payload["supported_clients"], ["claude", "gemini"])
+        self.assertEqual(payload["supported_clients"], ["claude"])
         self.assertIn("current client surface", payload["prompt"])
         self.assertIn("Name only the actual public tool, not a task label.", payload["prompt"])
         self.assertIn(
@@ -350,7 +294,6 @@ class RealClientEditContractTests(unittest.TestCase):
 
         self.assertFalse(module.client_supports_fixture("codex", fixture))
         self.assertTrue(module.client_supports_fixture("claude", fixture))
-        self.assertTrue(module.client_supports_fixture("gemini", fixture))
 
     def test_expand_matrix_excludes_codex_for_public_editing_tool_workspace_contract(self):
         module = load_module()
@@ -365,14 +308,14 @@ class RealClientEditContractTests(unittest.TestCase):
         )
 
         cases = module.expand_matrix(
-            clients=["codex", "claude", "gemini"],
+            clients=["codex", "claude"],
             lanes=[lane],
             fixtures=[fixture],
             phase="basic",
             skip_slow=False,
         )
 
-        self.assertEqual([case.client_name for case in cases], ["claude", "gemini"])
+        self.assertEqual([case.client_name for case in cases], ["claude"])
 
 
 if __name__ == "__main__":

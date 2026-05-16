@@ -21,14 +21,18 @@ In the table below, provider columns describe the official tool surface. Portabi
 
 ## Provider comparison
 
-| Dimension | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Gemini `generateContent` | Proxy guidance |
-| --- | --- | --- | --- | --- | --- |
-| Function tools | Native | Native | Native via `tools[].input_schema` | Native via `functionDeclarations` | This is the portability baseline. |
-| Hosted / server tools | Rich official surface: web search, file search, code interpreter, image generation, computer use, shell, MCP/connectors, and more | No official hosted/server tool family in the public Chat create surface | Server tools and MCP connector are first-class, but with Anthropic-specific blocks and stop reasons | Official `Tool` schema includes code execution plus built-in/server-side tools such as Google Search, URL context, Maps, File Search, computer use, and related tool config | Preserve hosted/server tools only on same-provider/native passthrough lanes or through explicit compatibility shims. Cross-provider translation should default to drop-or-warn. |
-| MCP / remote tools | Remote MCP is an official Responses tool family | No portable Chat-native MCP schema | `mcp_servers` and MCP connector are Anthropic-specific beta surfaces | `mcpServers` is an official Gemini `Tool` branch in the current request/discovery docs | Never pretend these are interchangeable. |
-| Tool choice | `auto`, `none`, required/forced tool variants | Similar function-tool control surface | `auto`, `none`, `any`, `tool`, plus flags like `disable_parallel_tool_use` | `functionCallingConfig` controls mode, but not with the same semantics | Map only the intent you can prove. Forced tool use is usually approximate. |
-| Parallelism | Explicit `parallel_tool_calls` | Explicit `parallel_tool_calls` | Exposed as a disable flag inside tool choice | No equivalent global flag in the same shape | Preserve only the "allow vs disallow parallelism" intent when possible. |
-| Tool result shape | Typed output items and streamed tool events | `tool_calls` plus tool-role follow-up messages | `tool_use`, `tool_result`, and server-tool blocks | `functionCall` / `functionResponse` plus server-side `toolCall` / `toolResponse` parts | Normalize around function name, arguments, and result payload only. |
+| Dimension | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Proxy guidance |
+| --- | --- | --- | --- | --- |
+| Function tools | Native | Native | Native via `tools[].input_schema` | This is the portability baseline. |
+| Hosted / server tools | Rich official surface: web search, file search, code interpreter, image generation, computer use, shell, MCP/connectors, and more | No official hosted/server tool family in the public Chat create surface | Server tools and MCP connector are first-class, but with Anthropic-specific blocks and stop reasons | Preserve hosted/server tools only on same-provider/native passthrough lanes or through explicit compatibility shims. Cross-provider translation should default to drop-or-warn. |
+| MCP / remote tools | Remote MCP is an official Responses tool family | No portable Chat-native MCP schema | `mcp_servers` and MCP connector are Anthropic-specific beta surfaces | Never pretend these are interchangeable. |
+| Tool choice | `auto`, `none`, required/forced tool variants | Similar function-tool control surface | `auto`, `none`, `any`, `tool`, plus flags like `disable_parallel_tool_use` | Map only the intent you can prove. Forced tool use is usually approximate. |
+| Parallelism | Explicit `parallel_tool_calls` | Explicit `parallel_tool_calls` | Exposed as a disable flag inside tool choice | Preserve only the "allow vs disallow parallelism" intent when possible. |
+| Tool result shape | Typed output items and streamed tool events | `tool_calls` plus tool-role follow-up messages | `tool_use`, `tool_result`, and server-tool blocks | Normalize around function name, arguments, and result payload only. |
+
+Google OpenAI-compatible Gemini uses the OpenAI Chat-compatible tool surface in
+active proxy behavior. Native Google/Gemini tool details are retired historical
+baseline context, not active proxy support.
 
 ## What should be considered vendor-specific
 
@@ -36,8 +40,7 @@ In the table below, provider columns describe the official tool surface. Portabi
 | --- | --- |
 | OpenAI hosted tools and include expansions | They depend on Responses-specific item types and tool event families. |
 | Anthropic server tools and `pause_turn` loops | They rely on Messages block semantics and server-side iteration limits. |
-| Anthropic MCP connector | It uses request fields, beta headers, and result blocks that have no OpenAI or Gemini mirror. |
-| Gemini built-in tools, `mcpServers`, and server-side tool parts | The tool families and result payloads do not line up with OpenAI Responses or Anthropic server tools. |
+| Anthropic MCP connector | It uses request fields, beta headers, and result blocks that have no OpenAI mirror. |
 
 ## Implementation stance
 

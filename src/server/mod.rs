@@ -498,6 +498,7 @@ fn data_cors_layer_from_env() -> Result<Option<CorsLayer>, String> {
                 header::AUTHORIZATION,
                 header::CONTENT_TYPE,
                 HeaderName::from_static("x-api-key"),
+                HeaderName::from_static("x-goog-api-key"),
                 HeaderName::from_static("api-key"),
                 HeaderName::from_static("openai-api-key"),
                 HeaderName::from_static("anthropic-api-key"),

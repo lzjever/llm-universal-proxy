@@ -94,6 +94,43 @@ class ProtocolDocsContractTests(unittest.TestCase):
         self.assertIn("Google OpenAI-compatible Gemini", combined)
         self.assertIn("`format: openai-completion`", combined)
 
+    def test_active_protocol_baselines_do_not_model_native_gemini_as_active_surface(self):
+        active_baselines = (
+            "docs/protocol-baselines/capabilities/cache.md",
+            "docs/protocol-baselines/capabilities/reasoning.md",
+            "docs/protocol-baselines/capabilities/state-continuity.md",
+            "docs/protocol-baselines/capabilities/streaming.md",
+            "docs/protocol-baselines/capabilities/tools.md",
+            "docs/protocol-baselines/matrices/field-mapping-matrix.md",
+            "docs/protocol-baselines/matrices/provider-capability-matrix.md",
+        )
+        forbidden = (
+            "Gemini `generateContent`",
+            "Gemini `streamGenerateContent`",
+            "`functionDeclarations`",
+            "`functionCall`",
+            "`functionResponse`",
+            "`thinkingConfig`",
+            "`cachedContent`",
+            "`inlineData`",
+            "`fileData`",
+            "`mcpServers`",
+            "`toolConfig`",
+            "`functionCallingConfig`",
+            "Gemini video",
+            "Gemini-routed",
+            "Gemini-native",
+            "Gemini built-in",
+        )
+
+        combined = "\n".join(read_doc(path) for path in active_baselines)
+        for snippet in forbidden:
+            with self.subTest(snippet=snippet):
+                self.assertNotIn(snippet, combined)
+
+        self.assertIn("Google OpenAI-compatible", combined)
+        self.assertIn("retired historical", combined)
+
     def test_tools_baseline_preserves_hosted_tools_only_on_native_or_shim_lanes(self):
         text = read_doc("docs/protocol-baselines/capabilities/tools.md")
         row = table_row(text, "Hosted / server tools")

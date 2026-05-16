@@ -641,12 +641,7 @@ fn selector_container_key_is_visible_identity_carrier(key: &str) -> bool {
             | "selected_tool"
             | "selected_tools"
             | "selectedTools"
-            | "allowedFunctionNames"
             | "allowed_function_names"
-            | "functionCallingConfig"
-            | "function_calling_config"
-            | "toolConfig"
-            | "tool_config"
     )
 }
 

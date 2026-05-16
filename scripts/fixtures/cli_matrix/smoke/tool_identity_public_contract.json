@@ -12,9 +12,6 @@
       ],
       "claude": [
         "Edit"
-      ],
-      "gemini": [
-        "replace"
       ]
     },
     "contains_any_by_client_match_mode": "presented_tool_name",

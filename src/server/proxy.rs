@@ -581,6 +581,7 @@ fn test_client_provider_key_from_headers(headers: &HeaderMap) -> Option<String> 
         .or_else(|| {
             [
                 "x-api-key",
+                "x-goog-api-key",
                 "api-key",
                 "openai-api-key",
                 "anthropic-api-key",

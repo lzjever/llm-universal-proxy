@@ -158,8 +158,21 @@ def _body_has_force_error(value: object) -> bool:
 
 
 def _body_has_tool_request(value: object) -> bool:
-    rendered = _body_text(value)
-    return any(marker in rendered for marker in ("tools", "functionDeclarations"))
+    if not isinstance(value, dict):
+        return False
+    tools = value.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        input_schema = tool.get("input_schema")
+        if isinstance(function, dict) or isinstance(input_schema, dict):
+            return True
+        if tool.get("type") == "function":
+            return True
+    return False
 
 
 def _json_bytes(payload: object) -> bytes:

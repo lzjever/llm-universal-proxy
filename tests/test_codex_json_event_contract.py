@@ -470,7 +470,7 @@ class CodexJsonEventContractTests(unittest.TestCase):
         )
 
         cases = module.expand_matrix(
-            clients=["codex", "claude", "gemini"],
+            clients=["codex", "claude"],
             lanes=[lane],
             fixtures=[fixture],
             phase="basic",

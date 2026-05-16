@@ -324,6 +324,7 @@ fn request_scoped_credential_secrets(headers: &HeaderMap) -> Vec<String> {
     }
     for name in [
         "x-api-key",
+        "x-goog-api-key",
         "api-key",
         "openai-api-key",
         "anthropic-api-key",
@@ -391,6 +392,19 @@ mod tests {
             redacted,
             "short credentials [REDACTED], [REDACTED], and [REDACTED] must not leak"
         );
+    }
+
+    #[test]
+    fn request_scoped_credential_secrets_collects_x_goog_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-goog-api-key"),
+            "google-secret".parse().expect("header value"),
+        );
+
+        let secrets = request_scoped_credential_secrets(&headers);
+
+        assert_eq!(secrets, vec!["google-secret".to_string()]);
     }
 
     #[test]

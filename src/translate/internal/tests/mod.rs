@@ -7480,6 +7480,32 @@ fn translate_response_same_format_rejects_nested_selector_containers() {
 }
 
 #[test]
+fn translate_response_same_format_ignores_removed_native_gemini_selector_containers() {
+    let body = json!({
+        "id": "resp_removed_native_gemini_selector",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "output": [],
+        "tool_choice": {
+            "type": "allowed_tools",
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "allowedFunctionNames": ["__llmup_custom__lookup_weather"]
+                }
+            }
+        }
+    });
+
+    translate_response(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiResponses,
+        &body,
+    )
+    .expect("removed native Gemini selector fields should not be active identity carriers");
+}
+
+#[test]
 fn translate_response_claude_to_openai_has_choices() {
     let body = json!({
         "id": "msg_1",

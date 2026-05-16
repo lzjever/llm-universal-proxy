@@ -704,6 +704,7 @@ fn strip_client_credential_headers(headers: &mut HeaderMap) {
     for name in [
         header::AUTHORIZATION,
         HeaderName::from_static("x-api-key"),
+        HeaderName::from_static("x-goog-api-key"),
         HeaderName::from_static("api-key"),
         HeaderName::from_static("openai-api-key"),
         HeaderName::from_static("anthropic-api-key"),
@@ -718,6 +719,7 @@ fn extract_standard_credential(headers: &HeaderMap) -> Result<Option<String>, Cr
     collect_authorization_credentials(headers, &mut credentials)?;
     for name in [
         "x-api-key",
+        "x-goog-api-key",
         "api-key",
         "openai-api-key",
         "anthropic-api-key",
@@ -769,6 +771,27 @@ fn collect_api_key_credentials(
         credentials.push(value.to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_and_strips_x_goog_api_key_as_sensitive_credential() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-goog-api-key"),
+            HeaderValue::from_static("google-secret"),
+        );
+
+        let credential =
+            extract_standard_credential(&headers).expect("x-goog-api-key should parse");
+        assert_eq!(credential.as_deref(), Some("google-secret"));
+
+        strip_client_credential_headers(&mut headers);
+        assert!(!headers.contains_key("x-goog-api-key"));
+    }
 }
 
 pub(super) fn cors_allowed_origins_from_env() -> Result<Vec<HeaderValue>, String> {

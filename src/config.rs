@@ -1548,6 +1548,7 @@ pub(crate) fn is_forbidden_upstream_header_name(name: &str) -> bool {
         "authorization"
             | "proxy-authorization"
             | "x-api-key"
+            | "x-goog-api-key"
             | "api-key"
             | "openai-api-key"
             | "anthropic-api-key"
@@ -2530,6 +2531,7 @@ upstreams:
             "authorization",
             "proxy-authorization",
             "x-api-key",
+            "x-goog-api-key",
             "api-key",
             "openai-api-key",
             "anthropic-api-key",

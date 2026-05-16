@@ -3919,15 +3919,6 @@ def _tool_names_from_tool_value(value: object) -> list[str]:
         if isinstance(function_name, str):
             names.append(function_name)
 
-    declarations = value.get("functionDeclarations")
-    if isinstance(declarations, list):
-        for declaration in declarations:
-            if not isinstance(declaration, dict):
-                continue
-            declaration_name = declaration.get("name")
-            if isinstance(declaration_name, str):
-                names.append(declaration_name)
-
     return names
 
 
@@ -3947,13 +3938,8 @@ def _tool_names_from_trace_value(value: object) -> list[str]:
         for tool in tools:
             names.extend(_tool_names_from_tool_value(tool))
 
-    declarations = value.get("functionDeclarations")
-    if isinstance(declarations, list):
-        for declaration in declarations:
-            names.extend(_tool_names_from_tool_value(declaration))
-
     for child_value in value.values():
-        if child_value is tools or child_value is declarations:
+        if child_value is tools:
             continue
         if isinstance(child_value, (dict, list)):
             names.extend(_tool_names_from_trace_value(child_value))
@@ -3961,26 +3947,41 @@ def _tool_names_from_trace_value(value: object) -> list[str]:
     return names
 
 
-def _tool_selector_names_from_trace_value(value: object) -> list[str]:
+def _tool_selector_names_from_trace_value(
+    value: object, *, selector_context: bool = False
+) -> list[str]:
     names: list[str] = []
     if isinstance(value, list):
-        names.extend(_string_list(value))
+        if selector_context:
+            names.extend(_string_list(value))
         for item in value:
-            names.extend(_tool_selector_names_from_trace_value(item))
+            names.extend(
+                _tool_selector_names_from_trace_value(
+                    item, selector_context=selector_context
+                )
+            )
         return names
     if not isinstance(value, dict):
         return names
 
-    names.extend(_tool_names_from_tool_value(value))
-    for key in (
+    if selector_context:
+        names.extend(_tool_names_from_tool_value(value))
+    active_selector_keys = [
         "allowed_tool_names",
-        "allowedFunctionNames",
         "allowed_function_names",
         "tool_names",
-    ):
-        names.extend(_string_list(value.get(key)))
-
-    for child_value in value.values():
+    ]
+    if selector_context:
+        active_selector_keys.extend(["allowed_tools", "tool_choice", "tools"])
+    for key in active_selector_keys:
+        names.extend(
+            _tool_selector_names_from_trace_value(
+                value.get(key), selector_context=True
+            )
+        )
+    for child_key, child_value in value.items():
+        if child_key in active_selector_keys:
+            continue
         if isinstance(child_value, (dict, list)):
             names.extend(_tool_selector_names_from_trace_value(child_value))
 
@@ -3993,14 +3994,13 @@ def _trace_summary_tool_selector_names(summary: dict[str, object]) -> list[str]:
         "tool_choice",
         "allowed_tools",
         "allowed_tool_names",
-        "allowedFunctionNames",
         "allowed_function_names",
-        "functionCallingConfig",
-        "function_calling_config",
-        "toolConfig",
-        "tool_config",
     ):
-        names.extend(_tool_selector_names_from_trace_value(summary.get(key)))
+        names.extend(
+            _tool_selector_names_from_trace_value(
+                summary.get(key), selector_context=True
+            )
+        )
     return names
 
 

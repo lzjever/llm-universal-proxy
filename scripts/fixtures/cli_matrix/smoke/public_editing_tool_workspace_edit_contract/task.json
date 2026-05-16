@@ -7,8 +7,7 @@
   "timeout_secs": 180,
   "workspace_template": "workspace",
   "supported_clients": [
-    "claude",
-    "gemini"
+    "claude"
   ],
   "requires_tool_loop": true,
   "unsupported_lanes": [
@@ -20,11 +19,11 @@
       {
         "type": "stdout_contract",
         "contains_any_by_client": {
+          "codex": [
+            "apply_patch"
+          ],
           "claude": [
             "Edit"
-          ],
-          "gemini": [
-            "replace"
           ]
         },
         "contains_any_by_client_match_mode": "used_tool_name_mention",
