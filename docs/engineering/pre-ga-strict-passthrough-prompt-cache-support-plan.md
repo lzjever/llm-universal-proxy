@@ -258,7 +258,7 @@ Known gaps:
 
 ### Translated-Mode Prompt-Cache Rules
 
-Translated-mode prompt-cache support has two levels:
+The provider prompt-cache modifier has two policy modes:
 
 - `explicit`: the proxy only forwards or maps explicit provider-native extension fields.
 - `auto_safe`: the proxy may synthesize target-provider prompt-cache controls from deterministic route/session/prefix information.

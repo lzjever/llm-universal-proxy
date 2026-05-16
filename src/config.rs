@@ -2031,7 +2031,7 @@ upstreams:
 
     #[test]
     fn legacy_runtime_payload_compatibility_modes_are_accepted_but_not_serialized() {
-        for mode in ["strict", "balanced", "max_compat"] {
+        for mode in ["strict", "balanced", "max_compat", "max-compat"] {
             let payload: RuntimeConfigPayload = serde_json::from_value(serde_json::json!({
                 "listen": "127.0.0.1:0",
                 "upstream_timeout_secs": 30,
@@ -2057,7 +2057,7 @@ upstreams:
 
     #[test]
     fn config_from_yaml_str_accepts_legacy_compatibility_modes_without_serializing_them() {
-        for mode in ["strict", "balanced", "max_compat"] {
+        for mode in ["strict", "balanced", "max_compat", "max-compat"] {
             let c = Config::from_yaml_str(&format!(
                 r#"
 compatibility_mode: {mode}
