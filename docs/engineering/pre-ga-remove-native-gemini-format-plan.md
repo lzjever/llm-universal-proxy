@@ -23,22 +23,23 @@ Gemini 只能作为 OpenAI-compatible upstream 使用；在 `llmup` 内部不再
 
 本计划是另外两份计划的范围前置条件：
 
-- [pre-ga-strict-passthrough-prompt-cache-support-plan.md](./pre-ga-strict-passthrough-prompt-cache-support-plan.md) 必须按 3 个 active protocol families 设计：OpenAI Chat、OpenAI Responses、Anthropic Messages。
+- [Raw provider passthrough and prompt-cache support plan](./pre-ga-strict-passthrough-prompt-cache-support-plan.md) 必须按 3 个 active protocol families 设计：OpenAI Chat、OpenAI Responses、Anthropic Messages。
 - [pre-ga-conversation-state-bridge-plan.md](./pre-ga-conversation-state-bridge-plan.md) 的 MVP 只支持 Responses -> OpenAI Chat / Anthropic replay，不实现 Responses -> Gemini `generateContent`。
 - 删除 native Gemini 的 PR 应优先合并，或至少作为其他两个分支的共同 rebase base。
+- 最大兼容翻译策略不能重新引入 hidden Gemini-native scope；`cachedContent`、`thoughtSignature`、`extra_body.google.cached_content` 仍由本删除计划排除。
 
 并行开发时的文件所有权建议：
 
 | Workstream | 主要所有权 | 避免踩线 |
 | --- | --- | --- |
 | Remove Native Gemini | `UpstreamFormat::Google`、`/google/*` routes、Gemini translators、Gemini streaming、Gemini tests/docs/examples/scripts | 不新增 prompt-cache/state bridge 逻辑 |
-| Strict Passthrough + Provider Prompt Cache | execution lane、raw passthrough、OpenAI/Anthropic cache optimizer、usage observation | 不修改或新增 Gemini translator/cache 功能；等 Gemini 删除后收敛测试矩阵 |
+| Raw Provider Passthrough + Provider Prompt Cache | execution lane、raw passthrough、OpenAI/Anthropic cache optimizer、usage observation | 不修改或新增 Gemini translator/cache 功能；等 Gemini 删除后收敛测试矩阵 |
 | Conversation State Bridge | memory store、Responses `previous_response_id` replay、state capture、state trace | 不实现 Gemini replay；状态展开后再交给 prompt-cache optimizer |
 
 合并顺序：
 
 1. 先合并本计划的 Phase 0-4，移除 public Gemini surface 和核心转换/streaming 分支。
-2. strict passthrough/cache 分支基于 3 协议矩阵补 golden tests 和 optimizer。
+2. passthrough/cache 分支基于 3 协议矩阵补 golden tests 和 optimizer。
 3. state bridge 分支基于 3 协议目标实现 replay。
 4. 最后统一跑全量 `cargo test`、Python 文档合同测试、`rg` 清理项和 `git diff --check`。
 
@@ -77,7 +78,7 @@ upstreams:
 这条路径的原则：
 
 - 它是 OpenAI-compatible wire protocol，不是 Gemini format。
-- 同协议时可以走 OpenAI Chat strict passthrough，前提是不需要 body mutation。
+- 同协议时可以走 OpenAI Chat raw passthrough execution lane，前提是不需要 body mutation。
 - Gemini 模型名，例如 `gemini-3-flash-preview`，只是 model string，不让 `llmup` 进入 Gemini-native adapter。
 - OpenAI-compatible provider extensions 默认不做特殊支持；如果以后确实需要，必须作为显式 provider extension plan 独立评估。
 
@@ -302,7 +303,7 @@ git diff --check
 - OpenAI-compatible Gemini upstream 可以保留 OpenAI-shaped request 字段，例如普通 Chat Completions 参数。
 - 不默认支持 Gemini native `cachedContent`，因为它是 provider-side resource handle，会重新引入 Gemini resource lifecycle。
 - 不默认支持 `extra_body.google.cached_content`，即使 Google OpenAI-compatible 文档允许 `extra_body.google` 传递部分 Gemini 字段。这个扩展会重新制造 provider-specific branch，和本次简化目标冲突。
-- 如果后续明确有强经济收益，可以单独设计 “Google OpenAI-compatible provider extension” 小计划，但它必须保持显式配置、不可跨协议泛化、不可进入 strict passthrough。
+- 如果后续明确有强经济收益，可以单独设计 “Google OpenAI-compatible provider extension” 小计划，但它必须保持显式配置、不可跨协议泛化、不可影响 raw passthrough。
 
 这样做会损失 Gemini explicit cached-content 优化，但换来主转换矩阵和状态/cache 设计的显著简化。对于 pre-GA，建议优先收敛复杂度。
 

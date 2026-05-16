@@ -31,7 +31,7 @@ OpenAI Responses, Conversations, and compact main surface checks did not show an
 obvious change that alters the current GA contract. The existing proxy posture
 still treats OpenAI state continuity, previous response IDs, Conversations, and
 compaction as native/stateful surfaces that are portable only where explicitly
-documented or preserved by same-provider/native passthrough.
+documented or preserved by raw/native passthrough.
 
 Gemini generateContent remains the main REST content-generation surface for the
 current GA docs. The spot-check did not identify a change that affects the proxy

@@ -24,7 +24,7 @@ In the table below, provider columns describe the official tool surface. Portabi
 | Dimension | OpenAI Responses | OpenAI Chat Completions | Anthropic Messages | Proxy guidance |
 | --- | --- | --- | --- | --- |
 | Function tools | Native | Native | Native via `tools[].input_schema` | This is the portability baseline. |
-| Hosted / server tools | Rich official surface: web search, file search, code interpreter, image generation, computer use, shell, MCP/connectors, and more | No official hosted/server tool family in the public Chat create surface | Server tools and MCP connector are first-class, but with Anthropic-specific blocks and stop reasons | Preserve hosted/server tools only on same-provider/native passthrough lanes or through explicit compatibility shims. Cross-provider translation should default to drop-or-warn. |
+| Hosted / server tools | Rich official surface: web search, file search, code interpreter, image generation, computer use, shell, MCP/connectors, and more | No official hosted/server tool family in the public Chat create surface | Server tools and MCP connector are first-class, but with Anthropic-specific blocks and stop reasons | Preserve hosted/server tools only on raw/native passthrough lanes or through explicit compatibility shims. Cross-provider translation should warn/drop or fail closed when the target cannot represent the tool safely. |
 | MCP / remote tools | Remote MCP is an official Responses tool family | No portable Chat-native MCP schema | `mcp_servers` and MCP connector are Anthropic-specific beta surfaces | Never pretend these are interchangeable. |
 | Tool choice | `auto`, `none`, required/forced tool variants | Similar function-tool control surface | `auto`, `none`, `any`, `tool`, plus flags like `disable_parallel_tool_use` | Map only the intent you can prove. Forced tool use is usually approximate. |
 | Parallelism | Explicit `parallel_tool_calls` | Explicit `parallel_tool_calls` | Exposed as a disable flag inside tool choice | Preserve only the "allow vs disallow parallelism" intent when possible. |
@@ -45,6 +45,6 @@ baseline context, not active proxy support.
 ## Implementation stance
 
 1. Treat function calling as the universal core.
-2. Gate hosted/server tools behind same-provider/native passthrough or explicit compatibility shims.
+2. Gate hosted/server tools behind raw/native passthrough or explicit compatibility shims.
 3. Emit compatibility warnings whenever non-function tool capabilities are dropped or approximated.
 4. Never rely on visible synthetic tool renaming as the primary live bridge for agent-facing translated paths. If a function-only bridge is needed, preserve the original visible tool name and carry bridge provenance in request-scoped translator context.

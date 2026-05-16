@@ -3391,7 +3391,7 @@ class RealCliMatrixTests(unittest.TestCase):
                 for snippet in forbidden_snippets:
                     self.assertNotIn(snippet, text)
 
-    def test_max_compat_docs_publish_stable_name_request_scoped_bridge_direction(self):
+    def test_maximum_compatibility_docs_publish_stable_name_request_scoped_bridge_direction(self):
         for path, required_snippets in REQUIRED_TOOL_BRIDGE_DIRECTION_LANGUAGE.items():
             with self.subTest(path=path.name):
                 text = path.read_text(encoding="utf-8")

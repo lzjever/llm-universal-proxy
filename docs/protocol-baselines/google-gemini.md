@@ -181,7 +181,7 @@ Media sub-objects:
 Proxy rules:
 
 - Preserve part order exactly.
-- On Gemini-native traffic and same-provider passthrough, preserve unknown or opaque fields such as `partMetadata` and real Gemini `thoughtSignature` values.
+- On historical Gemini-native raw/native passthrough traffic, preserve unknown or opaque fields such as `partMetadata` and real Gemini `thoughtSignature` values.
 - Cross-protocol request translators must not synthesize or replay Gemini `thoughtSignature` / `thought_signature` values. If those fields appear anywhere in translated request content or history, fail closed instead of guessing provenance or part placement.
 - Do not coerce a union branch into another branch.
 - Do not flatten multimodal messages into plain text.
@@ -387,7 +387,7 @@ Non-function-call signatures:
 Proxy portability rules:
 
 - OpenAI-to-Gemini conversion must not add synthetic `thoughtSignature` values to tool-call history, reasoning parts, or replayed assistant turns.
-- A real Gemini `thoughtSignature` may be preserved only on Gemini-native / same-provider passthrough traffic.
+- A real Gemini `thoughtSignature` may be preserved only on historical Gemini-native raw/native passthrough traffic.
 - Cross-protocol Gemini requests containing `thoughtSignature` or `thought_signature`, including nested `history[].parts[]` or function-response payloads, fail closed.
 - Documented dummy validator signatures are not part of the current proxy behavior. They must not be generated as a compatibility shortcut for foreign or manually constructed traces.
 

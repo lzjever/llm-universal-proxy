@@ -29,13 +29,13 @@ USER_ENTRY_DOCS = (
     "docs/clients.md",
 )
 REASONING_COMPACTION_BOUNDARY_SNIPPETS = (
-    "default/max_compat",
+    "maximum safe compatibility",
     "visible summary",
     "visible transcript",
-    "strict/balanced",
     "opaque-only reasoning",
     "opaque-only compaction",
-    "same-provider/native passthrough",
+    "hard portability boundary",
+    "raw/native passthrough",
     "provider-owned state",
 )
 
@@ -229,7 +229,7 @@ class DocsHomepageContractTests(unittest.TestCase):
                 with self.subTest(path=relative_path, snippet=snippet):
                     self.assertIn(snippet, text)
 
-    def test_readmes_use_same_provider_native_not_same_protocol_native_boundary(self):
+    def test_readmes_use_single_maximum_safe_compatibility_boundary(self):
         readme = self.read_text("README.md")
         readme_cn = self.read_text("README_CN.md")
 
@@ -237,18 +237,18 @@ class DocsHomepageContractTests(unittest.TestCase):
         self.assertNotIn("同协议路径尽量保持 native passthrough", readme_cn)
 
         english_snippets = (
-            "same-provider/native passthrough preserves provider-native fields and lifecycle state",
-            "compatible same-protocol lanes promise portable core/portable fields only",
-            "not native provider passthrough",
+            "raw same-protocol passthrough is the intended pre-GA execution lane",
+            "single maximum safe compatibility strategy",
+            "fail-closed behavior is a hard portability boundary",
         )
         for snippet in english_snippets:
             with self.subTest(language="README", snippet=snippet):
                 self.assertIn(snippet, readme)
 
         chinese_snippets = (
-            "same-provider/native passthrough 才保留 provider-native 字段和 lifecycle state",
-            "compatible same-protocol lane 只承诺 portable core/portable fields",
-            "不等同于 native provider passthrough",
+            "raw same-protocol passthrough 是 pre-GA intended execution lane",
+            "maximum safe compatibility strategy",
+            "fail-closed 是 hard portability boundary",
         )
         for snippet in chinese_snippets:
             with self.subTest(language="README_CN", snippet=snippet):

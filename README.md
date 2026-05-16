@@ -108,11 +108,11 @@ Reasoning effort such as `xhigh` is a client/request-side setting, not part of t
 
 `llmup` gives clients a stable local protocol surface, not unlimited provider equivalence.
 
-- same-provider/native passthrough preserves provider-native fields and lifecycle state
-- compatible same-protocol lanes promise portable core/portable fields only; they are not native provider passthrough
-- translated paths target a portable core and may warn or reject non-portable provider-native features
-- native extensions and provider-owned lifecycle state stay on same-provider/native paths unless a documented shim says otherwise
-- Responses reasoning/compaction continuity is mode-bound: default/max_compat may drop an opaque carrier only when visible summary text or visible transcript history remains; strict/balanced fail closed; opaque-only reasoning and opaque-only compaction fail closed; same-provider/native passthrough preserves provider-owned state
+- raw same-protocol passthrough is the intended pre-GA execution lane for routes that can avoid body mutation and response normalization
+- translated paths use a single maximum safe compatibility strategy and may warn or reject non-portable provider-native features
+- fail-closed behavior is a hard portability boundary, not a lower compatibility setting
+- native extensions and provider-owned lifecycle state stay on raw/native paths unless a documented shim says otherwise
+- Responses reasoning/compaction continuity may warn and drop an opaque carrier only when visible summary text or visible transcript history remains; opaque-only reasoning and opaque-only compaction fail closed; raw/native passthrough is the intended lane for preserving provider-owned state when implemented and the route avoids mutation
 - the quickstart includes conservative text-only `surface_defaults`; turn on search, image, or parallel-tool flags only when that model surface really supports them
 - multimodal `surface.modalities.input` gates media types, not every source transport; HTTP(S) image/PDF URLs are distinct from provider or local URIs such as `gs://`, `s3://`, and `file://`
 - Gemini models remain usable through Google's OpenAI-compatible endpoint by configuring that upstream as `format: openai-completion`; native Gemini `generateContent` wire format is not an active proxy surface

@@ -585,8 +585,9 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "not a full live multi-client/provider matrix",
             "release-compatible-provider",
             "portable-core production GA",
-            "same-provider native passthrough",
-            "cross-provider documented compatibility/fail-closed",
+            "single maximum safe compatibility with hard portability boundaries",
+            "Raw/native passthrough is an intended pre-GA execution lane",
+            "pass through compatibility machinery",
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, ga_review)
@@ -620,27 +621,27 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
 
         required_by_doc = {
             "compatibility": (
-                "default/max_compat",
+                "maximum safe compatibility",
                 "visible summary",
                 "opaque-only",
-                "same-provider/native passthrough",
+                "raw/native passthrough",
             ),
             "reasoning": (
                 "reasoning.encrypted_content",
-                "default/max_compat",
+                "maximum-compatible",
                 "visible summary",
-                "strict and balanced",
+                "opaque-only reasoning fails closed",
             ),
             "state": (
                 "context_management",
                 "request-side compaction input",
-                "default/max_compat",
+                "maximum-compatible",
                 "opaque-only",
                 "native Responses passthrough",
             ),
             "field_mapping": (
                 "Reasoning opaque state",
-                "default/max_compat",
+                "maximum-compatible",
                 "Compaction",
                 "opaque-only compaction",
             ),
@@ -652,11 +653,10 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
                 "Native OpenAI Responses passthrough",
             ),
             "ga_review": (
-                "default/max_compat",
+                "maximum safe compatibility",
                 "visible summary",
-                "strict/balanced",
                 "opaque-only",
-                "same-provider/native passthrough",
+                "raw/native passthrough",
             ),
         }
 

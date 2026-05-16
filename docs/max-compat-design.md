@@ -1,17 +1,17 @@
 # Maximum Compatibility Design
 
 Status: active  
-Last updated: 2026-04-26
+Last updated: 2026-05-16
 
 ## Summary
 
-`llm-universal-proxy` uses a client-first maximum compatibility posture for translated paths, while staying protocol-first in the core architecture.
+`llm-universal-proxy` uses one client-first translation strategy: maximum safe compatibility. The core architecture stays protocol-first, and fail-closed portability boundaries remain hard safety contracts rather than lower compatibility tiers.
 
 This means:
 
 - do not model client product brands as first-class data-plane identities
 - do model a unified `capability surface` for each local model alias
-- do keep `max_compat` as an explicit runtime policy mode
+- do treat maximum safe compatibility as the only translated-path product behavior
 - do keep provider-owned state and provider-native lifecycle features native-only
 - do treat transport-only bridge artifacts as internal machinery, not as user-facing contract
 
@@ -26,7 +26,7 @@ Locked contract:
 The current system has the architectural seams for this work:
 
 - `src/server/proxy.rs` resolves routing and computes runtime policy
-- `src/translate/internal/assessment.rs` is the compatibility policy gate
+- `src/translate/internal/assessment.rs` is the hard portability boundary gate
 - `src/translate/internal/tools.rs` already contains the custom-tool bridge machinery
 - `src/server/responses_resources.rs` already protects native OpenAI Responses lifecycle ownership
 
@@ -51,26 +51,28 @@ would mix two different concerns:
 
 That is too coarse for the data plane.
 
-The correct core abstraction is:
+The correct core abstractions are:
 
-- `compatibility_mode`
+- execution lane
 - `capability_surface`
+- hard portability boundary
 
 where:
 
-- `compatibility_mode` answers "how aggressive should compatibility shims be?"
+- execution lane answers "raw passthrough, provider prompt-cache optimization, or maximum-compatible translation?"
 - `capability_surface` answers "what client-visible contract should this local alias advertise and preserve?"
+- hard portability boundary answers "what must fail closed because it cannot be represented safely?"
 
 Client brand names can still exist in wrappers, real-client test matrix labels, and debugging, but they should not become the main policy axis inside the proxy.
 
 ## Product Direction
 
-The product promise is bounded: protocol coverage means same-provider/native passthrough for native paths and portable-core translation for mismatched paths, not full-fidelity provider equivalence. A compatible same-protocol lane can satisfy the portable fields for that protocol family, but it is not the same thing as native provider passthrough.
+The product promise is bounded: protocol coverage means raw same-protocol passthrough where the proxy can forward bytes without body mutation, and maximum safe translation for mismatched protocol paths. It is not full-fidelity provider equivalence, and it is not a menu of weaker or stronger product tiers.
 
-- same-provider/native passthrough: preserve provider-native fields within proxy routing, auth, and observability boundaries
-- compatible same-protocol lane: keep portable fields for the compatible protocol surface, but do not promise provider-owned state, lifecycle resources, or native-only extensions
-- translated paths: `portable core` plus explicit compatibility behavior
-- provider-native state and native extensions: same-provider only unless a documented shim exists
+- raw same-protocol passthrough lane: preserve provider-native fields within proxy routing, auth, and observability boundaries
+- provider prompt-cache optimized lane: synthesize only explicit provider-native cache request controls; this is not a user-facing compatibility tier and not `llmup` caching
+- translated paths: preserve the maximum safe portable representation and warn when a safe degradation is visible
+- provider-native state and native extensions: native passthrough only unless a documented, explicit shim exists
 
 Portable core:
 
@@ -92,32 +94,30 @@ Native extensions:
 
 Current implementation facts:
 
-- RequestTranslationPolicy::default() is `max_compat`.
-- `translate_request()` defaults to `max_compat` when the caller does not supply an explicit policy.
-- same-format request translation passthrough preserves native fields when the source and upstream are the same provider-native surface.
+- The pre-GA implementation still contains legacy compatibility-policy plumbing, but the product design no longer treats compatibility as a user-selectable tier.
+- Translated paths should use the maximum safe representation by default and as the only product behavior.
+- Same-format raw passthrough preserves native fields when the source and upstream use the same wire protocol and the route does not require body mutation.
 - Native Responses passthrough preserves `context_management`, `include` values such as `reasoning.encrypted_content`, and input reasoning and compaction items with `encrypted_content` unchanged.
 - Responses lifecycle/resource endpoints require exactly one native OpenAI Responses upstream and the proxy does not reconstruct provider state.
 
 Request-side reasoning encrypted_content rules:
 
-- For request-side reasoning encrypted_content and include `reasoning.encrypted_content`, strict/balanced modes fail closed on cross-provider translation.
-- In default/max_compat, include `reasoning.encrypted_content` is warned and dropped on cross-provider translation because it only asks the source provider to emit an opaque carrier the target cannot use.
-- In default/max_compat, a reasoning item `encrypted_content` carrier may be dropped only when the item has visible summary text or the request still contains visible transcript/history that can be replayed as portable context.
-- The opaque-only reasoning case fails closed even in default/max_compat. The proxy must not silently discard the only continuity signal.
+- For request-side reasoning encrypted_content, include `reasoning.encrypted_content` is warned and dropped on cross-provider translation because it only asks the source provider to emit an opaque carrier the target cannot use.
+- A reasoning item `encrypted_content` carrier may be dropped only when the item has visible summary text or the request still contains visible transcript/history that can be replayed as portable context.
+- The opaque-only reasoning case always fails closed. The proxy must not silently discard the only continuity signal.
 
 Request-side compaction input rules:
 
-- For request-side compaction input, strict/balanced modes fail closed on cross-provider translation.
-- In default/max_compat, a compaction item may warn/drop opaque carrier fields only when that compaction item has an explicit visible summary, or when the request contains non-compaction visible portable transcript/history that can carry the context forward.
+- For request-side compaction input, a compaction item may warn/drop opaque carrier fields only when that compaction item has an explicit visible summary, or when the request contains non-compaction visible portable transcript/history that can carry the context forward.
 - In the same request, one summarized compaction item does not permit another opaque-only compaction item to be silently dropped.
-- Opaque-only compaction fails closed even in default/max_compat.
+- Opaque-only compaction always fails closed.
 - The native Responses passthrough lane preserves compaction items unchanged.
 
 Response-side reasoning encrypted_content is a separate translation concern. There is a dedicated Anthropic carrier recovery path for response-side reasoning encrypted_content; the request-side continuity rules above must not be generalized into a blanket rule for all response translation.
 
 ## Multimodal Phase 1 Boundary
 
-Multimodal support is currently a `max_compat` / request-policy protocol compatibility feature, not a blanket provider capability promise. The request policy gate recognizes typed media across OpenAI Chat/Responses and Anthropic Messages, then checks the effective `surface.modalities.input` for the routed alias. That surface value is a media-type gate only; source transport support is checked separately.
+Multimodal support is a maximum-compatible protocol translation feature, not a blanket provider capability promise. The request boundary recognizes typed media across OpenAI Chat/Responses and Anthropic Messages, then checks the effective `surface.modalities.input` for the routed alias. That surface value is a media-type gate only; source transport support is checked separately.
 
 Current input modality meanings:
 
@@ -141,32 +141,22 @@ Unsupported media and unsupported source transports are hard boundaries. HTTP(S)
 
 MIME provenance is part of that boundary. OpenAI Chat `file` and OpenAI Responses `input_file` parts may carry explicit `mime_type` / `mimeType`, MIME-bearing `file_data` data URIs, and filename-derived hints. The proxy treats disagreement between those sources as unsafe and rejects the request before translation, including same-format Responses passthrough. That prevents a request from passing a PDF-only surface gate while the translator later emits video, audio, image, or another concrete media type from the actual data URI.
 
-## Recommended Runtime Policy
+## Compatibility Is Not Tiered
 
-The runtime supports a namespace-level setting:
+The product behavior is intentionally singular:
 
-```yaml
-compatibility_mode: max_compat
-```
+- raw same-protocol passthrough remains an execution lane for routes that can avoid body mutation
+- translated paths use maximum safe compatibility
+- provider prompt-cache optimization is a provider-native request-control step, not a `llmup` cache and not a compatibility tier
+- hard portability boundaries fail closed before upstream when the proxy cannot preserve or safely degrade semantics
 
-Available modes:
-
-- `strict`: reject anything that is not native or safely portable
-- `balanced`: keep current warning-and-drop behavior for safe degradations
-- `max_compat`: prefer client usability for translated paths, while keeping hard semantic boundaries
-
-Current default direction:
-
-- passthrough paths remain native
-- omitted configs default to `max_compat` for translated agent-facing deployments
-- `strict` remains available for protocol verification, CI, and high-assurance integrations
-
-Hard boundaries that should stay unchanged even in `max_compat`:
+Hard boundaries:
 
 - the proxy does not reconstruct provider-owned state
 - OpenAI Responses lifecycle resources remain native-only
 - namespaced tool calls without safe portable form remain reject
 - incomplete tool calls remain non-replayable
+- unsupported media/source transports and opaque-only continuity carriers remain reject
 
 ## Unified Capability Surface
 
@@ -207,7 +197,7 @@ Implemented points:
 - `surface_defaults` on upstream config
 - `surface` on structured model aliases
 - `effective_model_surface()` in config resolution
-- compatibility mode and effective surface data carried into request policy
+- translation behavior and effective surface data carried into request policy
 - `llmup.surface` exposed from `/openai/v1/models` and `/anthropic/v1/models`
 
 Wrappers consume the same effective surface and fail fast when live model profiles omit fields required for agent-client catalogs.
@@ -308,11 +298,11 @@ Current live bridge behavior:
 - use request-scoped `ToolBridgeContext` so response and streaming translators know that `apply_patch` on this request is a bridged custom/freeform tool, not an ordinary function tool
 - reserve prefix-based bridge names for internal-only transport bookkeeping; public request and response paths must reject or clear them
 
-Current behavior by policy:
+Current behavior:
 
-- `strict`: if custom/freeform bridge would require changing the model-visible stable tool name, reject
-- `balanced`: allow bridged custom/freeform transport only when stable tool name remains unchanged and replay safety is preserved
-- `max_compat`: prefer bridged transport with stable tool identity preservation, warning when grammar or format constraints degrade on the target protocol
+- if custom/freeform bridge would require changing the model-visible stable tool name, reject
+- allow bridged custom/freeform transport only when stable tool name remains unchanged and replay safety is preserved
+- prefer bridged transport with stable tool identity preservation, warning when grammar or format constraints degrade on the target protocol
 
 `apply_patch` specifically should remain advertised to Codex as `freeform` in the client-visible surface, while the upstream transport bridge stays internal.
 
@@ -354,17 +344,17 @@ Additional rule:
 
 Delivered:
 
-- `compatibility_mode` and `ModelSurface` are in config and runtime.
+- `ModelSurface` is in config and runtime.
 - model catalog endpoints expose effective `llmup.surface` data.
 - wrappers consume live/effective surface metadata instead of relying only on legacy client-specific defaults.
 - live translated custom/freeform tool paths preserve stable names such as `apply_patch` and keep `__llmup_custom__*` internal.
-- strict safety tests, compatibility-mode policy tests, model-surface projection tests, and focused real-client matrix checks cover the public editing tool identity contract, including Codex `apply_patch` and Claude Code `Edit`.
+- safety tests, model-surface projection tests, and focused real-client matrix checks cover the public editing tool identity contract, including Codex `apply_patch` and Claude Code `Edit`.
 
 Remaining work:
 
 - broaden real-client coverage beyond the current public tool enumeration and supported workspace-edit lanes.
 - extend `ModelSurface` only after the runtime supports additional reasoning, session, or transport fields.
-- keep protocol baseline docs aligned with strict vs `max_compat` behavior for tools, state continuity, and streaming.
+- keep protocol baseline docs aligned with maximum-compatible translation behavior for tools, state continuity, and streaming.
 - expand arbitrary structured-tool behavior coverage without relaxing the visible tool identity contract.
 
 ## Non-Goals

@@ -270,15 +270,11 @@ Resource boundaries for client request bodies, upstream response bodies, and str
 - `stream_max_events`: maximum upstream SSE frames processed for one stream
 - `max_accumulated_stream_state_bytes`: maximum accumulated translator state for one stream
 
-### `compatibility_mode`
+### Compatibility Behavior
 
-Controls how aggressively the proxy tries to preserve client-facing behavior on translated paths.
+Translated paths use one product behavior: maximum safe compatibility. The proxy preserves the most complete client-visible representation it can, emits warnings for safe degradations, and rejects requests before upstream when a field would require unsafe approximation.
 
-- `max_compat` is the default and the normal choice for real coding clients
-- `balanced` is a middle ground
-- `strict` prefers hard boundaries over compatibility shims
-
-Responses reasoning/compaction continuity has specific mode boundaries: default/max_compat may drop an opaque carrier only when visible summary text or visible transcript history remains; strict/balanced fail closed; opaque-only reasoning and opaque-only compaction fail closed; same-provider/native passthrough preserves provider-owned state.
+Fail-closed behavior is a hard portability boundary, not a lower compatibility setting. Responses reasoning or compaction carriers may be warned and dropped only when visible summary text or visible transcript history remains. Requests with opaque-only reasoning, opaque-only compaction, provider-owned state, unsupported media, and unsupported source transports fail closed. In raw/native passthrough, the proxy preserves provider-owned state when the route does not require body mutation.
 
 ### `conversation_state_bridge`
 

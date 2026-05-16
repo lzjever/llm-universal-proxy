@@ -14,8 +14,8 @@ Start here based on what you need:
   Admin API, live namespace config updates, `/admin/data-auth`, CAS / revision behavior, and redacted state
 - [docs/ga-readiness-review.md](./ga-readiness-review.md)
   GA scope, required release evidence, and compatibility boundaries
-- [engineering/pre-ga-strict-passthrough-prompt-cache-support-plan.md](./engineering/pre-ga-strict-passthrough-prompt-cache-support-plan.md)
-  Pre-GA handoff plan for strict same-format passthrough, provider prompt-cache request support, and simplified compatibility boundaries
+- [Pre-GA raw provider passthrough and prompt-cache plan](./engineering/pre-ga-strict-passthrough-prompt-cache-support-plan.md)
+  Pre-GA handoff plan for raw same-protocol passthrough, provider prompt-cache request support, and simplified compatibility boundaries
 - [engineering/pre-ga-conversation-state-bridge-plan.md](./engineering/pre-ga-conversation-state-bridge-plan.md)
   Pre-GA handoff plan for lightweight in-memory Responses continuation replay across protocol translation
 - [engineering/pre-ga-remove-native-gemini-format-plan.md](./engineering/pre-ga-remove-native-gemini-format-plan.md)

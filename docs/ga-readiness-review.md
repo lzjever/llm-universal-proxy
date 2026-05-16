@@ -13,10 +13,13 @@ documented secure defaults, bounded resource behavior, release gates, and
 compatibility boundaries.
 
 This is not a provider-certified compatibility claim. The compatibility promise
-is same-provider native passthrough for native fields and lifecycle resources,
-and cross-provider documented compatibility/fail-closed for portability:
+is single maximum safe compatibility with hard portability boundaries:
 supported mappings are documented, high-risk unsupported fields fail before
 upstream calls, and low-risk degradation must be visible rather than silent.
+Raw/native passthrough is an intended pre-GA execution lane for preserving
+native fields and lifecycle resources when the route can avoid body mutation and
+response normalization; until that lane lands, same-protocol traffic may still
+pass through compatibility machinery.
 
 ## Completed Local Baseline
 
@@ -55,23 +58,25 @@ upstream calls, and low-risk degradation must be visible rather than silent.
 
 ### OpenAI Responses
 
-OpenAI Responses lifecycle and state resource endpoints remain
-same-provider/native passthrough only. Cross-provider reconstruction of
-provider-managed state, conversation continuity, `context_management`, compact
-resources, or opaque lifecycle resources must fail closed unless a future
-mapping is explicitly designed and tested.
+OpenAI Responses lifecycle and state resource endpoints target raw/native passthrough only when the lane is implemented and the route can avoid mutation.
+Cross-provider reconstruction of provider-managed state,
+conversation continuity, `context_management`, compact resources, or opaque
+lifecycle resources must fail closed unless a future mapping is explicitly
+designed and tested.
 
-Request-side opaque reasoning and compaction input items are mode-specific:
-strict/balanced fail closed, while default/max_compat may drop opaque carriers
-such as `encrypted_content` only when visible summary text or visible transcript
-history remains. Opaque-only reasoning or compaction state still fails closed,
-and native Responses passthrough preserves the native item unchanged.
+Request-side opaque reasoning and compaction input items follow the single
+maximum safe compatibility strategy: opaque carriers such as
+`encrypted_content` may be warned and dropped only when visible summary text or
+visible transcript history remains. Opaque-only reasoning or compaction state
+always fails closed, and native Responses passthrough should preserve the native
+item unchanged when the raw/native lane is available.
 
 ### Anthropic Messages
 
 Anthropic extended thinking, redacted thinking, and provider-signature behavior
-are native semantics. They are preserved on same-provider routes and rejected on
-cross-provider routes when the target cannot faithfully carry them.
+are native semantics. They should be preserved on raw/native routes that avoid
+mutation and rejected on cross-provider routes when the target cannot
+faithfully carry them.
 
 ### Google OpenAI-Compatible Gemini
 
@@ -132,8 +137,9 @@ provider credentials, and release artifacts validated by both local contracts
 and the protected provider-neutral compatible live smoke.
 
 It does not mean every provider-specific feature is equivalent across every
-target. The promises are same-provider native passthrough and cross-provider
-documented compatibility/fail-closed.
+target. The promise is maximum safe compatibility with hard fail-closed
+boundaries, plus raw/native passthrough as the intended execution lane when a
+route can avoid mutation and normalization.
 
 ## Official References
 

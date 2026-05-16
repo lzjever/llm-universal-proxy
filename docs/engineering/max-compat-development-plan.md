@@ -1,11 +1,12 @@
 # Maximum Compatibility Development Plan
 
 Status: active
-Last updated: 2026-04-26
+Last updated: 2026-05-16
 
 ## Goal
 
-Keep translated agent-facing paths on `max_compat` while enforcing two hard rules:
+Keep translated agent-facing paths on the single maximum safe compatibility
+strategy while enforcing two hard rules:
 
 - the proxy must not rewrite the visible tool name supplied by the client
 - the proxy must not reconstruct provider-owned lifecycle state
@@ -26,7 +27,7 @@ Phase 0 and Phase 1 together define the intended translated-path bridge: preserv
 
 ## Current Baseline
 
-- `compatibility_mode` exists in config and defaults omitted configs to `max_compat`.
+- Legacy compatibility-policy plumbing exists in the runtime, but the product contract no longer treats compatibility as a user-selectable tier.
 - `surface_defaults`, alias `surface`, and `effective_model_surface()` exist as the shared model-surface truth chain.
 - model catalog endpoints expose effective `llmup.surface` metadata for wrappers and clients.
 - wrappers consume live/effective surface metadata and fail fast when critical agent-client fields are missing.
@@ -55,16 +56,16 @@ Current contract:
 - structured function-only protocol hops can still decode back to native custom/freeform semantics
 - ambiguous same-name function/custom definitions reject clearly
 
-### Phase 2: Compatibility Mode Plumbing
+### Phase 2: Legacy Compatibility-Policy Plumbing
 
-Status: delivered.
+Status: delivered as internal plumbing; no longer a product-facing tier model.
 
 Current contract:
 
-- `strict`, `balanced`, and `max_compat` are explicit policy modes
-- the same request can be evaluated differently by mode
-- visible tool identity is enforced in all modes
-- `max_compat` may warn and bridge portable semantics, but it still rejects provider-state reconstruction and unsafe non-portable shapes
+- translated paths follow the single maximum safe compatibility strategy
+- fail-closed behavior is a hard portability boundary, not a lower compatibility setting
+- visible tool identity is enforced on live request and response surfaces
+- maximum-compatible translation may warn and bridge portable semantics, but it still rejects provider-state reconstruction and unsafe non-portable shapes
 
 ### Phase 3: Unified Capability Surface
 
@@ -107,7 +108,7 @@ v0.2.13 Codex verifier note: the prework-signal checks are real-client matrix/pr
 Delivered coverage:
 
 - translator and proxy tests for visible tool identity preservation
-- compatibility-mode policy tests
+- legacy compatibility-plumbing tests
 - model-surface merge and catalog projection tests
 - wrapper parsing/runtime-config tests for `surface_defaults` and alias `surface`
 - live surface fail-fast tests for critical `llmup.surface.tools` fields
@@ -117,7 +118,7 @@ Delivered coverage:
 ## Remaining Roadmap
 
 1. Broaden structured-tool behavior coverage beyond the current public tool enumeration and supported workspace-edit lanes.
-2. Keep protocol baseline docs aligned with strict vs `max_compat` behavior for tools, state continuity, and streaming.
+2. Keep protocol baseline docs aligned with maximum safe compatibility behavior for tools, state continuity, and streaming.
 3. Add more translated streaming regressions where bridge context, terminal events, and tool-call finalization interact.
 4. Continue tightening docs/example contract tests when wrapper live-profile requirements evolve.
 5. Preserve the fail-warn posture: translated paths should warn or reject non-portable native extensions rather than silently approximating them.

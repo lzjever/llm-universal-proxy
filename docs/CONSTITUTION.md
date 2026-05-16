@@ -2,13 +2,13 @@
 
 ## Fundamental Purpose
 
-LLM Universal Proxy is a **format-agnostic protocol translation middleware** for Large Language Model APIs. Its mission is to serve as a maximally compatible bridge layer between configured LLM clients and backends, with explicit portability boundaries when protocols differ.
+LLM Universal Proxy is a **format-agnostic protocol translation middleware** for Large Language Model APIs. Its mission is to serve as a maximally compatible bridge layer between configured LLM clients and backends, with explicit hard portability boundaries when protocol semantics cannot be preserved or safely degraded.
 
 ## Mission Statement
 
 **Enable supported LLM API clients to reach configured backends through one stable proxy, with explicit portability boundaries.**
 
-A client using OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages should be able to route to configured upstreams through a matching local namespace. When protocols differ, the proxy translates portable core semantics and warns or rejects non-portable native extensions instead of hiding the mismatch. Gemini models remain usable through Google OpenAI-compatible upstreams configured with `format: openai-completion`, not through a native Gemini client namespace.
+A client using OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages should be able to route to configured upstreams through a matching local namespace. The product behavior is single maximum safe compatibility: preserve the richest safe portable representation, warn on visible degradations, and fail closed on unsafe or non-portable semantics instead of hiding the mismatch. Gemini models remain usable through Google OpenAI-compatible upstreams configured with `format: openai-completion`, not through a native Gemini client namespace.
 
 ## Core Principles
 
@@ -37,11 +37,11 @@ When translating between protocols, the proxy must preserve as much semantic fid
 - **Stop reasons / finish reasons** — map between protocol-specific stop reason semantics
 - **Streaming** — translate SSE chunk streams in real time with correct lifecycle events
 
-When exact 1:1 mapping is impossible, the proxy must degrade gracefully and signal the degradation via `x-proxy-compat-warning` headers rather than silently losing information.
+When exact 1:1 mapping is impossible, the proxy must either degrade visibly under the maximum safe compatibility strategy or fail closed at a hard portability boundary. Safe degradations must be signaled via `x-proxy-compat-warning` headers rather than silently losing information.
 
-### 3. Same-Provider Native Passthrough
+### 3. Raw Passthrough Is An Execution Lane
 
-When the route is same-provider/native, the proxy must forward requests and responses with **zero translation overhead** apart from explicit proxy behavior such as routing, authentication policy, headers, and observability. A compatible endpoint that speaks the same wire protocol is a same-format lane: it preserves portable core fields unless an explicit compatibility shim says otherwise, but it must not be treated as native provider passthrough.
+Raw/native passthrough is an execution lane, not a product tier. The intended pre-GA target is to use raw same-protocol passthrough only when the proxy can avoid body mutation and response normalization, apart from explicit proxy behavior such as routing, authentication policy, headers, and observability. When a route needs provider shims, model body rewrites, response normalization, or other compatibility machinery, it must use the single maximum-compatible translation lane.
 
 ### 4. Protocol-Agnostic Client Interface
 
@@ -70,11 +70,11 @@ The proxy does not favor any particular LLM provider. It works equally well with
 These are non-negotiable properties that all future development must preserve:
 
 1. **Supported protocol routing**: Every supported client protocol must be able to reach every supported upstream protocol within documented portability boundaries.
-2. **Passthrough preserves native semantics**: Same-provider/native routes should avoid translation while still allowing explicit proxy behavior such as routing, auth policy, headers, and observability. Compatible same-protocol lanes preserve portable fields but are not native provider passthrough.
+2. **Raw passthrough is explicit**: Raw same-protocol passthrough should be used only when the proxy can avoid body mutation and response normalization, while still allowing explicit proxy behavior such as routing, auth policy, headers, and observability. Same-protocol routes that need shims use the maximum-compatible translation lane.
 3. **Translated responses keep the client protocol shape**: The response must conform to the client's expected protocol shape, and any non-portable degradation must remain visible through warnings or rejection.
 4. **Visible tool identity is preserved**: The proxy must never change the stable tool name supplied by the client on model-visible or client-visible surfaces.
 5. **Streaming is first-class**: Streaming (SSE) support is mandatory for supported protocol pairs within the same portability and reject rules as non-streaming translation.
-6. **Backward compatibility**: Adding a new protocol or feature must not break existing client-upstream combinations.
+6. **Single compatibility strategy**: Adding a new protocol or feature must preserve the single maximum safe compatibility product behavior rather than adding user-facing compatibility tiers.
 7. **Degradation is visible**: When the proxy must drop or approximate request/response fields, it must emit compatibility warnings rather than silently failing.
 8. **Typed media fails closed on conflicting identity**: If MIME provenance disagrees across explicit metadata, data URIs, or filename hints, the proxy must reject before contacting the upstream.
 
@@ -96,7 +96,7 @@ Locked tool identity contract:
 - Tool/function call translation across protocols
 - Reasoning/thinking output preservation
 - Usage/token metric normalization
-- Capability-surface projection for real agent clients and compatibility modes
+- Capability-surface projection for real agent clients
 - Proxy authentication boundaries for health, provider/model/resource, and admin-plane routes
 
 Proxy authentication is in scope:
@@ -111,10 +111,14 @@ Proxy authentication is in scope:
 
 - LLM inference execution — the proxy does not run models
 - Prompt engineering or content modification
-- Persistent conversation state (the proxy is stateless per request)
+- Persistent conversation state, except for the optional `conversation_state_bridge.mode=memory` narrow local replay buffer described below
 - Provider-owned lifecycle state reconstruction
 - Rate limiting or quota management (delegated to upstream providers)
 - Training data collection
+
+### Narrow State Exception
+
+The proxy is stateless by default. `conversation_state_bridge.mode=memory` is the only current exception: it is explicitly configured, memory-only, scoped to llmup-owned local response IDs such as `resp_llmup_*`, and used only to replay a narrow OpenAI Responses continuation into translated routes. Unknown IDs, expired entries, process restart, owner mismatch, `store:false`, and external provider IDs fail closed. This is not persistent conversation state, not provider-owned lifecycle reconstruction, and not a response cache.
 
 ## Design Philosophy
 

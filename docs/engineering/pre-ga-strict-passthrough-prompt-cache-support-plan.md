@@ -1,8 +1,8 @@
-# Pre-GA Strict Passthrough and Provider Prompt-Cache Support Plan
+# Pre-GA Raw Provider Passthrough and Provider Prompt-Cache Support Plan
 
 - Status: handoff-ready development plan
 - Date: 2026-05-16
-- Scope: same-format passthrough, provider prompt-cache request support, provider-returned cache usage observation, and compatibility simplification
+- Scope: raw same-protocol passthrough, provider prompt-cache request support, provider-returned cache usage observation, and compatibility simplification
 - Non-scope: any `llmup`-managed cache, gateway response cache, semantic cache, cache storage, cache lifecycle management, broad fallback DSLs, pricing catalogs, guardrails, prompt management, admin UI expansion
 
 ## Plan Coordination
@@ -21,23 +21,25 @@ Gemini remains usable only as a provider brand behind an OpenAI-compatible upstr
 
 Make the pre-GA behavior easy to reason about:
 
-- If the downstream client protocol and upstream wire protocol are the same, `llmup` uses a strict passthrough lane.
-- If the protocols differ, `llmup` uses an explicit translation lane with documented portability boundaries.
+- If the downstream client protocol and upstream wire protocol are the same, and the route can avoid body mutation and response normalization, `llmup` uses a raw provider passthrough lane.
+- If the protocols differ, `llmup` uses an explicit maximum-compatible translation lane with documented hard portability boundaries.
 - Provider-native prompt-cache request controls are preserved in the lane that can actually understand them.
 - The proxy does not cache responses, prompts, embeddings, tokens, KV state, or provider cache resources.
 - The proxy does not invent a cross-provider cache abstraction.
 
-Same-format means the provider-facing wire protocol, not the provider brand. An OpenAI-compatible upstream can use strict passthrough for OpenAI-shaped requests when the route does not require body mutation. If a compatible upstream needs provider shims, model body rewrites, or response normalization, it is a compatibility route rather than strict passthrough.
+Same-format means the provider-facing wire protocol, not the provider brand. An OpenAI-compatible upstream can use raw provider passthrough for OpenAI-shaped requests when the route does not require body mutation or response normalization. If a compatible upstream needs provider shims, model body rewrites, or response normalization, it is a maximum-compatible translation route rather than raw provider passthrough.
+
+Raw provider passthrough is an execution lane and implementation target, not a user-selectable compatibility level. Translated routes have one product behavior: maximum safe compatibility with fail-closed boundaries when semantics cannot be preserved or safely degraded.
 
 This is a pre-GA plan. It may break current tests and route behavior where they encode non-passthrough same-format mutation.
 
 ## Design Principles
 
-1. Strict passthrough is stricter than compatibility. Same-format request and response payloads must not be normalized, repaired, reserialized, or translated.
-2. Translation must be explicit. Compatibility shims belong in a translated or named compatibility lane, not in native passthrough.
+1. Raw provider passthrough is a raw execution lane. Same-format request and response payloads must not be normalized, repaired, reserialized, or translated.
+2. Translation must be explicit and maximum-compatible. Compatibility shims belong in a translated or named compatibility lane, not in native passthrough.
 3. Cache is provider-owned. OpenAI `prompt_cache_key` / `prompt_cache_retention` and Anthropic `cache_control` are provider prompt-cache request mechanisms with different semantics, billing, retention, and lifecycle rules.
 4. Preserve prefixes. Cache savings depend on stable prompt prefixes, message order, tool order, schemas, media detail, and provider-specific cache handles.
-5. Keep the mental model small. Route selection should answer one question: "strict passthrough or translated compatibility?"
+5. Keep the mental model small. Route selection should answer one question: "raw passthrough or maximum-compatible translation?"
 6. Stop scope creep early. Do not add `llmup` cache storage, universal cache controls, response caching, semantic caching, fallback routing languages, or synthetic provider state while hardening passthrough.
 
 ## Current Findings
@@ -49,13 +51,13 @@ The current implementation chooses a same upstream format correctly in discovery
 Important mutation points:
 
 - Request path: [src/server/proxy.rs](../../src/server/proxy.rs) calls boundary assessment and `translate_request_with_policy()` for all routes.
-- Same-format translation: [src/translate/internal.rs](../../src/translate/internal.rs) still performs role normalization, policy defaults, MiniMax/provider shims, public tool validation, and bridge-context cleanup even when formats match.
+- Same-format translation: [src/translate/internal.rs](../../src/translate/internal.rs) still performs role normalization, translation defaults, MiniMax/provider shims, public tool validation, and bridge-context cleanup even when formats match.
 - Model rewrite: [src/server/proxy.rs](../../src/server/proxy.rs) rewrites or removes the request `model` field after translation.
 - Non-stream response path: [src/server/proxy.rs](../../src/server/proxy.rs) reads the whole body, parses JSON, translates, redacts, and reserializes even for same-format success responses; provider error bodies can also be wrapped into client-protocol errors.
 - Stream response path: [src/streaming/stream.rs](../../src/streaming/stream.rs) uses guarded SSE parsing plus redaction rather than raw passthrough for same-format streams.
 - Headers: [src/server/headers.rs](../../src/server/headers.rs) rebuilds request and response headers with allowlists and defaults.
 
-These behaviors are valuable in the translation lane, but they are not strict passthrough. Several current tests also encode the old behavior by expecting same-format role repair, parallel tool defaults, MiniMax overrides, and alias model rewrites.
+These behaviors are valuable in the translation lane, but they are not raw provider passthrough. Several current tests also encode the old behavior by expecting same-format role repair, parallel tool defaults, MiniMax overrides, and alias model rewrites.
 
 ### External Product Patterns
 
@@ -69,7 +71,7 @@ Comparable gateways split the world in ways that support this plan:
 - Vercel AI Gateway namespaces gateway behavior in `providerOptions.gateway`, including `caching: 'auto'`, instead of pretending provider cache controls are the same.
 - Envoy AI Gateway exposes a provider-agnostic `cache_control` field, but scopes it to Anthropic-compatible targets where it can be translated into native Anthropic / Vertex Claude / Bedrock Claude controls.
 
-The common lesson for `llmup`: strict passthrough and translated compatibility should be separate lanes. Provider prompt-cache request fields should remain provider-native. Any cache usage observation must be read-only telemetry over provider-returned usage fields, not a `llmup` cache implementation.
+The common lesson for `llmup`: raw provider passthrough and maximum-compatible translation should be separate lanes. Provider prompt-cache request fields should remain provider-native. Any cache usage observation must be read-only telemetry over provider-returned usage fields, not a `llmup` cache implementation.
 
 ## Target Architecture
 
@@ -77,7 +79,7 @@ Introduce an explicit primary execution lane plus orthogonal modifiers:
 
 ```rust
 enum ExecutionLane {
-    StrictPassthrough,
+    RawProviderPassthrough,
     ProviderPromptCacheOptimized,
     CompatibilityTranslation,
 }
@@ -97,13 +99,13 @@ This plan owns the primary lane and provider prompt-cache modifier. [pre-ga-conv
 
 Lane selection:
 
-- `StrictPassthrough`: client protocol equals upstream wire protocol and no configured route feature requires body mutation.
-- `ProviderPromptCacheOptimized`: client protocol equals upstream wire protocol, but an explicit provider prompt-cache policy will synthesize target-provider request controls. This is native-provider optimization, not strict passthrough.
-- `CompatibilityTranslation`: protocols differ, or the selected route needs a compatibility shim such as model alias body rewrite, provider-specific role repair, policy default injection, format conversion, or error-shape conversion.
+- `RawProviderPassthrough`: client protocol equals upstream wire protocol and no configured route feature requires body mutation or response normalization.
+- `ProviderPromptCacheOptimized`: client protocol equals upstream wire protocol, but an explicit provider prompt-cache policy will synthesize target-provider request controls. This is native-provider optimization, not raw provider passthrough.
+- `CompatibilityTranslation`: protocols differ, or the selected route needs a compatibility shim such as model alias body rewrite, provider-specific role repair, translation default injection, format conversion, or error-shape conversion. This lane always follows the single maximum safe compatibility strategy.
 
 The route decision should be visible in debug traces and metrics as `llmup.execution_lane`, with modifiers such as `llmup.state_bridge` and `llmup.provider_prompt_cache`.
 
-### Strict Passthrough Contract
+### Raw Provider Passthrough Contract
 
 Allowed proxy behavior:
 
@@ -114,12 +116,12 @@ Allowed proxy behavior:
 - Trace IDs, metrics, and hooks that observe metadata.
 - Fail-closed rejection if a request contains a known proxy-private artifact such as `_llmup_tool_bridge_context` or `__llmup_custom__*` in a structured public control field.
 
-Disallowed in strict passthrough:
+Disallowed in raw provider passthrough:
 
 - JSON reserialization of request or success response bodies.
-- Role repair, role coalescing, tool-name repair, schema repair, MiniMax/provider shims, or max-compat defaults.
+- Role repair, role coalescing, tool-name repair, schema repair, MiniMax/provider shims, or translation defaults.
 - `stream` insertion, `parallel_tool_calls` insertion, max-token insertion, Anthropic `disable_parallel_tool_use` insertion, or other body defaults.
-- `model` field rewrite/removal. If alias expansion requires body mutation, the lane is not strict passthrough.
+- `model` field rewrite/removal. If alias expansion requires body mutation, the lane is not raw provider passthrough.
 - Provider error wrapping into another protocol shape.
 - SSE event parsing or rewriting for ordinary successful same-format streams.
 - Response redaction that changes client-visible bytes. Redaction should apply to stored traces, hook payloads, and logs, not passthrough output.
@@ -128,7 +130,7 @@ Header policy:
 
 - Request `Authorization` usually cannot be raw passthrough when `llmup` owns provider credentials. That is explicit proxy behavior, not protocol translation.
 - Preserve provider protocol headers where safe. Strip hop-by-hop headers, proxy-private headers, and headers that would leak downstream credentials.
-- For strict provider routes, do not synthesize protocol defaults such as `anthropic-version` unless the route is explicitly configured to do so; otherwise a client testing a provider's native failure mode will not see it.
+- For raw passthrough routes, do not synthesize protocol defaults such as `anthropic-version` unless the route is explicitly configured to do so; otherwise a client testing a provider's native failure mode will not see it.
 
 ### Translation Contract
 
@@ -137,13 +139,13 @@ The existing translation machinery should remain available, but only in `Compati
 Translation lane responsibilities:
 
 - Convert request and response schemas across OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
-- Apply `compatibility_mode`, surface gates, max-compat shims, and warnings.
+- Apply surface gates, maximum-compatible shims, warnings, and fail-closed portability boundaries.
 - Translate portable tool calls, media, stop reasons, usage, and streaming lifecycle events.
 - Fail closed on provider-owned lifecycle state and non-portable cache state that cannot be represented safely.
 
 ### Provider Prompt-Cache Optimized Lane
 
-This lane exists to avoid confusing strict passthrough with body mutation.
+This lane exists to avoid confusing raw provider passthrough with body mutation.
 
 Allowed behavior:
 
@@ -155,7 +157,7 @@ Allowed behavior:
 Disallowed behavior:
 
 - General role repair, schema repair, model body rewrite, response normalization, or cross-protocol error shaping.
-- Calling the result strict passthrough.
+- Calling the result raw provider passthrough.
 
 ## Provider Prompt-Cache Support Strategy
 
@@ -184,7 +186,7 @@ Add a first-class internal Provider Prompt Cache IR so the behavior is not scatt
 
 Do:
 
-- Preserve provider-native prompt-cache request fields in strict passthrough.
+- Preserve provider-native prompt-cache request fields in raw provider passthrough.
 - Preserve known provider cache usage counters in client-visible native responses.
 - Optionally observe provider-returned cache usage counters for metrics and debug traces.
 - Keep translated-mode support narrow: forward or map only explicit provider-native extension fields that are documented and intentionally supported.
@@ -254,7 +256,7 @@ Known gaps:
 - There is no shared policy object that explains why a cache control was preserved, dropped, or synthesized.
 - There is no target-provider optimization matrix that says what `llmup` should do for every source/target pair.
 - Cache-aware routing is not yet modeled: a fallback or load-balanced route can scatter equivalent cacheable requests across upstream credentials/projects/regions and lose provider cache warmth.
-- Strict same-format passthrough still needs the raw request/response work described above before native cache controls are truly byte-preserved.
+- Raw same-protocol passthrough still needs the raw request/response work described above before native cache controls are truly byte-preserved.
 
 ### Translated-Mode Prompt-Cache Rules
 
@@ -332,7 +334,7 @@ Anthropic `cache_control` synthesis:
 Google Gemini through OpenAI-compatible upstream:
 
 - Treat the upstream as OpenAI Chat wire protocol for active pre-GA work.
-- Do not synthesize, translate, or test `extra_body.google.cached_content` in this plan, even though Google documents the extension for OpenAI-compatible clients. Raw strict passthrough may carry unknown OpenAI-compatible fields as bytes, but `llmup` should not claim provider-cache support for them.
+- Do not synthesize, translate, or test `extra_body.google.cached_content` in this plan, even though Google documents the extension for OpenAI-compatible clients. Raw passthrough may carry unknown OpenAI-compatible fields as bytes, but `llmup` should not claim provider-cache support for them.
 - If future demand proves the economics justify it, create a separate Google-specific OpenAI-compatible extension plan with explicit operator consent.
 
 ### Source To Target Coverage Matrix
@@ -341,15 +343,15 @@ This matrix is the handoff checklist for every active pre-GA protocol pair after
 
 | Source client format | Target upstream format | Provider cache behavior |
 | --- | --- | --- |
-| OpenAI Chat | OpenAI Chat | Strict passthrough preserves `prompt_cache_key`, `prompt_cache_retention`, automatic prompt caching, and raw usage. Same-format synthesis, if enabled, uses `ProviderPromptCacheOptimized`, not strict passthrough. |
+| OpenAI Chat | OpenAI Chat | Raw passthrough preserves `prompt_cache_key`, `prompt_cache_retention`, automatic prompt caching, and raw usage. Same-format synthesis, if enabled, uses `ProviderPromptCacheOptimized`, not raw provider passthrough. |
 | OpenAI Chat | OpenAI Responses | Preserve OpenAI prompt-cache controls during OpenAI-family translation. Do not alter retention spelling. Preserve cache usage mapping in the client response. |
 | OpenAI Chat | Anthropic Messages | `explicit`: map `extra_body.anthropic.cache_control` to top-level `cache_control`, and preserve explicit eligible block markers. `auto_safe`: use configured Anthropic strategy: top-level for full-history conversations, or configured breakpoints for stable tools/system/docs. Do not infer block breakpoints from prose. |
 | OpenAI Responses | OpenAI Chat | Preserve OpenAI prompt-cache controls during OpenAI-family translation. Do not use Responses `store` / `previous_response_id` / `conversation` as cache controls. |
-| OpenAI Responses | OpenAI Responses | Strict passthrough preserves `prompt_cache_key`, `prompt_cache_retention`, automatic prompt caching, and raw usage. Same-format synthesis, if enabled, uses `ProviderPromptCacheOptimized`, not strict passthrough. |
+| OpenAI Responses | OpenAI Responses | Raw passthrough preserves `prompt_cache_key`, `prompt_cache_retention`, automatic prompt caching, and raw usage. Same-format synthesis, if enabled, uses `ProviderPromptCacheOptimized`, not raw provider passthrough. |
 | OpenAI Responses | Anthropic Messages | Same as OpenAI Chat -> Anthropic, after Responses input is converted to the Messages pivot. Keep visible summaries/history stable, but do not translate OpenAI state controls into cache controls. |
 | Anthropic Messages | OpenAI Chat | `explicit`: warn/drop Anthropic `cache_control`. `auto_safe`: synthesize OpenAI `prompt_cache_key` from policy inputs when no explicit OpenAI key exists. Never copy raw prompt text or Anthropic TTL into the key. |
 | Anthropic Messages | OpenAI Responses | Same as Anthropic -> OpenAI Chat, with OpenAI Responses `prompt_cache_key` and `prompt_cache_retention` as target fields. Do not map Anthropic `max_tokens: 0` prewarm into Responses state. |
-| Anthropic Messages | Anthropic Messages | Strict passthrough preserves top-level and block-level `cache_control`, TTL, `max_tokens: 0` prewarm, thinking cache behavior, and raw usage. |
+| Anthropic Messages | Anthropic Messages | Raw passthrough preserves top-level and block-level `cache_control`, TTL, `max_tokens: 0` prewarm, thinking cache behavior, and raw usage. |
 
 Native Gemini rows are intentionally absent. `format: google`, `format: gemini`, and `/google/v1beta/*` are owned by the removal plan and must not receive new cache optimizer work.
 
@@ -389,7 +391,7 @@ Provider prompt-cache economics depend on minimum prefix sizes and write/read ti
 OpenAI:
 
 - Prompt caching is automatic for cacheable prompts on recent models.
-- Preserve `prompt_cache_key` and `prompt_cache_retention` on OpenAI strict passthrough.
+- Preserve `prompt_cache_key` and `prompt_cache_retention` on OpenAI raw passthrough.
 - Track `usage.prompt_tokens_details.cached_tokens` and Responses `usage.input_tokens_details.cached_tokens`.
 - Current official docs document `prompt_cache_retention` values `in_memory` and `24h`. Most models default to `in_memory`; `gpt-5.5`, `gpt-5.5-pro`, and future models default to `24h` and do not support `in_memory`.
 - The optimizer must not synthesize `24h` unless route config explicitly asks for it. If the provider defaults a model to `24h`, that is provider-native behavior and should remain visible in usage/data-retention docs rather than being hidden by `llmup`.
@@ -400,7 +402,7 @@ Anthropic:
 - Top-level `cache_control` is the preferred low-complexity translated-mode target only for routes that represent growing full-history conversations. For one-shot requests with a stable prefix and dynamic suffix, explicit breakpoints at the last stable block are the safer cost-control default.
 - Anthropic's OpenAI SDK compatibility surface is not the same as native Messages prompt caching; `llmup` translated support should target Anthropic Messages requests, not assume Anthropic's OpenAI-compatible endpoint can honor every cache control.
 - Preserve `ttl: "1h"` only as user-supplied provider-native input; do not auto-upgrade TTLs because 1-hour writes cost more.
-- Preserve `max_tokens: 0` prewarm requests in Anthropic strict passthrough. Existing compatibility policy must not inject minimum max-token defaults into this lane.
+- Preserve `max_tokens: 0` prewarm requests in Anthropic raw passthrough. Translation behavior must not inject minimum max-token defaults into this lane.
 - Track `cache_creation_input_tokens`, `cache_read_input_tokens`, and `cache_creation` subfields.
 - Anthropic currently supports prompt caching on all active Claude models, with model-specific minimum token thresholds, a 20-block lookback window per breakpoint, and up to four breakpoints. It supports automatic top-level caching on Claude API, Claude Platform on AWS, and Microsoft Foundry; Bedrock and Vertex Claude routes require explicit block-level breakpoints.
 - Tool definitions, text blocks, user image/document blocks, assistant tool-use blocks, and user tool-result blocks are cacheable. Thinking blocks cannot be directly marked, although previous thinking can be cached as part of a larger prefix.
@@ -411,27 +413,27 @@ Anthropic:
 
 Deliverables:
 
-- Add the strict passthrough contract tests before changing behavior.
+- Add the raw provider passthrough contract tests before changing behavior.
 - Update docs to say same-format passthrough is raw payload passthrough plus explicit proxy behavior.
 - Mark current same-format mutation tests as expected-to-change.
 
 Acceptance:
 
-- Developers can point to one document that explains when a route is strict passthrough versus translated compatibility.
+- Developers can point to one document that explains when a route is raw provider passthrough versus maximum-compatible translation.
 - No new product feature is introduced in this phase.
 
 ### Phase 1: Introduce Execution Lane Plumbing
 
 Deliverables:
 
-- Add `ExecutionLane`, including `StrictPassthrough`, `ProviderPromptCacheOptimized`, and `CompatibilityTranslation`, plus state/cache modifier fields.
+- Add `ExecutionLane`, including `RawProviderPassthrough`, `ProviderPromptCacheOptimized`, and `CompatibilityTranslation`, plus state/cache modifier fields.
 - Route discovery returns both upstream format and lane.
 - Debug traces, metrics, and hooks include the lane.
 - Keep behavior unchanged while lane selection is observable.
 
 Acceptance:
 
-- Unit tests prove same-format routes select `StrictPassthrough` unless model alias rewriting or a configured shim requires mutation.
+- Unit tests prove same-format routes select `RawProviderPassthrough` unless model alias rewriting or a configured shim requires mutation or response normalization.
 - Cross-format routes select `CompatibilityTranslation`.
 
 ### Phase 2: Raw Request Passthrough
@@ -440,32 +442,32 @@ Deliverables:
 
 - Preserve raw request body bytes through routing.
 - Split the request representation into `raw_bytes` plus a parsed `serde_json::Value` used only for routing/boundary decisions. Strict passthrough sends `raw_bytes`; translated/cache/state lanes use the parsed/mutable JSON.
-- In `StrictPassthrough`, skip `translate_request_with_policy()`, role repair, policy defaults, MiniMax overrides, and body-level model rewrite.
+- In `RawProviderPassthrough`, skip `translate_request_with_policy()`, role repair, translation defaults, MiniMax overrides, and body-level model rewrite.
 - Replace body-mutating safety checks with narrow ingress checks that reject proxy-private structured artifacts without reserializing the body.
-- Ensure forced streaming does not insert `stream` in strict passthrough.
+- Ensure forced streaming does not insert `stream` in raw provider passthrough.
 
 Acceptance tests:
 
 - Golden upstream request bodies match client request bytes for OpenAI Chat, OpenAI Responses, and Anthropic Messages.
 - Golden bodies include field order, whitespace, numeric formatting, unknown provider fields, and provider error bodies where relevant.
-- Native cache fields remain byte-identical in strict passthrough.
+- Native cache fields remain byte-identical in raw provider passthrough.
 - Anthropic `max_tokens: 0` prewarm passes through unchanged.
-- Alias routes that need `model` body rewrite are classified as `CompatibilityTranslation`, not strict passthrough.
+- Alias routes that need `model` body rewrite are classified as `CompatibilityTranslation`, not raw provider passthrough.
 
 ### Phase 3: Raw Response And SSE Passthrough
 
 Deliverables:
 
-- In `StrictPassthrough`, forward upstream status, content type, selected safe response headers, and raw body bytes without JSON parse/translate/reserialize.
+- In `RawProviderPassthrough`, forward upstream status, content type, selected safe response headers, and raw body bytes without JSON parse/translate/reserialize.
 - Forward provider error bodies unchanged.
-- Add a raw SSE forwarding path for strict passthrough streams. Keep chunking transport-flexible, but preserve event bytes and event order.
-- Move redaction to trace/log/hook storage. Do not redact client-visible strict passthrough output.
+- Add a raw SSE forwarding path for raw provider passthrough streams. Keep chunking transport-flexible, but preserve event bytes and event order.
+- Move redaction to trace/log/hook storage. Do not redact client-visible raw provider passthrough output.
 
 Acceptance tests:
 
 - Non-stream success and error response bodies match upstream bytes.
 - SSE tests preserve `event`, `data`, `id`, `retry`, comments, blank lines, terminal events, and provider usage frames.
-- No strict passthrough response calls `translate_response_with_context()`.
+- No raw provider passthrough response calls `translate_response_with_context()`.
 
 ### Phase 4: Provider Prompt-Cache Optimizer
 
@@ -495,7 +497,7 @@ Acceptance tests:
 
 ### Phase 5: Cache-Aware Routing Guardrails
 
-This phase is optional for the first implementation unless the deployment has multiple equivalent upstreams for the same model. It must not block strict passthrough or basic provider prompt-cache request support.
+This phase is optional for the first implementation unless the deployment has multiple equivalent upstreams for the same model. It must not block raw provider passthrough or basic provider prompt-cache request support.
 
 Deliverables:
 
@@ -516,7 +518,7 @@ Acceptance tests:
 Deliverables:
 
 - Add an internal `ProviderCacheUsage` observation struct populated from raw provider usage after the response is already decided. This struct is telemetry only and must not drive cache lookup, cache keys, eviction, or response reuse.
-- Preserve raw usage in strict passthrough responses.
+- Preserve raw usage in raw provider passthrough responses.
 - Emit best-effort metrics:
   - `cache.read_tokens`
   - `cache.write_tokens`
@@ -535,14 +537,14 @@ Acceptance tests:
 
 Deliverables:
 
-- Move same-format role repair, policy defaults, MiniMax overrides, and model rewrite tests into the translation lane or delete them.
+- Move same-format role repair, translation defaults, MiniMax overrides, and model rewrite tests into the translation lane or delete them.
 - Rename any "passthrough" tests that actually assert compatibility mutation.
-- Update compatibility docs and matrix to reflect strict passthrough as the default same-format behavior.
+- Update compatibility docs and matrix to reflect raw provider passthrough as the intended same-format behavior when the route avoids mutation and normalization.
 
 Acceptance:
 
 - Test names and docs no longer use "passthrough" for a path that mutates protocol payloads.
-- All same-format strict passthrough tests pass without hidden exceptions.
+- All same-format raw provider passthrough tests pass without hidden exceptions.
 
 ## Test Matrix
 
@@ -557,16 +559,16 @@ Required local tests:
 | Provider prompt-cache support | Native cache request fields and usage fields preserved; explicit translated extensions map only to their target provider; `auto_safe` synthesis is deterministic, trace-visible, and provider-scoped; optional observation does not mutate output and does not cache anything |
 | Provider cache matrix | Every source/target pair in the Source To Target Coverage Matrix has at least one positive test and one non-portable/fail-closed test where applicable |
 | Cache-aware routing | Sticky routing improves provider cache warmth without overriding hard provider order and without serving cached responses |
-| Lane selection | Same-format routes choose strict passthrough; cross-format or shimmed routes choose translation |
-| Regressions | Existing max-compat cross-format behavior remains in translation lane |
+| Lane selection | Same-format routes that avoid mutation and normalization choose raw provider passthrough; cross-format or shimmed routes choose translation |
+| Regressions | Maximum-compatible cross-format behavior remains in translation lane |
 
 ## Handoff Tasks
 
 Recommended first PR stack:
 
-1. Add `ExecutionLane` and strict passthrough golden tests with no behavior change.
-2. Split request execution so strict passthrough forwards raw request bytes.
-3. Split non-stream and stream response execution so strict passthrough forwards raw upstream bytes.
+1. Add `ExecutionLane` and raw provider passthrough golden tests with no behavior change.
+2. Split request execution so raw provider passthrough forwards raw request bytes.
+3. Split non-stream and stream response execution so raw provider passthrough forwards raw upstream bytes.
 4. Add provider prompt-cache optimizer policy and explicit translated-mode provider prompt-cache request support for Anthropic and OpenAI targets.
 5. Add cache-aware routing for provider prompt-cache warmth only after state-bridge route consistency is clear; this can be split into a follow-up PR if it adds routing complexity.
 6. Add provider cache usage observation from raw usage while preserving native responses and without introducing any `llmup` cache.

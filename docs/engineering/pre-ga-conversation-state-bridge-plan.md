@@ -26,7 +26,7 @@
 - 展开后的上下文继续走现有协议转换器，目标 provider 看到的是完整 transcript，而不是 OpenAI Responses 的状态句柄。
 - 状态桥只保存会话重放所需的输入/输出事件，不缓存或复用模型响应。
 - 默认行为保持 fail closed；只有显式配置启用状态桥的路由才改变现有边界。
-- 状态桥不进入 `StrictPassthrough`。它属于有状态兼容增强，必须在 trace 和 warnings 中可见。
+- 状态桥不进入 `RawProviderPassthrough` raw execution lane。它属于有状态翻译增强，必须在 trace 和 warnings 中可见。
 
 一句话边界：这是 `ConversationStateBridge`，不是 cache。
 
@@ -96,7 +96,7 @@ Chat Completions 和 Anthropic Messages 的共同基线是显式 transcript repl
 3. 只保存可重放会话事件，不保存可直接返回给用户的响应缓存条目。
 4. 不服务缓存响应。每次客户端请求都必须调用目标 provider 生成新响应。
 5. 不反解 provider-private state。`encrypted_content`、opaque reasoning、provider compact state 等不能跨协议重建。
-6. 不在 strict passthrough 中启用。native OpenAI Responses upstream 继续透传 provider state；状态桥只服务 translated compatibility route。
+6. 不在 raw passthrough 中启用。native OpenAI Responses upstream 继续透传 provider state；状态桥只服务 maximum-compatible translated route。
 7. 明确最小 owner 边界。namespace 和认证主体必须参与状态隔离，避免不同调用方互相读取状态。
 8. 只实现简单 TTL 和全局最大内存占用。状态过期、进程重启、状态不存在时直接 fail closed。
 9. `store: false` 默认不保存状态。
@@ -129,11 +129,11 @@ conversation_state_bridge:
 
 ## 执行路径
 
-不新增单独主 lane；使用 strict/cache 计划里的 primary `CompatibilityTranslation` lane，并增加 state-bridge modifier：
+不新增单独主 lane；使用 passthrough/cache 计划里的 primary `CompatibilityTranslation` lane，并增加 state-bridge modifier。这里的 `CompatibilityTranslation` 表示单一最大兼容翻译策略，不是用户可选兼容档位：
 
 ```rust
 enum ExecutionLane {
-    StrictPassthrough,
+    RawProviderPassthrough,
     ProviderPromptCacheOptimized,
     CompatibilityTranslation,
 }
@@ -194,7 +194,7 @@ struct BridgeResponse {
     upstream_name: String,
     upstream_format: UpstreamFormat,
     upstream_model: String,
-    compatibility_mode: CompatibilityMode,
+    translation_contract_revision: Option<String>,
     surface_revision: Option<String>,
     namespace_revision: Option<String>,
     route_config_hash: String,
@@ -213,7 +213,7 @@ struct BridgeResponse {
 - assistant output items 中可转换的 message / function_call / custom_tool_call / reasoning summary。
 - tool call 与 tool output 的 `call_id` 关联。
 - 当前请求的 `tools`、tool choice、parallel tool policy、response format 等必要 controls。
-- resolved upstream name、target format、target model、compatibility/surface 信息，以及 namespace revision 或 route config hash，用于 continuation route 绑定。
+- resolved upstream name、target format、target model、translation contract/surface 信息，以及 namespace revision 或 route config hash，用于 continuation route 绑定。
 - 当前 response 的状态、完成时间、截断/不完整原因。
 
 不保存：
@@ -338,7 +338,7 @@ MVP 支持：
 Post-MVP 支持：
 
 - function call / function call output replay。
-- custom tool call 在现有 compatibility mode 支持范围内 replay。
+- custom tool call 在现有最大兼容翻译能力范围内 replay。
 - visible reasoning summary replay。
 
 初始不支持：
@@ -377,7 +377,7 @@ Post-MVP 支持：
 - client-provider-key 模式下，认证主体可以由下游 provider key 的安全 hash 派生。
 - proxy-key 模式下不能只靠共享 proxy key 隐式区分用户。初版要么要求 route 明确声明单租户，要么配置一个可信 tenant header/policy 并把它纳入 owner；否则 bridge mode 应 fail closed。
 - store lookup 只有四种结果：命中、未找到、过期、owner mismatch。除命中外都 fail closed。
-- continuation route owner 必须匹配上一次保存的 upstream name / target format / target model / compatibility surface / namespace revision 或 route config hash。配置变更后默认 fail closed；只有显式 route policy 才允许继续或迁移。cache-aware routing、fallback 或负载均衡不能改写 replay chain，除非 route policy 显式允许并记录 trace。
+- continuation route owner 必须匹配上一次保存的 upstream name / target format / target model / translation contract surface / namespace revision 或 route config hash。配置变更后默认 fail closed；只有显式 route policy 才允许继续或迁移。cache-aware routing、fallback 或负载均衡不能改写 replay chain，除非 route policy 显式允许并记录 trace。
 - debug trace 只记录状态 ID、展开条数和 fail reason，不记录 prompt 内容。
 
 内存保护：
@@ -451,7 +451,7 @@ Post-MVP 支持：
 
 - 第一轮模型返回 tool call，第二轮 client 提交 tool output + `previous_response_id`，目标 upstream 收到完整 assistant tool call + tool result 历史。
 - call_id 缺失、重复、跨 parent chain mismatch fail closed。
-- custom tool 在 strict/balanced/max_compat 下遵循现有 capability surface。
+- custom tool 在单一最大兼容翻译合同下遵循现有 capability surface，并在无法安全 replay 时 fail closed。
 
 ### Phase 4：流式响应捕获
 
@@ -576,4 +576,4 @@ Post-MVP 覆盖：
 
 - [docs/protocol-baselines/capabilities/state-continuity.md](../protocol-baselines/capabilities/state-continuity.md)
 - [docs/protocol-compatibility-matrix.md](../protocol-compatibility-matrix.md)
-- [docs/engineering/pre-ga-strict-passthrough-prompt-cache-support-plan.md](./pre-ga-strict-passthrough-prompt-cache-support-plan.md)
+- [Raw provider passthrough and prompt-cache support plan](./pre-ga-strict-passthrough-prompt-cache-support-plan.md)

@@ -26,7 +26,7 @@
 
 No cross-provider status cells changed. The recheck reinforces the existing proxy posture:
 
-- Preserve provider-native cache controls on same-provider/native passthrough lanes.
+- Preserve provider-native cache controls on raw/native passthrough lanes.
 - Preserve or map cache usage counters for observability where possible.
 - Do not translate cache handles or TTLs across providers by default.
 - Any future provider-cache auto-injection should be an explicit routing/config policy because writes can change cost and cache lifetime.

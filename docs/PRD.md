@@ -14,7 +14,7 @@ LLM Universal Proxy (public short name: llmup)
 
 ### 1.2 Product Definition
 
-A single-binary HTTP proxy that provides protocol-namespaced entrypoints and translation between supported LLM API surfaces. Clients using OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages can route through one stable proxy to configured upstream endpoints; same-provider/native passthrough preserves provider-native fields and lifecycle state, while compatible same-protocol lanes preserve only portable core/portable fields and are not native provider passthrough. Translated paths preserve the portable core and warn or reject non-portable provider-native features. Gemini models remain usable only through Google's OpenAI-compatible endpoint configured as `format: openai-completion`, not as a native Gemini wire protocol.
+A single-binary HTTP proxy that provides protocol-namespaced entrypoints and translation between supported LLM API surfaces. Clients using OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages can route through one stable proxy to configured upstream endpoints; raw same-protocol passthrough is the intended pre-GA execution lane for routes that can avoid body mutation and response normalization. Other routes use maximum safe compatibility: preserve the most complete portable representation possible, warn on safe degradations, and reject non-portable provider-native features before upstream. Gemini models remain usable only through Google's OpenAI-compatible endpoint configured as `format: openai-completion`, not as a native Gemini wire protocol.
 
 ### 1.3 Problem Statement
 
@@ -57,7 +57,7 @@ The proxy MUST support bidirectional translation between the active wire protoco
 | 8 | Anthropic Messages | OpenAI Responses | Yes |
 | 9 | Anthropic Messages | Anthropic Messages | No (passthrough) |
 
-All 9 combinations (3 passthrough + 6 translated) MUST be supported within documented portability boundaries. Same-provider/native passthrough remains lossless for provider-native fields; compatible same-protocol lanes and translated paths may warn or reject non-portable semantics rather than silently approximating them.
+All 9 combinations (3 same-protocol + 6 cross-protocol) MUST be supported within documented portability boundaries. Raw same-protocol passthrough is the pre-GA implementation target for same-protocol routes that require no body mutation or response normalization; translated paths use maximum safe compatibility and may warn or reject non-portable semantics rather than silently approximating them.
 
 ### 2.2 Client Endpoints
 
@@ -118,15 +118,11 @@ The proxy MUST translate the following response fields:
 | Cached token details | Should | Map cache-related usage fields |
 | Error responses | Must | Translate upstream errors into client-protocol-appropriate error shapes |
 
-### 2.6 Compatibility Modes
+### 2.6 Compatibility Strategy
 
-The proxy MUST support explicit compatibility modes for translated paths:
+The proxy MUST use one translated-path compatibility strategy: maximum safe compatibility. It MUST preserve portable core semantics and client-visible tool identity, emit compatibility warnings for safe degradations, and fail closed for provider-state reconstruction, unsafe semantic approximation, unsupported media/source transports, and opaque-only continuity carriers.
 
-| Mode | Goal | Expected behavior |
-|------|------|-------------------|
-| `strict` | High-assurance protocol safety | Reject any translation path that would require visible tool renaming, provider-state reconstruction, or other unsafe semantic approximation |
-| `balanced` | Safe interoperability | Preserve portable core semantics, emit compat warnings for allowed degradations, and keep current fail-closed behavior for high-risk surfaces |
-| `max_compat` | Agent-client usability | Prefer client-usable translated paths, but still preserve stable tool identity and never expose proxy-generated synthetic tool names as live tool contracts |
+Same-protocol raw passthrough is an execution lane, not a user-selectable compatibility level. Provider prompt-cache optimization is provider-native request-control synthesis or preservation; it MUST NOT introduce a `llmup` cache store, response cache, semantic cache, or provider cache resource lifecycle manager.
 
 Locked tool identity contract:
 
@@ -268,7 +264,7 @@ Admin namespace writes MUST use server-owned revisions with exact compare-and-sw
 ### 3.3 Compatibility
 
 - Compatible with HTTP clients that speak one of the supported protocol surfaces and can use a configured proxy base URL.
-- No SDK changes are required for portable request/response fields; provider-native extensions may require same-provider/native passthrough or a documented shim.
+- No SDK changes are required for portable request/response fields; provider-native extensions may require raw/native passthrough or a documented shim.
 - Works with official vendor APIs and third-party compatible endpoints within documented portability boundaries.
 
 ### 3.4 Deployment
@@ -298,15 +294,18 @@ This reduces the translation matrix from O(N²) to O(N) — adding a new protoco
 1. Client sends request in format A
 2. Detect client format from path + body
 3. Resolve model → upstream + real model name
-4. If the route is same-provider/native and no proxy policy requires translation -> native passthrough
-5. If the client and upstream share only a compatible wire format -> preserve portable fields within the documented compatibility lane
-6. Otherwise:
+4. If the client and upstream use the same wire protocol and the proxy can avoid body mutation and response normalization -> use the raw same-protocol passthrough execution lane
+5. Otherwise -> use the single maximum-compatible translation lane
+6. Apply hard portability boundaries before upstream: reject provider-owned state, opaque-only continuity, unsupported media/source transports, or unsafe approximations that cannot be preserved or safely degraded
+7. In the translation lane:
    a. Translate request: A → OpenAI Chat → B
    b. Send translated request to upstream
    c. Receive response from upstream
    d. Translate response: B → OpenAI Chat → A
    e. Return translated response to client
 ```
+
+Raw passthrough is a pre-GA implementation target and engineering lane. Current same-protocol routes may still pass through compatibility machinery until the raw lane work lands; the product contract is to make that behavior explicit rather than silently treating every same-protocol route as byte-preserving.
 
 ### 4.3 Streaming Translation
 
