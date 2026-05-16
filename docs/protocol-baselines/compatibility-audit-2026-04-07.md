@@ -1,8 +1,11 @@
 # Protocol Compatibility Audit — 2026-04-07
 
+- Status: retired historical audit
+- Proxy posture: this file records the pre-removal state captured on 2026-04-07. It is not an active protocol baseline or support commitment. Native Gemini `generateContent` / `streamGenerateContent` wire-format support and `/google/v1beta/*` proxy routes have been removed; Gemini models should use Google's OpenAI-compatible endpoint with `format: openai-completion`.
+
 ## Scope
 
-This audit compares the current codebase against the latest official documentation for:
+This retired audit compared the then-current codebase against the latest official documentation available on 2026-04-07 for:
 
 - OpenAI Chat Completions
 - OpenAI Responses
@@ -26,14 +29,16 @@ Raw snapshots are stored under `docs/protocol-baselines/snapshots/2026-04-07/`.
 
 ## Executive summary
 
-The proxy is now in good shape as a compatibility-forwarding layer:
+Historical note: the bullets below describe repository behavior at the time of this retired audit, before native Gemini wire-format support was removed. They are not active support claims.
+
+At the time, the proxy was in good shape as a compatibility-forwarding layer:
 
 - OpenAI Chat create is supported.
 - OpenAI Responses create and lifecycle routes are supported.
 - Anthropic Messages create is supported.
-- Gemini `generateContent` and `streamGenerateContent` are supported.
-- Gemini request parsing now accepts both official camelCase and shell-style snake_case part keys.
-- OpenAI tool-result translation now preserves the real Gemini `functionResponse.name`.
+- Gemini `generateContent` and `streamGenerateContent` were supported.
+- Gemini request parsing accepted both official camelCase and shell-style snake_case part keys.
+- OpenAI tool-result translation preserved the real Gemini `functionResponse.name`.
 
 The main remaining boundary is intentional rather than a missing implementation:
 
@@ -41,11 +46,11 @@ The main remaining boundary is intentional rather than a missing implementation:
 - stateful Responses features only work when the current request still carries enough routing information
 - lifecycle routes fail clearly if the proxy cannot uniquely determine a native Responses upstream
 
-That is consistent with the product's role as a protocol translation proxy rather than a session persistence layer.
+That was consistent with the product's role as a protocol translation proxy rather than a session persistence layer.
 
-## What matches well
+## What matched well at the time
 
-### 1. Core endpoint families
+### 1. Core endpoint families recorded in this retired audit
 
 - `POST /openai/v1/chat/completions`
 - `POST /openai/v1/responses`
@@ -54,12 +59,12 @@ That is consistent with the product's role as a protocol translation proxy rathe
 - `POST /openai/v1/responses/{response_id}/cancel`
 - `POST /openai/v1/responses/compact`
 - `POST /anthropic/v1/messages`
-- `POST /google/v1beta/models/{model}:generateContent`
-- `POST /google/v1beta/models/{model}:streamGenerateContent`
+- Retired native Gemini route: `POST /google/v1beta/models/{model}:generateContent`
+- Retired native Gemini route: `POST /google/v1beta/models/{model}:streamGenerateContent`
 
 ### 2. Translation and streaming behavior
 
-- OpenAI/Anthropic/Gemini request and response translation is covered.
+- OpenAI/Anthropic/Gemini request and response translation was covered.
 - Responses child events include `response_id` for downstream client compatibility.
 - SSE parsing tolerates both `\n\n` and `\r\n\r\n`.
 - gzip-compressed upstream OpenAI responses are covered by integration tests.
@@ -69,7 +74,7 @@ That is consistent with the product's role as a protocol translation proxy rathe
 - The proxy emits `x-proxy-compat-warning` headers when it must drop or approximate protocol-specific fields.
 - Responses-only fields such as `previous_response_id`, `truncation`, `include`, and non-function tools are explicitly signaled during cross-protocol degradation.
 
-## Current boundaries
+## Boundaries recorded in this retired audit
 
 ### 1. Responses state continuity is not reconstructed by the proxy
 
@@ -87,7 +92,7 @@ This is an intentional boundary, not a hidden best-effort feature.
 
 Severity: low
 
-Some official Responses fields are still not portable to Chat, Anthropic, or Gemini request formats:
+At the time, some official Responses fields were not portable to Chat, Anthropic, or Gemini request formats:
 
 - `previous_response_id`
 - `truncation`
@@ -112,8 +117,8 @@ The implementation is robust for broad OpenAI-style upstreams such as vLLM-like 
 
 But the repository still does not claim provider-certified integration for every OpenAI-like server. Compatibility should be described as broad OpenAI-compatible forwarding, not as formal certification for any specific third-party gateway unless separately tested.
 
-## Release conclusion
+## Historical release conclusion
 
-Release posture: suitable for release as a compatibility-forwarding proxy.
+Retired release posture recorded on 2026-04-07: suitable for release as a compatibility-forwarding proxy.
 
-The codebase now aligns well with the latest official protocol surfaces that it chooses to support. The remaining limitations are documented, tested as explicit boundaries, and consistent with the proxy's intended scope.
+This conclusion is superseded by the later removal of native Gemini wire-format support. The current active proxy posture is documented in the maintained protocol baselines and compatibility matrix.

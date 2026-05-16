@@ -131,6 +131,44 @@ class ProtocolDocsContractTests(unittest.TestCase):
         self.assertIn("Google OpenAI-compatible", combined)
         self.assertIn("retired historical", combined)
 
+    def test_root_protocol_baselines_mark_native_gemini_support_or_routes_retired(self):
+        native_gemini_signals = (
+            "Gemini `generateContent`",
+            "`streamGenerateContent`",
+            "/google/v1beta",
+            "Gemini request parsing",
+            "OpenAI/Anthropic/Gemini request and response translation",
+        )
+        retired_or_non_active_markers = (
+            "retired historical",
+            "not active",
+            "no longer an active",
+            "removed",
+            "non-active",
+        )
+
+        baseline_docs = sorted(
+            (REPO_ROOT / "docs" / "protocol-baselines").glob("*.md")
+        )
+        for path in baseline_docs:
+            text = path.read_text(encoding="utf-8")
+            if not any(signal in text for signal in native_gemini_signals):
+                continue
+
+            relative_path = path.relative_to(REPO_ROOT)
+            with self.subTest(path=str(relative_path)):
+                lower_text = text.casefold()
+                self.assertTrue(
+                    any(
+                        marker in lower_text
+                        for marker in retired_or_non_active_markers
+                    ),
+                    (
+                        f"{relative_path} contains native Gemini support/route "
+                        "language without an explicit retired/non-active marker"
+                    ),
+                )
+
     def test_tools_baseline_preserves_hosted_tools_only_on_native_or_shim_lanes(self):
         text = read_doc("docs/protocol-baselines/capabilities/tools.md")
         row = table_row(text, "Hosted / server tools")
