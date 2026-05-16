@@ -5,6 +5,18 @@
 - Scope: same-format passthrough, provider prompt-cache request support, provider-returned cache usage observation, and compatibility simplification
 - Non-scope: any `llmup`-managed cache, gateway response cache, semantic cache, cache storage, cache lifecycle management, broad fallback DSLs, pricing catalogs, guardrails, prompt management, admin UI expansion
 
+## Plan Coordination
+
+This plan assumes [pre-ga-remove-native-gemini-format-plan.md](./pre-ga-remove-native-gemini-format-plan.md) is accepted as the owning decision for native Gemini removal.
+
+Active pre-GA protocol families for this plan are therefore:
+
+- OpenAI Chat Completions
+- OpenAI Responses
+- Anthropic Messages
+
+Gemini remains usable only as a provider brand behind an OpenAI-compatible upstream. That path is handled as OpenAI Chat wire protocol. This plan must not add Gemini `generateContent`, `cachedContent`, `cachedContents/*`, `thoughtSignature`, or `extra_body.google.cached_content` work. Any future Google-specific OpenAI-compatible extension must be a separate explicit plan; it is not part of this pre-GA prompt-cache hardening.
+
 ## Goal
 
 Make the pre-GA behavior easy to reason about:
@@ -23,7 +35,7 @@ This is a pre-GA plan. It may break current tests and route behavior where they 
 
 1. Strict passthrough is stricter than compatibility. Same-format request and response payloads must not be normalized, repaired, reserialized, or translated.
 2. Translation must be explicit. Compatibility shims belong in a translated or named compatibility lane, not in native passthrough.
-3. Cache is provider-owned. OpenAI `prompt_cache_key`, Anthropic `cache_control`, and Gemini `cachedContent` are provider prompt-cache request mechanisms with different semantics, billing, retention, and lifecycle rules.
+3. Cache is provider-owned. OpenAI `prompt_cache_key` / `prompt_cache_retention` and Anthropic `cache_control` are provider prompt-cache request mechanisms with different semantics, billing, retention, and lifecycle rules.
 4. Preserve prefixes. Cache savings depend on stable prompt prefixes, message order, tool order, schemas, media detail, and provider-specific cache handles.
 5. Keep the mental model small. Route selection should answer one question: "strict passthrough or translated compatibility?"
 6. Stop scope creep early. Do not add `llmup` cache storage, universal cache controls, response caching, semantic caching, fallback routing languages, or synthetic provider state while hardening passthrough.
@@ -61,7 +73,7 @@ The common lesson for `llmup`: strict passthrough and translated compatibility s
 
 ## Target Architecture
 
-Introduce an explicit execution lane:
+Introduce an explicit primary execution lane plus orthogonal modifiers:
 
 ```rust
 enum ExecutionLane {
@@ -69,7 +81,19 @@ enum ExecutionLane {
     ProviderPromptCacheOptimized,
     CompatibilityTranslation,
 }
+
+struct ExecutionModifiers {
+    state_bridge: StateBridgeModifier,        // off | capture_candidate | expanded
+    provider_prompt_cache: PromptCacheModifier // none | preserved | synthesized
+}
 ```
+
+This plan owns the primary lane and provider prompt-cache modifier. [pre-ga-conversation-state-bridge-plan.md](./pre-ga-conversation-state-bridge-plan.md) owns the state-bridge modifier. This avoids inventing a separate lane for every combination such as "state bridge + translation + prompt-cache optimization". When the state bridge is enabled, execution order must be:
+
+1. Conversation state expansion.
+2. Source -> target protocol translation.
+3. Provider prompt-cache optimization.
+4. Upstream request.
 
 Lane selection:
 
@@ -77,7 +101,7 @@ Lane selection:
 - `ProviderPromptCacheOptimized`: client protocol equals upstream wire protocol, but an explicit provider prompt-cache policy will synthesize target-provider request controls. This is native-provider optimization, not strict passthrough.
 - `CompatibilityTranslation`: protocols differ, or the selected route needs a compatibility shim such as model alias body rewrite, provider-specific role repair, policy default injection, format conversion, or error-shape conversion.
 
-The route decision should be visible in debug traces and metrics as `llmup.execution_lane`.
+The route decision should be visible in debug traces and metrics as `llmup.execution_lane`, with modifiers such as `llmup.state_bridge` and `llmup.provider_prompt_cache`.
 
 ### Strict Passthrough Contract
 
@@ -112,7 +136,7 @@ The existing translation machinery should remain available, but only in `Compati
 
 Translation lane responsibilities:
 
-- Convert request and response schemas across OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent.
+- Convert request and response schemas across OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
 - Apply `compatibility_mode`, surface gates, max-compat shims, and warnings.
 - Translate portable tool calls, media, stop reasons, usage, and streaming lifecycle events.
 - Fail closed on provider-owned lifecycle state and non-portable cache state that cannot be represented safely.
@@ -156,8 +180,6 @@ Add a first-class internal Provider Prompt Cache IR so the behavior is not scatt
 - `anthropic.cache_control`
 - `anthropic.breakpoint_strategy`: `top_level_auto | configured_breakpoints`
 - `anthropic.ttl`
-- `gemini.cached_content`
-- `gemini.resource_policy`: `passthrough_only | managed_handles`
 - `skipped_reason`
 
 Do:
@@ -178,11 +200,10 @@ Do not:
 - Add gateway response cache in pre-GA.
 - Add semantic cache.
 - Add a cross-provider `cache: true` request parameter.
-- Treat OpenAI `prompt_cache_key`, Anthropic `cache_control`, or Gemini `cachedContent` as direct semantic equivalents.
+- Treat OpenAI `prompt_cache_key` and Anthropic `cache_control` as direct semantic equivalents.
 - Auto-insert provider cache controls with no policy, trace, or way to disable them.
 - Infer stable/static content from message text meaning. Heuristics must use protocol structure, configured cache groups, and deterministic fingerprints, not LLM judgment.
-- Drop Gemini `cachedContent` when translating away from Gemini unless an explicit `ignore_provider_cache_handle` policy accepts the semantic loss.
-- Create, update, delete, or renew Gemini `cachedContents` resources unless the client is on a Gemini-native resource passthrough route or a future explicit Gemini provider-cache resource adapter is enabled.
+- Add Google/Gemini-specific cache extensions, including `cachedContent`, `cached_content`, `cachedContents/*`, or `extra_body.google.cached_content`, in this plan.
 
 ### Provider Prompt-Cache Policy
 
@@ -197,8 +218,6 @@ provider_prompt_cache:
   anthropic:
     cache_control: configured_breakpoints # off | explicit | top_level_auto | configured_breakpoints
     ttl: preserve                        # preserve | 5m | 1h
-  gemini:
-    cached_content: explicit_handle_only # off | explicit_handle_only
 ```
 
 Recommended defaults:
@@ -211,10 +230,10 @@ Recommended defaults:
 - route / namespace / model alias
 - upstream provider, project, region, and model
 - authenticated tenant or configured cache group
-- client-supplied session, conversation, or metadata identifiers
+- configured session/cache group identifiers that are explicitly documented as cache grouping inputs
 - a hash of the stable protocol prefix when explicitly selected
 
-It must not hash the entire request as the default OpenAI `prompt_cache_key`: the full request includes dynamic user turns and would over-partition cache routing. It also must not inspect message prose and guess business semantics.
+It must not hash the entire request as the default OpenAI `prompt_cache_key`: the full request includes dynamic user turns and would over-partition cache routing. It also must not use `previous_response_id`, `conversation`, `resp_llmup_*`, request IDs, arbitrary metadata, or message prose as a cache key source.
 
 ### Current Functionality
 
@@ -224,17 +243,16 @@ Already present:
 - Anthropic `cache_control` is detected as non-portable when translating away from Anthropic and is warned/dropped instead of being mapped to unrelated provider controls.
 - OpenAI Chat/Responses to Anthropic does not inject `cache_control`; [tests/integration_test.rs](../../tests/integration_test.rs) has a regression test for concurrent OpenAI-to-Anthropic requests that asserts no marker injection.
 - Anthropic to OpenAI translation strips `cache_control` and does not currently synthesize OpenAI `prompt_cache_key`.
-- Gemini request-time cache support is present for explicit OpenAI-compatible extensions: OpenAI-shaped requests routed to Gemini can forward `cached_content` / `cachedContent`, direct `extra_body.cached_content`, and the official `extra_body.google.cached_content` shape.
-- Hooks and translation code already observe provider-returned cache usage fields such as OpenAI cached tokens, Anthropic cache read/write tokens, and Gemini cached-content token counts.
+- Current code still contains native Gemini cache-handle handling. That is historical implementation surface owned by the native-Gemini removal plan, not future work for this plan.
+- Hooks and translation code already observe provider-returned cache usage fields such as OpenAI cached tokens and Anthropic cache read/write tokens.
 
 Known gaps:
 
 - OpenAI-shaped requests routed to Anthropic have no explicit way to ask for Anthropic top-level automatic `cache_control`.
 - OpenAI-shaped content parts routed to Anthropic do not intentionally preserve explicit per-block Anthropic `cache_control` extension fields.
-- Anthropic-shaped and Gemini-shaped requests routed to OpenAI have no way to ask `llmup` to synthesize `prompt_cache_key`.
+- Anthropic-shaped requests routed to OpenAI have no way to ask `llmup` to synthesize `prompt_cache_key`.
 - There is no shared policy object that explains why a cache control was preserved, dropped, or synthesized.
 - There is no target-provider optimization matrix that says what `llmup` should do for every source/target pair.
-- OpenAI Responses-shaped requests routed to Gemini need explicit tests and implementation to preserve Gemini cache-handle extensions through the Responses-to-Chat pivot.
 - Cache-aware routing is not yet modeled: a fallback or load-balanced route can scatter equivalent cacheable requests across upstream credentials/projects/regions and lose provider cache warmth.
 - Strict same-format passthrough still needs the raw request/response work described above before native cache controls are truly byte-preserved.
 
@@ -266,19 +284,16 @@ Allowed translated support:
 - OpenAI Chat/Responses to Anthropic: map explicit `extra_body.anthropic.cache_control` to Anthropic top-level `cache_control`.
 - OpenAI Chat/Responses to Anthropic: in `auto_safe`, apply the configured Anthropic strategy when no explicit Anthropic cache control is present: top-level automatic caching for full-history conversations, or configured breakpoints for stable prefix blocks.
 - OpenAI Chat/Responses to Anthropic: optionally preserve explicit `cache_control` on OpenAI text content parts only when the target Anthropic block type can legally carry it. Do not infer block-level breakpoints from prose.
-- Anthropic/Gemini to OpenAI Chat/Responses: in `auto_safe`, synthesize OpenAI `prompt_cache_key` when no explicit OpenAI cache key is present.
-- OpenAI Chat/Responses to Gemini: map explicit Gemini `cached_content` / `cachedContent` extension fields, including official `extra_body.google.cached_content`, to `GenerateContentRequest.cachedContent`.
-- Anthropic to Gemini: warn/drop `cache_control`; do not synthesize Gemini `cachedContent`.
-- Gemini to OpenAI: fail closed when the request has `cachedContent`, unless explicit `ignore_provider_cache_handle` is set; in `auto_safe`, synthesize OpenAI `prompt_cache_key` only when no Gemini cache handle is present.
-- Gemini to Anthropic: fail closed when the request has `cachedContent`, unless explicit `ignore_provider_cache_handle` is set; do not synthesize Anthropic `cache_control` unless `auto_safe` explicitly enables an Anthropic strategy for the route.
+- Anthropic to OpenAI Chat/Responses: in `auto_safe`, synthesize OpenAI `prompt_cache_key` when no explicit OpenAI cache key is present.
+- OpenAI Chat <-> OpenAI Responses: preserve OpenAI prompt-cache controls across OpenAI-family translation without changing retention spelling.
 
 Disallowed translated support:
 
 - Do not read an arbitrary prompt and decide which blocks are "static" from natural-language meaning.
 - Do not add Anthropic block-level breakpoints based on content length, role, first message, last system message, or perceived repetition unless a future route-level policy explicitly names that behavior.
 - Do not auto-upgrade Anthropic TTL to `1h`.
-- Do not create Gemini cached-content resources from an OpenAI or Anthropic request in the default optimizer.
 - Do not copy an OpenAI `prompt_cache_key` value into another provider field as if the semantics were identical. In `auto_safe`, the key can be treated only as evidence of cache intent.
+- Do not support Google/Gemini `extra_body.google.cached_content` in the default OpenAI-compatible path. It is a provider-specific extension that would reintroduce native Gemini resource lifecycle scope.
 
 Anthropic explicit block-marker shape:
 
@@ -294,7 +309,7 @@ Target-provider matrix:
 | --- | --- | --- |
 | OpenAI Chat / Responses | Automatic prompt caching; optional `prompt_cache_key` and `prompt_cache_retention` | Preserve explicit OpenAI fields. In `auto_safe`, synthesize `prompt_cache_key` from configured cache group / tenant-route / stable-prefix fingerprint. Do not set `24h` unless explicit or configured. |
 | Anthropic Messages | `cache_control` top-level automatic mode or block-level breakpoints | Preserve explicit Anthropic fields. In `auto_safe`, choose a configured strategy: top-level automatic caching for growing full-history conversations, or block-level breakpoints at configured stable prefix boundaries such as tools/system/docs. |
-| Gemini GenerateContent | Implicit caching by default; explicit named `cachedContents/*` handle | Preserve explicit `cachedContent` handles. Forward OpenAI-compatible Gemini `extra_body.google.cached_content`. Do not create cache resources unless a future explicit Gemini resource-management feature is added. |
+| Google Gemini through OpenAI-compatible upstream | OpenAI Chat wire protocol plus Google-specific optional extensions | Treat as OpenAI Chat for this plan. Do not support `extra_body.google.cached_content` or native Gemini cache resources in pre-GA. |
 
 OpenAI `prompt_cache_key` synthesis:
 
@@ -314,37 +329,33 @@ Anthropic `cache_control` synthesis:
 - `ttl: "1h"` requires explicit user input or route config because write cost is higher.
 - Configured block-level marker synthesis should expose simple injection points such as `tools`, `system[last]`, `message[index]`, or `content_part[index]`, with a maximum of four Anthropic breakpoints and explicit rejection when TTL ordering would be invalid.
 
-Gemini explicit caching:
+Google Gemini through OpenAI-compatible upstream:
 
-- `auto_safe` should not create Gemini `cachedContents/*` resources. That would introduce provider resource lifecycle management, storage cost, expiry, invalidation, and cross-tenant ownership questions.
-- If future demand requires this, it should be a separate Gemini provider-cache resource adapter with explicit create/list/get/patch/delete passthrough and operator consent. It is still provider prompt-cache support, not gateway response caching, but it has enough lifecycle risk to deserve a separate phase.
+- Treat the upstream as OpenAI Chat wire protocol for active pre-GA work.
+- Do not synthesize, translate, or test `extra_body.google.cached_content` in this plan, even though Google documents the extension for OpenAI-compatible clients. Raw strict passthrough may carry unknown OpenAI-compatible fields as bytes, but `llmup` should not claim provider-cache support for them.
+- If future demand proves the economics justify it, create a separate Google-specific OpenAI-compatible extension plan with explicit operator consent.
 
 ### Source To Target Coverage Matrix
 
-This matrix is the handoff checklist for every currently supported protocol pair.
+This matrix is the handoff checklist for every active pre-GA protocol pair after native Gemini removal.
 
 | Source client format | Target upstream format | Provider cache behavior |
 | --- | --- | --- |
 | OpenAI Chat | OpenAI Chat | Strict passthrough preserves `prompt_cache_key`, `prompt_cache_retention`, automatic prompt caching, and raw usage. Same-format synthesis, if enabled, uses `ProviderPromptCacheOptimized`, not strict passthrough. |
 | OpenAI Chat | OpenAI Responses | Preserve OpenAI prompt-cache controls during OpenAI-family translation. Do not alter retention spelling. Preserve cache usage mapping in the client response. |
 | OpenAI Chat | Anthropic Messages | `explicit`: map `extra_body.anthropic.cache_control` to top-level `cache_control`, and preserve explicit eligible block markers. `auto_safe`: use configured Anthropic strategy: top-level for full-history conversations, or configured breakpoints for stable tools/system/docs. Do not infer block breakpoints from prose. |
-| OpenAI Chat | Gemini GenerateContent | Use Gemini implicit caching automatically through stable prompt prefixes. Preserve explicit Gemini cache handles: `cached_content`, `cachedContent`, `extra_body.cached_content`, and `extra_body.google.cached_content`. Do not create `cachedContents/*` resources in the default optimizer. |
 | OpenAI Responses | OpenAI Chat | Preserve OpenAI prompt-cache controls during OpenAI-family translation. Do not use Responses `store` / `previous_response_id` / `conversation` as cache controls. |
 | OpenAI Responses | OpenAI Responses | Strict passthrough preserves `prompt_cache_key`, `prompt_cache_retention`, automatic prompt caching, and raw usage. Same-format synthesis, if enabled, uses `ProviderPromptCacheOptimized`, not strict passthrough. |
 | OpenAI Responses | Anthropic Messages | Same as OpenAI Chat -> Anthropic, after Responses input is converted to the Messages pivot. Keep visible summaries/history stable, but do not translate OpenAI state controls into cache controls. |
-| OpenAI Responses | Gemini GenerateContent | Planned behavior matches OpenAI Chat -> Gemini for explicit Gemini cache handles, but implementation must preserve those extensions through the Responses-to-Chat pivot. OpenAI `prompt_cache_key` is not a Gemini `cachedContent` handle. |
 | Anthropic Messages | OpenAI Chat | `explicit`: warn/drop Anthropic `cache_control`. `auto_safe`: synthesize OpenAI `prompt_cache_key` from policy inputs when no explicit OpenAI key exists. Never copy raw prompt text or Anthropic TTL into the key. |
 | Anthropic Messages | OpenAI Responses | Same as Anthropic -> OpenAI Chat, with OpenAI Responses `prompt_cache_key` and `prompt_cache_retention` as target fields. Do not map Anthropic `max_tokens: 0` prewarm into Responses state. |
 | Anthropic Messages | Anthropic Messages | Strict passthrough preserves top-level and block-level `cache_control`, TTL, `max_tokens: 0` prewarm, thinking cache behavior, and raw usage. |
-| Anthropic Messages | Gemini GenerateContent | Warn/drop Anthropic `cache_control`; rely on Gemini implicit caching unless the caller supplies an explicit Gemini cache handle extension or a future Gemini resource adapter is enabled. |
-| Gemini GenerateContent | OpenAI Chat | Fail closed if `cachedContent` is present unless explicit `ignore_provider_cache_handle` is set. `auto_safe` may synthesize OpenAI `prompt_cache_key` only when no Gemini handle is present. |
-| Gemini GenerateContent | OpenAI Responses | Same as Gemini -> OpenAI Chat, targeting Responses cache fields. Gemini `cachedContent` is not OpenAI `prompt_cache_key`. |
-| Gemini GenerateContent | Anthropic Messages | Fail closed if `cachedContent` is present unless explicit `ignore_provider_cache_handle` is set. `auto_safe` may use the configured Anthropic strategy only when no Gemini handle is present. |
-| Gemini GenerateContent | Gemini GenerateContent | Strict passthrough preserves `cachedContent`, implicit caching behavior, and raw `usageMetadata.cachedContentTokenCount`. Resource routes under `cachedContents/*` remain provider-native passthrough; same-format synthesis uses `ProviderPromptCacheOptimized`. |
+
+Native Gemini rows are intentionally absent. `format: google`, `format: gemini`, and `/google/v1beta/*` are owned by the removal plan and must not receive new cache optimizer work.
 
 ### Optimizer Invariants
 
-- Run optimizer logic after translation has produced the target-provider request shape, because cache hits depend on the bytes/structure the target provider sees.
+- Run optimizer logic after any conversation-state expansion and after translation has produced the target-provider request shape, because cache hits depend on the bytes/structure the target provider sees.
 - Preserve target prompt prefix order: tools, system/developer instructions, static media/document context, then dynamic user content. Avoid reordering tool definitions or schema keys during optimization.
 - Never use natural-language classification to decide that content is stable. Use only configured cache groups, route identity, tenant/session identifiers, and deterministic structural prefix fingerprints.
 - Do not place timestamps, request IDs, random trace IDs, short-lived user text, or provider credentials inside synthesized cache keys.
@@ -357,11 +368,13 @@ Cache-aware routing is provider prompt-cache support, not gateway response cachi
 
 Rules:
 
+- Route priority: explicit upstream/model choice > state-bridge continuation owner > native provider state owner > cache-aware sticky routing.
 - Sticky key components: tenant/auth boundary, namespace, model alias, upstream provider, credential/project/region, target model, provider prompt-cache key or stable-prefix fingerprint.
 - Never override a hard provider choice or explicit upstream order.
 - If a warm provider is unavailable and failover is allowed, annotate the trace with `cache_warm_provider_unavailable`.
 - Do not let sticky routing create a semantic response cache. The provider still generates every response.
-- For OpenAI, sticky routing complements `prompt_cache_key`; for Gemini implicit caching, it helps keep similar prefixes in the same project/region; for Anthropic, it matters when multiple workspaces/regions/providers can satisfy the same route.
+- For OpenAI, sticky routing complements `prompt_cache_key`; for Anthropic, it matters when multiple workspaces/regions/providers can satisfy the same route.
+- Conversation-state bridge continuations must keep their originally resolved route/upstream unless an explicit route policy says failover is allowed. Cache-aware routing must not scatter a replay chain.
 
 ### Prewarm And Threshold Diagnostics
 
@@ -369,8 +382,7 @@ Provider prompt-cache economics depend on minimum prefix sizes and write/read ti
 
 - OpenAI: prompt caching is automatic above the provider threshold; `prompt_cache_key` only helps route similar prefixes. The optimizer should record when it synthesizes a key and let `cached_tokens` prove effectiveness.
 - Anthropic: prompts below model-specific minimum token thresholds silently receive no cache benefit. The optimizer may add top-level `cache_control` in `auto_safe`, but should surface `cache_creation_input_tokens == 0 && cache_read_input_tokens == 0` as a possible "not cached" diagnostic. A future optional `count_tokens` preflight may warn before sending, but should not be default because it adds latency and another upstream call.
-- Anthropic prewarm: `max_tokens: 0` is useful only for explicit prewarm flows and has official restrictions. Cross-protocol translated prewarm should require explicit Anthropic extension or route config; it should not be inferred from an ordinary OpenAI/Gemini request.
-- Gemini: implicit caching is default but has no savings guarantee. Explicit `cachedContents/*` gives stronger economics but requires provider resource lifecycle management. Default `auto_safe` should not create resources; a future adapter must report TTL, model binding, credential/project ownership, and resource cleanup behavior.
+- Anthropic prewarm: `max_tokens: 0` is useful only for explicit prewarm flows and has official restrictions. Cross-protocol translated prewarm should require explicit Anthropic extension or route config; it should not be inferred from an ordinary OpenAI request.
 
 ### Provider Notes
 
@@ -393,15 +405,6 @@ Anthropic:
 - Anthropic currently supports prompt caching on all active Claude models, with model-specific minimum token thresholds, a 20-block lookback window per breakpoint, and up to four breakpoints. It supports automatic top-level caching on Claude API, Claude Platform on AWS, and Microsoft Foundry; Bedrock and Vertex Claude routes require explicit block-level breakpoints.
 - Tool definitions, text blocks, user image/document blocks, assistant tool-use blocks, and user tool-result blocks are cacheable. Thinking blocks cannot be directly marked, although previous thinking can be cached as part of a larger prefix.
 
-Gemini:
-
-- Preserve native `cachedContent` on Gemini GenerateContent.
-- Preserve Gemini OpenAI-compatible `extra_body.google.cached_content` / `cached_content` only on Gemini-routed OpenAI-compatible paths.
-- Keep tests for the official OpenAI-library `extra_body` shape with the `google.cached_content` namespace, plus any simpler `cached_content` extension shape that `llmup` intentionally supports.
-- Treat `cachedContents/*` as provider-owned, model-bound state. Do not proxy-share it across providers, projects, credentials, or models.
-- Track `usageMetadata.cachedContentTokenCount` / SDK-equivalent usage fields when present.
-- Gemini implicit caching is enabled by default on Gemini 2.5 and newer models, with no savings guarantee. Explicit `cachedContents/*` gives stronger cost behavior but carries TTL/storage/model-binding lifecycle cost.
-
 ## Development Plan
 
 ### Phase 0: Freeze The Contract
@@ -421,7 +424,7 @@ Acceptance:
 
 Deliverables:
 
-- Add `ExecutionLane`, including `StrictPassthrough`, `ProviderPromptCacheOptimized`, and `CompatibilityTranslation`.
+- Add `ExecutionLane`, including `StrictPassthrough`, `ProviderPromptCacheOptimized`, and `CompatibilityTranslation`, plus state/cache modifier fields.
 - Route discovery returns both upstream format and lane.
 - Debug traces, metrics, and hooks include the lane.
 - Keep behavior unchanged while lane selection is observable.
@@ -436,13 +439,15 @@ Acceptance:
 Deliverables:
 
 - Preserve raw request body bytes through routing.
+- Split the request representation into `raw_bytes` plus a parsed `serde_json::Value` used only for routing/boundary decisions. Strict passthrough sends `raw_bytes`; translated/cache/state lanes use the parsed/mutable JSON.
 - In `StrictPassthrough`, skip `translate_request_with_policy()`, role repair, policy defaults, MiniMax overrides, and body-level model rewrite.
 - Replace body-mutating safety checks with narrow ingress checks that reject proxy-private structured artifacts without reserializing the body.
 - Ensure forced streaming does not insert `stream` in strict passthrough.
 
 Acceptance tests:
 
-- Golden upstream request bodies match client request bytes for OpenAI Chat, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent.
+- Golden upstream request bodies match client request bytes for OpenAI Chat, OpenAI Responses, and Anthropic Messages.
+- Golden bodies include field order, whitespace, numeric formatting, unknown provider fields, and provider error bodies where relevant.
 - Native cache fields remain byte-identical in strict passthrough.
 - Anthropic `max_tokens: 0` prewarm passes through unchanged.
 - Alias routes that need `model` body rewrite are classified as `CompatibilityTranslation`, not strict passthrough.
@@ -472,9 +477,7 @@ Deliverables:
 - Add explicit OpenAI-shaped to Anthropic support for eligible block-level `cache_control` only when the translated Anthropic block type can legally carry it.
 - Add `auto_safe` Anthropic synthesis using configured strategy: top-level automatic caching for full-history routes or configured breakpoints for stable-prefix routes.
 - Add `auto_safe` OpenAI `prompt_cache_key` synthesis for translated OpenAI targets when no explicit cache key is present.
-- Add OpenAI Responses-shaped to Gemini extension preservation for `cached_content` / `extra_body.google.cached_content` through the Responses-to-Chat pivot.
-- Keep Gemini OpenAI-compatible `extra_body.google.cached_content` support covered by tests.
-- Continue warning/dropping low-risk non-portable provider cache controls when the target provider cannot honor them, but fail closed for non-reconstructable provider cache handles such as Gemini `cachedContent`.
+- Continue warning/dropping low-risk non-portable provider cache controls when the target provider cannot honor them.
 - Keep translation marker-free unless explicit extension or `auto_safe` route/global policy is present.
 - Add trace/debug fields that show `provider_prompt_cache.mode`, target provider, synthesized fields, and key source.
 
@@ -484,28 +487,28 @@ Acceptance tests:
 - `extra_body.anthropic.cache_control` maps exactly to Anthropic top-level `cache_control`.
 - Invalid or conflicting Anthropic cache-control extension shapes fail closed before upstream.
 - Explicit OpenAI content/tool `cache_control` maps only to eligible Anthropic blocks; direct thinking markers, empty text, sub-content markers, and ambiguous tool-call/tool-result marker shapes are rejected.
-- Anthropic `cache_control` translated to OpenAI/Gemini still warns/drops in `explicit` mode rather than becoming synthetic OpenAI/Gemini cache controls.
+- Anthropic `cache_control` translated to OpenAI still warns/drops in `explicit` mode rather than becoming a synthetic OpenAI cache control.
 - Anthropic-to-OpenAI in `auto_safe` synthesizes a bounded `prompt_cache_key` with the configured source and never copies raw prompt text into the key.
-- Gemini-to-OpenAI in `auto_safe` synthesizes a bounded `prompt_cache_key` with the configured source and never copies raw prompt text into the key.
 - OpenAI-to-Anthropic in `auto_safe` applies the configured Anthropic strategy and does not add block-level markers unless explicitly configured.
-- Gemini `cachedContent` translated away from Gemini fails closed unless explicit `ignore_provider_cache_handle` is set.
-- OpenAI Responses-shaped Gemini cache-handle extensions survive the pivot and map to Gemini `cachedContent`.
 - `prompt_cache_retention: "24h"` and Anthropic `ttl: "1h"` are never synthesized from each other without explicit route config.
-- `extra_body.google.cached_content` maps to Gemini `cachedContent`.
+- `extra_body.google.cached_content` fails closed in translated paths when treated as an explicit cache request; it is not mapped to a native Gemini field.
 
-### Phase 5: Cache-Aware Routing
+### Phase 5: Cache-Aware Routing Guardrails
+
+This phase is optional for the first implementation unless the deployment has multiple equivalent upstreams for the same model. It must not block strict passthrough or basic provider prompt-cache request support.
 
 Deliverables:
 
-- Add cache-aware sticky routing keyed by provider prompt-cache policy, tenant/auth boundary, namespace, model alias, upstream provider, credential/project/region, target model, and provider prompt-cache key or stable-prefix fingerprint.
+- Add cache-aware sticky routing only for routes that already have multiple equivalent upstream choices, keyed by provider prompt-cache policy, tenant/auth boundary, namespace, model alias, upstream provider, credential/project/region, target model, and provider prompt-cache key or stable-prefix fingerprint.
 - Keep hard provider overrides and explicit upstream order authoritative.
 - Annotate failover from a warm route with `cache_warm_provider_unavailable`.
 - Keep metrics separate from gateway response cache metrics.
 
 Acceptance tests:
 
-- Equivalent cacheable requests route to the same upstream when multiple equivalent upstreams exist.
+- Equivalent cacheable requests route to the same upstream when multiple equivalent upstreams exist and cache-aware routing is enabled.
 - Explicit provider order disables sticky rerouting.
+- State-bridge replay chains keep their originally resolved upstream unless explicit failover policy allows otherwise.
 - Failover emits a cache-warmth diagnostic and does not reuse response bodies.
 
 ### Phase 6: Provider Cache Usage Observation Only
@@ -526,28 +529,9 @@ Acceptance tests:
 
 - OpenAI cached tokens are observed without changing response body.
 - Anthropic read/write counters are observed without changing response body.
-- Gemini cached-content token counts are observed without changing response body.
 - Unknown usage shapes do not fail requests.
 
-### Phase 7: Optional Gemini Provider-Cache Resource Adapter
-
-Deliverables:
-
-- Add only after the strict passthrough and `auto_safe` optimizer phases are stable.
-- Provide explicit Gemini `cachedContents/*` create/list/get/patch/delete passthrough for clients that already speak Gemini resource semantics.
-- Optionally add a managed-handle mode that can create a Gemini cached-content resource from a configured stable prefix, but only with route/operator consent.
-- Store only provider resource metadata needed for lifecycle tracking, never response bodies or prompt text.
-- Partition resource handles by tenant, upstream credential/project/region, and model.
-- Expose TTL, expire time, model binding, token count, and cleanup state in traces/admin diagnostics.
-
-Acceptance tests:
-
-- Default optimizer never creates Gemini `cachedContents/*`.
-- Managed mode refuses to create a cache without explicit route config and provider credential ownership.
-- A cached-content resource created for one model/project/credential is never reused for another.
-- Expired or missing Gemini cache handles fail clearly or fall back according to explicit route policy, not silently.
-
-### Phase 8: Remove Same-Format Compatibility Shims
+### Phase 7: Remove Same-Format Compatibility Shims
 
 Deliverables:
 
@@ -566,7 +550,7 @@ Required local tests:
 
 | Area | Required coverage |
 | --- | --- |
-| Request payload | Byte-for-byte upstream body equality for all four protocol families |
+| Request payload | Byte-for-byte upstream body equality for OpenAI Chat, OpenAI Responses, and Anthropic Messages |
 | Response payload | Byte-for-byte downstream body equality for success and provider error responses |
 | Streaming | Raw SSE event preservation for ordinary success streams |
 | Headers | Auth rewrite and hop-by-hop stripping are explicit; provider protocol headers are preserved where safe |
@@ -583,11 +567,10 @@ Recommended first PR stack:
 1. Add `ExecutionLane` and strict passthrough golden tests with no behavior change.
 2. Split request execution so strict passthrough forwards raw request bytes.
 3. Split non-stream and stream response execution so strict passthrough forwards raw upstream bytes.
-4. Add provider prompt-cache optimizer policy and explicit translated-mode provider prompt-cache request support for Anthropic, OpenAI, and Gemini targets.
-5. Add cache-aware routing for provider prompt-cache warmth.
+4. Add provider prompt-cache optimizer policy and explicit translated-mode provider prompt-cache request support for Anthropic and OpenAI targets.
+5. Add cache-aware routing for provider prompt-cache warmth only after state-bridge route consistency is clear; this can be split into a follow-up PR if it adds routing complexity.
 6. Add provider cache usage observation from raw usage while preserving native responses and without introducing any `llmup` cache.
-7. Add optional Gemini provider-cache resource adapter only if the release owner accepts its lifecycle scope.
-8. Remove or rewrite old same-format mutation tests and update protocol docs.
+7. Remove or rewrite old same-format mutation tests and update protocol docs.
 
 Primary code areas:
 
@@ -597,7 +580,6 @@ Primary code areas:
 - [src/server/headers.rs](../../src/server/headers.rs)
 - [src/streaming/stream.rs](../../src/streaming/stream.rs)
 - [src/translate/internal.rs](../../src/translate/internal.rs)
-- [src/translate/internal/request_gemini.rs](../../src/translate/internal/request_gemini.rs)
 - [src/translate/internal/tests/mod.rs](../../src/translate/internal/tests/mod.rs)
 - [tests/integration_test.rs](../../tests/integration_test.rs)
 
@@ -608,7 +590,8 @@ Primary code areas:
 - Any `llmup` cache store, cache lookup, cache eviction, response-reuse cache key, or cache lifecycle manager.
 - Universal cache TTL or cache key schema.
 - Automatic provider cache marker insertion with no route/global policy, trace, or disable switch.
-- Provider-owned state reconstruction for OpenAI Responses or Anthropic thinking/tool state. Gemini `cachedContents` lifecycle management is out of scope unless implemented through the explicit provider-cache resource adapter described above.
+- Provider-owned state reconstruction for OpenAI Responses or Anthropic thinking/tool state.
+- Google/Gemini native cache resource lifecycle management, including `cachedContent`, `cachedContents/*`, `thoughtSignature`, and `extra_body.google.cached_content`.
 - Broad fallback, retry, load-balancing, budget, pricing, model catalog, virtual-key, guardrail, prompt-management, or eval features.
 - Making `llmup` a LiteLLM/Portkey/OpenRouter-style universal API product.
 
@@ -621,16 +604,13 @@ Provider official references:
 - OpenAI Chat Completions create reference: <https://platform.openai.com/docs/api-reference/chat/create>
 - Anthropic prompt caching: <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>
 - Anthropic OpenAI SDK compatibility: <https://platform.claude.com/docs/en/api/openai-sdk>
-- Gemini context caching: <https://ai.google.dev/gemini-api/docs/caching>
-- Gemini OpenAI compatibility: <https://ai.google.dev/gemini-api/docs/openai>
-- Gemini cachedContents API: <https://ai.google.dev/api/caching>
+- Google Gemini OpenAI compatibility, for migration context only: <https://ai.google.dev/gemini-api/docs/openai>
 
 Comparable gateway references:
 
 - LiteLLM OpenAI passthrough: <https://docs.litellm.ai/docs/pass_through/openai_passthrough>
 - LiteLLM prompt caching: <https://docs.litellm.ai/docs/completion/prompt_caching>
 - LiteLLM auto-inject prompt caching checkpoints: <https://docs.litellm.ai/docs/tutorials/prompt_caching>
-- LiteLLM Gemini context caching: <https://docs.litellm.ai/docs/providers/gemini#context-caching>
 - LiteLLM proxy caching: <https://docs.litellm.ai/docs/proxy/caching>
 - Cloudflare AI Gateway provider-native endpoints: <https://developers.cloudflare.com/ai-gateway/usage/providers/>
 - Cloudflare AI Gateway caching: <https://developers.cloudflare.com/ai-gateway/features/caching/>

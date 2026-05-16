@@ -5,9 +5,20 @@
 - 范围：为 `llmup` 增加可选、纯内存的会话状态桥，用于把使用状态型接口的客户端转换到无状态 provider 协议
 - 非范围：LLM 响应缓存、语义缓存、跨进程持久化数据库、provider 私有 opaque state 反解、默认无配置保存用户数据、后台任务队列产品化、提示词管理产品
 
+## 计划协同
+
+本计划以 [pre-ga-remove-native-gemini-format-plan.md](./pre-ga-remove-native-gemini-format-plan.md) 为 native Gemini 的范围裁剪依据。状态桥不为 Gemini `generateContent`、`thoughtSignature`、`cachedContent` 或 `/google/v1beta/*` 增加新能力。
+
+删除 native Gemini 后，状态桥的 active MVP 目标只包括：
+
+- OpenAI Responses stateful client -> OpenAI Chat upstream。
+- OpenAI Responses stateful client -> Anthropic Messages upstream。
+
+如果 Gemini 作为 Google OpenAI-compatible upstream 使用，它在 `llmup` 内部属于 OpenAI Chat wire protocol，不需要 Gemini-specific replay。
+
 ## 目标
 
-让 Codex-like、OpenAI Responses-like 的状态型客户端，在显式开启的情况下，也能通过 `llmup` 使用 Anthropic Messages、OpenAI Chat Completions、Gemini GenerateContent 等无状态或手动 replay 型协议。
+让 Codex-like、OpenAI Responses-like 的状态型客户端，在显式开启的情况下，也能通过 `llmup` 使用 Anthropic Messages、OpenAI Chat Completions 等无状态或手动 replay 型协议。
 
 核心目标：
 
@@ -24,6 +35,12 @@
 为了保持实现简单快速，初版只做一个能力：
 
 - `POST /openai/v1/responses` translated route 上的 `previous_response_id` continuation。
+
+第一个可合并 MVP 只要求非流式 text-only continuation：
+
+- 第一轮保存 visible user input 和 completed assistant text。
+- 第二轮用本地 `resp_llmup_*` 展开历史，发送到 OpenAI Chat 或 Anthropic upstream。
+- 工具调用、custom tool、reasoning summary、streaming capture 是后续阶段，不阻塞 text-only MVP。
 
 初版不做：
 
@@ -43,9 +60,9 @@ OpenAI Responses 和 Conversations 是状态型接口。官方文档描述了两
 - `previous_response_id`：用上一个 response ID 串联多轮 response。
 - `conversation`：使用 Conversations API 保存并检索 conversation items。
 
-Chat Completions、Anthropic Messages、Gemini `generateContent` 的共同基线是显式 transcript replay。客户端或 SDK 通常需要在每次请求里带上完整历史。
+Chat Completions 和 Anthropic Messages 的共同基线是显式 transcript replay。客户端或 SDK 通常需要在每次请求里带上完整历史。
 
-当前 `llmup` 已经支持 OpenAI Responses 请求转换到 Chat/Anthropic/Gemini，但只支持当前请求体里可见的 `input` / `instructions` / tools 等内容。当前请求只带 `previous_response_id` 或 `conversation` 时，`llmup` 没有上下文可展开，因此现在正确地 fail closed。
+当前 `llmup` 已经支持 OpenAI Responses 请求转换到 Chat/Anthropic/Gemini，但只支持当前请求体里可见的 `input` / `instructions` / tools 等内容。Native Gemini 支持会由 sibling plan 删除；本计划不继续扩展它。当前请求只带 `previous_response_id` 或 `conversation` 时，`llmup` 没有上下文可展开，因此现在正确地 fail closed。
 
 ## 当前 Codebase 判断
 
@@ -53,7 +70,7 @@ Chat Completions、Anthropic Messages、Gemini `generateContent` 的共同基线
 
 - OpenAI Responses 原生 state/resource 路由透传，包括 `/responses/compact`、`/responses/{id}/input_items`、`/conversations/*`。
 - 省略 `model` 的 stateful OpenAI Responses 请求可以在唯一、明确的 native Responses upstream 上路由。
-- OpenAI Responses 带完整 `input` 时，可以通过 `responses_to_messages()` 转成 Chat-style messages，再进入现有 Anthropic/Gemini/OpenAI Chat 转换链。
+- OpenAI Responses 带完整 `input` 时，可以通过 `responses_to_messages()` 转成 Chat-style messages，再进入现有 Anthropic/OpenAI Chat 转换链。当前 Gemini 分支是待删除的历史实现，不应成为状态桥开发目标。
 - 请求边界检查会识别 `previous_response_id`、`conversation`、`background`、`prompt`、`context_management`、`store: true` 等 stateful controls，并在跨协议时拒绝。
 - 文档和测试已经锁定“provider-owned state 不重建”的现有行为。
 - server-side stateful detector 与 translator detector 有一个已知不一致：server-side `responses_stateful_request_controls()` 当前未包含 `context_management`，translator detector 已包含。即使 MVP 不实现 `context_management`，也应在合同更新时统一检测，避免模型缺省路由和翻译边界分叉。
@@ -78,7 +95,7 @@ Chat Completions、Anthropic Messages、Gemini `generateContent` 的共同基线
 2. 只重放 `llmup` 自己观察并保存过的状态。外部 OpenAI 返回的 `resp_*` / `conv_*` ID 不可凭空使用。
 3. 只保存可重放会话事件，不保存可直接返回给用户的响应缓存条目。
 4. 不服务缓存响应。每次客户端请求都必须调用目标 provider 生成新响应。
-5. 不反解 provider-private state。`encrypted_content`、opaque reasoning、provider compact state、Gemini `thoughtSignature` 等不能跨协议重建。
+5. 不反解 provider-private state。`encrypted_content`、opaque reasoning、provider compact state 等不能跨协议重建。
 6. 不在 strict passthrough 中启用。native OpenAI Responses upstream 继续透传 provider state；状态桥只服务 translated compatibility route。
 7. 明确最小 owner 边界。namespace 和认证主体必须参与状态隔离，避免不同调用方互相读取状态。
 8. 只实现简单 TTL 和全局最大内存占用。状态过期、进程重启、状态不存在时直接 fail closed。
@@ -87,7 +104,7 @@ Chat Completions、Anthropic Messages、Gemini `generateContent` 的共同基线
 
 状态类型必须分清：
 
-- `ProviderNativeHandle`：OpenAI provider 的真实 `resp_*` / `conv_*`、Gemini `thoughtSignature`、Gemini `cachedContent`、Anthropic thinking signature 等。只在原生 passthrough 中保留。
+- `ProviderNativeHandle`：OpenAI provider 的真实 `resp_*` / `conv_*`、Anthropic thinking signature、以及待删除 native Gemini 实现里的 `thoughtSignature` / `cachedContent` 等 provider-owned handle。只在原生 passthrough 或 retired native route 中保留，不能被状态桥导入。
 - `LlmupOwnedTranscript`：`llmup` 自己保存的短期内存 transcript，可跨协议 replay。
 - `OpaqueCarrier`：`encrypted_content`、opaque compaction、不可见 reasoning carrier 等。不能跨协议展开。
 
@@ -112,18 +129,32 @@ conversation_state_bridge:
 
 ## 执行路径
 
-新增一个显式执行能力，不改变 strict passthrough 定义：
+不新增单独主 lane；使用 strict/cache 计划里的 primary `CompatibilityTranslation` lane，并增加 state-bridge modifier：
 
 ```rust
 enum ExecutionLane {
     StrictPassthrough,
     ProviderPromptCacheOptimized,
-    ConversationStateBridgeTranslation,
     CompatibilityTranslation,
+}
+
+enum StateBridgeModifier {
+    Off,
+    CaptureCandidate,
+    Expanded,
 }
 ```
 
-`ConversationStateBridgeTranslation` 的触发条件：
+`state_bridge` modifier 有两个入口：
+
+`BridgeCaptureCandidate`：
+
+- client format 是 OpenAI Responses。
+- target upstream format 不是 OpenAI Responses，或者 route 明确要求翻译。
+- `conversation_state_bridge.mode = "memory"`。
+- 请求可以不包含 `previous_response_id`。第一轮也必须经过 bridge preprocessor，用于消费 `store` 并决定 capture/no-save policy。
+
+`BridgeContinuation`：
 
 - client format 是 OpenAI Responses。
 - target upstream format 不是 OpenAI Responses，或者 route 明确要求翻译。
@@ -135,8 +166,9 @@ enum ExecutionLane {
 
 插入点要求：
 
-- 状态展开必须发生在现有 request boundary assessment 之前。
-- 展开成功后，要移除 `previous_response_id`，把历史和当前 `input` 合成显式 `input`，再进入现有 `assess_request_translation_with_surface()` 和 `translate_request_with_policy()`。
+- 状态展开/lookup 必须发生在 `resolve_requested_model_or_error()` 和 `original_body` 进入 boundary assessment 之前。否则 model-less `previous_response_id` 会先被现有 stateful routing 逻辑拒绝。
+- Bridge preprocessor 成功后，要消费并移除本地 `previous_response_id` 和 `store` 控制，把历史和当前 `input` 合成显式 `input`，再进入现有 `assess_request_translation_with_surface()` 和 `translate_request_with_policy()`。
+- 第一轮保存必须记录 resolved route owner；第二轮省略 `model` 时用 store owner 恢复路由，第二轮显式 `model` 与 store owner 冲突时 fail closed。
 - 状态 store 挂在 `AppState`，不要塞进 `RuntimeState` 快照，避免每次认证上下文 clone 大状态。
 
 ## 内部状态模型
@@ -159,6 +191,13 @@ struct StateOwner {
 struct BridgeResponse {
     id: String,
     owner: StateOwner,
+    upstream_name: String,
+    upstream_format: UpstreamFormat,
+    upstream_model: String,
+    compatibility_mode: CompatibilityMode,
+    surface_revision: Option<String>,
+    namespace_revision: Option<String>,
+    route_config_hash: String,
     parent_response_id: Option<String>,
     request_items: Vec<BridgeItem>,
     output_items: Vec<BridgeItem>,
@@ -174,6 +213,7 @@ struct BridgeResponse {
 - assistant output items 中可转换的 message / function_call / custom_tool_call / reasoning summary。
 - tool call 与 tool output 的 `call_id` 关联。
 - 当前请求的 `tools`、tool choice、parallel tool policy、response format 等必要 controls。
+- resolved upstream name、target format、target model、compatibility/surface 信息，以及 namespace revision 或 route config hash，用于 continuation route 绑定。
 - 当前 response 的状态、完成时间、截断/不完整原因。
 
 不保存：
@@ -230,8 +270,9 @@ MVP 不支持本地 `conversation` bridge。
 
 规则：
 
+- Bridge preprocessor 必须先消费 `store`，再进入跨协议 stateful-control assessment。
 - `store: false`：不保存 response state；返回的 response ID 不能用于后续 `previous_response_id` replay。
-- `store: true` 或省略：在 bridge mode 且 route 允许时保存。
+- `store: true` 或省略：在 bridge mode 且 route 允许时保存。显式 `store: true` 不应继续触发现有 translated route 的 provider-owned state fail-closed 规则，因为它在 bridge mode 下表达的是 `llmup` 本地短期 state。
 - 如果未来引入 route-level no-store/ZDR policy，它必须禁用 bridge 保存；初版只需要尊重请求级 `store: false`。
 
 ### `background`
@@ -285,15 +326,17 @@ MVP 不支持本地 `conversation` bridge。
 4. 客户端断连、上游错误、stream parse fatal 时不提交 completed 状态；可选记录 aborted metadata，但不能用于 replay。
 5. 流式事件中客户端可见 ID 必须与最终 store ID 一致。
 
-## 转换覆盖范围
+## 分阶段覆盖范围
 
-初始支持：
+MVP 支持：
 
 - OpenAI Responses client -> OpenAI Chat upstream。
 - OpenAI Responses client -> Anthropic Messages upstream。
-- OpenAI Responses client -> Gemini GenerateContent upstream。
 - text message replay。
 - assistant text replay。
+
+Post-MVP 支持：
+
 - function call / function call output replay。
 - custom tool call 在现有 compatibility mode 支持范围内 replay。
 - visible reasoning summary replay。
@@ -332,8 +375,9 @@ MVP 不支持本地 `conversation` bridge。
 
 - State owner 至少包含 namespace 和认证主体 hash。
 - client-provider-key 模式下，认证主体可以由下游 provider key 的安全 hash 派生。
-- proxy-key 模式下，初版至少按 namespace 隔离；如果后续引入用户身份 header/policy，再把它纳入 owner。
+- proxy-key 模式下不能只靠共享 proxy key 隐式区分用户。初版要么要求 route 明确声明单租户，要么配置一个可信 tenant header/policy 并把它纳入 owner；否则 bridge mode 应 fail closed。
 - store lookup 只有四种结果：命中、未找到、过期、owner mismatch。除命中外都 fail closed。
+- continuation route owner 必须匹配上一次保存的 upstream name / target format / target model / compatibility surface / namespace revision 或 route config hash。配置变更后默认 fail closed；只有显式 route policy 才允许继续或迁移。cache-aware routing、fallback 或负载均衡不能改写 replay chain，除非 route policy 显式允许并记录 trace。
 - debug trace 只记录状态 ID、展开条数和 fail reason，不记录 prompt 内容。
 
 内存保护：
@@ -400,7 +444,7 @@ MVP 不支持本地 `conversation` bridge。
 
 - 保存 assistant function_call / custom_tool_call output items。
 - 保存 client 后续 function_call_output / custom_tool_call_output input items。
-- 用现有 tool bridge 规则转成 Chat/Anthropic/Gemini 可接受的历史。
+- 用现有 tool bridge 规则转成 Chat/Anthropic 可接受的历史。
 - 处理 pending tool call 状态。
 
 验收：
@@ -432,7 +476,7 @@ MVP 不支持本地 `conversation` bridge。
 - 实现全局 `max_bytes` 检查。
 - 在 debug trace 中记录 bridge enabled、state hit/miss/expired/owner_mismatch、replay item count。
 - 确认 hook/debug 不包含状态内容。
-- 统一 server-side 和 translator-side stateful detector，至少补齐 `context_management`。
+- 统一 server-side 和 translator-side Responses stateful-control detector，不只补齐 `context_management`。每个字段必须明确是 presence-based 还是 enabled-based，例如 `background: false`、`store: false`、`store: true`、非 bool `store`、`previous_response_id`、`conversation`、`prompt`、`context_management`。
 
 验收：
 
@@ -440,7 +484,7 @@ MVP 不支持本地 `conversation` bridge。
 - 超过 `max_bytes` 时不提交 replay 状态，并记录 warning/trace。
 - debug trace 只含 metadata，不含 prompt 内容。
 - `store: false` 不保存。
-- model-less `context_management` 在 native routing resolver 和 translation boundary 上行为一致。
+- Responses stateful controls 在 native routing resolver、bridge preprocessor 和 translation boundary 上行为一致。
 
 ### Phase 6：可选增强
 
@@ -451,28 +495,34 @@ MVP 不支持本地 `conversation` bridge。
 - 本地 prompt template registry。
 - 持久化 store 后端。
 - 外部 OpenAI state import adapter。
-- Gemini explicit cachedContent managed handle 与 ConversationStateBridge 的协同。
 - 容量配额、LRU、admin state browser、跨进程恢复、分布式状态同步。
 
 这些增强必须单独评审，不属于初版。
 
 ## 测试矩阵
 
-必须覆盖：
+MVP 必须覆盖：
 
 | 区域 | 覆盖要求 |
 | --- | --- |
 | 默认行为 | bridge off 时，现有 stateful controls 跨协议 fail closed |
-| 非流式 replay | Responses -> Chat/Anthropic/Gemini 的 `previous_response_id` 多轮上下文展开 |
-| 工具调用 | function_call/custom_tool_call + tool output replay |
-| 流式 | completed 后可 replay，abort/error 不可 replay |
+| 非流式 text replay | Responses -> Chat/Anthropic 的 `previous_response_id` 多轮上下文展开 |
 | 隔离 | namespace/auth subject mismatch fail closed |
+| Route owner | model-less continuation 使用保存的 upstream/model/config owner；显式 model 或 config revision/hash 冲突 fail closed |
 | TTL | expired state fail closed 且有 trace reason |
 | max_bytes | 超过全局内存上限时不提交 state，且有 warning/trace |
 | store:false | 不保存、不 replay、不泄露内容 |
-| detector 统一 | `context_management` 在 resolver 和 translation boundary 上一致 fail/route |
+| detector 统一 | Responses stateful controls 在 resolver、bridge preprocessor、translation boundary 上一致 fail/route |
 | Native passthrough | OpenAI Responses native routes 不被本地 bridge 改写 |
 | Prompt cache 顺序 | state 展开先于 provider prompt-cache optimizer |
+
+Post-MVP 覆盖：
+
+| 区域 | 覆盖要求 |
+| --- | --- |
+| 工具调用 | function_call/custom_tool_call + tool output replay |
+| 流式 | completed 后可 replay，abort/error 不可 replay |
+| Reasoning summary | 只 replay visible summary；opaque-only carrier fail closed |
 
 ## Handoff 任务顺序
 
@@ -480,11 +530,11 @@ MVP 不支持本地 `conversation` bridge。
 
 1. 文档与配置合同：新增配置、更新 state-continuity/constitution。
 2. 内存 `ConversationStateStore` 和 ID/TTL/max_bytes 基础设施。
-3. 非流式 translated Responses response capture。
-4. `previous_response_id` replay 到 Chat/Anthropic/Gemini。
-5. 工具调用 replay。
-6. 流式响应捕获。
-7. TTL 清理、trace metadata、hook/debug 泄露检查、`context_management` detector 统一。
+3. 非流式 text-only translated Responses response capture，包含 upstream/model/config owner 绑定。
+4. `previous_response_id` replay 到 Chat/Anthropic。
+5. TTL 清理、trace metadata、hook/debug 泄露检查、Responses stateful-control detector 统一。
+6. 工具调用 replay。
+7. 流式响应捕获。
 8. 与 prompt-cache optimizer 的执行顺序和 trace 集成。
 9. 后续再评估本地 Conversations API bridge。
 

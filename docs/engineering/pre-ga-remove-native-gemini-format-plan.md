@@ -19,6 +19,31 @@
 
 Gemini 只能作为 OpenAI-compatible upstream 使用；在 `llmup` 内部不再存在 `google` / `gemini` format。
 
+## 三计划协同
+
+本计划是另外两份计划的范围前置条件：
+
+- [pre-ga-strict-passthrough-prompt-cache-support-plan.md](./pre-ga-strict-passthrough-prompt-cache-support-plan.md) 必须按 3 个 active protocol families 设计：OpenAI Chat、OpenAI Responses、Anthropic Messages。
+- [pre-ga-conversation-state-bridge-plan.md](./pre-ga-conversation-state-bridge-plan.md) 的 MVP 只支持 Responses -> OpenAI Chat / Anthropic replay，不实现 Responses -> Gemini `generateContent`。
+- 删除 native Gemini 的 PR 应优先合并，或至少作为其他两个分支的共同 rebase base。
+
+并行开发时的文件所有权建议：
+
+| Workstream | 主要所有权 | 避免踩线 |
+| --- | --- | --- |
+| Remove Native Gemini | `UpstreamFormat::Google`、`/google/*` routes、Gemini translators、Gemini streaming、Gemini tests/docs/examples/scripts | 不新增 prompt-cache/state bridge 逻辑 |
+| Strict Passthrough + Provider Prompt Cache | execution lane、raw passthrough、OpenAI/Anthropic cache optimizer、usage observation | 不修改或新增 Gemini translator/cache 功能；等 Gemini 删除后收敛测试矩阵 |
+| Conversation State Bridge | memory store、Responses `previous_response_id` replay、state capture、state trace | 不实现 Gemini replay；状态展开后再交给 prompt-cache optimizer |
+
+合并顺序：
+
+1. 先合并本计划的 Phase 0-4，移除 public Gemini surface 和核心转换/streaming 分支。
+2. strict passthrough/cache 分支基于 3 协议矩阵补 golden tests 和 optimizer。
+3. state bridge 分支基于 3 协议目标实现 replay。
+4. 最后统一跑全量 `cargo test`、Python 文档合同测试、`rg` 清理项和 `git diff --check`。
+
+如果必须完全并行开发，其他两个 workstream 必须把所有 Gemini 相关改动视为 remove-native-gemini workstream 的独占范围，不再添加新的 Gemini cache/state 测试或 helper。
+
 ## 为什么值得做
 
 Native Gemini 是当前复杂度最高、收益最低的一条协议线：
@@ -110,9 +135,14 @@ upstreams:
 - [src/streaming/openai_sink.rs](../../src/streaming/openai_sink.rs)：OpenAI chunk -> Gemini SSE sink。
 - [src/streaming/state.rs](../../src/streaming/state.rs)：Gemini stream state。
 - [src/server/models.rs](../../src/server/models.rs)：Google model listing/detail handlers。
+- [src/hooks.rs](../../src/hooks.rs)：Google/Gemini usage、SSE accumulator、hook summary。
+- [src/debug_trace.rs](../../src/debug_trace.rs)：Google/Gemini stream/request summary 和相关测试。
+- [src/detect.rs](../../src/detect.rs)、[src/discovery.rs](../../src/discovery.rs)、[src/server/headers.rs](../../src/server/headers.rs)：Gemini request detection、discovery capability、Google API key/header 处理。
 - [tests/multimodal_gemini_boundary_test.rs](../../tests/multimodal_gemini_boundary_test.rs)：Gemini multimodal boundary tests。
+- [tests/reasoning_test.rs](../../tests/reasoning_test.rs)、[tests/multimodal_integration_test.rs](../../tests/multimodal_integration_test.rs)：Gemini reasoning/multimodal translation coverage。
 - [src/streaming/tests/gemini_source.rs](../../src/streaming/tests/gemini_source.rs) / [src/streaming/tests/gemini_sink.rs](../../src/streaming/tests/gemini_sink.rs)：Gemini stream tests。
 - [scripts/run_gemini_proxy.sh](../../scripts/run_gemini_proxy.sh)：Gemini client helper。
+- [scripts/real_cli_matrix.py](../../scripts/real_cli_matrix.py)、[scripts/real_endpoint_matrix.py](../../scripts/real_endpoint_matrix.py)：Gemini native route smoke/matrix。
 - [examples/upstream-proxy.yaml](../../examples/upstream-proxy.yaml)：`format: google` 示例。
 - [README.md](../../README.md)、[docs/clients.md](../clients.md)、[docs/protocol-compatibility-matrix.md](../protocol-compatibility-matrix.md)、[docs/protocol-baselines/google-gemini.md](../protocol-baselines/google-gemini.md)：用户文档和协议矩阵。
 
@@ -124,29 +154,32 @@ upstreams:
 
 - 合并本计划。
 - 在工程文档中明确：native Gemini support 被移除，Gemini 只通过 OpenAI-compatible upstream 使用。
-- 更新 prompt-cache 和 conversation-state 两份计划，把 Gemini native rows 标记为 removed 或删除。
+- 更新 prompt-cache 和 conversation-state 两份计划，把 Gemini native rows 标记为 removed 或删除。这是硬冻结点，不能等到后续阶段。
+- 更新 docs contract tests 的预期，避免旧合同继续要求 Gemini native active support。
 
 验收：
 
 - `docs/engineering/README.md` 链接本计划。
 - 用户文档不再把 Gemini native 作为 GA 支持路径。
 - 保留的 Gemini 提及只用于 OpenAI-compatible migration 或 retired baseline。
+- Prompt-cache/state 两份计划不再包含 `provider_prompt_cache.gemini.*`、Gemini resource adapter、Responses -> Gemini replay、Gemini cache/state 测试任务。
 
-### Phase 1：删除 public route 和 config format
+### Phase 1：关闭 public surface 和配置入口
 
 任务：
 
 - 从 router 删除 `/google/v1beta/*` 和 namespaced `/google/v1beta/*`。
-- 从 `UpstreamFormat` 删除 `Google` variant。
-- 删除 `google` / `gemini` parser alias。
+- 暂时保留内部 `UpstreamFormat::Google`，直到 translation/streaming/observability 引用都删除；不要在本阶段先删 enum 导致无法编译。
+- 对用户配置删除 `google` / `gemini` parser alias 或在 validation 层拒绝它们，并返回迁移错误。
 - 配置加载遇到 `format: google` / `format: gemini` 时返回明确错误。
-- 删除 Google URL builder 分支和 tests。
+- Google URL builder、auth/header、discovery match arms 在内部 enum 删除前可以先保留为 inert code；只有在所有调用点移除后再删除。不要为了 Phase 1 破坏 `cargo check`。
 
 验收：
 
 - `format: google` / `format: gemini` 不再能启动服务。
 - `/google/v1beta/models` 和 `/google/v1beta/models/{id}:generateContent` 不再注册。
 - 错误提示包含 `format: openai-completion` 和 Google OpenAI-compatible base URL 迁移方向。
+- 本阶段仍能 `cargo check`；不要求 `UpstreamFormat::Google` 命中为零。
 
 ### Phase 2：删除 Gemini translation 分支
 
@@ -162,7 +195,8 @@ upstreams:
 
 - translator 编译时不存在 `UpstreamFormat::Google` match。
 - 跨协议转换矩阵是 3x3。
-- `rg -n "GenerateContent|cachedContent|thoughtSignature|UpstreamFormat::Google" src` 无活跃实现命中。
+- `src/translate/**` 中不存在 Gemini native request/response 转换逻辑。
+- 本阶段仍能 `cargo check`；全局 `UpstreamFormat::Google` 清零留到最终清理阶段。
 
 ### Phase 3：删除 Gemini streaming 实现
 
@@ -180,12 +214,15 @@ upstreams:
 - Gemini stream tests 删除或移入 retired reference，不参与 CI。
 - 同协议 OpenAI-compatible Gemini upstream 仍可使用 OpenAI Chat stream path。
 
-### Phase 4：更新 models、examples、scripts、docs
+### Phase 4：删除 observability、detect、models、scripts、docs
 
 任务：
 
 - 删除 Google model handler。
+- 删除 hooks/debug trace 中的 Gemini accumulator、usage summary 和 stream/request summary。
+- 删除 Gemini request detection、discovery default target、Google-specific auth/header helpers。
 - 删除 `scripts/run_gemini_proxy.sh` 或改为已废弃说明，不再推荐。
+- 更新 `scripts/real_cli_matrix.py` 和 `scripts/real_endpoint_matrix.py`，移除 native Gemini route/smoke 项。
 - 更新 examples，移除 `format: google`。
 - 更新 README、clients、configuration、container、GA readiness、protocol compatibility matrix。
 - 将 `docs/protocol-baselines/google-gemini.md` 移到 retired 区域，或在文件头标记“historical reference only, not active support”。
@@ -197,15 +234,13 @@ upstreams:
 - 示例配置中不存在 `format: google`。
 - `docs/protocol-baselines` 明确区分 active baselines 和 retired references。
 
-### Phase 5：同步 prompt-cache 和 state 计划
+### Phase 5：核验 prompt-cache 和 state 计划仍然收敛
 
 任务：
 
-- Prompt-cache plan 从 4x4 Gemini-aware matrix 收敛到 3x3。
-- 删除 Gemini `cachedContent` fail-closed 和 optional resource adapter 阶段。
-- 明确 Google OpenAI-compatible upstream 默认只获得 OpenAI-shaped request support；不支持 `extra_body.google.cached_content` 专有扩展。
-- Conversation-state bridge plan 删除 OpenAI Responses -> Gemini `generateContent` replay 目标。
-- 状态桥目标改为 OpenAI Chat 和 Anthropic Messages。
+- 核验 prompt-cache plan 仍是 3x3，不重新引入 Gemini cache fields、`extra_body.google.cached_content` mapping 或 Gemini resource adapter。
+- 核验 conversation-state bridge plan 仍只支持 OpenAI Responses -> OpenAI Chat / Anthropic Messages。
+- 核验 Google OpenAI-compatible upstream 只被描述为 OpenAI-shaped upstream，不是 native Gemini format。
 
 验收：
 
@@ -229,13 +264,16 @@ upstreams:
 验收命令：
 
 ```bash
+cargo check
+cargo test --no-run
 cargo test
 python3 -m unittest \
   tests.test_protocol_docs_contract \
   tests.test_project_docs_contract \
   tests.test_ga_docs_contract \
   tests.test_cli_matrix_contracts \
-  tests.test_real_cli_matrix
+  tests.test_real_cli_matrix \
+  tests.test_real_endpoint_matrix
 git diff --check
 ```
 
@@ -243,6 +281,7 @@ git diff --check
 
 任务：
 
+- 删除内部 `UpstreamFormat::Google` variant、serde alias、parser alias、Display 分支和所有 leftover match arms。
 - `rg -n "UpstreamFormat::Google|format: google|format: gemini|GOOGLE_GEMINI_BASE_URL|generateContent|streamGenerateContent|cachedContent|thoughtSignature" src tests docs examples scripts README.md`
 - 对命中项分类：
   - active support：必须为零。
