@@ -1,5 +1,8 @@
 use super::*;
 
+const TOOL_BRIDGE_CONTEXT_VERSION: u64 = 2;
+const TOOL_BRIDGE_CONTEXT_PURPOSE: &str = "openai_responses_custom_tool_bridge";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StreamToolBridgeContextEntry {
     stable_name: String,
@@ -51,7 +54,7 @@ impl StreamToolBridgeContextEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StreamToolBridgeContext {
     version: u64,
-    compatibility_mode: String,
+    purpose: String,
     entries: std::collections::BTreeMap<String, StreamToolBridgeContextEntry>,
 }
 
@@ -59,11 +62,11 @@ impl StreamToolBridgeContext {
     fn from_value(value: &Value) -> Option<Self> {
         let object = value.as_object()?;
         let version = object.get("version").and_then(Value::as_u64)?;
-        if version != 1 {
+        if version != TOOL_BRIDGE_CONTEXT_VERSION {
             return None;
         }
-        let compatibility_mode = object.get("compatibility_mode").and_then(Value::as_str)?;
-        if !matches!(compatibility_mode, "strict" | "balanced" | "max_compat") {
+        let purpose = object.get("purpose").and_then(Value::as_str)?;
+        if purpose != TOOL_BRIDGE_CONTEXT_PURPOSE {
             return None;
         }
         let entries_object = object.get("entries")?.as_object()?;
@@ -77,14 +80,14 @@ impl StreamToolBridgeContext {
         }
         Some(Self {
             version,
-            compatibility_mode: compatibility_mode.to_string(),
+            purpose: purpose.to_string(),
             entries,
         })
     }
 
     fn expects_canonical_input_wrapper(&self, name: &str) -> bool {
-        self.version == 1
-            && !self.compatibility_mode.is_empty()
+        self.version == TOOL_BRIDGE_CONTEXT_VERSION
+            && self.purpose == TOOL_BRIDGE_CONTEXT_PURPOSE
             && self
                 .entries
                 .get(name)

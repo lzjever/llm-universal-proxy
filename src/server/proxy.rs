@@ -54,6 +54,9 @@ use super::secret_redaction::{redactor_for_request, RedactingSseStream, SecretRe
 use super::state::{AppState, RuntimeNamespaceState, DEFAULT_NAMESPACE};
 use super::tracked_body::TrackedBodyStream;
 
+const TOOL_BRIDGE_CONTEXT_VERSION: u64 = 2;
+const TOOL_BRIDGE_CONTEXT_PURPOSE: &str = "openai_responses_custom_tool_bridge";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrustedToolBridgeContextEntry {
     stable_name: String,
@@ -104,7 +107,7 @@ impl TrustedToolBridgeContextEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrustedToolBridgeContext {
     version: u64,
-    compatibility_mode: String,
+    purpose: String,
     entries: BTreeMap<String, TrustedToolBridgeContextEntry>,
 }
 
@@ -112,11 +115,11 @@ impl TrustedToolBridgeContext {
     fn from_value(value: Value) -> Option<Self> {
         let object = value.as_object()?;
         let version = object.get("version").and_then(Value::as_u64)?;
-        if version != 1 {
+        if version != TOOL_BRIDGE_CONTEXT_VERSION {
             return None;
         }
-        let compatibility_mode = object.get("compatibility_mode").and_then(Value::as_str)?;
-        if !matches!(compatibility_mode, "strict" | "balanced" | "max_compat") {
+        let purpose = object.get("purpose").and_then(Value::as_str)?;
+        if purpose != TOOL_BRIDGE_CONTEXT_PURPOSE {
             return None;
         }
         let entries_object = object.get("entries")?.as_object()?;
@@ -130,7 +133,7 @@ impl TrustedToolBridgeContext {
         }
         Some(Self {
             version,
-            compatibility_mode: compatibility_mode.to_string(),
+            purpose: purpose.to_string(),
             entries,
         })
     }
@@ -150,7 +153,7 @@ impl TrustedToolBridgeContext {
             .collect::<serde_json::Map<String, Value>>();
         serde_json::json!({
             "version": self.version,
-            "compatibility_mode": self.compatibility_mode,
+            "purpose": self.purpose,
             "entries": entries
         })
     }
@@ -1761,7 +1764,6 @@ pub(super) fn classify_request_boundary(
         upstream_format,
         body,
         &RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
             surface: crate::config::ModelSurface::default(),
         },
     )
@@ -1777,7 +1779,6 @@ fn classify_request_boundary_with_policy(
         client_format,
         upstream_format,
         body,
-        policy.compatibility_mode,
         &policy.surface,
     )
     .decision()
@@ -1856,8 +1857,5 @@ fn request_translation_policy(
             })
         });
 
-    RequestTranslationPolicy {
-        compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
-        surface,
-    }
+    RequestTranslationPolicy { surface }
 }

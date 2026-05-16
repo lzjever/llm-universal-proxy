@@ -1,11 +1,7 @@
 use super::*;
 use serde_json::json;
 
-fn typed_tool_bridge_context(
-    stable_name: &str,
-    source_kind: &str,
-    compatibility_mode: &str,
-) -> serde_json::Value {
+fn typed_tool_bridge_context(stable_name: &str, source_kind: &str) -> serde_json::Value {
     let mut entries = serde_json::Map::new();
     entries.insert(
         stable_name.to_string(),
@@ -18,8 +14,8 @@ fn typed_tool_bridge_context(
         }),
     );
     json!({
-        "version": 1,
-        "compatibility_mode": compatibility_mode,
+        "version": 2,
+        "purpose": "openai_responses_custom_tool_bridge",
         "entries": entries
     })
 }
@@ -27,10 +23,9 @@ fn typed_tool_bridge_context(
 fn response_translation_context(
     stable_name: &str,
     source_kind: &str,
-    compatibility_mode: &str,
 ) -> ResponseTranslationContext {
     ResponseTranslationContext::default().with_request_scoped_tool_bridge_context_value(Some(
-        typed_tool_bridge_context(stable_name, source_kind, compatibility_mode),
+        typed_tool_bridge_context(stable_name, source_kind),
     ))
 }
 
@@ -39,39 +34,24 @@ fn assess_request_translation(
     upstream_format: UpstreamFormat,
     body: &serde_json::Value,
 ) -> super::models::TranslationAssessment {
-    super::assessment::assess_request_translation(
-        client_format,
-        upstream_format,
-        body,
-        crate::config::CompatibilityMode::Balanced,
-    )
+    super::assessment::assess_request_translation(client_format, upstream_format, body)
 }
 
-fn request_translation_policy(
-    compatibility_mode: crate::config::CompatibilityMode,
-    max_output_tokens: Option<u64>,
-) -> RequestTranslationPolicy {
-    request_translation_policy_with_surface(
-        compatibility_mode,
-        crate::config::ModelSurface {
-            limits: max_output_tokens.map(|max_output_tokens| crate::config::ModelLimits {
-                context_window: None,
-                max_output_tokens: Some(max_output_tokens),
-            }),
-            modalities: None,
-            tools: None,
-        },
-    )
+fn request_translation_policy(max_output_tokens: Option<u64>) -> RequestTranslationPolicy {
+    request_translation_policy_with_surface(crate::config::ModelSurface {
+        limits: max_output_tokens.map(|max_output_tokens| crate::config::ModelLimits {
+            context_window: None,
+            max_output_tokens: Some(max_output_tokens),
+        }),
+        modalities: None,
+        tools: None,
+    })
 }
 
 fn request_translation_policy_with_surface(
-    compatibility_mode: crate::config::CompatibilityMode,
     surface: crate::config::ModelSurface,
 ) -> RequestTranslationPolicy {
-    RequestTranslationPolicy {
-        compatibility_mode,
-        surface,
-    }
+    RequestTranslationPolicy { surface }
 }
 
 fn same_format_surface_input_result(
@@ -85,17 +65,14 @@ fn same_format_surface_input_result(
         client_format,
         model,
         &mut body,
-        request_translation_policy_with_surface(
-            crate::config::CompatibilityMode::MaxCompat,
-            crate::config::ModelSurface {
-                limits: None,
-                modalities: Some(crate::config::ModelModalities {
-                    input: Some(input),
-                    output: None,
-                }),
-                tools: None,
-            },
-        ),
+        request_translation_policy_with_surface(crate::config::ModelSurface {
+            limits: None,
+            modalities: Some(crate::config::ModelModalities {
+                input: Some(input),
+                output: None,
+            }),
+            tools: None,
+        }),
         false,
     )
 }
@@ -252,38 +229,20 @@ fn inline_base64_helper_rejects_raw_pollution_and_empty_payloads() {
 }
 
 #[test]
-fn request_translation_policy_default_uses_default_compatibility_mode() {
-    assert_eq!(
-        crate::config::CompatibilityMode::default(),
-        crate::config::CompatibilityMode::MaxCompat
-    );
-
+fn request_translation_policy_default_is_empty_without_surface_hooks() {
     let default_policy = RequestTranslationPolicy::default();
-    assert_eq!(
-        default_policy.compatibility_mode,
-        crate::config::CompatibilityMode::MaxCompat
-    );
     assert!(default_policy.is_empty());
 
-    let balanced_policy = RequestTranslationPolicy {
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
-        surface: crate::config::ModelSurface::default(),
-    };
-    assert!(!balanced_policy.is_empty());
-
-    let serial_tool_policy = request_translation_policy_with_surface(
-        crate::config::CompatibilityMode::MaxCompat,
-        crate::config::ModelSurface {
-            limits: None,
-            modalities: None,
-            tools: Some(crate::config::ModelToolSurface {
-                supports_search: None,
-                supports_view_image: None,
-                apply_patch_transport: None,
-                supports_parallel_calls: Some(false),
-            }),
-        },
-    );
+    let serial_tool_policy = request_translation_policy_with_surface(crate::config::ModelSurface {
+        limits: None,
+        modalities: None,
+        tools: Some(crate::config::ModelToolSurface {
+            supports_search: None,
+            supports_view_image: None,
+            apply_patch_transport: None,
+            supports_parallel_calls: Some(false),
+        }),
+    });
     assert!(!serial_tool_policy.is_empty());
 }
 
@@ -306,19 +265,16 @@ fn translate_request_openai_passthrough_defaults_parallel_tool_calls_when_surfac
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        request_translation_policy_with_surface(
-            crate::config::CompatibilityMode::MaxCompat,
-            crate::config::ModelSurface {
-                limits: None,
-                modalities: None,
-                tools: Some(crate::config::ModelToolSurface {
-                    supports_search: None,
-                    supports_view_image: None,
-                    apply_patch_transport: None,
-                    supports_parallel_calls: Some(false),
-                }),
-            },
-        ),
+        request_translation_policy_with_surface(crate::config::ModelSurface {
+            limits: None,
+            modalities: None,
+            tools: Some(crate::config::ModelToolSurface {
+                supports_search: None,
+                supports_view_image: None,
+                apply_patch_transport: None,
+                supports_parallel_calls: Some(false),
+            }),
+        }),
         false,
     )
     .expect("surface should force serial tool execution for native OpenAI passthrough");
@@ -347,19 +303,16 @@ fn translate_request_openai_passthrough_rejects_parallel_tool_calls_override_whe
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        request_translation_policy_with_surface(
-            crate::config::CompatibilityMode::MaxCompat,
-            crate::config::ModelSurface {
-                limits: None,
-                modalities: None,
-                tools: Some(crate::config::ModelToolSurface {
-                    supports_search: None,
-                    supports_view_image: None,
-                    apply_patch_transport: None,
-                    supports_parallel_calls: Some(false),
-                }),
-            },
-        ),
+        request_translation_policy_with_surface(crate::config::ModelSurface {
+            limits: None,
+            modalities: None,
+            tools: Some(crate::config::ModelToolSurface {
+                supports_search: None,
+                supports_view_image: None,
+                apply_patch_transport: None,
+                supports_parallel_calls: Some(false),
+            }),
+        }),
         false,
     )
     .expect_err("surface should reject explicit parallel tool execution override");
@@ -389,17 +342,14 @@ fn translate_request_openai_passthrough_rejects_image_input_when_surface_is_text
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        request_translation_policy_with_surface(
-            crate::config::CompatibilityMode::MaxCompat,
-            crate::config::ModelSurface {
-                limits: None,
-                modalities: Some(crate::config::ModelModalities {
-                    input: Some(vec![crate::config::ModelModality::Text]),
-                    output: None,
-                }),
-                tools: None,
-            },
-        ),
+        request_translation_policy_with_surface(crate::config::ModelSurface {
+            limits: None,
+            modalities: Some(crate::config::ModelModalities {
+                input: Some(vec![crate::config::ModelModality::Text]),
+                output: None,
+            }),
+            tools: None,
+        }),
         false,
     )
     .expect_err("surface should reject unsupported image input");
@@ -424,17 +374,14 @@ fn translate_request_openai_passthrough_rejects_audio_output_when_surface_is_tex
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o-audio-preview",
         &mut body,
-        request_translation_policy_with_surface(
-            crate::config::CompatibilityMode::MaxCompat,
-            crate::config::ModelSurface {
-                limits: None,
-                modalities: Some(crate::config::ModelModalities {
-                    input: None,
-                    output: Some(vec![crate::config::ModelModality::Text]),
-                }),
-                tools: None,
-            },
-        ),
+        request_translation_policy_with_surface(crate::config::ModelSurface {
+            limits: None,
+            modalities: Some(crate::config::ModelModalities {
+                input: None,
+                output: Some(vec![crate::config::ModelModality::Text]),
+            }),
+            tools: None,
+        }),
         false,
     )
     .expect_err("surface should reject unsupported audio output");
@@ -468,17 +415,14 @@ fn translate_request_anthropic_passthrough_rejects_image_input_when_surface_is_t
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
-        request_translation_policy_with_surface(
-            crate::config::CompatibilityMode::MaxCompat,
-            crate::config::ModelSurface {
-                limits: None,
-                modalities: Some(crate::config::ModelModalities {
-                    input: Some(vec![crate::config::ModelModality::Text]),
-                    output: None,
-                }),
-                tools: None,
-            },
-        ),
+        request_translation_policy_with_surface(crate::config::ModelSurface {
+            limits: None,
+            modalities: Some(crate::config::ModelModalities {
+                input: Some(vec![crate::config::ModelModality::Text]),
+                output: None,
+            }),
+            tools: None,
+        }),
         false,
     )
     .expect_err("surface should reject unsupported image input on Anthropic passthrough");
@@ -509,17 +453,14 @@ fn translate_request_anthropic_passthrough_rejects_audio_input_when_surface_is_t
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
-        request_translation_policy_with_surface(
-            crate::config::CompatibilityMode::MaxCompat,
-            crate::config::ModelSurface {
-                limits: None,
-                modalities: Some(crate::config::ModelModalities {
-                    input: Some(vec![crate::config::ModelModality::Text]),
-                    output: None,
-                }),
-                tools: None,
-            },
-        ),
+        request_translation_policy_with_surface(crate::config::ModelSurface {
+            limits: None,
+            modalities: Some(crate::config::ModelModalities {
+                input: Some(vec![crate::config::ModelModality::Text]),
+                output: None,
+            }),
+            tools: None,
+        }),
         false,
     )
     .expect_err("surface should reject unsupported audio input on Anthropic passthrough");
@@ -545,19 +486,16 @@ fn translate_request_anthropic_passthrough_defaults_disable_parallel_tool_use_wh
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
-        request_translation_policy_with_surface(
-            crate::config::CompatibilityMode::MaxCompat,
-            crate::config::ModelSurface {
-                limits: None,
-                modalities: None,
-                tools: Some(crate::config::ModelToolSurface {
-                    supports_search: None,
-                    supports_view_image: None,
-                    apply_patch_transport: None,
-                    supports_parallel_calls: Some(false),
-                }),
-            },
-        ),
+        request_translation_policy_with_surface(crate::config::ModelSurface {
+            limits: None,
+            modalities: None,
+            tools: Some(crate::config::ModelToolSurface {
+                supports_search: None,
+                supports_view_image: None,
+                apply_patch_transport: None,
+                supports_parallel_calls: Some(false),
+            }),
+        }),
         false,
     )
     .expect("surface should force serial tool execution for native Anthropic passthrough");
@@ -587,19 +525,16 @@ fn translate_request_anthropic_passthrough_rejects_parallel_tool_use_override_wh
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut body,
-        request_translation_policy_with_surface(
-            crate::config::CompatibilityMode::MaxCompat,
-            crate::config::ModelSurface {
-                limits: None,
-                modalities: None,
-                tools: Some(crate::config::ModelToolSurface {
-                    supports_search: None,
-                    supports_view_image: None,
-                    apply_patch_transport: None,
-                    supports_parallel_calls: Some(false),
-                }),
-            },
-        ),
+        request_translation_policy_with_surface(crate::config::ModelSurface {
+            limits: None,
+            modalities: None,
+            tools: Some(crate::config::ModelToolSurface {
+                supports_search: None,
+                supports_view_image: None,
+                apply_patch_transport: None,
+                supports_parallel_calls: Some(false),
+            }),
+        }),
         false,
     )
     .expect_err("surface should reject explicit Anthropic parallel tool override");
@@ -1048,7 +983,8 @@ fn messages_to_responses_preserves_reasoning_items() {
 }
 
 #[test]
-fn openai_responses_round_trip_preserves_role_order_and_multimodal_parts() {
+fn openai_responses_round_trip_preserves_order_and_multimodal_parts_with_default_instruction_downgrade(
+) {
     let original = json!({
         "model": "gpt-4o",
         "messages": [
@@ -1093,21 +1029,25 @@ fn openai_responses_round_trip_preserves_role_order_and_multimodal_parts() {
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::Balanced, None),
+        request_translation_policy(None),
         false,
     )
     .unwrap();
 
     let messages = body["messages"].as_array().expect("messages");
-    assert_eq!(messages.len(), 4, "messages = {messages:?}");
-    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages.len(), 3, "messages = {messages:?}");
+    assert_eq!(messages[0]["role"], "user");
     assert_eq!(messages[1]["role"], "user");
-    assert_eq!(messages[2]["role"], "developer");
-    assert_eq!(messages[3]["role"], "user");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[0]["content"], "System instructions:\nSystem A");
     assert_eq!(messages[1]["content"][0]["type"], "text");
     assert_eq!(messages[1]["content"][1]["type"], "image_url");
     assert_eq!(messages[1]["content"][2]["type"], "input_audio");
     assert_eq!(messages[1]["content"][3]["type"], "file");
+    assert_eq!(
+        messages[2]["content"],
+        "Developer instructions:\nDeveloper B\n\nContinue"
+    );
 }
 
 #[test]
@@ -1461,8 +1401,8 @@ fn translate_request_responses_to_openai_bridges_custom_tool_definition_choice_a
     assert_eq!(
         body["_llmup_tool_bridge_context"],
         json!({
-            "version": 1,
-            "compatibility_mode": "max_compat",
+            "version": 2,
+            "purpose": "openai_responses_custom_tool_bridge",
             "entries": {
                 "code_exec": {
                     "stable_name": "code_exec",
@@ -2580,7 +2520,7 @@ fn translate_request_same_format_does_not_scan_regular_text_or_schema_as_selecto
 }
 
 #[test]
-fn translate_request_openai_same_format_max_compat_downgrades_developer_role() {
+fn translate_request_openai_same_format_default_downgrades_developer_role() {
     let mut body = json!({
         "model": "gpt-4o",
         "messages": [
@@ -2603,29 +2543,6 @@ fn translate_request_openai_same_format_max_compat_downgrades_developer_role() {
         messages[0]["content"],
         "Developer instructions:\nFollow repo rules.\n\nHi"
     );
-}
-
-#[test]
-fn translate_request_openai_same_format_balanced_normalizes_developer_role() {
-    let mut body = json!({
-        "model": "gpt-4o",
-        "messages": [
-            { "role": "developer", "content": "Follow repo rules." },
-            { "role": "user", "content": "Hi" }
-        ]
-    });
-    translate_request_with_policy(
-        UpstreamFormat::OpenAiCompletion,
-        UpstreamFormat::OpenAiCompletion,
-        "gpt-4o",
-        &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::Balanced, None),
-        true,
-    )
-    .unwrap();
-    let messages = body["messages"].as_array().unwrap();
-    assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[1]["role"], "user");
 }
 
 #[test]
@@ -2711,7 +2628,7 @@ fn translate_request_responses_same_format_normalizes_developer_role() {
 }
 
 #[test]
-fn translate_request_responses_upstream_keeps_native_instruction_roles_in_max_compat() {
+fn translate_request_responses_upstream_keeps_native_instruction_roles_by_default() {
     let mut body = json!({
         "model": "gpt-4o",
         "instructions": "Use native Responses instructions.",
@@ -2844,7 +2761,7 @@ fn translate_request_responses_to_openai_flattens_text_only_content_arrays() {
 }
 
 #[test]
-fn translate_request_responses_to_openai_max_compat_downgrades_developer_role_to_user() {
+fn translate_request_responses_to_openai_default_downgrades_developer_role_to_user() {
     let mut body = json!({
         "model": "gpt-4o",
         "input": [
@@ -3100,7 +3017,7 @@ fn translate_request_responses_to_non_responses_rejects_item_reference_items() {
 }
 
 #[test]
-fn translate_request_responses_compaction_summary_text_survives_max_compat() {
+fn translate_request_responses_compaction_summary_text_survives_default_translation() {
     let mut body = json!({
         "model": "gpt-4o",
         "input": [{
@@ -3115,10 +3032,10 @@ fn translate_request_responses_compaction_summary_text_survives_max_compat() {
         UpstreamFormat::OpenAiCompletion,
         "target-model",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        request_translation_policy(None),
         false,
     )
-    .expect("max_compat should preserve explicit compaction summary text");
+    .expect("default behavior should preserve explicit compaction summary text");
 
     let messages = body["messages"].as_array().expect("messages");
     assert_eq!(messages.len(), 1, "body = {body:?}");
@@ -3149,7 +3066,7 @@ fn translate_request_responses_passthrough_preserves_compaction_fields() {
         UpstreamFormat::OpenAiResponses,
         "gpt-4o",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        request_translation_policy(None),
         false,
     )
     .expect("native Responses passthrough should preserve compaction fields");
@@ -3181,7 +3098,7 @@ fn translate_request_responses_to_openai_drops_reasoning_encrypted_content_and_u
         &mut body,
         false,
     )
-    .expect("default max_compat should drop opaque reasoning state and use summary");
+    .expect("default behavior should drop opaque reasoning state and use summary");
 
     let messages = body["messages"].as_array().expect("messages");
     assert_eq!(messages[0]["reasoning_content"], "thinking");
@@ -3218,7 +3135,7 @@ fn translate_request_responses_to_claude_drops_non_string_reasoning_encrypted_co
         &mut body,
         false,
     )
-    .expect("default max_compat should ignore malformed opaque state and use summary");
+    .expect("default behavior should ignore malformed opaque state and use summary");
 
     let assistant_content = body["messages"][1]["content"]
         .as_array()
@@ -3266,7 +3183,7 @@ fn translate_request_responses_to_claude_drops_valid_reasoning_carrier_and_uses_
         &mut body,
         false,
     )
-    .expect("default max_compat should not replay provider-owned carrier state");
+    .expect("default behavior should not replay provider-owned carrier state");
 
     let assistant_content = body["messages"][1]["content"]
         .as_array()
@@ -4233,47 +4150,12 @@ fn assess_request_translation_responses_custom_tool_to_anthropic_rejects_nonport
         err.contains("custom tool") && err.contains("format") && err.contains("Anthropic"),
         "err = {err}"
     );
+    assert!(err.contains("failing closed"), "err = {err}");
+    assert!(!err.contains("downgrading"), "err = {err}");
 }
 
 #[test]
-fn assess_request_translation_responses_custom_tool_to_anthropic_strict_rejects_any_bridge() {
-    let body = json!({
-        "model": "claude-3-7-sonnet",
-        "tools": [{
-            "type": "custom",
-            "name": "code_exec",
-            "description": "Executes code",
-            "format": { "type": "text" }
-        }],
-        "tool_choice": {
-            "type": "custom",
-            "name": "code_exec"
-        },
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [{ "type": "input_text", "text": "run this" }]
-        }]
-    });
-
-    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
-        UpstreamFormat::OpenAiResponses,
-        UpstreamFormat::Anthropic,
-        &body,
-        crate::config::CompatibilityMode::Strict,
-    );
-
-    let TranslationDecision::Reject(err) = assessment.decision() else {
-        panic!("expected reject policy, got {assessment:?}");
-    };
-    assert_eq!(
-        err,
-        custom_tools_not_portable_message(UpstreamFormat::Anthropic)
-    );
-}
-
-#[test]
-fn assess_request_translation_responses_custom_tool_to_anthropic_balanced_allows_plain_text_but_rejects_grammar(
+fn assess_request_translation_responses_custom_tool_to_anthropic_default_allows_plain_text_and_warns_for_grammar(
 ) {
     let plain_text_body = json!({
         "model": "claude-3-7-sonnet",
@@ -4293,13 +4175,11 @@ fn assess_request_translation_responses_custom_tool_to_anthropic_balanced_allows
             "content": [{ "type": "input_text", "text": "run this" }]
         }]
     });
-    let plain_text_assessment =
-        super::assessment::assess_request_translation_with_compatibility_mode(
-            UpstreamFormat::OpenAiResponses,
-            UpstreamFormat::Anthropic,
-            &plain_text_body,
-            crate::config::CompatibilityMode::Balanced,
-        );
+    let plain_text_assessment = assess_request_translation(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::Anthropic,
+        &plain_text_body,
+    );
     assert_eq!(plain_text_assessment.decision(), TranslationDecision::Allow);
 
     let grammar_body = json!({
@@ -4324,61 +4204,31 @@ fn assess_request_translation_responses_custom_tool_to_anthropic_balanced_allows
             "content": [{ "type": "input_text", "text": "create hello.txt" }]
         }]
     });
-    let grammar_assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+    let grammar_assessment = assess_request_translation(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         &grammar_body,
-        crate::config::CompatibilityMode::Balanced,
     );
 
-    let TranslationDecision::Reject(err) = grammar_assessment.decision() else {
-        panic!("expected reject policy, got {grammar_assessment:?}");
+    let TranslationDecision::AllowWithWarnings(warnings) = grammar_assessment.decision() else {
+        panic!("expected warning policy, got {grammar_assessment:?}");
     };
     assert!(
-        err.contains("apply_patch") && err.contains("Anthropic"),
-        "err = {err}"
+        warnings
+            .iter()
+            .any(|warning| warning.contains("apply_patch") && warning.contains("Anthropic")),
+        "warnings = {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("downgrading to raw string input semantics")),
+        "warnings = {warnings:?}"
     );
 }
 
 #[test]
-fn assess_request_translation_responses_custom_tool_to_openai_strict_rejects_any_bridge() {
-    let body = json!({
-        "model": "gpt-4o",
-        "tools": [{
-            "type": "custom",
-            "name": "code_exec",
-            "description": "Executes code",
-            "format": { "type": "text" }
-        }],
-        "tool_choice": {
-            "type": "custom",
-            "name": "code_exec"
-        },
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [{ "type": "input_text", "text": "run this" }]
-        }]
-    });
-
-    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
-        UpstreamFormat::OpenAiResponses,
-        UpstreamFormat::OpenAiCompletion,
-        &body,
-        crate::config::CompatibilityMode::Strict,
-    );
-
-    let TranslationDecision::Reject(err) = assessment.decision() else {
-        panic!("expected reject policy, got {assessment:?}");
-    };
-    assert_eq!(
-        err,
-        custom_tools_not_portable_message(UpstreamFormat::OpenAiCompletion)
-    );
-}
-
-#[test]
-fn assess_request_translation_responses_custom_tool_to_openai_balanced_allows_plain_text_but_rejects_grammar(
+fn assess_request_translation_responses_custom_tool_to_openai_default_allows_plain_text_and_warns_for_grammar(
 ) {
     let plain_text_body = json!({
         "model": "gpt-4o",
@@ -4398,13 +4248,11 @@ fn assess_request_translation_responses_custom_tool_to_openai_balanced_allows_pl
             "content": [{ "type": "input_text", "text": "run this" }]
         }]
     });
-    let plain_text_assessment =
-        super::assessment::assess_request_translation_with_compatibility_mode(
-            UpstreamFormat::OpenAiResponses,
-            UpstreamFormat::OpenAiCompletion,
-            &plain_text_body,
-            crate::config::CompatibilityMode::Balanced,
-        );
+    let plain_text_assessment = assess_request_translation(
+        UpstreamFormat::OpenAiResponses,
+        UpstreamFormat::OpenAiCompletion,
+        &plain_text_body,
+    );
     assert_eq!(plain_text_assessment.decision(), TranslationDecision::Allow);
 
     let grammar_body = json!({
@@ -4429,19 +4277,26 @@ fn assess_request_translation_responses_custom_tool_to_openai_balanced_allows_pl
             "content": [{ "type": "input_text", "text": "create hello.txt" }]
         }]
     });
-    let grammar_assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+    let grammar_assessment = assess_request_translation(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::OpenAiCompletion,
         &grammar_body,
-        crate::config::CompatibilityMode::Balanced,
     );
 
-    let TranslationDecision::Reject(err) = grammar_assessment.decision() else {
-        panic!("expected reject policy, got {grammar_assessment:?}");
+    let TranslationDecision::AllowWithWarnings(warnings) = grammar_assessment.decision() else {
+        panic!("expected warning policy, got {grammar_assessment:?}");
     };
     assert!(
-        err.contains("apply_patch") && err.contains("OpenAI Chat Completions"),
-        "err = {err}"
+        warnings.iter().any(|warning| {
+            warning.contains("apply_patch") && warning.contains("OpenAI Chat Completions")
+        }),
+        "warnings = {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("downgrading to raw string input semantics")),
+        "warnings = {warnings:?}"
     );
 }
 
@@ -4478,7 +4333,7 @@ fn translate_request_openai_to_claude_uses_policy_default_max_output_tokens_when
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
+        request_translation_policy(Some(128_000)),
         false,
     )
     .unwrap();
@@ -4499,7 +4354,7 @@ fn translate_request_openai_to_claude_preserves_explicit_max_completion_tokens_o
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
+        request_translation_policy(Some(128_000)),
         false,
     )
     .unwrap();
@@ -4520,7 +4375,7 @@ fn translate_request_openai_to_claude_preserves_explicit_max_tokens_over_policy(
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
+        request_translation_policy(Some(128_000)),
         false,
     )
     .unwrap();
@@ -4540,7 +4395,7 @@ fn translate_request_openai_to_responses_uses_policy_default_max_output_tokens_w
         UpstreamFormat::OpenAiResponses,
         "gpt-4o",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
+        request_translation_policy(Some(128_000)),
         false,
     )
     .unwrap();
@@ -4560,7 +4415,7 @@ fn translate_request_responses_to_openai_uses_policy_default_max_completion_toke
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::Balanced, Some(128_000)),
+        request_translation_policy(Some(128_000)),
         false,
     )
     .unwrap();
@@ -4765,7 +4620,7 @@ fn assess_request_translation_openai_to_anthropic_reasoning_without_replay_prove
 }
 
 #[test]
-fn assess_request_translation_responses_to_openai_rejects_reasoning_encrypted_content() {
+fn assess_request_translation_responses_to_openai_warns_for_dropped_reasoning_encrypted_content() {
     let body = json!({
         "model": "gpt-4o",
         "input": [{
@@ -4780,13 +4635,14 @@ fn assess_request_translation_responses_to_openai_rejects_reasoning_encrypted_co
         UpstreamFormat::OpenAiCompletion,
         &body,
     );
-    let TranslationDecision::Reject(message) = assessment.decision() else {
-        panic!("expected reject policy, got {assessment:?}");
+    let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
+        panic!("expected warning policy, got {assessment:?}");
     };
-    assert!(message.contains("encrypted_content"), "message = {message}");
     assert!(
-        message.contains("native OpenAI Responses"),
-        "message = {message}"
+        warnings
+            .iter()
+            .any(|warning| warning.contains("input[].reasoning.encrypted_content")),
+        "warnings = {warnings:?}"
     );
 }
 
@@ -5357,8 +5213,8 @@ fn translate_request_responses_custom_tool_to_claude_bridges_definition_choice_a
     assert_eq!(
         body["_llmup_tool_bridge_context"],
         json!({
-            "version": 1,
-            "compatibility_mode": "max_compat",
+            "version": 2,
+            "purpose": "openai_responses_custom_tool_bridge",
             "entries": {
                 "code_exec": {
                     "stable_name": "code_exec",
@@ -5483,7 +5339,7 @@ fn translate_request_claude_structured_tool_result_content_round_trips() {
 }
 
 #[test]
-fn translate_request_responses_string_grammar_custom_tool_to_claude_max_compat_bridges_with_text_contract(
+fn translate_request_responses_string_grammar_custom_tool_to_claude_default_bridges_with_text_contract(
 ) {
     let apply_patch_grammar = r#"start: begin_patch hunk+ end_patch
 begin_patch: "*** Begin Patch" LF
@@ -5546,17 +5402,17 @@ eof_line: "*** End of File" LF
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        request_translation_policy(None),
         false,
     )
-    .expect("string-grammar custom tools should bridge to Anthropic under max_compat");
+    .expect("string-grammar custom tools should bridge to Anthropic by default");
 
     let tools = body["tools"].as_array().expect("anthropic tools");
     assert_eq!(
         body["_llmup_tool_bridge_context"],
         json!({
-            "version": 1,
-            "compatibility_mode": "max_compat",
+            "version": 2,
+            "purpose": "openai_responses_custom_tool_bridge",
             "entries": {
                 "apply_patch": {
                     "stable_name": "apply_patch",
@@ -5627,7 +5483,7 @@ eof_line: "*** End of File" LF
 }
 
 #[test]
-fn translate_request_responses_string_grammar_custom_tool_to_claude_max_compat_warns_and_records_mode(
+fn translate_request_responses_string_grammar_custom_tool_to_claude_default_warns_and_records_v2_purpose(
 ) {
     let mut body = json!({
         "model": "claude-3-7-sonnet",
@@ -5652,11 +5508,10 @@ fn translate_request_responses_string_grammar_custom_tool_to_claude_max_compat_w
         }]
     });
 
-    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+    let assessment = assess_request_translation(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         &body,
-        crate::config::CompatibilityMode::MaxCompat,
     );
     let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
         panic!("expected warning policy, got {assessment:?}");
@@ -5673,16 +5528,18 @@ fn translate_request_responses_string_grammar_custom_tool_to_claude_max_compat_w
         UpstreamFormat::Anthropic,
         "claude-3-7-sonnet",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        request_translation_policy(None),
         false,
     )
-    .expect("max_compat grammar custom tools should bridge to Anthropic");
+    .expect("default grammar custom tools should bridge to Anthropic");
 
+    let bridge_context = &body["_llmup_tool_bridge_context"];
+    assert_eq!(bridge_context["version"], 2);
     assert_eq!(
-        body["_llmup_tool_bridge_context"]["compatibility_mode"],
-        "max_compat"
+        bridge_context["purpose"],
+        "openai_responses_custom_tool_bridge"
     );
-    assert_eq!(body["_llmup_tool_bridge_context"]["version"], 1);
+    assert!(bridge_context.get("compatibility_mode").is_none());
     assert_eq!(
         body["_llmup_tool_bridge_context"]["entries"]["apply_patch"]["stable_name"],
         "apply_patch"
@@ -5693,7 +5550,7 @@ fn translate_request_responses_string_grammar_custom_tool_to_claude_max_compat_w
 }
 
 #[test]
-fn translate_request_responses_string_grammar_custom_tool_to_openai_max_compat_warns_and_records_mode(
+fn translate_request_responses_string_grammar_custom_tool_to_openai_default_warns_and_records_v2_purpose(
 ) {
     let mut body = json!({
         "model": "gpt-4o",
@@ -5718,11 +5575,10 @@ fn translate_request_responses_string_grammar_custom_tool_to_openai_max_compat_w
         }]
     });
 
-    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+    let assessment = assess_request_translation(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::OpenAiCompletion,
         &body,
-        crate::config::CompatibilityMode::MaxCompat,
     );
     let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
         panic!("expected warning policy, got {assessment:?}");
@@ -5739,16 +5595,18 @@ fn translate_request_responses_string_grammar_custom_tool_to_openai_max_compat_w
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        request_translation_policy(None),
         false,
     )
-    .expect("max_compat grammar custom tools should bridge to OpenAI Chat Completions");
+    .expect("default grammar custom tools should bridge to OpenAI Chat Completions");
 
+    let bridge_context = &body["_llmup_tool_bridge_context"];
+    assert_eq!(bridge_context["version"], 2);
     assert_eq!(
-        body["_llmup_tool_bridge_context"]["compatibility_mode"],
-        "max_compat"
+        bridge_context["purpose"],
+        "openai_responses_custom_tool_bridge"
     );
-    assert_eq!(body["_llmup_tool_bridge_context"]["version"], 1);
+    assert!(bridge_context.get("compatibility_mode").is_none());
     assert_eq!(
         body["_llmup_tool_bridge_context"]["entries"]["apply_patch"]["stable_name"],
         "apply_patch"
@@ -5763,7 +5621,7 @@ fn translate_request_responses_string_grammar_custom_tool_to_openai_max_compat_w
 }
 
 #[test]
-fn translate_request_responses_string_grammar_custom_tool_to_openai_max_compat_bridges_with_chat_completions_contract(
+fn translate_request_responses_string_grammar_custom_tool_to_openai_default_bridges_with_chat_completions_contract(
 ) {
     let apply_patch_grammar = r#"start: begin_patch hunk+ end_patch
 begin_patch: "*** Begin Patch" LF
@@ -5826,16 +5684,15 @@ eof_line: "*** End of File" LF
         UpstreamFormat::OpenAiCompletion,
         "gpt-4o",
         &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        request_translation_policy(None),
         false,
     )
-    .expect(
-        "string-grammar custom tools should bridge to OpenAI Chat Completions under max_compat",
-    );
+    .expect("string-grammar custom tools should bridge to OpenAI Chat Completions by default");
 
+    assert_eq!(body["_llmup_tool_bridge_context"]["version"], 2);
     assert_eq!(
-        body["_llmup_tool_bridge_context"]["compatibility_mode"],
-        "max_compat"
+        body["_llmup_tool_bridge_context"]["purpose"],
+        "openai_responses_custom_tool_bridge"
     );
     let tools = body["tools"].as_array().expect("openai tools");
     assert_eq!(tools[0]["function"]["name"], "apply_patch");
@@ -5907,11 +5764,7 @@ fn translate_request_claude_request_scoped_custom_tool_history_to_responses_rest
 {
     let exact_input = "first line\n{\"patch\":\"*** Begin Patch\"}\n\"quoted\"";
     let mut body = json!({
-        "_llmup_tool_bridge_context": typed_tool_bridge_context(
-            "code_exec",
-            "custom_text",
-            "balanced"
-        ),
+        "_llmup_tool_bridge_context": typed_tool_bridge_context("code_exec", "custom_text"),
         "model": "gpt-5",
         "tools": [{
             "name": "code_exec",
@@ -5999,11 +5852,7 @@ fn translate_request_claude_request_scoped_custom_tool_history_to_responses_rest
 #[test]
 fn translate_request_claude_request_scoped_noncanonical_custom_tool_history_falls_back_open() {
     let mut body = json!({
-        "_llmup_tool_bridge_context": typed_tool_bridge_context(
-            "code_exec",
-            "custom_text",
-            "balanced"
-        ),
+        "_llmup_tool_bridge_context": typed_tool_bridge_context("code_exec", "custom_text"),
         "model": "gpt-5",
         "messages": [
             {
@@ -6105,8 +5954,8 @@ fn responses_custom_tool_bridge_round_trip_preserves_trusted_non_replayable_mark
         .expect("tool call");
 
     let bridge_context = super::tools::ToolBridgeContext::from_value(&json!({
-        "version": 1,
-        "compatibility_mode": "balanced",
+        "version": 2,
+        "purpose": "openai_responses_custom_tool_bridge",
         "entries": {
             "apply_patch": {
                 "stable_name": "apply_patch",
@@ -6229,21 +6078,20 @@ fn translate_request_responses_passthrough_preserves_native_state_and_reasoning_
 }
 
 #[test]
-fn translate_request_responses_reasoning_encrypted_content_include_warns_and_drops_in_max_compat() {
+fn translate_request_responses_reasoning_encrypted_content_include_warns_and_drops_by_default() {
     let body = json!({
         "model": "gpt-4o",
         "include": ["reasoning.encrypted_content"],
         "input": "Hi"
     });
 
-    let assessment = super::assessment::assess_request_translation_with_compatibility_mode(
+    let assessment = assess_request_translation(
         UpstreamFormat::OpenAiResponses,
         UpstreamFormat::Anthropic,
         &body,
-        crate::config::CompatibilityMode::MaxCompat,
     );
     let TranslationDecision::AllowWithWarnings(warnings) = assessment.decision() else {
-        panic!("expected max_compat warning path, got {assessment:?}");
+        panic!("expected default warning path, got {assessment:?}");
     };
     assert!(
         warnings
@@ -6258,10 +6106,10 @@ fn translate_request_responses_reasoning_encrypted_content_include_warns_and_dro
         UpstreamFormat::Anthropic,
         "claude-3",
         &mut translated,
-        request_translation_policy(crate::config::CompatibilityMode::MaxCompat, None),
+        request_translation_policy(None),
         false,
     )
-    .expect("max_compat should warn and drop Responses reasoning encrypted_content include");
+    .expect("default behavior should warn and drop Responses reasoning encrypted_content include");
 
     assert!(translated.get("include").is_none(), "body = {translated:?}");
 }
@@ -6468,7 +6316,7 @@ fn translate_request_claude_to_non_anthropic_rejects_user_turn_that_would_reorde
 }
 
 #[test]
-fn translate_request_claude_to_openai_max_compat_downgrades_multiblock_system_without_injected_newlines(
+fn translate_request_claude_to_openai_default_downgrades_multiblock_system_without_injected_newlines(
 ) {
     let mut body = json!({
         "model": "claude-3",
@@ -6495,38 +6343,6 @@ fn translate_request_claude_to_openai_max_compat_downgrades_multiblock_system_wi
         messages[0]["content"],
         "System instructions:\nSystem ASystem B\n\nHi"
     );
-}
-
-#[test]
-fn translate_request_claude_to_openai_balanced_preserves_multiblock_system_without_injected_newlines(
-) {
-    let mut body = json!({
-        "model": "claude-3",
-        "system": [
-            { "type": "text", "text": "System A" },
-            { "type": "text", "text": "System B" }
-        ],
-        "messages": [{ "role": "user", "content": "Hi" }]
-    });
-
-    translate_request_with_policy(
-        UpstreamFormat::Anthropic,
-        UpstreamFormat::OpenAiCompletion,
-        "claude-3",
-        &mut body,
-        request_translation_policy(crate::config::CompatibilityMode::Balanced, None),
-        false,
-    )
-    .unwrap();
-
-    let messages = body["messages"].as_array().expect("messages");
-    assert_eq!(messages[0]["role"], "system");
-    let content = messages[0]["content"].as_array().expect("system parts");
-    assert_eq!(content.len(), 2);
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "System A");
-    assert_eq!(content[1]["type"], "text");
-    assert_eq!(content[1]["text"], "System B");
 }
 
 #[test]
@@ -7426,11 +7242,7 @@ fn translate_response_responses_same_format_rejects_reserved_public_tool_identit
 #[test]
 fn translate_response_same_format_rejects_internal_bridge_context_field() {
     let body = json!({
-        "_llmup_tool_bridge_context": typed_tool_bridge_context(
-            "apply_patch",
-            "custom_grammar",
-            "balanced"
-        ),
+        "_llmup_tool_bridge_context": typed_tool_bridge_context("apply_patch", "custom_grammar"),
         "id": "resp_internal_context",
         "object": "response",
         "created_at": 1,
@@ -8785,7 +8597,7 @@ fn translate_response_openai_to_responses_decodes_request_scoped_function_call_t
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::OpenAiResponses,
         &body,
-        response_translation_context("code_exec", "custom_text", "balanced"),
+        response_translation_context("code_exec", "custom_text"),
     )
     .unwrap();
 
@@ -8832,7 +8644,7 @@ fn translate_response_openai_to_responses_decodes_request_scoped_custom_bridge_w
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::OpenAiResponses,
         &body,
-        response_translation_context("apply_patch", "custom_grammar", "balanced"),
+        response_translation_context("apply_patch", "custom_grammar"),
     )
     .unwrap();
 
@@ -8853,11 +8665,7 @@ fn translate_response_ignores_upstream_body_supplied_bridge_context_without_side
     let exact_input = "print('hi')";
     let raw_arguments = serde_json::to_string(&json!({ "input": exact_input })).expect("json");
     let body = json!({
-        "_llmup_tool_bridge_context": typed_tool_bridge_context(
-            "code_exec",
-            "custom_text",
-            "balanced"
-        ),
+        "_llmup_tool_bridge_context": typed_tool_bridge_context("code_exec", "custom_text"),
         "id": "chatcmpl_tools",
         "object": "chat.completion",
         "choices": [{
@@ -8912,7 +8720,7 @@ fn translate_response_uses_trusted_sidecar_bridge_context_for_custom_tool_restor
     });
     let context =
         ResponseTranslationContext::default().with_request_scoped_tool_bridge_context_value(Some(
-            typed_tool_bridge_context("code_exec", "custom_text", "balanced"),
+            typed_tool_bridge_context("code_exec", "custom_text"),
         ));
 
     let out = translate_response_with_context(
@@ -8964,7 +8772,7 @@ fn translate_response_openai_to_responses_request_scoped_custom_bridge_falls_bac
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::OpenAiResponses,
         &body,
-        response_translation_context("apply_patch", "custom_grammar", "balanced"),
+        response_translation_context("apply_patch", "custom_grammar"),
     )
     .expect("noncanonical request-scoped bridge args should fall back to function_call");
 
@@ -9082,7 +8890,7 @@ fn translate_response_openai_to_responses_request_scoped_bridge_falls_back_when_
             UpstreamFormat::OpenAiCompletion,
             UpstreamFormat::OpenAiResponses,
             &body,
-            response_translation_context("code_exec", "custom_text", "balanced"),
+            response_translation_context("code_exec", "custom_text"),
         )
         .expect("noncanonical bridged args should fall back to function_call");
 
@@ -9113,24 +8921,40 @@ fn translate_response_openai_to_responses_fails_closed_for_incomplete_or_invalid
     });
     let cases = [
         (
-            "missing version",
+            "legacy v1 sidecar",
             json!({
-                "compatibility_mode": "balanced",
+                "version": 1,
+                "compatibility_mode": "max_compat",
                 "entries": { "code_exec": entry.clone() }
             }),
         ),
         (
-            "missing compatibility_mode",
+            "missing version",
             json!({
-                "version": 1,
+                "purpose": "openai_responses_custom_tool_bridge",
+                "entries": { "code_exec": entry.clone() }
+            }),
+        ),
+        (
+            "missing purpose",
+            json!({
+                "version": 2,
+                "entries": { "code_exec": entry.clone() }
+            }),
+        ),
+        (
+            "invalid purpose",
+            json!({
+                "version": 2,
+                "purpose": "other",
                 "entries": { "code_exec": entry.clone() }
             }),
         ),
         (
             "missing stable_name",
             json!({
-                "version": 1,
-                "compatibility_mode": "balanced",
+                "version": 2,
+                "purpose": "openai_responses_custom_tool_bridge",
                 "entries": {
                     "code_exec": {
                         "source_kind": "custom_text",
@@ -9144,8 +8968,8 @@ fn translate_response_openai_to_responses_fails_closed_for_incomplete_or_invalid
         (
             "stable_name mismatch",
             json!({
-                "version": 1,
-                "compatibility_mode": "balanced",
+                "version": 2,
+                "purpose": "openai_responses_custom_tool_bridge",
                 "entries": {
                     "code_exec": {
                         "stable_name": "other",
@@ -9161,15 +8985,15 @@ fn translate_response_openai_to_responses_fails_closed_for_incomplete_or_invalid
             "non-integer version",
             json!({
                 "version": "1",
-                "compatibility_mode": "balanced",
+                "purpose": "openai_responses_custom_tool_bridge",
                 "entries": { "code_exec": entry.clone() }
             }),
         ),
         (
             "future version",
             json!({
-                "version": 2,
-                "compatibility_mode": "balanced",
+                "version": 3,
+                "purpose": "openai_responses_custom_tool_bridge",
                 "entries": { "code_exec": entry }
             }),
         ),
@@ -9523,7 +9347,7 @@ fn translate_response_claude_request_scoped_tool_use_restores_responses_custom_t
         UpstreamFormat::Anthropic,
         UpstreamFormat::OpenAiResponses,
         &body,
-        response_translation_context("code_exec", "custom_text", "balanced"),
+        response_translation_context("code_exec", "custom_text"),
     )
     .expect("Anthropic bridged tool_use should restore Responses custom tool calls");
 

@@ -57,6 +57,16 @@ pub(crate) fn custom_tool_format_downgraded_message(
     )
 }
 
+pub(crate) fn custom_tool_format_reject_message(
+    source_label: &str,
+    tool_name: &str,
+    target_label: &str,
+) -> String {
+    format!(
+        "{source_label} custom tool `{tool_name}` format constraints cannot be faithfully translated to {target_label}; failing closed because this custom format has no safe raw string bridge"
+    )
+}
+
 pub(crate) fn reserved_openai_custom_bridge_prefix_message(name: &str) -> String {
     format!(
         "OpenAI Responses function name `{name}` uses reserved bridge prefix `__llmup_custom__`; this namespace is reserved for synthetic custom-tool bridging to OpenAI Chat Completions"

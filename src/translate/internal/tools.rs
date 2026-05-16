@@ -343,7 +343,8 @@ pub(crate) fn openai_custom_tool_bridge_description_for_target(
 
 pub(crate) const OPENAI_RESPONSES_CUSTOM_BRIDGE_PREFIX: &str = "__llmup_custom__";
 pub(crate) const REQUEST_SCOPED_TOOL_BRIDGE_CONTEXT_FIELD: &str = "_llmup_tool_bridge_context";
-const TOOL_BRIDGE_CONTEXT_VERSION: u64 = 1;
+const TOOL_BRIDGE_CONTEXT_VERSION: u64 = 2;
+const TOOL_BRIDGE_CONTEXT_PURPOSE: &str = "openai_responses_custom_tool_bridge";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolBridgeSourceKind {
@@ -496,15 +497,15 @@ impl ToolBridgeContextEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolBridgeContext {
     pub(crate) version: u64,
-    pub(crate) compatibility_mode: String,
+    purpose: String,
     pub(crate) entries: BTreeMap<String, ToolBridgeContextEntry>,
 }
 
 impl ToolBridgeContext {
-    fn new(compatibility_mode: &str) -> Self {
+    fn new() -> Self {
         Self {
             version: TOOL_BRIDGE_CONTEXT_VERSION,
-            compatibility_mode: compatibility_mode.to_string(),
+            purpose: TOOL_BRIDGE_CONTEXT_PURPOSE.to_string(),
             entries: BTreeMap::new(),
         }
     }
@@ -515,8 +516,8 @@ impl ToolBridgeContext {
         if version != TOOL_BRIDGE_CONTEXT_VERSION {
             return None;
         }
-        let compatibility_mode = object.get("compatibility_mode").and_then(Value::as_str)?;
-        if !matches!(compatibility_mode, "strict" | "balanced" | "max_compat") {
+        let purpose = object.get("purpose").and_then(Value::as_str)?;
+        if purpose != TOOL_BRIDGE_CONTEXT_PURPOSE {
             return None;
         }
         let entries_object = object.get("entries").and_then(Value::as_object)?;
@@ -530,7 +531,7 @@ impl ToolBridgeContext {
         }
         Some(Self {
             version,
-            compatibility_mode: compatibility_mode.to_string(),
+            purpose: purpose.to_string(),
             entries,
         })
     }
@@ -543,13 +544,9 @@ impl ToolBridgeContext {
             .collect::<serde_json::Map<_, _>>();
         serde_json::json!({
             "version": self.version,
-            "compatibility_mode": self.compatibility_mode,
+            "purpose": self.purpose,
             "entries": entries
         })
-    }
-
-    pub(crate) fn set_compatibility_mode(&mut self, compatibility_mode: &str) {
-        self.compatibility_mode = compatibility_mode.to_string();
     }
 
     pub(crate) fn expects_canonical_input_wrapper(&self, name: &str) -> bool {
@@ -853,7 +850,7 @@ fn request_scoped_custom_bridge_source_kind(
 pub(crate) fn request_scoped_openai_custom_bridge_context(
     tools: &[NormalizedOpenAiFamilyToolDef],
 ) -> Option<ToolBridgeContext> {
-    let mut bridge_context = ToolBridgeContext::new("balanced");
+    let mut bridge_context = ToolBridgeContext::new();
     for tool in tools {
         let NormalizedOpenAiFamilyToolDef::Custom(custom) = tool else {
             continue;

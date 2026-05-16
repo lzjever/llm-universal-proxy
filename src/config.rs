@@ -12,9 +12,19 @@ use crate::formats::UpstreamFormat;
 mod model_surface;
 
 pub use self::model_surface::{
-    ApplyPatchTransport, CompatibilityMode, ModelModalities, ModelModality, ModelSurface,
-    ModelSurfacePatch, ModelToolSurface,
+    ApplyPatchTransport, ModelModalities, ModelModality, ModelSurface, ModelSurfacePatch,
+    ModelToolSurface,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum LegacyCompatibilityMode {
+    #[serde(rename = "strict")]
+    Strict,
+    #[serde(rename = "balanced")]
+    Balanced,
+    #[serde(rename = "max_compat", alias = "max-compat")]
+    MaxCompat,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookConfig {
@@ -788,7 +798,7 @@ impl<'de> Deserialize<'de> for RuntimeConfigPayload {
             #[serde(default = "default_upstream_timeout_secs")]
             upstream_timeout_secs: u64,
             #[serde(default)]
-            compatibility_mode: Option<CompatibilityMode>,
+            compatibility_mode: Option<LegacyCompatibilityMode>,
             #[serde(default, alias = "upstream_proxy")]
             proxy: Option<ProxyConfig>,
             #[serde(default)]
@@ -901,7 +911,7 @@ struct FileConfig {
     #[serde(default = "default_upstream_timeout_secs")]
     upstream_timeout_secs: u64,
     #[serde(default, rename = "compatibility_mode")]
-    _compatibility_mode: Option<CompatibilityMode>,
+    _compatibility_mode: Option<LegacyCompatibilityMode>,
     #[serde(default, alias = "upstream_proxy")]
     proxy: Option<ProxyConfig>,
     #[serde(default)]
@@ -2043,11 +2053,6 @@ upstreams:
                 "legacy mode {mode} should not be serialized: {round_trip}"
             );
         }
-    }
-
-    #[test]
-    fn compatibility_mode_default_remains_max_compat_for_internal_branches() {
-        assert_eq!(CompatibilityMode::default(), CompatibilityMode::MaxCompat);
     }
 
     #[test]

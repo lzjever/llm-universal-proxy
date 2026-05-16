@@ -26,7 +26,7 @@
 - 展开后的上下文继续走现有协议转换器，目标 provider 看到的是完整 transcript，而不是 OpenAI Responses 的状态句柄。
 - 状态桥只保存会话重放所需的输入/输出事件，不缓存或复用模型响应。
 - 默认行为保持 fail closed；只有显式配置启用状态桥的路由才改变现有边界。
-- 状态桥不进入 `RawProviderPassthrough` raw execution lane。它属于有状态翻译增强，必须在 trace 和 warnings 中可见。
+- 状态桥不进入 `RawProviderPassthrough` raw execution path。它属于有状态翻译增强，必须在 trace 和 warnings 中可见。
 
 一句话边界：这是 `ConversationStateBridge`，不是 cache。
 
@@ -129,13 +129,12 @@ conversation_state_bridge:
 
 ## 执行路径
 
-不新增单独主 lane；使用 passthrough/cache 计划里的 primary `CompatibilityTranslation` lane，并增加 state-bridge modifier。这里的 `CompatibilityTranslation` 表示单一最大兼容翻译策略，不是用户可选兼容档位：
+不新增单独主 path；使用 passthrough/cache 计划里的 primary `MaximumCompatibilityTranslation` path，并增加 state-bridge modifier。这里的 `MaximumCompatibilityTranslation` 表示单一最大兼容翻译策略，不是用户可选兼容档位；provider prompt-cache 合成仍只是 provider-native request-control modifier，不是第三个主 path：
 
 ```rust
-enum ExecutionLane {
+enum PrimaryExecutionPath {
     RawProviderPassthrough,
-    ProviderPromptCacheOptimized,
-    CompatibilityTranslation,
+    MaximumCompatibilityTranslation,
 }
 
 enum StateBridgeModifier {

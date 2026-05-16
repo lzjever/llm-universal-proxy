@@ -2283,8 +2283,8 @@ async fn live_responses_custom_tool_bridge_to_openai_restores_non_stream_respons
 async fn live_openai_responses_same_format_success_rejects_upstream_bridge_context_leak() {
     let response_body = serde_json::json!({
         "_llmup_tool_bridge_context": {
-            "version": 1,
-            "compatibility_mode": "balanced",
+            "version": 2,
+            "purpose": "openai_responses_custom_tool_bridge",
             "entries": {
                 "code_exec": {
                     "stable_name": "code_exec",
@@ -2555,8 +2555,8 @@ async fn live_responses_rejects_external_tool_bridge_context_ingress() {
                 "content": [{ "type": "input_text", "text": "Create hello.txt" }]
             }],
             "_llmup_tool_bridge_context": {
-                "version": 1,
-                "compatibility_mode": "max_compat",
+                "version": 2,
+                "purpose": "openai_responses_custom_tool_bridge",
                 "entries": {
                     "code_exec": {
                         "stable_name": "code_exec",
@@ -2599,7 +2599,7 @@ async fn live_responses_rejects_external_tool_bridge_context_ingress() {
 }
 
 #[tokio::test]
-async fn live_responses_custom_tool_bridge_ignores_legacy_strict_config_and_uses_max_compat() {
+async fn live_responses_custom_tool_bridge_ignores_legacy_strict_config_and_uses_default_bridge() {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
         "object": "chat.completion",
@@ -2681,7 +2681,7 @@ upstreams:
 }
 
 #[tokio::test]
-async fn live_responses_grammar_custom_tool_bridge_to_openai_uses_max_compat_by_default() {
+async fn live_responses_grammar_custom_tool_bridge_to_openai_uses_default_bridge() {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
         "object": "chat.completion",
@@ -2739,7 +2739,7 @@ async fn live_responses_grammar_custom_tool_bridge_to_openai_uses_max_compat_by_
 }
 
 #[tokio::test]
-async fn live_responses_grammar_custom_tool_bridge_to_openai_max_compat_allows_with_warning_and_stable_names(
+async fn live_responses_grammar_custom_tool_bridge_to_openai_default_allows_with_warning_and_stable_names(
 ) {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
@@ -2842,8 +2842,7 @@ async fn live_responses_grammar_custom_tool_bridge_to_openai_max_compat_allows_w
 }
 
 #[tokio::test]
-async fn live_responses_custom_tool_bridge_to_anthropic_uses_max_compat_for_plain_text_custom_tools(
-) {
+async fn live_responses_custom_tool_bridge_to_anthropic_uses_default_for_plain_text_custom_tools() {
     let response_body = serde_json::json!({
         "id": "msg_1",
         "type": "message",
@@ -2901,7 +2900,7 @@ async fn live_responses_custom_tool_bridge_to_anthropic_uses_max_compat_for_plai
 }
 
 #[tokio::test]
-async fn live_responses_grammar_custom_tool_bridge_to_anthropic_uses_max_compat_by_default() {
+async fn live_responses_grammar_custom_tool_bridge_to_anthropic_uses_default_bridge() {
     let response_body = serde_json::json!({
         "id": "msg_1",
         "type": "message",
@@ -2956,7 +2955,7 @@ async fn live_responses_grammar_custom_tool_bridge_to_anthropic_uses_max_compat_
 }
 
 #[tokio::test]
-async fn live_responses_grammar_custom_tool_bridge_to_anthropic_max_compat_allows_with_warning_and_stable_names(
+async fn live_responses_grammar_custom_tool_bridge_to_anthropic_default_allows_with_warning_and_stable_names(
 ) {
     let response_body = serde_json::json!({
         "id": "msg_1",

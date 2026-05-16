@@ -85,7 +85,7 @@ docs/
 | Path | Contributor entrypoint |
 | --- | --- |
 | `src/config.rs` | YAML/env config, static `data_auth`, upstream `provider_key.inline` / `provider_key.env` / `provider_key_env`, namespace/admin config payloads, aliases, validation, resource limits |
-| `src/config/model_surface.rs` | Effective model surface vocabulary: modalities, tool flags, `apply_patch_transport`, compatibility mode |
+| `src/config/model_surface.rs` | Effective model surface vocabulary: modalities, tool flags, `apply_patch_transport` |
 | `src/formats.rs` | Shared client/upstream protocol names |
 | `src/detect.rs` | Request-format detection by path and body shape |
 | `src/discovery.rs` | Upstream capability probing and default-target selection |

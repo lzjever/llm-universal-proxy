@@ -2,15 +2,15 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use crate::config::{CompatibilityMode, ModelModality, ModelSurface};
+use crate::config::{ModelModality, ModelSurface};
 use crate::formats::UpstreamFormat;
 
 use super::media::{openai_file_part_mime_conflict_message, openai_file_part_resolved_mime_type};
 use super::messages::{
-    custom_tool_format_downgraded_message, custom_tools_not_portable_message,
-    openai_assistant_audio_history_not_portable_message, openai_request_audio_not_portable_message,
-    responses_reasoning_continuity_not_portable_message, single_candidate_choice_contract_message,
-    translation_target_label,
+    custom_tool_format_downgraded_message, custom_tool_format_reject_message,
+    custom_tools_not_portable_message, openai_assistant_audio_history_not_portable_message,
+    openai_request_audio_not_portable_message, responses_reasoning_continuity_not_portable_message,
+    single_candidate_choice_contract_message, translation_target_label,
 };
 use super::models::{
     NormalizedLogprobsControls, NormalizedOpenAiAudioContract, NormalizedOpenAiFamilyToolDef,
@@ -392,7 +392,6 @@ pub(super) fn openai_warning_only_request_controls_for_translate(
 pub(super) fn responses_warning_only_request_controls_for_translate(
     body: &Value,
     target_format: UpstreamFormat,
-    compatibility_mode: CompatibilityMode,
 ) -> Vec<String> {
     let profile = shared_control_profile_for_target(target_format);
     let mut controls = Vec::new();
@@ -411,19 +410,13 @@ pub(super) fn responses_warning_only_request_controls_for_translate(
     if responses_include_has_nonportable_items(body, target_format) {
         controls.push("include".to_string());
     }
-    if compatibility_mode == CompatibilityMode::MaxCompat
-        && responses_include_items(body).contains(&"reasoning.encrypted_content")
-    {
+    if responses_include_items(body).contains(&"reasoning.encrypted_content") {
         controls.push("reasoning.encrypted_content".to_string());
     }
-    if compatibility_mode == CompatibilityMode::MaxCompat
-        && responses_input_reasoning_encrypted_content_present(body)
-    {
+    if responses_input_reasoning_encrypted_content_present(body) {
         controls.push("input[].reasoning.encrypted_content".to_string());
     }
-    if compatibility_mode == CompatibilityMode::MaxCompat
-        && responses_input_compaction_carrier_present(body)
-    {
+    if responses_input_compaction_carrier_present(body) {
         controls.push("input[].compaction".to_string());
     }
 
@@ -639,7 +632,7 @@ pub(super) fn responses_custom_tool_format_reject_message(
             Ok(Some(NormalizedOpenAiFamilyToolDef::Custom(custom)))
                 if !openai_custom_tool_format_supports_anthropic_bridge(custom.format.as_ref()) =>
             {
-                Some(custom_tool_format_downgraded_message(
+                Some(custom_tool_format_reject_message(
                     "OpenAI Responses",
                     &custom.name,
                     translation_target_label(target_format),
@@ -649,57 +642,14 @@ pub(super) fn responses_custom_tool_format_reject_message(
         })
 }
 
-fn responses_custom_tool_bridge_mode_reject_message(
+fn responses_custom_tool_bridge_warning_messages(
     body: &Value,
     target_format: UpstreamFormat,
-    compatibility_mode: CompatibilityMode,
-) -> Option<String> {
-    if !matches!(
-        target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
-    ) {
-        return None;
-    }
-
-    let tools = body.get("tools").and_then(Value::as_array)?;
-    for tool in tools {
-        let Ok(Some(NormalizedOpenAiFamilyToolDef::Custom(custom))) =
-            normalized_responses_tool_definition(tool)
-        else {
-            continue;
-        };
-        if !openai_custom_tool_format_supports_anthropic_bridge(custom.format.as_ref()) {
-            continue;
-        }
-        match compatibility_mode {
-            CompatibilityMode::Strict => {
-                return Some(custom_tools_not_portable_message(target_format));
-            }
-            CompatibilityMode::Balanced
-                if !openai_custom_tool_format_is_plain_text(custom.format.as_ref()) =>
-            {
-                return Some(custom_tool_format_downgraded_message(
-                    "OpenAI Responses",
-                    &custom.name,
-                    translation_target_label(target_format),
-                ));
-            }
-            CompatibilityMode::Balanced | CompatibilityMode::MaxCompat => {}
-        }
-    }
-    None
-}
-
-fn responses_custom_tool_bridge_mode_warning_messages(
-    body: &Value,
-    target_format: UpstreamFormat,
-    compatibility_mode: CompatibilityMode,
 ) -> Vec<String> {
     if !matches!(
         target_format,
         UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
-    ) || compatibility_mode != CompatibilityMode::MaxCompat
-    {
+    ) {
         return Vec::new();
     }
 
@@ -847,7 +797,6 @@ fn responses_content_part_has_visible_portable_context(part: &Value) -> bool {
 pub(super) fn responses_nonportable_input_item_message(
     body: &Value,
     target_format: UpstreamFormat,
-    compatibility_mode: CompatibilityMode,
 ) -> Option<String> {
     let target_label = translation_target_label(target_format);
     let items = body.get("input").and_then(Value::as_array)?;
@@ -866,21 +815,15 @@ pub(super) fn responses_nonportable_input_item_message(
             ));
         }
         if responses_input_item_is_compaction(item) {
-            if compatibility_mode == CompatibilityMode::MaxCompat
-                && responses_compaction_item_can_drop_opaque_state(
-                    item,
-                    has_non_compaction_visible_portable_context,
-                )
+            if responses_compaction_item_can_drop_opaque_state(
+                item,
+                has_non_compaction_visible_portable_context,
+            )
             {
                 return None;
             }
-            if compatibility_mode == CompatibilityMode::MaxCompat {
-                return Some(format!(
-                    "OpenAI Responses compaction input item contains provider-owned opaque state and cannot be safely dropped when translating to {target_label} because no visible portable transcript or summary remains"
-                ));
-            }
             return Some(format!(
-                "OpenAI Responses compaction input item requires native Responses continuity semantics and cannot be faithfully translated to {target_label}"
+                "OpenAI Responses compaction input item contains provider-owned opaque state and cannot be safely dropped when translating to {target_label} because no visible portable transcript or summary remains"
             ));
         }
         if responses_portable_input_item_type(item_type) {
@@ -929,26 +872,9 @@ fn responses_input_reasoning_encrypted_content_requires_native_continuity(body: 
 pub(super) fn responses_reasoning_continuity_request_message(
     body: &Value,
     target_format: UpstreamFormat,
-    compatibility_mode: CompatibilityMode,
 ) -> Option<String> {
-    if compatibility_mode == CompatibilityMode::MaxCompat {
-        if responses_input_reasoning_encrypted_content_requires_native_continuity(body) {
-            let target_label = translation_target_label(target_format);
-            return Some(responses_reasoning_continuity_not_portable_message(
-                "input[].reasoning.encrypted_content",
-                target_label,
-            ));
-        }
-        return None;
-    }
-    let target_label = translation_target_label(target_format);
-    if responses_include_items(body).contains(&"reasoning.encrypted_content") {
-        return Some(responses_reasoning_continuity_not_portable_message(
-            "reasoning.encrypted_content",
-            target_label,
-        ));
-    }
-    if responses_input_reasoning_encrypted_content_present(body) {
+    if responses_input_reasoning_encrypted_content_requires_native_continuity(body) {
+        let target_label = translation_target_label(target_format);
         return Some(responses_reasoning_continuity_not_portable_message(
             "input[].reasoning.encrypted_content",
             target_label,
@@ -1497,14 +1423,13 @@ pub(crate) fn assess_request_translation_with_surface(
     client_format: UpstreamFormat,
     upstream_format: UpstreamFormat,
     body: &Value,
-    compatibility_mode: CompatibilityMode,
     surface: &ModelSurface,
 ) -> TranslationAssessment {
     let mut assessment = TranslationAssessment::default();
     assess_surface_request_policy(&mut assessment, client_format, body, surface);
-    assessment.issues.extend(
-        assess_request_translation(client_format, upstream_format, body, compatibility_mode).issues,
-    );
+    assessment
+        .issues
+        .extend(assess_request_translation(client_format, upstream_format, body).issues);
     assessment
 }
 
@@ -1539,7 +1464,6 @@ pub(crate) fn assess_request_translation(
     client_format: UpstreamFormat,
     upstream_format: UpstreamFormat,
     body: &Value,
-    compatibility_mode: CompatibilityMode,
 ) -> TranslationAssessment {
     let mut assessment = TranslationAssessment::default();
 
@@ -1571,18 +1495,12 @@ pub(crate) fn assess_request_translation(
                 "Responses request controls {quoted} require a native OpenAI Responses upstream and cannot be translated to {upstream_format}; the proxy does not reconstruct provider state"
             ));
         }
-        if let Some(message) = responses_reasoning_continuity_request_message(
-            body,
-            upstream_format,
-            compatibility_mode,
-        ) {
+        if let Some(message) = responses_reasoning_continuity_request_message(body, upstream_format)
+        {
             assessment.reject(message);
         }
-        let dropped_controls = responses_warning_only_request_controls_for_translate(
-            body,
-            upstream_format,
-            compatibility_mode,
-        );
+        let dropped_controls =
+            responses_warning_only_request_controls_for_translate(body, upstream_format);
         if !dropped_controls.is_empty() {
             let quoted = dropped_controls
                 .iter()
@@ -1597,9 +1515,7 @@ pub(crate) fn assess_request_translation(
         if let Some(message) = responses_nonportable_tool_choice_message(body, upstream_format) {
             assessment.reject(message);
         }
-        if let Some(message) =
-            responses_nonportable_input_item_message(body, upstream_format, compatibility_mode)
-        {
+        if let Some(message) = responses_nonportable_input_item_message(body, upstream_format) {
             assessment.reject(message);
         }
         if let Some(message) = responses_nonportable_tool_definition_message(
@@ -1615,18 +1531,7 @@ pub(crate) fn assess_request_translation(
         if let Some(message) = responses_custom_tool_format_reject_message(body, upstream_format) {
             assessment.reject(message);
         }
-        if let Some(message) = responses_custom_tool_bridge_mode_reject_message(
-            body,
-            upstream_format,
-            compatibility_mode,
-        ) {
-            assessment.reject(message);
-        }
-        for warning in responses_custom_tool_bridge_mode_warning_messages(
-            body,
-            upstream_format,
-            compatibility_mode,
-        ) {
+        for warning in responses_custom_tool_bridge_warning_messages(body, upstream_format) {
             assessment.warning(warning);
         }
     }
@@ -1777,14 +1682,4 @@ pub(crate) fn assess_request_translation(
     }
 
     assessment
-}
-
-#[cfg(test)]
-pub(crate) fn assess_request_translation_with_compatibility_mode(
-    client_format: UpstreamFormat,
-    upstream_format: UpstreamFormat,
-    body: &Value,
-    compatibility_mode: CompatibilityMode,
-) -> TranslationAssessment {
-    assess_request_translation(client_format, upstream_format, body, compatibility_mode)
 }

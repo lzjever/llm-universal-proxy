@@ -553,7 +553,6 @@ fn translate_sse_event_anthropic_to_responses_decodes_bridged_custom_tool_use() 
         request_scoped_tool_bridge_context: Some(typed_tool_bridge_context(
             "code_exec",
             "custom_text",
-            "balanced",
         )),
         ..Default::default()
     };
@@ -623,7 +622,6 @@ fn translate_sse_event_anthropic_to_responses_malformed_bridged_payload_falls_ba
         request_scoped_tool_bridge_context: Some(typed_tool_bridge_context(
             "code_exec",
             "custom_text",
-            "balanced",
         )),
         ..Default::default()
     };

@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use crate::config::{CompatibilityMode, ModelSurface};
+use crate::config::ModelSurface;
 use crate::formats::UpstreamFormat;
 
 pub(crate) mod assessment;
@@ -13,7 +13,6 @@ pub(crate) mod models;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RequestTranslationPolicy {
-    pub(crate) compatibility_mode: CompatibilityMode,
     pub(crate) surface: ModelSurface,
 }
 
@@ -21,7 +20,6 @@ impl RequestTranslationPolicy {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         !self.has_native_request_policy_hooks()
-            && self.compatibility_mode == CompatibilityMode::default()
     }
 
     fn max_output_tokens(&self) -> Option<u64> {
@@ -77,7 +75,6 @@ pub fn translate_request_with_policy(
             client_format,
             upstream_format,
             body,
-            policy.compatibility_mode,
             &policy.surface,
         )
         .decision()
@@ -87,18 +84,14 @@ pub fn translate_request_with_policy(
     validate_public_request_tool_names(client_format, body)?;
 
     if client_format == upstream_format {
-        if stream
-            && !(client_format == UpstreamFormat::OpenAiCompletion
-                && policy.compatibility_mode == CompatibilityMode::MaxCompat)
-        {
+        if stream && client_format != UpstreamFormat::OpenAiCompletion {
             normalize_openai_roles_for_compatibility(client_format, body);
         }
         if client_format == UpstreamFormat::OpenAiCompletion {
-            apply_openai_completion_max_compat_role_repairs(policy.compatibility_mode, body);
+            apply_openai_completion_maximum_safe_role_repairs(body);
             apply_openai_completion_compat_overrides(model, body);
         }
         apply_request_translation_policy_defaults(upstream_format, &policy, body);
-        apply_request_translation_policy_bridge_context(&policy, body);
         return Ok(());
     }
     let translated_from_openai_completion = client_format == UpstreamFormat::OpenAiCompletion;
@@ -107,7 +100,7 @@ pub fn translate_request_with_policy(
         client_to_openai_completion(client_format, upstream_format, body)?;
     }
     apply_request_translation_policy_defaults(UpstreamFormat::OpenAiCompletion, &policy, body);
-    apply_max_compat_structural_repair_pass(policy.compatibility_mode, upstream_format, body)?;
+    apply_request_scoped_bridge_structural_repair_pass(upstream_format, body)?;
     // Step 2: openai → upstream (if upstream is not openai)
     if upstream_format != UpstreamFormat::OpenAiCompletion {
         openai_completion_to_upstream(upstream_format, model, body)?;
@@ -121,44 +114,20 @@ pub fn translate_request_with_policy(
             }
         }
     } else {
-        if stream
-            && !(upstream_format == UpstreamFormat::OpenAiCompletion
-                && policy.compatibility_mode == CompatibilityMode::MaxCompat)
-        {
+        if stream && upstream_format != UpstreamFormat::OpenAiCompletion {
             normalize_openai_roles_for_compatibility(upstream_format, body);
         }
-        apply_openai_completion_max_compat_role_repairs(policy.compatibility_mode, body);
+        apply_openai_completion_maximum_safe_role_repairs(body);
         apply_openai_completion_compat_overrides(model, body);
     }
     apply_request_translation_policy_defaults(upstream_format, &policy, body);
-    apply_request_translation_policy_bridge_context(&policy, body);
     Ok(())
 }
 
-fn apply_request_translation_policy_bridge_context(
-    policy: &RequestTranslationPolicy,
-    body: &mut Value,
-) {
-    let Some(mut bridge_context) = request_scoped_tool_bridge_context_from_body(body) else {
-        return;
-    };
-    let compatibility_mode = match policy.compatibility_mode {
-        CompatibilityMode::Strict => "strict",
-        CompatibilityMode::Balanced => "balanced",
-        CompatibilityMode::MaxCompat => "max_compat",
-    };
-    bridge_context.set_compatibility_mode(compatibility_mode);
-    insert_request_scoped_tool_bridge_context(body, &bridge_context);
-}
-
-fn apply_max_compat_structural_repair_pass(
-    compatibility_mode: CompatibilityMode,
+fn apply_request_scoped_bridge_structural_repair_pass(
     target_format: UpstreamFormat,
     body: &mut Value,
 ) -> Result<(), String> {
-    if compatibility_mode != CompatibilityMode::MaxCompat {
-        return Ok(());
-    }
     let Some(bridge_context) = request_scoped_tool_bridge_context_from_body(body) else {
         return Ok(());
     };
@@ -504,17 +473,11 @@ fn normalize_openai_messages_for_compatibility(body: &mut Value) {
     coalesce_openai_string_messages(body);
 }
 
-fn apply_openai_completion_max_compat_role_repairs(
-    compatibility_mode: CompatibilityMode,
-    body: &mut Value,
-) {
-    if compatibility_mode != CompatibilityMode::MaxCompat {
-        return;
-    }
-    downgrade_openai_instruction_messages_to_user_for_max_compat(body);
+fn apply_openai_completion_maximum_safe_role_repairs(body: &mut Value) {
+    downgrade_openai_instruction_messages_to_user_for_maximum_safe_compatibility(body);
 }
 
-fn downgrade_openai_instruction_messages_to_user_for_max_compat(body: &mut Value) {
+fn downgrade_openai_instruction_messages_to_user_for_maximum_safe_compatibility(body: &mut Value) {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -531,14 +494,17 @@ fn downgrade_openai_instruction_messages_to_user_for_max_compat(body: &mut Value
             continue;
         }
 
-        annotate_openai_instruction_message_for_max_compat(message, &role);
+        annotate_openai_instruction_message_for_maximum_safe_compatibility(message, &role);
         message["role"] = Value::String("user".to_string());
     }
 
     coalesce_openai_string_messages(body);
 }
 
-fn annotate_openai_instruction_message_for_max_compat(message: &mut Value, role: &str) {
+fn annotate_openai_instruction_message_for_maximum_safe_compatibility(
+    message: &mut Value,
+    role: &str,
+) {
     let Some(content) = message.get("content") else {
         return;
     };

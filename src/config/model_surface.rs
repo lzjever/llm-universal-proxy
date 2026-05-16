@@ -4,17 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use super::ModelLimits;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub enum CompatibilityMode {
-    #[serde(rename = "strict")]
-    Strict,
-    #[serde(rename = "balanced")]
-    Balanced,
-    #[default]
-    #[serde(rename = "max_compat", alias = "max-compat")]
-    MaxCompat,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub enum ModelModality {
     #[serde(rename = "text")]

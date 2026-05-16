@@ -9,11 +9,7 @@ fn parse_sse_json(bytes: &[u8]) -> Value {
     take_one_sse_event(&mut buf).expect("parse sse event")
 }
 
-fn typed_tool_bridge_context(
-    stable_name: &str,
-    source_kind: &str,
-    compatibility_mode: &str,
-) -> Value {
+fn typed_tool_bridge_context(stable_name: &str, source_kind: &str) -> Value {
     let mut entries = serde_json::Map::new();
     entries.insert(
         stable_name.to_string(),
@@ -26,8 +22,8 @@ fn typed_tool_bridge_context(
         }),
     );
     serde_json::json!({
-        "version": 1,
-        "compatibility_mode": compatibility_mode,
+        "version": 2,
+        "purpose": "openai_responses_custom_tool_bridge",
         "entries": entries
     })
 }

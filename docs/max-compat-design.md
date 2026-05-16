@@ -53,14 +53,16 @@ That is too coarse for the data plane.
 
 The correct core abstractions are:
 
-- execution lane
+- primary execution path
 - `capability_surface`
+- provider-native request-control modifiers
 - hard portability boundary
 
 where:
 
-- execution lane answers "raw passthrough, provider prompt-cache optimization, or maximum-compatible translation?"
+- primary execution path answers "strict raw passthrough or maximum-compatible request construction?"
 - `capability_surface` answers "what client-visible contract should this local alias advertise and preserve?"
+- provider-native request-control modifiers answer "what explicit target-provider controls may be preserved or synthesized after the target request shape is known?"
 - hard portability boundary answers "what must fail closed because it cannot be represented safely?"
 
 Client brand names can still exist in wrappers, real-client test matrix labels, and debugging, but they should not become the main policy axis inside the proxy.
@@ -69,8 +71,8 @@ Client brand names can still exist in wrappers, real-client test matrix labels, 
 
 The product promise is bounded: protocol coverage means raw same-protocol passthrough where the proxy can forward bytes without body mutation, and maximum safe translation for mismatched protocol paths. It is not full-fidelity provider equivalence, and it is not a menu of weaker or stronger product tiers.
 
-- raw same-protocol passthrough lane: preserve provider-native fields within proxy routing, auth, and observability boundaries
-- provider prompt-cache optimized lane: synthesize only explicit provider-native cache request controls; this is not a user-facing compatibility tier and not `llmup` caching
+- raw same-protocol passthrough path: preserve the original provider payload within proxy routing, auth, and observability boundaries
+- provider prompt-cache optimization: synthesize only explicit provider-native cache request controls as a request-control modifier; this is not a user-facing compatibility tier, not `llmup` caching, and not a third primary lane
 - translated paths: preserve the maximum safe portable representation and warn when a safe degradation is visible
 - provider-native state and native extensions: native passthrough only unless a documented, explicit shim exists
 
@@ -94,8 +96,9 @@ Native extensions:
 
 Current implementation facts:
 
-- The pre-GA implementation still contains legacy compatibility-policy plumbing, but the product design no longer treats compatibility as a user-selectable tier.
+- The implementation has removed user-selectable compatibility tiers.
 - Translated paths should use the maximum safe representation by default and as the only product behavior.
+- Legacy compatibility config input is accepted only as no-op parsing compatibility and is not stored, serialized, or exposed.
 - Same-format raw passthrough preserves native fields when the source and upstream use the same wire protocol and the route does not require body mutation.
 - Native Responses passthrough preserves `context_management`, `include` values such as `reasoning.encrypted_content`, and input reasoning and compaction items with `encrypted_content` unchanged.
 - Responses lifecycle/resource endpoints require exactly one native OpenAI Responses upstream and the proxy does not reconstruct provider state.
@@ -111,7 +114,7 @@ Request-side compaction input rules:
 - For request-side compaction input, a compaction item may warn/drop opaque carrier fields only when that compaction item has an explicit visible summary, or when the request contains non-compaction visible portable transcript/history that can carry the context forward.
 - In the same request, one summarized compaction item does not permit another opaque-only compaction item to be silently dropped.
 - Opaque-only compaction always fails closed.
-- The native Responses passthrough lane preserves compaction items unchanged.
+- The native Responses passthrough path preserves compaction items unchanged.
 
 Response-side reasoning encrypted_content is a separate translation concern. There is a dedicated Anthropic carrier recovery path for response-side reasoning encrypted_content; the request-side continuity rules above must not be generalized into a blanket rule for all response translation.
 
@@ -145,9 +148,9 @@ MIME provenance is part of that boundary. OpenAI Chat `file` and OpenAI Response
 
 The product behavior is intentionally singular:
 
-- raw same-protocol passthrough remains an execution lane for routes that can avoid body mutation
+- raw same-protocol passthrough remains a strict execution path for routes that can avoid body mutation
 - translated paths use maximum safe compatibility
-- provider prompt-cache optimization is a provider-native request-control step, not a `llmup` cache and not a compatibility tier
+- provider prompt-cache optimization is a provider-native request-control step, not a `llmup` cache, not a compatibility tier, and not a third primary lane
 - hard portability boundaries fail closed before upstream when the proxy cannot preserve or safely degrade semantics
 
 Hard boundaries:
@@ -224,7 +227,7 @@ That means:
 
 This creates a hard design consequence:
 
-- encoding custom/freeform semantics by renaming the visible tool name is not acceptable on live translated paths for agent clients
+- encoding Responses custom-tool semantics by renaming the visible tool name is not acceptable on live translated paths for agent clients
 
 ## Legacy Prefix Bridge Failure Mode
 
@@ -287,21 +290,21 @@ So the live fix could not be "rename and hide later".
 The translated-path bridge contract is:
 
 - keep the original stable tool name visible to the upstream model
-- move custom/freeform bridge provenance into request-scoped translation context
-- decode upstream function tool calls back to custom/freeform using that context
+- move custom text/grammar bridge provenance into request-scoped translation context
+- decode upstream function tool calls back to Responses custom tool calls using that context
 
 Current live bridge behavior:
 
 - do not rename `apply_patch` to `__llmup_custom__apply_patch` on live translated request paths
 - keep the visible upstream tool name as `apply_patch`
 - continue using the canonical object wrapper `{ "input": string }` on function-only protocol hops
-- use request-scoped `ToolBridgeContext` so response and streaming translators know that `apply_patch` on this request is a bridged custom/freeform tool, not an ordinary function tool
+- use request-scoped `ToolBridgeContext` so response and streaming translators know that `apply_patch` on this request is a bridged custom text/grammar tool, not an ordinary function tool
 - reserve prefix-based bridge names for internal-only transport bookkeeping; public request and response paths must reject or clear them
 
 Current behavior:
 
-- if custom/freeform bridge would require changing the model-visible stable tool name, reject
-- allow bridged custom/freeform transport only when stable tool name remains unchanged and replay safety is preserved
+- if custom text/grammar bridge would require changing the model-visible stable tool name, reject
+- allow bridged custom text/grammar transport only when stable tool name remains unchanged and replay safety is preserved
 - prefer bridged transport with stable tool identity preservation, warning when grammar or format constraints degrade on the target protocol
 
 `apply_patch` specifically should remain advertised to Codex as `freeform` in the client-visible surface, while the upstream transport bridge stays internal.
@@ -316,13 +319,18 @@ Current conceptual shape:
 
 ```text
 ToolBridgeContext
-  stable_name -> {
-    source_kind: custom_freeform | custom_grammar | function
-    transport_kind: function_object_wrapper
-    wrapper_field: "input"
-    expected_canonical_shape: single_required_string
-  }
+  version: 2
+  purpose: openai_responses_custom_tool_bridge
+  entries:
+    stable_name -> {
+      source_kind: custom_text | custom_grammar
+      transport_kind: function_object_wrapper
+      wrapper_field: "input"
+      expected_canonical_shape: single_required_string
+    }
 ```
+
+The normal parser accepts only the v2 shape with the expected purpose. Missing purpose, missing version, or legacy v1 context must not restore custom tool semantics.
 
 The context is created during request translation and passed to:
 
@@ -338,7 +346,7 @@ This lets the proxy:
 
 Additional rule:
 
-- if one request contains both a function tool and a custom/freeform tool with the same stable name, reject the request as ambiguous
+- if one request contains both a function tool and a Responses custom tool with the same stable name, reject the request as ambiguous
 
 ## Current Rollout State
 
@@ -347,7 +355,7 @@ Delivered:
 - `ModelSurface` is in config and runtime.
 - model catalog endpoints expose effective `llmup.surface` data.
 - wrappers consume live/effective surface metadata instead of relying only on legacy client-specific defaults.
-- live translated custom/freeform tool paths preserve stable names such as `apply_patch` and keep `__llmup_custom__*` internal.
+- live translated custom text/grammar tool paths preserve stable names such as `apply_patch` and keep `__llmup_custom__*` internal.
 - safety tests, model-surface projection tests, and focused real-client matrix checks cover the public editing tool identity contract, including Codex `apply_patch` and Claude Code `Edit`.
 
 Remaining work:

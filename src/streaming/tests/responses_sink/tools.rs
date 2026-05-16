@@ -101,7 +101,6 @@ fn openai_chunk_to_responses_sse_decodes_request_scoped_custom_bridge_without_pr
         request_scoped_tool_bridge_context: Some(typed_tool_bridge_context(
             "code_exec",
             "custom_text",
-            "balanced",
         )),
         ..Default::default()
     };
@@ -205,24 +204,40 @@ fn openai_chunk_to_responses_sse_fails_closed_for_incomplete_or_invalid_tool_bri
     });
     let contexts = [
         (
-            "missing version",
+            "legacy v1 sidecar",
             serde_json::json!({
-                "compatibility_mode": "balanced",
+                "version": 1,
+                "compatibility_mode": "max_compat",
                 "entries": { "code_exec": entry.clone() }
             }),
         ),
         (
-            "missing compatibility_mode",
+            "missing version",
             serde_json::json!({
-                "version": 1,
+                "purpose": "openai_responses_custom_tool_bridge",
+                "entries": { "code_exec": entry.clone() }
+            }),
+        ),
+        (
+            "missing purpose",
+            serde_json::json!({
+                "version": 2,
+                "entries": { "code_exec": entry.clone() }
+            }),
+        ),
+        (
+            "invalid purpose",
+            serde_json::json!({
+                "version": 2,
+                "purpose": "other",
                 "entries": { "code_exec": entry.clone() }
             }),
         ),
         (
             "missing stable_name",
             serde_json::json!({
-                "version": 1,
-                "compatibility_mode": "balanced",
+                "version": 2,
+                "purpose": "openai_responses_custom_tool_bridge",
                 "entries": {
                     "code_exec": {
                         "source_kind": "custom_text",
@@ -237,15 +252,15 @@ fn openai_chunk_to_responses_sse_fails_closed_for_incomplete_or_invalid_tool_bri
             "non-integer version",
             serde_json::json!({
                 "version": "1",
-                "compatibility_mode": "balanced",
+                "purpose": "openai_responses_custom_tool_bridge",
                 "entries": { "code_exec": entry.clone() }
             }),
         ),
         (
             "future version",
             serde_json::json!({
-                "version": 2,
-                "compatibility_mode": "balanced",
+                "version": 3,
+                "purpose": "openai_responses_custom_tool_bridge",
                 "entries": { "code_exec": entry }
             }),
         ),

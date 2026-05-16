@@ -106,12 +106,22 @@ class ProtocolDocsContractTests(unittest.TestCase):
             "same" + "-provider/native passthrough",
             "same" + "-provider native passthrough",
             "compatibility" + "_mode",
+            "Provider" + "PromptCacheOptimized",
+            "provider prompt-cache optimized " + "lane",
+            "raw passthrough, provider prompt-cache optimization, "
+            + "or maximum-compatible translation",
         )
 
         for path in paths:
             relative_path = path.relative_to(REPO_ROOT)
             text = path.read_text(encoding="utf-8")
             for snippet in forbidden:
+                if (
+                    snippet == "compatibility" + "_mode"
+                    and str(relative_path)
+                    == "docs/engineering/max-compat-development-plan.md"
+                ):
+                    continue
                 with self.subTest(path=str(relative_path), snippet=snippet):
                     self.assertNotIn(snippet, text)
 
@@ -256,7 +266,8 @@ class ProtocolDocsContractTests(unittest.TestCase):
             "raw same-protocol passthrough",
             "hard portability boundary",
             "provider prompt-cache optimization is a provider-native request-control step",
-            "legacy compatibility-policy plumbing",
+            "not a third primary lane",
+            "Legacy compatibility config input is accepted only as no-op parsing compatibility",
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, text)
@@ -373,6 +384,26 @@ class ProtocolDocsContractTests(unittest.TestCase):
         text = read_doc("docs/engineering/max-compat-development-plan.md")
 
         self.assertIn("hermetic scripted interactive Codex wrapper gate", text)
+
+    def test_development_plan_records_removed_compatibility_policy_plumbing(self):
+        text = read_doc("docs/engineering/max-compat-development-plan.md")
+
+        for snippet in (
+            "User-selectable compatibility-policy plumbing has been removed",
+            "single maximum safe compatibility strategy",
+            "legacy `"
+            + "compatibility"
+            + "_mode"
+            + "` is accepted only as no-op input parsing",
+            "not stored, serialized, or exposed",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, text)
+        self.assertNotIn("Legacy compatibility-policy plumbing exists in the runtime", text)
+        self.assertNotIn(
+            "Status: delivered as internal plumbing; no longer a product-facing tier model.",
+            text,
+        )
 
     def test_reasoning_docs_do_not_overstate_opaque_continuity_rules(self):
         for relative_path in (
