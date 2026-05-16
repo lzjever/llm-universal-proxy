@@ -37,7 +37,7 @@ LOCKED_TOOL_CONTRACT_SPEC_PATHS = (
     REPO_ROOT / "docs" / "CONSTITUTION.md",
     REPO_ROOT / "docs" / "protocol-baselines" / "capabilities" / "tools.md",
     REPO_ROOT / "docs" / "max-compat-design.md",
-    REPO_ROOT / "docs" / "max-compat-development-plan.md",
+    REPO_ROOT / "docs" / "engineering" / "max-compat-development-plan.md",
 )
 LOCKED_TOOL_CONTRACT_LINES = (
     "The proxy must not rewrite the visible tool name supplied by the client.",
@@ -79,7 +79,7 @@ REQUIRED_TOOL_BRIDGE_DIRECTION_LANGUAGE = {
     REPO_ROOT / "docs" / "max-compat-design.md": (
         "The intended translated-path bridge preserves the stable visible tool name and carries bridge provenance in request-scoped translation context.",
     ),
-    REPO_ROOT / "docs" / "max-compat-development-plan.md": (
+    REPO_ROOT / "docs" / "engineering" / "max-compat-development-plan.md": (
         "Phase 0 and Phase 1 together define the intended translated-path bridge: preserve the stable visible tool name on live requests and carry bridge provenance in request-scoped translation context.",
     ),
 }

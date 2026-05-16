@@ -185,7 +185,7 @@ class ProtocolDocsContractTests(unittest.TestCase):
                 self.assertIn(snippet, audit)
 
     def test_development_plan_records_interactive_codex_wrapper_gate(self):
-        text = read_doc("docs/max-compat-development-plan.md")
+        text = read_doc("docs/engineering/max-compat-development-plan.md")
 
         self.assertIn("hermetic scripted interactive Codex wrapper gate", text)
 

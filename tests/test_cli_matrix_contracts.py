@@ -1120,7 +1120,7 @@ class CliMatrixContractTests(unittest.TestCase):
 
     def test_prd_and_plan_describe_current_real_cli_contract_scope(self):
         prd_text = self.read_text("docs/PRD.md")
-        plan_text = self.read_text("docs/max-compat-development-plan.md")
+        plan_text = self.read_text("docs/engineering/max-compat-development-plan.md")
 
         self.assertIn("Current real-client regression coverage is intentionally narrow", prd_text)
         self.assertIn("public tool identity", prd_text)

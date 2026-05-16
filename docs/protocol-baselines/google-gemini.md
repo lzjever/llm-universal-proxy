@@ -5,6 +5,7 @@
 - `captured_at_utc`: `2026-04-17T07:00:00Z`
 - `snapshot_bucket`: `2026-04-16`
 - `snapshot_bucket_note`: This capture completed at `2026-04-17T00:00:00-07:00` in `America/Los_Angeles` and remained in the `2026-04-16` bucket because the collection workflow grouped it with the rest of that day's snapshot batch.
+- `online_recheck_at_utc`: `2026-05-16T00:00:00Z`
 - `source_urls`:
   - `https://ai.google.dev/api`
   - `https://ai.google.dev/api/generate-content`
@@ -595,6 +596,12 @@ GenerateContent interaction:
 - `cachedContentTokenCount` breaks out the cached subset.
 
 The captured docs separate cache creation from request-time cache references: reusable `systemInstruction`, `tools`, and `toolConfig` can live on `CachedContent`, while `GenerateContentRequest.cachedContent` is only a reference.
+
+Online recheck on 2026-05-16:
+
+- The current caching guide still treats explicit caching as a separate `cachedContents` resource family and `GenerateContentRequest.cachedContent` as a named-resource reference.
+- The guide now states that implicit caching is enabled by default on Gemini 2.5 and newer models. The proxy should still preserve the distinction between implicit cache hits and explicit `cachedContent` handles.
+- The guide shows Gemini cached-content use through OpenAI-library compatibility via a provider-specific `extra_body.google.cached_content` extension shape. The proxy also accepts the simpler `extra_body.cached_content` / top-level `cached_content` extension shapes only on Gemini-routed requests. These are Gemini-native extensions, not portable OpenAI prompt-cache keys.
 
 ## `camelCase` vs `snake_case` in official docs
 

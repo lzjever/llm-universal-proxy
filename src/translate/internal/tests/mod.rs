@@ -7936,6 +7936,44 @@ fn translate_request_openai_to_gemini_maps_response_format_json_schema() {
 }
 
 #[test]
+fn translate_request_openai_to_gemini_maps_cached_content_extension() {
+    for mut body in [
+        json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "cached_content": "cachedContents/cache-123"
+        }),
+        json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "extra_body": {
+                "cached_content": "cachedContents/cache-123"
+            }
+        }),
+        json!({
+            "model": "gemini-2.5-flash",
+            "messages": [{ "role": "user", "content": "Hi" }],
+            "extra_body": {
+                "google": {
+                    "cached_content": "cachedContents/cache-123"
+                }
+            }
+        }),
+    ] {
+        translate_request(
+            UpstreamFormat::OpenAiCompletion,
+            UpstreamFormat::Google,
+            "gemini-2.5-flash",
+            &mut body,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(body["cachedContent"], "cachedContents/cache-123");
+    }
+}
+
+#[test]
 fn translate_request_openai_to_responses_maps_response_format_json_schema() {
     let mut body = json!({
         "model": "gpt-4o",

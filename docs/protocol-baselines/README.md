@@ -2,6 +2,7 @@
 
 - Status: active
 - Vendor snapshot/captured date: 2026-04-16
+- Latest online recheck date: 2026-05-16
 - Proxy posture updated date: 2026-04-26
 - Audience: proxy implementers, test authors, and maintainers refreshing protocol docs
 - This file is intentionally only an entrypoint and update guide.
@@ -12,7 +13,7 @@
 | --- | --- | --- |
 | Official baselines | Vendor contract and snapshot/source facts copied from official docs, kept per protocol; proxy posture may appear only when clearly labeled | `openai-responses.md`, `openai-chat-completions.md`, `anthropic-messages.md`, `google-gemini.md` |
 | Capability diffs | Cross-provider comparison of official surface coverage, degradations, proxy policy, and proxy posture for features that do not map 1:1 | `overview.md`, `capabilities/`, `matrices/` |
-| Versioned audits | Date-stamped refresh notes, change detection, and implementation risk calls | [`audits/2026-04-16-spec-refresh.md`](audits/2026-04-16-spec-refresh.md), [`audits/2026-04-27-ga-source-spot-check.md`](audits/2026-04-27-ga-source-spot-check.md) |
+| Versioned audits | Date-stamped refresh notes, change detection, and implementation risk calls | [`audits/2026-05-16-online-recheck.md`](audits/2026-05-16-online-recheck.md), [`audits/2026-04-27-ga-source-spot-check.md`](audits/2026-04-27-ga-source-spot-check.md), [`audits/2026-04-16-spec-refresh.md`](audits/2026-04-16-spec-refresh.md) |
 
 ## Metadata model
 

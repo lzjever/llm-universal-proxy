@@ -361,7 +361,7 @@ class GaDocsContractTests(unittest.TestCase):
         self.assertIn("pass, warn, or reject as specified", success_metrics)
 
     def test_max_compat_phase_5_is_delivered_for_ga_docs_with_maintenance_open(self):
-        text = read_doc("docs/max-compat-development-plan.md")
+        text = read_doc("docs/engineering/max-compat-development-plan.md")
         phase_5 = text.split("### Phase 5: Documentation Rollout", 1)[1].split(
             "\n### Phase 6:", 1
         )[0]

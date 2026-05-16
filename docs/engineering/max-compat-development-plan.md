@@ -1,6 +1,6 @@
 # Maximum Compatibility Development Plan
 
-Status: active  
+Status: active
 Last updated: 2026-04-26
 
 ## Goal

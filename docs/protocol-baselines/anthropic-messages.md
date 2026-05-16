@@ -5,6 +5,7 @@
 - `captured_at_utc`: `2026-04-17T07:04:42Z`
 - `snapshot_bucket`: `2026-04-16`
 - `snapshot_bucket_note`: This capture completed at `2026-04-17T00:04:42-07:00` in `America/Los_Angeles` and remained in the `2026-04-16` bucket because the collection workflow grouped it with the rest of that day's snapshot batch.
+- `online_recheck_at_utc`: `2026-05-16T00:00:00Z`
 - `source_urls`:
   - `https://docs.anthropic.com/en/api/messages`
   - `https://docs.anthropic.com/en/docs/build-with-claude/streaming`
@@ -375,6 +376,8 @@ Prompt caching is a native Anthropic feature with its own TTLs, pricing, and inv
 
 - Prompt caching is eligible for Zero Data Retention
 - `usage` may include both `cache_creation_input_tokens` and `cache_read_input_tokens`
+- Online recheck on 2026-05-16: the current prompt-caching guide still documents both top-level automatic caching and block-level explicit breakpoints. It now names newer Claude 4.x model families in the cache pricing table, including Opus 4.7/4.6/4.5, Sonnet 4.6/4.5, and Haiku 4.5, but those catalog additions do not change the wire shape.
+- Online recheck on 2026-05-16: the current Messages API reference says `max_tokens: 0` can be used to populate the prompt cache without generating a response; that is a native Anthropic operational trick, not a portable generation semantic.
 
 ## Context management, container reuse, and service tiers
 

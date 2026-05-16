@@ -3,6 +3,7 @@
 - Layer: capability-diff matrix
 - Status: active
 - Vendor snapshot/captured date: 2026-04-16
+- Latest online recheck date: 2026-05-16
 - Proxy posture updated date: 2026-04-26
 - Scope: one-page comparison of the protocol surfaces the proxy has to reason about
 

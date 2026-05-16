@@ -1559,6 +1559,9 @@ pub(super) fn openai_to_gemini(body: &mut Value, target_model: &str) -> Result<(
         "generationConfig": {},
         "safetySettings": []
     });
+    if let Some(cached_content) = openai_gemini_cached_content_extension(body) {
+        result["cachedContent"] = cached_content.clone();
+    }
     if let Some(mt) = body
         .get("max_completion_tokens")
         .cloned()
@@ -1731,6 +1734,35 @@ pub(super) fn openai_to_gemini(body: &mut Value, target_model: &str) -> Result<(
     }
     *body = result;
     Ok(())
+}
+
+fn openai_gemini_cached_content_extension(body: &Value) -> Option<&Value> {
+    body.get("cachedContent")
+        .or_else(|| body.get("cached_content"))
+        .or_else(|| {
+            body.get("extra_body")
+                .and_then(|extra_body| extra_body.get("cachedContent"))
+        })
+        .or_else(|| {
+            body.get("extra_body")
+                .and_then(|extra_body| extra_body.get("cached_content"))
+        })
+        .or_else(|| {
+            body.get("extra_body")
+                .and_then(|extra_body| extra_body.get("google"))
+                .and_then(|google| google.get("cachedContent"))
+        })
+        .or_else(|| {
+            body.get("extra_body")
+                .and_then(|extra_body| extra_body.get("google"))
+                .and_then(|google| google.get("cached_content"))
+        })
+        .filter(|value| {
+            value
+                .as_str()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        })
 }
 
 pub(super) fn openai_content_to_gemini_parts(

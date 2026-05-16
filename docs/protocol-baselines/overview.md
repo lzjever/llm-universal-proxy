@@ -2,7 +2,7 @@
 
 - Layer: capability-diff overview
 - Status: active
-- Last refreshed: 2026-04-16
+- Last refreshed: 2026-05-16
 - Scope: explains how to read the baseline set without duplicating vendor-specific wire docs
 
 ## Why the docs are split
@@ -44,7 +44,7 @@ The summary matrices deliberately split provider-surface coverage from portabili
 | --- | --- |
 | One-page provider comparison | [`matrices/provider-capability-matrix.md`](matrices/provider-capability-matrix.md) |
 | High-risk field mapping and downgrade rules | [`matrices/field-mapping-matrix.md`](matrices/field-mapping-matrix.md) |
-| Dated refresh decisions and risks | [`audits/2026-04-16-spec-refresh.md`](audits/2026-04-16-spec-refresh.md) |
+| Dated refresh decisions and risks | [`audits/2026-05-16-online-recheck.md`](audits/2026-05-16-online-recheck.md) |
 
 ## Working rule for future refreshes
 

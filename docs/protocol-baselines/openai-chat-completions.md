@@ -5,6 +5,7 @@
 - `captured_at_utc`: `2026-04-17T06:59:44Z`
 - `snapshot_bucket`: `2026-04-16`
 - `snapshot_bucket_note`: Snapshot artifacts are stored under the `2026-04-16` bucket because this capture completed at `2026-04-16T23:59:44-07:00` in `America/Los_Angeles`.
+- `online_recheck_at_utc`: `2026-05-16T00:00:00Z`
 - `source_urls`:
   - `https://developers.openai.com/api/reference/resources/chat/index.md`
   - `https://developers.openai.com/api/docs/guides/prompt-caching`
@@ -249,6 +250,13 @@ Other captured prompt-caching details:
 - extended retention can keep cached prefixes active up to 24 hours
 - prompt caches are organization-scoped, not shared across orgs
 - cache hits surface through `usage.prompt_tokens_details.cached_tokens`
+
+Online recheck on 2026-05-16:
+
+- The current prompt-caching guide still describes automatic caching for cacheable prompts and still exposes `prompt_cache_key` / `prompt_cache_retention` as the explicit controls for improving routing and retention.
+- The guide still says caching is enabled for recent OpenAI models and uses a 1024-token cacheability threshold with 128-token hit increments.
+- The guide continues to document `prompt_cache_retention: "in_memory"` and `"24h"` in guide examples, while the earlier captured API reference used `"in-memory"`; the proxy should keep treating the value as provider-native rather than normalizing or validating it.
+- No official OpenAI-domain page found during this recheck changed the Chat prompt-cache wire shape captured on 2026-04-16.
 
 ## Conversation state and stored resources
 

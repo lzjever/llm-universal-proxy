@@ -6,6 +6,7 @@
 - `snapshot_bucket`: `2026-04-16`
 - `snapshot_bucket_note`: Snapshot artifacts are stored under the `2026-04-16` bucket because this capture completed at `2026-04-16T23:59:44-07:00` in `America/Los_Angeles`.
 - `proxy_posture_updated`: `2026-04-26`
+- `online_recheck_at_utc`: `2026-05-16T00:00:00Z`
 - `source_urls`:
   - `https://developers.openai.com/api/reference/resources/responses/index.md`
   - `https://developers.openai.com/api/reference/resources/conversations/index.md`
@@ -363,6 +364,13 @@ Useful guide-level details for implementers and operators:
 - prompt caches are scoped to an organization
 
 Measure cache behavior via `usage.input_tokens_details.cached_tokens`.
+
+Online recheck on 2026-05-16:
+
+- The current prompt-caching guide still treats caching as automatic and exposes `prompt_cache_key` / `prompt_cache_retention` as provider-native optimization controls on OpenAI request surfaces.
+- The guide still says caching is enabled for recent OpenAI models and uses a 1024-token cacheability threshold with 128-token hit increments.
+- The guide still uses `prompt_cache_retention: "in_memory"` and `"24h"` while the captured create reference used `"in-memory"`; the proxy should preserve the caller-provided spelling and avoid translating this into a cross-provider TTL.
+- No official OpenAI-domain page found during this recheck changed the Responses prompt-cache wire shape captured on 2026-04-16.
 
 ## Stored resources
 
