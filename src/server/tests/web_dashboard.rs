@@ -62,6 +62,7 @@ async fn dashboard_shell_is_public_when_admin_token_is_configured() {
     assert!(body.contains("existing admin API"));
     assert!(body.contains("placeholder=\"Paste admin token\""));
     assert!(!body.contains("placeholder=\"Paste LLM_UNIVERSAL_PROXY_ADMIN_TOKEN\""));
+    assert!(!body.contains("compatibility_mode"));
 }
 
 #[tokio::test]

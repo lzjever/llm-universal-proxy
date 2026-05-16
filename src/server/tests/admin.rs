@@ -171,7 +171,6 @@ async fn admin_namespace_state_sanitizes_urls_and_redacts_sensitive_headers() {
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Proxy {
             url: "http://global-user:global-pass@proxy.example:8080/global-hop?token=global-secret#frag".to_string(),
         }),
@@ -339,7 +338,6 @@ async fn admin_namespace_state_reports_environment_proxy_without_echoing_url() {
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: None,
         upstreams: vec![crate::config::UpstreamConfig {
             name: "default".to_string(),
@@ -435,7 +433,6 @@ async fn admin_namespace_state_reports_namespace_proxy_source() {
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Proxy {
             url: "http://global-user:global-pass@proxy.example:8080/global-hop?token=global-secret#frag"
                 .to_string(),

@@ -463,7 +463,6 @@ fn snapshot_race_config(
     crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![redaction_upstream_config(
             "primary",
@@ -2114,8 +2113,7 @@ async fn live_responses_store_true_fails_closed_before_upstream() {
 }
 
 #[tokio::test]
-async fn live_responses_plain_text_custom_tool_bridge_to_openai_balanced_keeps_visible_tool_names_stable(
-) {
+async fn live_responses_plain_text_custom_tool_bridge_to_openai_keeps_visible_tool_names_stable() {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
         "object": "chat.completion",
@@ -2601,7 +2599,7 @@ async fn live_responses_rejects_external_tool_bridge_context_ingress() {
 }
 
 #[tokio::test]
-async fn live_responses_custom_tool_bridge_to_openai_strict_rejects_plain_text_custom_tools() {
+async fn live_responses_custom_tool_bridge_ignores_legacy_strict_config_and_uses_max_compat() {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
         "object": "chat.completion",
@@ -2614,16 +2612,29 @@ async fn live_responses_custom_tool_bridge_to_openai_strict_rejects_plain_text_c
         }]
     });
     let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
-    let state =
-        app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
-    {
-        let mut runtime = state.runtime.write().await;
-        let namespace = runtime
-            .namespaces
-            .get_mut(DEFAULT_NAMESPACE)
-            .expect("default namespace");
-        namespace.config.compatibility_mode = crate::config::CompatibilityMode::Strict;
-    }
+    let state = app_state_for_single_upstream(
+        mock_base.clone(),
+        crate::formats::UpstreamFormat::OpenAiCompletion,
+    );
+    let legacy_strict_config = crate::config::Config::from_yaml_str(&format!(
+        r#"
+listen: 127.0.0.1:0
+upstream_timeout_secs: 30
+compatibility_mode: strict
+proxy: direct
+upstreams:
+  primary:
+    api_root: {mock_base}
+    format: openai-completion
+"#
+    ))
+    .expect("legacy compatibility_mode should parse");
+    replace_runtime_and_data_auth(
+        &state,
+        legacy_strict_config,
+        data_auth::DataAccess::ClientProviderKey,
+    )
+    .await;
 
     let response = handle_request_core(
         state,
@@ -2655,15 +2666,22 @@ async fn live_responses_custom_tool_bridge_to_openai_strict_rejects_plain_text_c
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     let recorded = requests.lock().await;
-    assert!(recorded.is_empty(), "requests = {recorded:?}");
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    assert!(
+        recorded[0]
+            .get(INTERNAL_TOOL_BRIDGE_CONTEXT_FIELD)
+            .is_none(),
+        "internal bridge context must not be sent upstream: {:?}",
+        recorded[0]
+    );
 
     server.abort();
 }
 
 #[tokio::test]
-async fn live_responses_grammar_custom_tool_bridge_to_openai_balanced_rejects() {
+async fn live_responses_grammar_custom_tool_bridge_to_openai_uses_max_compat_by_default() {
     let response_body = serde_json::json!({
         "id": "chatcmpl_1",
         "object": "chat.completion",
@@ -2713,9 +2731,9 @@ async fn live_responses_grammar_custom_tool_bridge_to_openai_balanced_rejects() 
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     let recorded = requests.lock().await;
-    assert!(recorded.is_empty(), "requests = {recorded:?}");
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
 
     server.abort();
 }
@@ -2737,14 +2755,6 @@ async fn live_responses_grammar_custom_tool_bridge_to_openai_max_compat_allows_w
     let (mock_base, requests, server) = spawn_openai_completion_mock(response_body).await;
     let state =
         app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::OpenAiCompletion);
-    {
-        let mut runtime = state.runtime.write().await;
-        let namespace = runtime
-            .namespaces
-            .get_mut(DEFAULT_NAMESPACE)
-            .expect("default namespace");
-        namespace.config.compatibility_mode = crate::config::CompatibilityMode::MaxCompat;
-    }
 
     let response = handle_request_core(
         state,
@@ -2832,7 +2842,8 @@ async fn live_responses_grammar_custom_tool_bridge_to_openai_max_compat_allows_w
 }
 
 #[tokio::test]
-async fn live_responses_custom_tool_bridge_to_anthropic_strict_rejects_plain_text_custom_tools() {
+async fn live_responses_custom_tool_bridge_to_anthropic_uses_max_compat_for_plain_text_custom_tools(
+) {
     let response_body = serde_json::json!({
         "id": "msg_1",
         "type": "message",
@@ -2844,14 +2855,6 @@ async fn live_responses_custom_tool_bridge_to_anthropic_strict_rejects_plain_tex
     });
     let (mock_base, requests, server) = spawn_anthropic_messages_mock(response_body).await;
     let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Anthropic);
-    {
-        let mut runtime = state.runtime.write().await;
-        let namespace = runtime
-            .namespaces
-            .get_mut(DEFAULT_NAMESPACE)
-            .expect("default namespace");
-        namespace.config.compatibility_mode = crate::config::CompatibilityMode::Strict;
-    }
 
     let response = handle_request_core(
         state,
@@ -2883,15 +2886,22 @@ async fn live_responses_custom_tool_bridge_to_anthropic_strict_rejects_plain_tex
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     let recorded = requests.lock().await;
-    assert!(recorded.is_empty(), "requests = {recorded:?}");
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
+    assert!(
+        recorded[0]
+            .get(INTERNAL_TOOL_BRIDGE_CONTEXT_FIELD)
+            .is_none(),
+        "internal bridge context must not be sent upstream: {:?}",
+        recorded[0]
+    );
 
     server.abort();
 }
 
 #[tokio::test]
-async fn live_responses_grammar_custom_tool_bridge_to_anthropic_balanced_rejects() {
+async fn live_responses_grammar_custom_tool_bridge_to_anthropic_uses_max_compat_by_default() {
     let response_body = serde_json::json!({
         "id": "msg_1",
         "type": "message",
@@ -2938,9 +2948,9 @@ async fn live_responses_grammar_custom_tool_bridge_to_anthropic_balanced_rejects
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     let recorded = requests.lock().await;
-    assert!(recorded.is_empty(), "requests = {recorded:?}");
+    assert_eq!(recorded.len(), 1, "requests = {recorded:?}");
 
     server.abort();
 }
@@ -2959,14 +2969,6 @@ async fn live_responses_grammar_custom_tool_bridge_to_anthropic_max_compat_allow
     });
     let (mock_base, requests, server) = spawn_anthropic_messages_mock(response_body).await;
     let state = app_state_for_single_upstream(mock_base, crate::formats::UpstreamFormat::Anthropic);
-    {
-        let mut runtime = state.runtime.write().await;
-        let namespace = runtime
-            .namespaces
-            .get_mut(DEFAULT_NAMESPACE)
-            .expect("default namespace");
-        namespace.config.compatibility_mode = crate::config::CompatibilityMode::MaxCompat;
-    }
 
     let response = handle_request_core(
         state,
@@ -3352,7 +3354,6 @@ async fn live_openai_same_format_request_applies_surface_parallel_tool_gate() {
             .namespaces
             .get_mut(DEFAULT_NAMESPACE)
             .expect("default namespace");
-        namespace.config.compatibility_mode = crate::config::CompatibilityMode::MaxCompat;
         namespace.config.model_aliases.insert(
             "serial-openai".to_string(),
             crate::config::ModelAlias {
@@ -3415,7 +3416,6 @@ fn resolve_requested_model_or_error_requires_model_for_multi_upstream_namespace(
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![
             crate::config::UpstreamConfig {
@@ -3465,7 +3465,6 @@ fn resolve_requested_model_or_error_explains_previous_response_boundary() {
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![
             crate::config::UpstreamConfig {

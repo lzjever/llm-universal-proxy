@@ -672,8 +672,6 @@ pub struct Config {
     pub listen: String,
     /// Request timeout to upstream.
     pub upstream_timeout: Duration,
-    /// Compatibility posture for translated request paths in this namespace.
-    pub compatibility_mode: CompatibilityMode,
     /// Default upstream proxy policy for this namespace. When unset, environment proxy resolution is used.
     pub proxy: Option<ProxyConfig>,
     /// Named upstreams available to the proxy.
@@ -751,15 +749,12 @@ pub struct RuntimeUpstreamConfig {
     pub surface_defaults: Option<ModelSurfacePatch>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RuntimeConfigPayload {
     #[serde(default = "default_listen")]
     pub listen: String,
     #[serde(default = "default_upstream_timeout_secs")]
     pub upstream_timeout_secs: u64,
-    #[serde(default)]
-    pub compatibility_mode: CompatibilityMode,
     #[serde(
         default,
         alias = "upstream_proxy",
@@ -778,6 +773,52 @@ pub struct RuntimeConfigPayload {
     pub resource_limits: ResourceLimits,
     #[serde(default)]
     pub conversation_state_bridge: ConversationStateBridgeConfig,
+}
+
+impl<'de> Deserialize<'de> for RuntimeConfigPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RuntimeConfigPayloadWire {
+            #[serde(default = "default_listen")]
+            listen: String,
+            #[serde(default = "default_upstream_timeout_secs")]
+            upstream_timeout_secs: u64,
+            #[serde(default)]
+            compatibility_mode: Option<CompatibilityMode>,
+            #[serde(default, alias = "upstream_proxy")]
+            proxy: Option<ProxyConfig>,
+            #[serde(default)]
+            upstreams: Vec<RuntimeUpstreamConfig>,
+            #[serde(default)]
+            model_aliases: BTreeMap<String, ModelAlias>,
+            #[serde(default)]
+            hooks: RuntimeHookConfig,
+            #[serde(default)]
+            debug_trace: DebugTraceConfig,
+            #[serde(default)]
+            resource_limits: ResourceLimits,
+            #[serde(default)]
+            conversation_state_bridge: ConversationStateBridgeConfig,
+        }
+
+        let wire = RuntimeConfigPayloadWire::deserialize(deserializer)?;
+        let _legacy_compatibility_mode = wire.compatibility_mode;
+        Ok(Self {
+            listen: wire.listen,
+            upstream_timeout_secs: wire.upstream_timeout_secs,
+            proxy: wire.proxy,
+            upstreams: wire.upstreams,
+            model_aliases: wire.model_aliases,
+            hooks: wire.hooks,
+            debug_trace: wire.debug_trace,
+            resource_limits: wire.resource_limits,
+            conversation_state_bridge: wire.conversation_state_bridge,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -842,7 +883,6 @@ pub struct AdminUpstreamConfigView {
 pub struct AdminConfigView {
     pub listen: String,
     pub upstream_timeout_secs: u64,
-    pub compatibility_mode: CompatibilityMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy: Option<ProxyConfig>,
     pub upstreams: Vec<AdminUpstreamConfigView>,
@@ -860,8 +900,8 @@ struct FileConfig {
     listen: String,
     #[serde(default = "default_upstream_timeout_secs")]
     upstream_timeout_secs: u64,
-    #[serde(default)]
-    compatibility_mode: CompatibilityMode,
+    #[serde(default, rename = "compatibility_mode")]
+    _compatibility_mode: Option<CompatibilityMode>,
     #[serde(default, alias = "upstream_proxy")]
     proxy: Option<ProxyConfig>,
     #[serde(default)]
@@ -988,7 +1028,6 @@ impl Default for Config {
         Self {
             listen: default_listen(),
             upstream_timeout: Duration::from_secs(default_upstream_timeout_secs()),
-            compatibility_mode: CompatibilityMode::default(),
             proxy: None,
             upstreams: Vec::new(),
             model_aliases: BTreeMap::new(),
@@ -1098,7 +1137,6 @@ impl Config {
         Ok(Self {
             listen: parsed.listen,
             upstream_timeout: Duration::from_secs(parsed.upstream_timeout_secs),
-            compatibility_mode: parsed.compatibility_mode,
             proxy: parsed.proxy,
             upstreams,
             model_aliases,
@@ -1362,7 +1400,6 @@ impl TryFrom<RuntimeConfigPayload> for Config {
         let config = Self {
             listen: value.listen,
             upstream_timeout: Duration::from_secs(value.upstream_timeout_secs),
-            compatibility_mode: value.compatibility_mode,
             proxy: value.proxy,
             upstreams,
             model_aliases: value.model_aliases,
@@ -1395,7 +1432,6 @@ impl From<&Config> for RuntimeConfigPayload {
         Self {
             listen: value.listen.clone(),
             upstream_timeout_secs: value.upstream_timeout.as_secs(),
-            compatibility_mode: value.compatibility_mode,
             proxy: value.proxy.clone(),
             upstreams: value
                 .upstreams
@@ -1447,7 +1483,6 @@ impl From<&Config> for AdminConfigView {
         Self {
             listen: value.listen.clone(),
             upstream_timeout_secs: value.upstream_timeout.as_secs(),
-            compatibility_mode: value.compatibility_mode,
             proxy: value.proxy.as_ref().map(sanitize_proxy_config_for_admin),
             upstreams: value
                 .upstreams
@@ -1911,7 +1946,6 @@ upstreams:
         let payload = RuntimeConfigPayload {
             listen: "127.0.0.1:0".to_string(),
             upstream_timeout_secs: 30,
-            compatibility_mode: CompatibilityMode::Balanced,
             proxy: Some(ProxyConfig::Direct),
             upstreams: vec![RuntimeUpstreamConfig {
                 name: "default".to_string(),
@@ -1958,27 +1992,84 @@ upstreams:
     }
 
     #[test]
-    fn config_defaults_compatibility_mode_to_max_compat() {
-        assert_eq!(CompatibilityMode::default(), CompatibilityMode::MaxCompat);
-        assert_eq!(
-            Config::default().compatibility_mode,
-            CompatibilityMode::MaxCompat
-        );
-    }
-
-    #[test]
-    fn config_from_yaml_str_defaults_compatibility_mode_when_omitted() {
-        let c = Config::from_yaml_str(
+    fn admin_and_runtime_config_views_do_not_emit_compatibility_mode() {
+        let config = Config::from_yaml_str(
             r#"
+compatibility_mode: strict
 upstreams:
   demo:
     api_root: https://api.openai.com/v1
     format: openai-completion
 "#,
         )
-        .unwrap();
+        .expect("legacy compatibility_mode should parse");
 
-        assert_eq!(c.compatibility_mode, CompatibilityMode::MaxCompat);
+        let admin_view = serde_json::to_value(AdminConfigView::from(&config)).unwrap();
+        assert!(admin_view.get("compatibility_mode").is_none());
+
+        let runtime_payload = RuntimeConfigPayload::from(&config);
+        let runtime_view = serde_json::to_value(&runtime_payload).unwrap();
+        assert!(runtime_view.get("compatibility_mode").is_none());
+
+        let snapshot = RuntimeConfigSnapshot {
+            revision: "rev-1".to_string(),
+            config: runtime_payload,
+        };
+        let snapshot_view = serde_json::to_value(snapshot).unwrap();
+        assert!(snapshot_view["config"].get("compatibility_mode").is_none());
+    }
+
+    #[test]
+    fn legacy_runtime_payload_compatibility_modes_are_accepted_but_not_serialized() {
+        for mode in ["strict", "balanced", "max_compat"] {
+            let payload: RuntimeConfigPayload = serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1:0",
+                "upstream_timeout_secs": 30,
+                "compatibility_mode": mode,
+                "proxy": "direct",
+                "upstreams": [{
+                    "name": "default",
+                    "api_root": "https://api.openai.com/v1",
+                    "fixed_upstream_format": "openai-completion"
+                }],
+                "model_aliases": {}
+            }))
+            .expect("legacy compatibility_mode should parse");
+
+            let config = Config::try_from(payload).expect("runtime config is valid");
+            let round_trip = serde_json::to_value(RuntimeConfigPayload::from(&config)).unwrap();
+            assert!(
+                round_trip.get("compatibility_mode").is_none(),
+                "legacy mode {mode} should not be serialized: {round_trip}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_mode_default_remains_max_compat_for_internal_branches() {
+        assert_eq!(CompatibilityMode::default(), CompatibilityMode::MaxCompat);
+    }
+
+    #[test]
+    fn config_from_yaml_str_accepts_legacy_compatibility_modes_without_serializing_them() {
+        for mode in ["strict", "balanced", "max_compat"] {
+            let c = Config::from_yaml_str(&format!(
+                r#"
+compatibility_mode: {mode}
+upstreams:
+  demo:
+    api_root: https://api.openai.com/v1
+    format: openai-completion
+"#,
+            ))
+            .unwrap();
+
+            let runtime_view = serde_json::to_value(RuntimeConfigPayload::from(&c)).unwrap();
+            assert!(
+                runtime_view.get("compatibility_mode").is_none(),
+                "legacy mode {mode} should not be serialized: {runtime_view}"
+            );
+        }
     }
 
     #[test]
@@ -2635,7 +2726,6 @@ upstreams:
         let mut payload = RuntimeConfigPayload {
             listen: "127.0.0.1:0".to_string(),
             upstream_timeout_secs: 30,
-            compatibility_mode: CompatibilityMode::Balanced,
             proxy: Some(ProxyConfig::Direct),
             upstreams: vec![RuntimeUpstreamConfig {
                 name: "default".to_string(),
@@ -2806,7 +2896,6 @@ upstreams:
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             upstream_timeout: Duration::from_secs(30),
-            compatibility_mode: CompatibilityMode::Balanced,
             proxy: Some(ProxyConfig::Proxy {
                 url: "http://global-user:global-pass@proxy.example:8080/global-hop?api_key=proxy-secret#frag".to_string(),
             }),

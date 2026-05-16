@@ -17,10 +17,10 @@ use common::proxy_helpers::proxy_config;
 use common::runtime_proxy::{start_proxy, upstream_api_root};
 use futures_util::{future::join_all, stream, StreamExt};
 use llm_universal_proxy::config::{
-    ApplyPatchTransport, CompatibilityMode, Config, DebugTraceConfig, HookConfig,
-    HookEndpointConfig, ModelAlias, ModelLimits, ModelModalities, ModelModality, ModelSurface,
-    ModelSurfacePatch, ModelToolSurface, ProxyConfig, RuntimeConfigPayload, RuntimeHookConfig,
-    RuntimeUpstreamConfig, SecretSourceConfig, UpstreamConfig,
+    ApplyPatchTransport, Config, DebugTraceConfig, HookConfig, HookEndpointConfig, ModelAlias,
+    ModelLimits, ModelModalities, ModelModality, ModelSurface, ModelSurfacePatch, ModelToolSurface,
+    ProxyConfig, RuntimeConfigPayload, RuntimeHookConfig, RuntimeUpstreamConfig,
+    SecretSourceConfig, UpstreamConfig,
 };
 use llm_universal_proxy::formats::UpstreamFormat;
 use llm_universal_proxy::server::{
@@ -203,7 +203,6 @@ fn bridge_memory_proxy_config(
         r#"
 listen: 127.0.0.1:0
 upstream_timeout_secs: 30
-compatibility_mode: balanced
 proxy: direct
 conversation_state_bridge:
   mode: memory
@@ -257,7 +256,6 @@ fn demo_runtime_config(mock_base: &str) -> RuntimeConfigPayload {
     RuntimeConfigPayload {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout_secs: 30,
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![RuntimeUpstreamConfig {
             name: "default".to_string(),
@@ -324,7 +322,6 @@ fn yaml_config_parses_structured_model_alias_limits() {
     let config = Config::from_yaml_str(
         r#"
 listen: 127.0.0.1:18888
-compatibility_mode: max_compat
 upstreams:
   MINIMAX-OPENAI:
     api_root: https://api.minimaxi.com/v1
@@ -358,7 +355,6 @@ model_aliases:
     )
     .unwrap();
 
-    assert_eq!(config.compatibility_mode, CompatibilityMode::MaxCompat);
     assert_eq!(
         config.upstreams[0].limits,
         Some(ModelLimits {
@@ -411,7 +407,6 @@ model_aliases:
 #[test]
 fn runtime_config_round_trip_preserves_model_alias_limits() {
     let mut payload = demo_runtime_config("http://example.com");
-    payload.compatibility_mode = CompatibilityMode::MaxCompat;
     payload.proxy = Some(ProxyConfig::Proxy {
         url: "http://global-user:global-pass@proxy.example:8080/global-hop?token=secret#frag"
             .to_string(),
@@ -467,7 +462,6 @@ fn runtime_config_round_trip_preserves_model_alias_limits() {
     let config = Config::try_from(payload).unwrap();
     let round_trip = RuntimeConfigPayload::from(&config);
 
-    assert_eq!(round_trip.compatibility_mode, CompatibilityMode::MaxCompat);
     assert_eq!(
         round_trip.proxy,
         Some(ProxyConfig::Proxy {
@@ -537,7 +531,6 @@ fn runtime_config_round_trip_preserves_model_alias_limits() {
 #[test]
 fn effective_model_surface_merges_upstream_defaults_and_alias_overrides() {
     let mut config = proxy_config("http://example.com", UpstreamFormat::OpenAiCompletion);
-    config.compatibility_mode = CompatibilityMode::MaxCompat;
     config.upstreams[0].limits = Some(ModelLimits {
         context_window: Some(200_000),
         max_output_tokens: Some(128_000),
@@ -603,7 +596,6 @@ fn auto_discovery_config(upstream_base: &str, api_root_format: UpstreamFormat) -
     Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
@@ -961,7 +953,6 @@ fn multi_native_responses_config(first_base: &str, second_base: &str) -> Config 
     Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream(
@@ -993,7 +984,6 @@ fn pinned_responses_plus_auto_discovery_config(
     Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream(
@@ -1146,7 +1136,6 @@ async fn admin_bootstrap_empty_config_starts_without_data_auth_then_admin_config
             "config": {
                 "listen": "127.0.0.1:0",
                 "upstream_timeout_secs": 30,
-                "compatibility_mode": "balanced",
                 "proxy": "direct",
                 "upstreams": [{
                     "name": "default",
@@ -1333,7 +1322,6 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
     let payload = RuntimeConfigPayload {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout_secs: 30,
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![RuntimeUpstreamConfig {
             name: "default".to_string(),
@@ -1429,6 +1417,47 @@ async fn runtime_namespace_config_can_be_created_from_empty_start_with_null_or_m
     assert!(res.status().is_success());
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["object"], "chat.completion");
+}
+
+#[tokio::test]
+async fn admin_runtime_payload_accepts_legacy_compatibility_mode_but_state_omits_it() {
+    let _env_guard = ADMIN_TOKEN_ENV_LOCK.lock().await;
+    let _admin_token = ScopedEnvVar::remove("LLM_UNIVERSAL_PROXY_ADMIN_TOKEN");
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
+    let (proxy_base, _proxy) = start_proxy(Config::default()).await;
+    let client = Client::new();
+
+    let apply = client
+        .post(format!("{proxy_base}/admin/namespaces/legacy/config"))
+        .json(&json!({
+            "if_revision": null,
+            "config": {
+                "listen": "127.0.0.1:0",
+                "upstream_timeout_secs": 30,
+                "compatibility_mode": "strict",
+                "proxy": "direct",
+                "upstreams": [{
+                    "name": "default",
+                    "api_root": upstream_api_root(&mock_base, UpstreamFormat::OpenAiCompletion),
+                    "fixed_upstream_format": "openai-completion"
+                }],
+                "model_aliases": {}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(apply.status(), StatusCode::OK);
+
+    let state: Value = client
+        .get(format!("{proxy_base}/admin/namespaces/legacy/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(state["config"].get("compatibility_mode").is_none());
 }
 
 #[tokio::test]
@@ -1863,7 +1892,6 @@ async fn admin_namespace_provider_key_inline_hot_swaps_and_state_redacts_secret(
         json!({
             "listen": "127.0.0.1:0",
             "upstream_timeout_secs": 30,
-            "compatibility_mode": "balanced",
             "proxy": "direct",
             "upstreams": [{
                 "name": "default",
@@ -2129,7 +2157,6 @@ async fn admin_put_data_auth_does_not_overwrite_concurrent_namespace_cas_update(
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
@@ -2557,7 +2584,6 @@ async fn admin_namespace_state_redacts_inline_credentials_and_hook_authorization
             "config": RuntimeConfigPayload {
                 listen: "127.0.0.1:0".to_string(),
                 upstream_timeout_secs: 30,
-                compatibility_mode: CompatibilityMode::Balanced,
                 proxy: Some(ProxyConfig::Proxy {
                     url: "http://global-user:global-pass@proxy.example:8080/global-hop?token=global-secret#frag".to_string(),
                 }),
@@ -2754,7 +2780,6 @@ async fn admin_namespace_state_reports_namespace_proxy_source_over_http() {
             "config": RuntimeConfigPayload {
                 listen: "127.0.0.1:0".to_string(),
                 upstream_timeout_secs: 30,
-                compatibility_mode: CompatibilityMode::Balanced,
                 proxy: Some(ProxyConfig::Proxy {
                     url: "http://global-user:global-pass@proxy.example:8080/global-hop?token=global-secret#frag".to_string(),
                 }),
@@ -3121,7 +3146,6 @@ async fn proxy_key_auth_uses_provider_key_env_and_does_not_forward_or_hook_proxy
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "GLM-OFFICIAL".to_string(),
@@ -3217,7 +3241,6 @@ async fn proxy_key_mode_without_provider_key_env_fails_closed_at_startup() {
     let config = Config {
         listen: "0.0.0.0:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "default".to_string(),
@@ -3252,7 +3275,6 @@ fn config_with_upstream_header(header_name: &str) -> Config {
     Config {
         listen: "0.0.0.0:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "default".to_string(),
@@ -3994,7 +4016,6 @@ async fn discovery_empty_result_does_not_masquerade_as_openai_chat_and_returns_5
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
@@ -4150,7 +4171,6 @@ async fn admin_namespace_state_exposes_unavailable_upstream_discovery_status() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "AUTO".to_string(),
@@ -4210,7 +4230,6 @@ async fn openai_responses_create_with_alias_routes_to_configured_upstream() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream(
@@ -4908,7 +4927,6 @@ async fn responses_stateful_request_without_model_routes_to_unique_native_respon
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream(
@@ -4960,7 +4978,6 @@ async fn stateful_model_less_create_returns_503_when_unique_configured_native_ow
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![named_upstream(
             "RESPONSES_A",
@@ -5671,7 +5688,6 @@ async fn openai_models_endpoint_lists_local_aliases() {
             max_output_tokens: Some(128_000),
         }),
     );
-    config.compatibility_mode = CompatibilityMode::MaxCompat;
     config.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
         modalities: Some(ModelModalities {
             input: Some(vec![ModelModality::Text]),
@@ -5762,7 +5778,6 @@ async fn anthropic_models_endpoint_retrieves_local_alias() {
             max_output_tokens: Some(128_000),
         }),
     );
-    config.compatibility_mode = CompatibilityMode::MaxCompat;
     config.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
         modalities: Some(ModelModalities {
             input: Some(vec![ModelModality::Text]),
@@ -5852,7 +5867,6 @@ async fn openai_models_endpoint_retrieves_local_alias_object_with_llmup_owner() 
 async fn openai_models_endpoint_resolves_direct_upstream_model_surface() {
     let (mock_base, _mock) = spawn_openai_completion_mock().await;
     let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
-    config.compatibility_mode = CompatibilityMode::MaxCompat;
     config.upstreams[0].name = "MINIMAX-OPENAI".to_string();
     config.upstreams[0].limits = Some(ModelLimits {
         context_window: Some(200_000),
@@ -6674,7 +6688,6 @@ async fn multi_upstream_supports_explicit_upstream_model_selector() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
@@ -6728,7 +6741,6 @@ async fn multi_upstream_supports_local_model_alias() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
@@ -6772,7 +6784,6 @@ async fn multi_upstream_requires_explicit_resolution_for_ambiguous_model() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![
             named_upstream("GLM-OFFICIAL", &glm_base, UpstreamFormat::Anthropic, None),
@@ -6814,7 +6825,6 @@ async fn multi_upstream_uses_client_provider_key() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![named_upstream(
             "GLM-OFFICIAL",
@@ -6863,7 +6873,6 @@ async fn proxy_key_auth_ignores_raw_client_provider_key() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "GLM-OFFICIAL".to_string(),
@@ -7822,7 +7831,6 @@ async fn upstream_unreachable_returns_502() {
     let config = Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_millis(100),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "default".to_string(),

@@ -27,7 +27,6 @@ async fn build_runtime_namespace_state_exposes_resolved_per_upstream_clients() {
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: None,
         upstreams: vec![crate::config::UpstreamConfig {
             name: "primary".to_string(),
@@ -114,7 +113,6 @@ async fn dashboard_runtime_snapshot_tracks_live_namespace_state() {
     let mut config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![crate::config::UpstreamConfig {
             name: "auto".to_string(),

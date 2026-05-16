@@ -798,7 +798,6 @@ mod tests {
         Config {
             listen: "127.0.0.1:0".to_string(),
             upstream_timeout: timeout,
-            compatibility_mode: crate::config::CompatibilityMode::Balanced,
             proxy: Some(ProxyConfig::Direct),
             upstreams: Vec::new(),
             model_aliases: Default::default(),

@@ -1123,7 +1123,6 @@ async fn openai_responses_resource_uses_request_snapshot_after_auth_runtime_race
     let replacement_config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![redaction_upstream_config(
             "primary",
@@ -1342,7 +1341,6 @@ fn resolve_native_responses_stateful_route_or_error_rejects_multi_upstream_auto_
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![pinned.clone(), auto.clone()],
         model_aliases: Default::default(),
@@ -1478,7 +1476,6 @@ async fn handle_openai_responses_resource_uses_upstream_state_client() {
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(5),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![upstream.clone()],
         model_aliases: Default::default(),

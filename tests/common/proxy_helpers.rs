@@ -1,9 +1,7 @@
 //! Shared proxy configuration helpers for integration tests.
 
 use super::runtime_proxy::upstream_api_root;
-use llm_universal_proxy::config::{
-    CompatibilityMode, Config, DebugTraceConfig, ProxyConfig, UpstreamConfig,
-};
+use llm_universal_proxy::config::{Config, DebugTraceConfig, ProxyConfig, UpstreamConfig};
 use llm_universal_proxy::formats::UpstreamFormat;
 use std::time::Duration;
 
@@ -11,7 +9,6 @@ pub fn proxy_config(upstream_base: &str, format: UpstreamFormat) -> Config {
     Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![UpstreamConfig {
             name: "default".to_string(),

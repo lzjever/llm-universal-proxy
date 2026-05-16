@@ -130,7 +130,6 @@ pub(super) async fn app_state_for_redaction_upstreams(
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams,
         model_aliases: Default::default(),
@@ -202,7 +201,6 @@ pub(super) fn runtime_namespace_state_for_tests(
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: upstreams
             .iter()
@@ -363,7 +361,6 @@ pub(super) fn app_state_for_single_upstream_with_timeout(
     let config = crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout,
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![upstream.clone()],
         model_aliases: Default::default(),

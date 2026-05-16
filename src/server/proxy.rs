@@ -1761,7 +1761,7 @@ pub(super) fn classify_request_boundary(
         upstream_format,
         body,
         &RequestTranslationPolicy {
-            compatibility_mode: crate::config::CompatibilityMode::Balanced,
+            compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
             surface: crate::config::ModelSurface::default(),
         },
     )
@@ -1857,7 +1857,7 @@ fn request_translation_policy(
         });
 
     RequestTranslationPolicy {
-        compatibility_mode: namespace_config.compatibility_mode,
+        compatibility_mode: crate::config::CompatibilityMode::MaxCompat,
         surface,
     }
 }

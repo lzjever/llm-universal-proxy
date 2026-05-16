@@ -1236,7 +1236,6 @@ fn runtime_namespace_config(
     RuntimeConfigPayload {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout_secs: 30,
-        compatibility_mode: llm_universal_proxy::config::CompatibilityMode::Balanced,
         proxy: Some(ProxyConfig::Direct),
         upstreams: vec![RuntimeUpstreamConfig {
             name: "default".to_string(),

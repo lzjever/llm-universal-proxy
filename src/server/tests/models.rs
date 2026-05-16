@@ -11,7 +11,6 @@ fn models_snapshot_config(alias: &str) -> crate::config::Config {
     crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![upstream],
         model_aliases: BTreeMap::from([(
@@ -51,7 +50,6 @@ fn models_catalog_config(
     crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![upstream],
         model_aliases: BTreeMap::from([(
@@ -78,7 +76,6 @@ fn models_not_found_config(
     crate::config::Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: std::time::Duration::from_secs(30),
-        compatibility_mode: crate::config::CompatibilityMode::Balanced,
         proxy: Some(crate::config::ProxyConfig::Direct),
         upstreams: vec![
             redaction_upstream_config(

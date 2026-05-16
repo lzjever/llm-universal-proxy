@@ -12,9 +12,7 @@ use axum::{
     Json as AxumJson, Router,
 };
 use forward_proxy::spawn_http_forward_proxy;
-use llm_universal_proxy::config::{
-    CompatibilityMode, Config, DebugTraceConfig, RuntimeConfigPayload, UpstreamConfig,
-};
+use llm_universal_proxy::config::{Config, DebugTraceConfig, RuntimeConfigPayload, UpstreamConfig};
 use llm_universal_proxy::formats::UpstreamFormat;
 use reqwest::{
     header::{HeaderMap as ReqwestHeaderMap, HeaderValue},
@@ -98,7 +96,6 @@ fn openai_auto_discovery_config(upstream_base: &str) -> Config {
     Config {
         listen: "127.0.0.1:0".to_string(),
         upstream_timeout: Duration::from_secs(30),
-        compatibility_mode: CompatibilityMode::Balanced,
         proxy: None,
         upstreams: vec![UpstreamConfig {
             name: "default".to_string(),

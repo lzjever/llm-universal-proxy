@@ -12,7 +12,6 @@ mod common;
 use common::mock_upstream::*;
 use common::proxy_helpers::proxy_config;
 use common::runtime_proxy::start_proxy;
-use llm_universal_proxy::config::CompatibilityMode;
 use llm_universal_proxy::formats::UpstreamFormat;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
@@ -235,8 +234,7 @@ async fn anthropic_signed_thinking_responses_round_trip_non_streaming_degrades_c
     let message_item = output[1].clone();
 
     let (capture_base, _capture_mock, mut captured) = spawn_capture_anthropic_mock().await;
-    let mut capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
-    capture_config.compatibility_mode = CompatibilityMode::MaxCompat;
+    let capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
     let (capture_proxy_base, _capture_proxy) = start_proxy(capture_config).await;
 
     let second_response = client
@@ -322,8 +320,7 @@ async fn anthropic_omitted_thinking_responses_round_trip_non_streaming_drops_car
     let message_item = output[1].clone();
 
     let (capture_base, _capture_mock, mut captured) = spawn_capture_anthropic_mock().await;
-    let mut capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
-    capture_config.compatibility_mode = CompatibilityMode::MaxCompat;
+    let capture_config = proxy_config(&capture_base, UpstreamFormat::Anthropic);
     let (capture_proxy_base, _capture_proxy) = start_proxy(capture_config).await;
 
     let second_response = client
