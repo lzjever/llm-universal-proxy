@@ -858,6 +858,19 @@ async fn handle_request_core_with_downstream_cancellation(
         );
     };
     let upstream_format = capability.upstream_format_for_request(client_format);
+    if let Some(message) = reject_local_bridge_id_on_native_responses_passthrough(
+        client_format,
+        upstream_format,
+        &body,
+    ) {
+        tracker.finish_error(StatusCode::BAD_REQUEST.as_u16());
+        return redacted_error_response(
+            client_format,
+            StatusCode::BAD_REQUEST,
+            message,
+            &request_redactor,
+        );
+    }
     if let Some(obj) = body.as_object_mut() {
         if let Some(forced_stream) = forced_stream {
             obj.insert("stream".to_string(), Value::Bool(forced_stream));
@@ -1433,6 +1446,27 @@ fn conversation_state_bridge_can_preload(
         })
         .unwrap_or(false);
     !(fixed_native || discovered_native)
+}
+
+fn reject_local_bridge_id_on_native_responses_passthrough(
+    client_format: UpstreamFormat,
+    upstream_format: UpstreamFormat,
+    body: &Value,
+) -> Option<&'static str> {
+    if client_format != UpstreamFormat::OpenAiResponses
+        || upstream_format != UpstreamFormat::OpenAiResponses
+    {
+        return None;
+    }
+
+    let previous_response_id = body.get("previous_response_id").and_then(Value::as_str)?;
+    if !previous_response_id.starts_with(LOCAL_RESPONSE_ID_PREFIX) {
+        return None;
+    }
+
+    Some(
+        "Responses `previous_response_id` is a local conversation_state_bridge id and cannot be used on native OpenAI Responses passthrough; use a local replay translated route",
+    )
 }
 
 async fn preload_local_bridge_response(

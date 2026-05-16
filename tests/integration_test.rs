@@ -4779,6 +4779,49 @@ async fn conversation_state_bridge_does_not_intercept_native_responses_passthrou
 }
 
 #[tokio::test]
+async fn conversation_state_bridge_rejects_local_id_on_native_responses_passthrough() {
+    let (mock_base, _mock, captured) = spawn_asserting_openai_responses_mock(|_| Ok(())).await;
+    let config =
+        bridge_memory_proxy_config(&mock_base, UpstreamFormat::OpenAiResponses, 60, 1024 * 1024);
+    let (proxy_base, _proxy) = start_proxy(config).await;
+
+    let res = Client::new()
+        .post(format!("{proxy_base}/openai/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4",
+            "previous_response_id": "resp_llmup_native_passthrough",
+            "input": "Continue",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = res.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("local conversation_state_bridge id"),
+        "message = {message}"
+    );
+    assert!(
+        message.contains("native OpenAI Responses passthrough"),
+        "message = {message}"
+    );
+    assert!(
+        message.contains("local replay translated route"),
+        "message = {message}"
+    );
+    assert_eq!(
+        captured
+            .wait_for_count(1, Duration::from_millis(200))
+            .await
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn responses_translation_rejects_conversation_and_background_stateful_controls() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
     let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
