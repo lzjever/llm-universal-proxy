@@ -15,7 +15,7 @@ Locked contract:
 - The proxy must not rewrite the visible tool name supplied by the client.
 - `__llmup_custom__*` is an internal transport artifact, not a public contract.
 - `apply_patch` remains a public freeform tool on client-visible surfaces.
-- Real-client public editing contracts preserve each client's public tool name: Codex `apply_patch`, Claude Code `Edit`, and Gemini `replace`; the proxy does not rewrite them to a shared proxy name.
+- Real-client public editing contracts preserve each supported client's public tool name, such as Codex `apply_patch` and Claude Code `Edit`; the proxy does not rewrite them to a shared proxy name.
 
 Public-boundary text scanning boundary:
 
@@ -43,7 +43,7 @@ Current contract:
 
 - reserved names such as `__llmup_custom__apply_patch` must not appear on public client-visible or model-visible surfaces
 - translated live requests preserve stable tool names in public `tools` and `tool_choice`
-- real-client smoke coverage asserts the per-client public editing tool names: Codex `apply_patch`, Claude Code `Edit`, and Gemini `replace`, while omitting reserved prefixes
+- real-client smoke coverage asserts the per-client public editing tool names, including Codex `apply_patch` and Claude Code `Edit`, while omitting reserved prefixes
 
 ### Phase 1: Request-Scoped Tool Bridge Context
 
@@ -73,12 +73,12 @@ Status: delivered.
 Current contract:
 
 - upstream `surface_defaults` and alias `surface` merge into one effective model surface
-- `/openai/v1/models`, `/anthropic/v1/models`, and `/google/v1beta/models` expose `llmup.surface`
+- `/openai/v1/models` and `/anthropic/v1/models` expose `llmup.surface`
 - `apply_patch_transport` remains an internal transport description; the public Codex catalog still advertises `apply_patch` as `freeform`
 
 ### Phase 4: Wrapper Alignment
 
-Status: delivered for the current Codex, Claude Code, and Gemini wrappers.
+Status: delivered for the current Codex and Claude Code wrappers.
 
 Current contract:
 

@@ -7,7 +7,7 @@ Start here based on what you need:
 - [configuration.md](./configuration.md)
   Static YAML configuration, static `data_auth`, provider credential sources, provider-neutral preset sources, full field reference, and upstream proxy support
 - [clients.md](./clients.md)
-  Codex, Claude Code, and Gemini wrapper setup plus common client notes
+  Codex, Claude Code, OpenAI-compatible client setup, and common client notes
 - [container.md](./container.md)
   GHCR image usage, Docker Compose example, container smoke, and release policy
 - [admin-dynamic-config.md](./admin-dynamic-config.md)

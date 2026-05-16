@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch Codex, Claude, or Gemini in interactive mode through the proxy."""
+"""Launch Codex or Claude through the proxy."""
 
 from __future__ import annotations
 
@@ -47,7 +47,6 @@ from real_cli_matrix import (  # noqa: E402
 DEFAULT_MODEL_BY_CLIENT = {
     "codex": "preset-openai-compatible",
     "claude": "preset-anthropic-compatible",
-    "gemini": "preset-openai-compatible",
 }
 
 
@@ -150,20 +149,6 @@ def build_interactive_command(
         if dangerous_harness:
             command.append("--dangerously-skip-permissions")
         command.extend(["--add-dir", str(workspace)])
-        ensure_no_public_internal_tool_artifacts(
-            command, context="interactive CLI command"
-        )
-        return command
-
-    if client_name == "gemini":
-        command = [
-            "gemini",
-            "--model",
-            model,
-        ]
-        if dangerous_harness:
-            command.extend(["--sandbox=false", "--yolo"])
-        command.extend(["--include-directories", str(workspace)])
         ensure_no_public_internal_tool_artifacts(
             command, context="interactive CLI command"
         )

@@ -14,7 +14,7 @@ LLM Universal Proxy (public short name: llmup)
 
 ### 1.2 Product Definition
 
-A single-binary HTTP proxy that provides protocol-namespaced entrypoints and translation between supported LLM API surfaces. Clients using OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, or Google Gemini can route through one stable proxy to configured upstream endpoints; same-provider/native passthrough preserves provider-native fields and lifecycle state, while compatible same-protocol lanes preserve only portable core/portable fields and are not native provider passthrough. Translated paths preserve the portable core and warn or reject non-portable provider-native features.
+A single-binary HTTP proxy that provides protocol-namespaced entrypoints and translation between supported LLM API surfaces. Clients using OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages can route through one stable proxy to configured upstream endpoints; same-provider/native passthrough preserves provider-native fields and lifecycle state, while compatible same-protocol lanes preserve only portable core/portable fields and are not native provider passthrough. Translated paths preserve the portable core and warn or reject non-portable provider-native features. Gemini models remain usable only through Google's OpenAI-compatible endpoint configured as `format: openai-completion`, not as a native Gemini wire protocol.
 
 ### 1.3 Problem Statement
 
@@ -23,7 +23,7 @@ The LLM ecosystem is fragmented across incompatible API protocols:
 - **OpenAI Chat Completions** — the de facto standard for most third-party LLM providers
 - **OpenAI Responses API** — used by newer tools like Codex CLI
 - **Anthropic Messages** — used by Claude Code and Claude-native applications
-- **Google Gemini** — used by Gemini CLI and Google-native applications
+- **Google OpenAI-compatible Gemini** — usable as an OpenAI Chat-compatible upstream, not as a native Gemini `generateContent` proxy surface
 
 Each client tool typically speaks only one protocol. Each upstream endpoint typically supports only one or two protocols. This creates an N×M compatibility matrix that is impractical for users and tool developers to manage individually.
 
@@ -33,7 +33,6 @@ Each client tool typically speaks only one protocol. Each upstream endpoint typi
 |------|----------|
 | Developer using Codex CLI | Wants to use a non-OpenAI model (GLM, MiniMax, Kimi, local vLLM) through Codex's Responses-only interface |
 | Developer using Claude Code | Wants to route Claude Code requests to a non-Anthropic upstream for cost or availability reasons |
-| Developer using Gemini CLI | Wants to use Gemini CLI with a non-Google upstream endpoint |
 | Team with multiple LLM providers | Wants a single stable endpoint that normalizes model naming across providers |
 | Operator running local models | Wants to expose a local vLLM/Ollama instance to any LLM client tool regardless of protocol |
 | AI infrastructure engineer | Wants an observability layer for request/response auditing and usage metering |
@@ -44,28 +43,21 @@ Each client tool typically speaks only one protocol. Each upstream endpoint typi
 
 ### 2.1 Protocol Support Matrix
 
-The proxy MUST support bidirectional translation between all four protocols:
+The proxy MUST support bidirectional translation between the active wire protocols:
 
 | # | Client Protocol | Upstream Protocol | Translation Required |
 |---|----------------|-------------------|---------------------|
 | 1 | OpenAI Chat Completions | OpenAI Chat Completions | No (passthrough) |
 | 2 | OpenAI Chat Completions | OpenAI Responses | Yes |
 | 3 | OpenAI Chat Completions | Anthropic Messages | Yes |
-| 4 | OpenAI Chat Completions | Google Gemini | Yes |
-| 5 | OpenAI Responses | OpenAI Chat Completions | Yes |
-| 6 | OpenAI Responses | OpenAI Responses | No (passthrough) |
-| 7 | OpenAI Responses | Anthropic Messages | Yes |
-| 8 | OpenAI Responses | Google Gemini | Yes |
-| 9 | Anthropic Messages | OpenAI Chat Completions | Yes |
-| 10 | Anthropic Messages | OpenAI Responses | Yes |
-| 11 | Anthropic Messages | Anthropic Messages | No (passthrough) |
-| 12 | Anthropic Messages | Google Gemini | Yes |
-| 13 | Google Gemini | OpenAI Chat Completions | Yes |
-| 14 | Google Gemini | OpenAI Responses | Yes |
-| 15 | Google Gemini | Anthropic Messages | Yes |
-| 16 | Google Gemini | Google Gemini | No (passthrough) |
+| 4 | OpenAI Responses | OpenAI Chat Completions | Yes |
+| 5 | OpenAI Responses | OpenAI Responses | No (passthrough) |
+| 6 | OpenAI Responses | Anthropic Messages | Yes |
+| 7 | Anthropic Messages | OpenAI Chat Completions | Yes |
+| 8 | Anthropic Messages | OpenAI Responses | Yes |
+| 9 | Anthropic Messages | Anthropic Messages | No (passthrough) |
 
-All 16 combinations (4 passthrough + 12 translated) MUST be supported within documented portability boundaries. Same-provider/native passthrough remains lossless for provider-native fields; compatible same-protocol lanes and translated paths may warn or reject non-portable semantics rather than silently approximating them.
+All 9 combinations (3 passthrough + 6 translated) MUST be supported within documented portability boundaries. Same-provider/native passthrough remains lossless for provider-native fields; compatible same-protocol lanes and translated paths may warn or reject non-portable semantics rather than silently approximating them.
 
 ### 2.2 Client Endpoints
 
@@ -81,18 +73,15 @@ The proxy MUST expose the following namespaced endpoints:
 | `/openai/v1/models` | Model catalog | GET |
 | `/anthropic/v1/messages` | Anthropic Messages | POST |
 | `/anthropic/v1/models` | Model catalog | GET |
-| `/google/v1beta/models/:id` | Gemini GenerateContent | POST |
-| `/google/v1beta/models` | Model catalog | GET |
 
 ### 2.3 Streaming Support
 
-- The proxy MUST support SSE (Server-Sent Events) streaming for all 16 protocol combinations within the same portability, warning, and reject boundaries as non-streaming translation.
+- The proxy MUST support SSE (Server-Sent Events) streaming for all active protocol combinations within the same portability, warning, and reject boundaries as non-streaming translation.
 - Streaming translation MUST operate chunk-by-chunk without buffering the entire response.
 - Each protocol's streaming lifecycle events MUST be correctly translated:
   - **OpenAI Chat Completions**: `data:` chunks + `[DONE]`
   - **OpenAI Responses**: `response.created` → `response.in_progress` → `output_item.added` → `content_part.added` → `output_text.delta` → ... → `response.completed`
   - **Anthropic Messages**: `message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`
-  - **Google Gemini**: `candidates` chunks with `parts`
 
 ### 2.4 Request Translation
 
@@ -101,13 +90,13 @@ The proxy MUST translate the following request fields across protocols:
 | Field | Status | Notes |
 |-------|--------|-------|
 | Text messages | Must | Preserve portable text content across supported formats |
-| System instructions | Must | Map between `system` role (OpenAI), top-level `system` (Anthropic), `systemInstruction` (Gemini), `instructions` (Responses) |
+| System instructions | Must | Map between `system` role (OpenAI), top-level `system` (Anthropic), and `instructions` (Responses) |
 | Function tool definitions | Must | Map portable `function` tools across supported formats |
 | Visible tool identity | Must | The stable tool name supplied by the client is part of the semantic contract and must not be rewritten on model-visible or client-visible surfaces |
 | Tool choice (auto/none/required) | Must | Map between format-specific tool choice objects |
 | `max_output_tokens` / `max_tokens` | Must | Normalize field names |
 | `temperature`, `top_p` | Should | Pass through generation config where applicable |
-| Image content | Should | Map portable image parts between OpenAI, Anthropic, and Gemini when the effective surface allows `image`; OpenAI HTTP(S) image URLs can map to Anthropic URL image sources, but Anthropic remote image URLs to Gemini fail closed without an explicit fetch/upload adapter |
+| Image content | Should | Map portable image parts between OpenAI and Anthropic when the effective surface allows `image`; OpenAI HTTP(S) image URLs can map to Anthropic URL image sources |
 | PDF content | Should | Map PDF data URIs and PDF HTTP(S) file references when PDF MIME or filename provenance is available and the effective surface allows `pdf` or `file` |
 | Typed media source boundary | Must | Treat `surface.modalities.input` as a media-type gate, not a source transport promise; provider `file_id` and provider-native or local URIs such as `gs://`, `s3://`, and `file://` fail closed unless a documented adapter supports them |
 | Typed media MIME provenance | Must | Reject conflicting MIME hints before routing so surface gates and translators cannot disagree about the actual media kind |
@@ -121,11 +110,11 @@ The proxy MUST translate the following response fields:
 | Field | Status | Notes |
 |-------|--------|-------|
 | Text content | Must | Preserve portable text content; warn or reject when a response field cannot be represented safely |
-| Tool calls / function calls | Must | Map between `tool_calls` (OpenAI), `tool_use` blocks (Anthropic), `functionCall` parts (Gemini) |
-| Tool results | Must | Map between `tool` role messages (OpenAI), `tool_result` blocks (Anthropic), `functionResponse` parts (Gemini) |
-| Usage / token metrics | Must | Map between `prompt_tokens/completion_tokens` (OpenAI), `input_tokens/output_tokens` (Anthropic), `promptTokenCount/candidatesTokenCount` (Gemini) |
-| Finish reasons | Must | Map stop reasons: `stop` ↔ `end_turn` ↔ `STOP`, `tool_calls` ↔ `tool_use` ↔ `STOP`, `length` ↔ `max_tokens` ↔ `MAX_TOKENS` |
-| Reasoning / thinking output | Should | Preserve as `reasoning_content` (OpenAI), `thinking` blocks (Anthropic), `thought` parts (Gemini) |
+| Tool calls / function calls | Must | Map between `tool_calls` (OpenAI) and `tool_use` blocks (Anthropic) |
+| Tool results | Must | Map between `tool` role messages (OpenAI) and `tool_result` blocks (Anthropic) |
+| Usage / token metrics | Must | Map between `prompt_tokens/completion_tokens` (OpenAI) and `input_tokens/output_tokens` (Anthropic) |
+| Finish reasons | Must | Map stop reasons: `stop` ↔ `end_turn`, `tool_calls` ↔ `tool_use`, `length` ↔ `max_tokens` |
+| Reasoning / thinking output | Should | Preserve as `reasoning_content` (OpenAI) or `thinking` blocks (Anthropic) |
 | Cached token details | Should | Map cache-related usage fields |
 | Error responses | Must | Translate upstream errors into client-protocol-appropriate error shapes |
 
@@ -144,7 +133,7 @@ Locked tool identity contract:
 - The proxy must not rewrite the visible tool name supplied by the client.
 - `__llmup_custom__*` is an internal transport artifact, not a public contract.
 - `apply_patch` remains a public freeform tool on client-visible surfaces.
-- Public editing tool identity is per client: Codex exposes `apply_patch`, Claude Code exposes `Edit`, and Gemini exposes `replace`; the proxy must not rewrite those public names.
+- Public editing tool identity is per client: Codex exposes `apply_patch`, and Claude Code exposes `Edit`; the proxy must not rewrite those public names.
 
 ### 2.7 Upstream Configuration
 
@@ -192,7 +181,6 @@ The proxy MUST support namespace-prefixed routes for multi-tenant deployments:
 
 - `/namespaces/:namespace/openai/v1/...`
 - `/namespaces/:namespace/anthropic/v1/...`
-- `/namespaces/:namespace/google/v1beta/...`
 
 Runtime configuration per namespace via admin API:
 - `POST /admin/namespaces/:namespace/config`
@@ -279,7 +267,7 @@ Admin namespace writes MUST use server-owned revisions with exact compare-and-sw
 
 ### 3.3 Compatibility
 
-- Compatible with HTTP clients that speak one of the four supported protocol surfaces and can use a configured proxy base URL.
+- Compatible with HTTP clients that speak one of the supported protocol surfaces and can use a configured proxy base URL.
 - No SDK changes are required for portable request/response fields; provider-native extensions may require same-provider/native passthrough or a documented shim.
 - Works with official vendor APIs and third-party compatible endpoints within documented portability boundaries.
 
@@ -344,7 +332,7 @@ Stateful accumulators track message IDs, tool call IDs, content buffers, and fin
 |----------|----------|---------|
 | OpenAI | OpenAI Responses + Chat Completions | `api.openai.com` |
 | Anthropic | Anthropic Messages | `api.anthropic.com` |
-| Google | Google Gemini | `generativelanguage.googleapis.com` |
+| Google Gemini models | OpenAI-compatible Chat Completions | `generativelanguage.googleapis.com/v1beta/openai` |
 
 ### 5.2 Third-Party Compatible Endpoints
 
@@ -412,7 +400,6 @@ without relying on live provider credentials:
 | OpenAI Chat Completions | Unary, stream, tool, error |
 | OpenAI Responses | Unary, stream, tool, error |
 | Anthropic Messages | Unary, stream, tool, error |
-| Google Gemini GenerateContent | Unary, stream, tool, error |
 
 Protected compatible-provider smoke is narrower than the local mock matrix. It
 validates real OpenAI-compatible chat-completions and Anthropic-compatible
@@ -426,11 +413,10 @@ operator validation/example evidence.
 |-------------|----------------|-------------|
 | Codex CLI | OpenAI Responses | `codex exec --ephemeral` with proxy base URL |
 | Claude Code | Anthropic Messages | `claude --print` with proxy base URL |
-| Gemini CLI | Google Gemini | `gemini --prompt` with proxy base URL |
 | curl (OpenAI) | OpenAI Chat Completions | Direct HTTP request |
 | curl (Anthropic) | Anthropic Messages | Direct HTTP request |
 
-Current real-client regression coverage is intentionally narrow: smoke cases assert public tool identity as a per-client public editing tool contract by requiring Codex `apply_patch`, Claude Code `Edit`, or Gemini `replace` on the matching client surface, rejecting other clients' public tool names, and keeping `__llmup_custom__*` absent from public output. Long-horizon cases validate workspace-edit execution on supported lanes. This is not yet a full matrix of arbitrary structured tool behavior.
+Current real-client regression coverage is intentionally narrow: smoke cases assert public tool identity as a per-client public editing tool contract by requiring Codex `apply_patch` or Claude Code `Edit` on the matching client surface, rejecting other clients' public tool names, and keeping `__llmup_custom__*` absent from public output. Long-horizon cases validate workspace-edit execution on supported lanes. This is not yet a full matrix of arbitrary structured tool behavior.
 
 ---
 
@@ -484,8 +470,8 @@ These are NOT in scope for the current version but inform architectural decision
 
 | Metric | Target |
 |--------|--------|
-| All 16 protocol combinations within documented portability boundaries | 16/16 assessed as pass, warn, or reject as specified |
-| Streaming behavior across all protocol combinations within documented portability boundaries | 16/16 assessed as pass, warn, or reject as specified |
+| All 9 active protocol combinations within documented portability boundaries | 9/9 assessed as pass, warn, or reject as specified |
+| Streaming behavior across all active protocol combinations within documented portability boundaries | 9/9 assessed as pass, warn, or reject as specified |
 | Codex CLI works through configured proxy lanes | Required test upstreams pass within the wrapper surface contract |
 | Claude Code works through configured proxy lanes | Required test upstreams pass within the wrapper surface contract |
 | Passthrough adds < 1ms latency | Measured |

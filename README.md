@@ -7,7 +7,7 @@
 It is most useful when you want to:
 
 - use non-native models behind Codex CLI
-- route Claude Code or Gemini CLI through one local proxy
+- route Codex CLI and Claude Code through one local proxy
 - expose stable local model aliases instead of vendor model IDs
 
 > [!IMPORTANT]
@@ -115,10 +115,10 @@ Reasoning effort such as `xhigh` is a client/request-side setting, not part of t
 - Responses reasoning/compaction continuity is mode-bound: default/max_compat may drop an opaque carrier only when visible summary text or visible transcript history remains; strict/balanced fail closed; opaque-only reasoning and opaque-only compaction fail closed; same-provider/native passthrough preserves provider-owned state
 - the quickstart includes conservative text-only `surface_defaults`; turn on search, image, or parallel-tool flags only when that model surface really supports them
 - multimodal `surface.modalities.input` gates media types, not every source transport; HTTP(S) image/PDF URLs are distinct from provider or local URIs such as `gs://`, `s3://`, and `file://`
-- Gemini `inlineData` can be preserved when translating to OpenAI Chat/Responses, but all Gemini `fileData.fileUri` sources currently fail closed until an explicit fetch/upload adapter exists
+- Gemini models remain usable through Google's OpenAI-compatible endpoint by configuring that upstream as `format: openai-completion`; native Gemini `generateContent` wire format is not an active proxy surface
 - typed media metadata must be internally consistent; conflicting MIME hints such as `mime_type` versus a `file_data` data URI are rejected before the upstream call
 
-## Codex / Claude Code / Gemini Basic Setup
+## Codex / Claude Code Basic Setup
 
 For day-to-day usage, prefer the repo's wrapper scripts instead of hand-configuring each client. They handle local environment isolation, base URL injection, preset hydration, and client-specific metadata.
 
@@ -128,7 +128,6 @@ The defaults in `scripts/interactive_cli.py` match the provider-neutral preset n
 | --- | --- |
 | Codex CLI | `preset-openai-compatible` |
 | Claude Code | `preset-anthropic-compatible` |
-| Gemini CLI | `preset-openai-compatible` |
 
 ### Codex CLI
 
@@ -148,15 +147,6 @@ bash scripts/run_claude_proxy.sh \
   --model preset-anthropic-compatible
 ```
 
-### Gemini CLI
-
-```bash
-bash scripts/run_gemini_proxy.sh \
-  --config-source examples/quickstart-provider-neutral.yaml \
-  --workspace "$PWD" \
-  --model preset-openai-compatible
-```
-
 Pass `--proxy-base http://127.0.0.1:8080` when you want to attach to a proxy you started separately. When `--proxy-base` is omitted, the wrapper renders the preset config, starts the proxy, waits for `/health`, launches the client, and stops the proxy when the session exits.
 
 Wrapper base URL and actual proxy endpoint are related but not identical.
@@ -167,9 +157,20 @@ For Codex specifically, the wrapper currently fixes `wire_api="responses"`, so C
 | --- | --- | --- | --- |
 | Codex CLI | `OPENAI_BASE_URL=<proxy>/openai/v1` | `/responses` | `/openai/v1/responses` |
 | Claude Code | `ANTHROPIC_BASE_URL=<proxy>/anthropic` | `/v1/messages` | `/anthropic/v1/messages` |
-| Gemini CLI | `GOOGLE_GEMINI_BASE_URL=<proxy>/google` | `/v1beta/models/...` | `/google/v1beta/models/...` |
 
 Codex especially benefits from the wrapper because it injects temporary model metadata for proxy-backed aliases. For more detail, see [docs/clients.md](./docs/clients.md).
+
+To use Gemini as a provider, configure Google's OpenAI-compatible endpoint as a normal OpenAI-compatible upstream:
+
+```yaml
+upstreams:
+  GOOGLE-OPENAI-COMPATIBLE:
+    api_root: https://generativelanguage.googleapis.com/v1beta/openai
+    format: openai-completion
+    provider_key_env: GEMINI_API_KEY
+model_aliases:
+  gemini-flash: GOOGLE-OPENAI-COMPATIBLE:gemini-2.0-flash
+```
 
 ## Most Common Static Configuration
 
@@ -190,7 +191,7 @@ The static YAML story is intentionally small:
 Practical rules:
 
 - `api_root` should be the provider API root and include its version segment, such as `.../v1` or `.../v1beta`
-- `format` pins the upstream protocol: `openai-responses`, `openai-completion`, `anthropic`, or `google`
+- `format` pins the upstream protocol: `openai-responses`, `openai-completion`, or `anthropic`
 - aliases such as `preset-openai-compatible` and `preset-anthropic-compatible` are local names; they do not need to equal the upstream model ID
 - use structured aliases only when you want extra `limits` or `surface` metadata on top of `target: UPSTREAM:MODEL`
 - the provider-neutral `PRESET_*` placeholders are for wrapper-rendered config sources; direct static YAML should contain concrete URLs and model IDs
@@ -227,7 +228,7 @@ That flow is documented in [docs/admin-dynamic-config.md](./docs/admin-dynamic-c
 ## Keep Reading
 
 - [docs/configuration.md](./docs/configuration.md): static config, alias patterns, YAML reference
-- [docs/clients.md](./docs/clients.md): Codex / Claude Code / Gemini wrapper setup and base URL details
+- [docs/clients.md](./docs/clients.md): Codex / Claude Code wrapper setup and base URL details
 - [docs/container.md](./docs/container.md): GHCR image usage, Docker Compose, container smoke, and release policy
 - [docs/admin-dynamic-config.md](./docs/admin-dynamic-config.md): admin API, live config, CAS updates
 - [docs/ga-readiness-review.md](./docs/ga-readiness-review.md): GA scope, release evidence, and compatibility boundaries

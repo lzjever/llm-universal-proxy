@@ -145,7 +145,7 @@ class DocsHomepageContractTests(unittest.TestCase):
             self.read_text("README.md"),
             (
                 "## Quick Start",
-                "## Codex / Claude Code / Gemini Basic Setup",
+                "## Codex / Claude Code Basic Setup",
                 "## Most Common Static Configuration",
                 "## Dynamic Configuration Overview",
             ),
@@ -154,7 +154,7 @@ class DocsHomepageContractTests(unittest.TestCase):
             self.read_text("README_CN.md"),
             (
                 "## Quick Start",
-                "## Codex / Claude Code / Gemini 基本接法",
+                "## Codex / Claude Code 基本接法",
                 "## 最常用静态配置",
                 "## 动态配置概要",
             ),
@@ -291,10 +291,13 @@ class DocsHomepageContractTests(unittest.TestCase):
         )
         self.assertIn("`OPENAI_BASE_URL=<proxy>/openai/v1`", text)
         self.assertIn("`ANTHROPIC_BASE_URL=<proxy>/anthropic`", text)
-        self.assertIn("`GOOGLE_GEMINI_BASE_URL=<proxy>/google`", text)
         self.assertIn("`/openai/v1/responses`", text)
         self.assertIn("`/anthropic/v1/messages`", text)
-        self.assertIn("`/google/v1beta/models/...`", text)
+        self.assertIn("https://generativelanguage.googleapis.com/v1beta/openai", text)
+        self.assertIn("format: openai-completion", text)
+        self.assertNotIn("`GOOGLE_GEMINI_BASE_URL=<proxy>/google`", text)
+        self.assertNotIn("`/google/v1beta/models/...`", text)
+        self.assertNotIn("### Gemini CLI", text)
         self.assertIn("`preset-openai-compatible`", text)
         self.assertIn("`preset-anthropic-compatible`", text)
         self.assertIn("examples/quickstart-provider-neutral.yaml", text)

@@ -285,33 +285,6 @@ fn anthropic_protocol_terminal(
     }
 }
 
-fn google_protocol_terminal(event: &Value) -> Option<ProtocolTerminal> {
-    let candidate = event
-        .get("candidates")
-        .and_then(Value::as_array)
-        .and_then(|candidates| candidates.first())?;
-    let finish_reason = candidate
-        .get("finishReason")
-        .and_then(Value::as_str)
-        .map(str::to_string)?;
-    let kind = match finish_reason.as_str() {
-        "MAX_TOKENS" | "SAFETY" | "RECITATION" => ProtocolTerminalKind::Incomplete,
-        "MALFORMED_FUNCTION_CALL"
-        | "UNEXPECTED_TOOL_CALL"
-        | "TOO_MANY_TOOL_CALLS"
-        | "MISSING_THOUGHT_SIGNATURE" => ProtocolTerminalKind::Failed,
-        _ => ProtocolTerminalKind::Success,
-    };
-    Some(ProtocolTerminal {
-        kind,
-        event_type: "candidate".to_string(),
-        finish_reason: Some(finish_reason.clone()),
-        incomplete_reason: matches!(kind, ProtocolTerminalKind::Incomplete)
-            .then_some(finish_reason),
-        error: None,
-    })
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct HeaderEntry {
     pub name: String,
@@ -428,28 +401,6 @@ impl NormalizedUsage {
                     cache_read_input_tokens: usage
                         .get("cache_read_input_tokens")
                         .and_then(Value::as_u64),
-                }
-            }
-            UpstreamFormat::Google => {
-                let usage = body.get("usageMetadata").unwrap_or(&Value::Null);
-                let input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
-                let output_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64);
-                Self {
-                    input_tokens,
-                    output_tokens,
-                    total_tokens: usage
-                        .get("totalTokenCount")
-                        .and_then(Value::as_u64)
-                        .or_else(|| match (input_tokens, output_tokens) {
-                            (Some(i), Some(o)) => Some(i + o),
-                            _ => None,
-                        }),
-                    cached_input_tokens: usage
-                        .get("cachedContentTokenCount")
-                        .and_then(Value::as_u64),
-                    reasoning_tokens: usage.get("thoughtsTokenCount").and_then(Value::as_u64),
-                    cache_creation_input_tokens: None,
-                    cache_read_input_tokens: None,
                 }
             }
         }
@@ -1270,7 +1221,6 @@ fn is_client_credential_header_name(name: &str) -> bool {
             | "x-api-key"
             | "api-key"
             | "openai-api-key"
-            | "x-goog-api-key"
             | "anthropic-api-key"
             | "x-llmup-data-token"
     )
@@ -1399,7 +1349,6 @@ enum ClientSseAccumulator {
     OpenAiCompletion(OpenAiCompletionAccumulator),
     Responses(ResponsesAccumulator),
     Anthropic(AnthropicAccumulator),
-    Google(GoogleAccumulator),
 }
 
 impl ClientSseAccumulator {
@@ -1408,7 +1357,6 @@ impl ClientSseAccumulator {
             UpstreamFormat::OpenAiCompletion => Self::OpenAiCompletion(Default::default()),
             UpstreamFormat::OpenAiResponses => Self::Responses(Default::default()),
             UpstreamFormat::Anthropic => Self::Anthropic(Default::default()),
-            UpstreamFormat::Google => Self::Google(Default::default()),
         }
     }
 
@@ -1417,7 +1365,6 @@ impl ClientSseAccumulator {
             Self::OpenAiCompletion(acc) => acc.on_event(event, capture_exchange),
             Self::Responses(acc) => acc.on_event(event, capture_exchange),
             Self::Anthropic(acc) => acc.on_event(event, capture_exchange),
-            Self::Google(acc) => acc.on_event(event, capture_exchange),
         }
     }
 
@@ -1426,7 +1373,6 @@ impl ClientSseAccumulator {
             Self::OpenAiCompletion(acc) => acc.final_body(),
             Self::Responses(acc) => acc.final_body(),
             Self::Anthropic(acc) => acc.final_body(),
-            Self::Google(acc) => acc.final_body(),
         }
     }
 
@@ -1435,7 +1381,6 @@ impl ClientSseAccumulator {
             Self::OpenAiCompletion(acc) => acc.final_usage(),
             Self::Responses(acc) => acc.final_usage(),
             Self::Anthropic(acc) => acc.final_usage(),
-            Self::Google(acc) => acc.final_usage(),
         }
     }
 
@@ -1444,7 +1389,6 @@ impl ClientSseAccumulator {
             Self::OpenAiCompletion(acc) => acc.protocol_terminal(),
             Self::Responses(acc) => acc.protocol_terminal(),
             Self::Anthropic(acc) => acc.protocol_terminal(),
-            Self::Google(acc) => acc.protocol_terminal(),
         }
     }
 }
@@ -2673,86 +2617,5 @@ mod tests {
         assert_eq!(body["reason"], "capture_queue_overflow");
         assert!(body["dropped_event_count"].as_u64().unwrap_or(0) >= 1);
         assert!(body.get("choices").is_none());
-    }
-}
-
-#[derive(Debug, Default)]
-struct GoogleAccumulator {
-    response: Value,
-    usage: Option<NormalizedUsage>,
-    protocol_terminal: Option<ProtocolTerminal>,
-}
-
-impl GoogleAccumulator {
-    fn on_event(&mut self, event: &Value, capture_exchange: bool) {
-        if capture_exchange && self.response.is_null() {
-            self.response = json!({
-                "candidates": [{
-                    "content": { "parts": [], "role": "model" }
-                }]
-            });
-        }
-        if let Some(candidates) = event.get("candidates").and_then(Value::as_array) {
-            if let Some(candidate) = candidates.first() {
-                if capture_exchange {
-                    if let Some(parts) = candidate
-                        .get("content")
-                        .and_then(|c| c.get("parts"))
-                        .and_then(Value::as_array)
-                    {
-                        let dest_parts = self.response["candidates"][0]["content"]["parts"]
-                            .as_array_mut()
-                            .unwrap();
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                if let Some(last) = dest_parts.last_mut() {
-                                    if last.get("text").is_some() {
-                                        let existing =
-                                            last.get("text").and_then(Value::as_str).unwrap_or("");
-                                        last["text"] = json!(format!("{}{}", existing, text));
-                                        continue;
-                                    }
-                                }
-                                dest_parts.push(json!({ "text": text }));
-                            } else if part.get("functionCall").is_some() {
-                                dest_parts.push(part.clone());
-                            }
-                        }
-                    }
-                    if let Some(reason) = candidate.get("finishReason") {
-                        self.response["candidates"][0]["finishReason"] = reason.clone();
-                    }
-                }
-                if candidate.get("finishReason").is_some() {
-                    self.protocol_terminal = google_protocol_terminal(event);
-                }
-            }
-        }
-        if capture_exchange {
-            if let Some(model) = event.get("modelVersion") {
-                self.response["modelVersion"] = model.clone();
-            }
-        }
-        if let Some(usage) = event.get("usageMetadata") {
-            if capture_exchange {
-                self.response["usageMetadata"] = usage.clone();
-            }
-            self.usage = Some(NormalizedUsage::from_client_body(
-                UpstreamFormat::Google,
-                &json!({ "usageMetadata": usage }),
-            ));
-        }
-    }
-
-    fn final_body(&self) -> Value {
-        self.response.clone()
-    }
-
-    fn final_usage(&self) -> NormalizedUsage {
-        self.usage.clone().unwrap_or_default()
-    }
-
-    fn protocol_terminal(&self) -> Option<ProtocolTerminal> {
-        self.protocol_terminal.clone()
     }
 }

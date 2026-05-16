@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real CLI matrix harness for Codex, Claude Code, and Gemini CLI."""
+"""Real CLI matrix harness for Codex and Claude Code."""
 
 from __future__ import annotations
 
@@ -48,26 +48,18 @@ VALID_PHASES = {
     "claude",
     "claude_basic",
     "claude_multi",
-    "gemini",
-    "gemini_basic",
-    "gemini_multi",
 }
-CLIENT_NAMES = ("codex", "claude", "gemini")
+CLIENT_NAMES = ("codex", "claude")
 TRACE_CLIENT_FORMAT_BY_CLIENT = {
     "codex": "openai-responses",
     "claude": "anthropic",
-    "gemini": "google",
 }
 TRACE_PATH_PREFIX_BY_CLIENT = {
     "codex": "/openai/",
     "claude": "/anthropic/",
-    "gemini": "/google/",
 }
 ANTHROPIC_NATIVE_UPSTREAM_FORMAT = "anthropic"
-GEMINI_NATIVE_UPSTREAM_FORMATS = frozenset({"google"})
 CANONICAL_UPSTREAM_FORMAT_BY_ALIAS = {
-    "google": "google",
-    "gemini": "google",
     "anthropic": "anthropic",
     "claude": "anthropic",
     "openai": "openai-completion",
@@ -93,18 +85,12 @@ SAFE_ENV_KEYS = (
     "WINDIR",
 )
 RUST_TOOLCHAIN_ENV_KEYS = ("CARGO_HOME", "RUSTUP_HOME")
-GEMINI_BOOTSTRAP_TIMEOUT_SECS = 180
-GEMINI_RUNNER_STATE_DIRNAME = "_runner_state"
-GEMINI_SHARED_HOME_DIRNAME = "gemini-home"
-GEMINI_BOOTSTRAP_MARKER = ".runner-gemini-bootstrap-ready"
 DEFAULT_PROXY_HEALTH_TIMEOUT_SECS = 45
 DEFAULT_CASE_TIMEOUT_FLOOR_SECS = 240
 DEFAULT_LONG_HORIZON_TIMEOUT_FLOOR_SECS = 420
-DEFAULT_GEMINI_BOOTSTRAP_TIMEOUT_SECS = 360
 DEFAULT_PROCESS_TERMINATE_GRACE_SECS = 15
 DEFAULT_POST_KILL_WAIT_SECS = 2
 DEFAULT_AUTO_COMPACT_RATIO = 0.85
-DEFAULT_GEMINI_COMPRESSION_THRESHOLD = DEFAULT_AUTO_COMPACT_RATIO
 DEFAULT_CODEX_TRUNCATION_LIMIT_BYTES = 10000
 RESERVED_INTERNAL_TOOL_NAME_PREFIX = "__llmup_custom__"
 INTERNAL_TOOL_ARTIFACT_PATTERN = re.compile(r"__llmup_custom__[A-Za-z0-9_:-]*")
@@ -481,12 +467,10 @@ class TimeoutPolicy:
     proxy_health_timeout_secs: int = DEFAULT_PROXY_HEALTH_TIMEOUT_SECS
     case_timeout_floor_secs: int = DEFAULT_CASE_TIMEOUT_FLOOR_SECS
     long_horizon_timeout_floor_secs: int = DEFAULT_LONG_HORIZON_TIMEOUT_FLOOR_SECS
-    gemini_bootstrap_timeout_secs: int = DEFAULT_GEMINI_BOOTSTRAP_TIMEOUT_SECS
     process_terminate_grace_secs: int = DEFAULT_PROCESS_TERMINATE_GRACE_SECS
 
 
 DEFAULT_TIMEOUT_POLICY = TimeoutPolicy()
-GEMINI_BOOTSTRAP_TIMEOUT_SECS = DEFAULT_TIMEOUT_POLICY.gemini_bootstrap_timeout_secs
 
 
 @dataclasses.dataclass
@@ -1825,24 +1809,6 @@ def expected_fail_closed_for_case(case: MatrixCase) -> ExpectedFailClosed | None
             required_all=("Anthropic request controls",),
             required_any=("thinking", "context_management"),
         )
-    if (
-        case.client_name == "gemini"
-        and case.fixture.requires_tool_loop
-        and upstream_format not in GEMINI_NATIVE_UPSTREAM_FORMATS
-    ):
-        return ExpectedFailClosed(
-            category="gemini_provider_thought_signature",
-            reason=(
-                "Gemini tool-loop provider thought-signature state requires native "
-                "Gemini upstream format"
-            ),
-            required_all=(
-                "Gemini content part field",
-                "provider thought-signature state",
-                "cannot be faithfully translated",
-            ),
-            required_any=("thoughtSignature", "thought_signature"),
-        )
     return None
 
 
@@ -1925,10 +1891,6 @@ def default_auto_compact_token_limit(
 
 def codex_model_catalog_path(home_dir: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(home_dir) / ".codex" / "catalog.json"
-
-
-def gemini_settings_path(home_dir: pathlib.Path) -> pathlib.Path:
-    return pathlib.Path(home_dir) / ".gemini" / "settings.json"
 
 
 def replay_marker_key_path(runtime_root: pathlib.Path) -> pathlib.Path:
@@ -2062,69 +2024,6 @@ def build_codex_proxy_provider_args(proxy_base: str) -> list[str]:
     ]
 
 
-def build_gemini_settings_payload(
-    model_name: str, model_limits: ModelLimits | None
-) -> dict[str, object] | None:
-    if model_limits is None:
-        return None
-
-    override_generate_content_config: dict[str, object] = {}
-    if model_limits.max_output_tokens is not None:
-        override_generate_content_config["maxOutputTokens"] = (
-            model_limits.max_output_tokens
-        )
-    if not override_generate_content_config and model_limits.context_window is None:
-        return None
-
-    model_definition: dict[str, object] = {
-        "displayName": model_name,
-        "tier": "custom",
-        "family": "proxy",
-        "isPreview": False,
-        "isVisible": True,
-        "features": {
-            "thinking": True,
-            "multimodalToolUse": False,
-        },
-    }
-    if model_limits.context_window is not None:
-        model_definition["dialogDescription"] = (
-            f"Proxy-backed model with about {model_limits.context_window} tokens of context."
-        )
-
-    payload: dict[str, object] = {
-        "model": {
-            "compressionThreshold": DEFAULT_GEMINI_COMPRESSION_THRESHOLD,
-        },
-        "modelConfigs": {
-            "modelDefinitions": {model_name: model_definition},
-        },
-    }
-    if override_generate_content_config:
-        payload["modelConfigs"]["customOverrides"] = [
-            {
-                "match": {"model": model_name},
-                "modelConfig": {
-                    "model": model_name,
-                    "generateContentConfig": override_generate_content_config,
-                },
-            }
-        ]
-    return payload
-
-
-def ensure_gemini_settings(
-    home_dir: pathlib.Path, model_name: str, model_limits: ModelLimits | None
-) -> pathlib.Path | None:
-    payload = build_gemini_settings_payload(model_name, model_limits)
-    if payload is None:
-        return None
-    settings_path = gemini_settings_path(home_dir)
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    return settings_path
-
-
 def ensure_replay_marker_key(runtime_root: pathlib.Path) -> str:
     key_path = replay_marker_key_path(runtime_root)
     if key_path.exists():
@@ -2160,11 +2059,6 @@ def add_timeout_policy_args(
             type=int,
             default=DEFAULT_TIMEOUT_POLICY.long_horizon_timeout_floor_secs,
         )
-        parser.add_argument(
-            "--gemini-bootstrap-timeout-secs",
-            type=int,
-            default=DEFAULT_TIMEOUT_POLICY.gemini_bootstrap_timeout_secs,
-        )
 
 
 def timeout_policy_from_args(args: argparse.Namespace) -> TimeoutPolicy:
@@ -2178,13 +2072,6 @@ def timeout_policy_from_args(args: argparse.Namespace) -> TimeoutPolicy:
                 args,
                 "long_horizon_timeout_floor_secs",
                 DEFAULT_TIMEOUT_POLICY.long_horizon_timeout_floor_secs,
-            )
-        ),
-        gemini_bootstrap_timeout_secs=int(
-            getattr(
-                args,
-                "gemini_bootstrap_timeout_secs",
-                DEFAULT_TIMEOUT_POLICY.gemini_bootstrap_timeout_secs,
             )
         ),
         process_terminate_grace_secs=int(args.process_stop_grace_secs),
@@ -2250,15 +2137,6 @@ def build_client_env(
                 "ANTHROPIC_BASE_URL": f"{proxy_base}/anthropic",
             }
         )
-    elif client_name == "gemini":
-        env.update(
-            {
-                "GEMINI_API_KEY": proxy_key,
-                "GOOGLE_GEMINI_BASE_URL": f"{proxy_base}/google",
-            }
-        )
-        if model_name is not None:
-            ensure_gemini_settings(home_dir, model_name, model_limits)
     else:
         raise ValueError(f"unknown client: {client_name}")
     return env
@@ -4352,7 +4230,7 @@ def _plain_presented_tool_name_context(line: str, expected: str) -> bool:
 def _presented_tool_name_present(stdout_text: str, expected: str) -> bool:
     normalized_text = stdout_text.replace("\\r\\n", "\n").replace("\\n", "\n")
     term_pattern = _presented_tool_name_token_pattern(expected)
-    client_label_pattern = r"(?:[`*_]+\s*)*(?:codex|claude|gemini)(?:\s*[`*_]+)*"
+    client_label_pattern = r"(?:[`*_]+\s*)*(?:codex|claude)(?:\s*[`*_]+)*"
     list_token_pattern = _presented_tool_name_list_token_pattern()
 
     for raw_line in normalized_text.splitlines():
@@ -4998,27 +4876,7 @@ def prepare_workspace(
 
 
 def resolve_client_home_dir(case: MatrixCase, runtime_root: pathlib.Path) -> pathlib.Path:
-    if case.client_name == "gemini":
-        return runtime_root / GEMINI_RUNNER_STATE_DIRNAME / GEMINI_SHARED_HOME_DIRNAME
     return runtime_root / "homes" / _client_runtime_case_token(case, runtime_root)
-
-
-def _gemini_bootstrap_bin_dir(home_dir: pathlib.Path) -> pathlib.Path:
-    return home_dir / ".gemini" / "tmp" / "bin"
-
-
-def gemini_bootstrap_ready(home_dir: pathlib.Path) -> bool:
-    bin_dir = _gemini_bootstrap_bin_dir(home_dir)
-    marker_path = home_dir / GEMINI_BOOTSTRAP_MARKER
-    return marker_path.exists() or any(
-        (bin_dir / candidate).exists() for candidate in ("rg", "rg.exe")
-    )
-
-
-def mark_gemini_bootstrap_ready(home_dir: pathlib.Path) -> None:
-    marker_path = home_dir / GEMINI_BOOTSTRAP_MARKER
-    marker_path.parent.mkdir(parents=True, exist_ok=True)
-    marker_path.write_text("ready\n", encoding="utf-8")
 
 
 def resolve_case_timeout_secs(
@@ -5031,11 +4889,7 @@ def resolve_case_timeout_secs(
         timeout_secs = max(
             timeout_secs, timeout_policy.long_horizon_timeout_floor_secs
         )
-    if case.client_name != "gemini":
-        return timeout_secs
-    if gemini_bootstrap_ready(home_dir):
-        return timeout_secs
-    return max(timeout_secs, timeout_policy.gemini_bootstrap_timeout_secs)
+    return timeout_secs
 
 
 def _report_path(report_dir: pathlib.Path, target: pathlib.Path) -> str:
@@ -5426,28 +5280,6 @@ def build_client_command(
             command, context="real CLI command"
         )
         return command
-    if client_name == "gemini":
-        command = [
-            "gemini",
-            "--prompt",
-            prompt_text,
-            "--model",
-            lane.proxy_model,
-        ]
-        if dangerous_harness:
-            command.extend(["--sandbox=false", "--yolo"])
-        command.extend(
-            [
-                "--include-directories",
-                str(workspace_dir),
-                "--output-format",
-                "text",
-            ]
-        )
-        ensure_no_public_internal_tool_artifacts(
-            command, context="real CLI command"
-        )
-        return command
     raise ValueError(f"unknown client: {client_name}")
 
 
@@ -5514,10 +5346,6 @@ def run_matrix_case(
         else:
             run_kwargs["stdin"] = subprocess.DEVNULL
         completed = subprocess.run(command, **run_kwargs)
-        if case.client_name == "gemini" and (
-            completed.returncode == 0 or gemini_bootstrap_ready(home_dir)
-        ):
-            mark_gemini_bootstrap_ready(home_dir)
         stdout_text = completed.stdout or ""
         stderr_text = completed.stderr or ""
         workspace_diff_summary = summarize_workspace_diff(
@@ -5856,7 +5684,6 @@ def run(argv: list[str] | None = None) -> int:
             print(f"Proxy healthy at {proxy_base}")
             print(f"OpenAI base: {proxy_base}/openai/v1")
             print(f"Anthropic base: {proxy_base}/anthropic")
-            print(f"Gemini base: {proxy_base}/google")
             try:
                 process.wait()
             except KeyboardInterrupt:

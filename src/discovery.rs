@@ -6,11 +6,10 @@ use crate::config::build_upstream_url;
 use crate::formats::UpstreamFormat;
 
 /// Order of "genericity" for default conversion target (first supported wins).
-const DEFAULT_TARGET_ORDER: [UpstreamFormat; 4] = [
+const DEFAULT_TARGET_ORDER: [UpstreamFormat; 3] = [
     UpstreamFormat::OpenAiCompletion,
     UpstreamFormat::OpenAiResponses,
     UpstreamFormat::Anthropic,
-    UpstreamFormat::Google,
 ];
 
 /// Resolved upstream capability: which formats are supported and the default target for translation.
@@ -146,9 +145,6 @@ fn minimal_probe_body(format: UpstreamFormat) -> serde_json::Value {
             "max_tokens": 1,
             "messages": []
         }),
-        UpstreamFormat::Google => serde_json::json!({
-            "contents": []
-        }),
     }
 }
 
@@ -199,7 +195,6 @@ fn auth_header_for_format(format: UpstreamFormat, api_key: &str) -> (&'static st
             ("authorization", format!("Bearer {api_key}"))
         }
         UpstreamFormat::Anthropic => ("x-api-key", api_key.to_string()),
-        UpstreamFormat::Google => ("x-goog-api-key", api_key.to_string()),
     }
 }
 
@@ -268,7 +263,6 @@ mod tests {
         assert!(supported.contains(&UpstreamFormat::OpenAiCompletion));
         assert!(supported.contains(&UpstreamFormat::OpenAiResponses));
         assert!(supported.contains(&UpstreamFormat::Anthropic));
-        assert!(supported.contains(&UpstreamFormat::Google));
 
         let recorded = paths.lock().await;
         assert!(
@@ -303,7 +297,6 @@ mod tests {
     #[test]
     fn capability_from_supported_default_target_order() {
         let mut supported = HashSet::new();
-        supported.insert(UpstreamFormat::Google);
         supported.insert(UpstreamFormat::OpenAiCompletion);
         let cap = UpstreamCapability::from_supported(supported).expect("capability");
         assert_eq!(cap.default_target, UpstreamFormat::OpenAiCompletion);
@@ -332,7 +325,6 @@ mod tests {
     #[test]
     fn default_target_order_respects_genericity() {
         let mut supported = HashSet::new();
-        supported.insert(UpstreamFormat::Google);
         supported.insert(UpstreamFormat::Anthropic);
         let cap = UpstreamCapability::from_supported(supported).expect("capability");
         assert_eq!(cap.default_target, UpstreamFormat::Anthropic);

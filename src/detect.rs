@@ -40,11 +40,6 @@ fn detect_by_body(body: &Value) -> UpstreamFormat {
         }
     }
 
-    // Gemini/Google: contents array
-    if body.get("contents").and_then(Value::as_array).is_some() {
-        return UpstreamFormat::Google;
-    }
-
     // OpenAI-specific fields (check before Claude)
     if body.get("stream_options").is_some()
         || body.get("response_format").is_some()
@@ -125,10 +120,13 @@ mod tests {
     }
 
     #[test]
-    fn detect_google_by_contents() {
-        let path = "/google/v1beta/models/gemini-local:generateContent";
+    fn contents_body_no_longer_selects_removed_google_format() {
+        let path = "/openai/v1/chat/completions";
         let body = json!({ "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }] });
-        assert_eq!(detect_request_format(path, &body), UpstreamFormat::Google);
+        assert_eq!(
+            detect_request_format(path, &body),
+            UpstreamFormat::OpenAiCompletion
+        );
     }
 
     #[test]

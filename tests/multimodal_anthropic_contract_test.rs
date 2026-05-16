@@ -18,7 +18,6 @@ use std::time::Duration;
 const TEST_PROVIDER_KEY: &str = "provider-secret";
 const AUDIO_WAV_B64: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
 const PDF_B64: &str = "JVBERi0x";
-const POLLUTED_PDF_B64: &str = "JVBE\r\nRi0x";
 const PDF_DATA_URI: &str = "data:application/pdf;base64,JVBERi0x";
 const POLLUTED_REMOTE_IMAGE_URL: &str = "https://example.test/assets/cat.png\nfile:///tmp/cat.png";
 const CONTROL_POLLUTED_REMOTE_IMAGE_URL: &str = "https://example.test/assets/\u{0007}cat.png";
@@ -913,113 +912,6 @@ async fn openai_non_pdf_file_audio_and_video_to_anthropic_fail_closed_before_ups
     }
 }
 
-#[tokio::test]
-async fn gemini_pdf_inline_and_file_data_to_anthropic_documents() {
-    let (mock_base, _mock, captured) =
-        spawn_asserting_anthropic_mock(assert_anthropic_gemini_pdf_documents).await;
-    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let response = authenticated_reqwest_client()
-        .post(format!(
-            "{proxy_base}/google/v1beta/models/claude-3-5-sonnet:generateContent"
-        ))
-        .json(&json!({
-            "model": "claude-3-5-sonnet",
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    { "text": "Summarize these PDFs" },
-                    { "inlineData": { "mimeType": "application/pdf", "data": PDF_B64 } },
-                    { "fileData": {
-                        "mimeType": "application/pdf",
-                        "fileUri": REMOTE_PDF_URL,
-                        "displayName": "policy.pdf"
-                    }}
-                ]
-            }]
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    assert_success_response(response).await;
-    assert_upstream_called_once(&captured).await;
-}
-
-#[tokio::test]
-async fn gemini_polluted_inline_data_to_anthropic_fails_closed_before_upstream() {
-    let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(|_| {
-        Err("polluted Gemini inlineData reached Anthropic upstream".to_string())
-    })
-    .await;
-    let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let response = authenticated_reqwest_client()
-        .post(format!(
-            "{proxy_base}/google/v1beta/models/claude-3-5-sonnet:generateContent"
-        ))
-        .json(&json!({
-            "model": "claude-3-5-sonnet",
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    { "text": "Summarize this PDF" },
-                    { "inlineData": { "mimeType": "application/pdf", "data": POLLUTED_PDF_B64 } }
-                ]
-            }]
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    assert_failure_response(response).await;
-    assert_no_upstream_request(&captured).await;
-}
-
-#[tokio::test]
-async fn gemini_audio_and_video_to_anthropic_fail_closed_before_upstream() {
-    for (label, part) in [
-        (
-            "Gemini audio",
-            json!({ "inlineData": { "mimeType": "audio/wav", "data": AUDIO_WAV_B64 } }),
-        ),
-        (
-            "Gemini video",
-            json!({ "inlineData": { "mimeType": "video/mp4", "data": "AAAA" } }),
-        ),
-    ] {
-        let (mock_base, _mock, captured) = spawn_asserting_anthropic_mock(move |_| {
-            Err(format!("{label} reached Anthropic upstream"))
-        })
-        .await;
-        let config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
-        let (proxy_base, _proxy) = start_proxy(config).await;
-
-        let response = authenticated_reqwest_client()
-            .post(format!(
-                "{proxy_base}/google/v1beta/models/claude-3-5-sonnet:generateContent"
-            ))
-            .json(&json!({
-                "model": "claude-3-5-sonnet",
-                "contents": [{
-                    "role": "user",
-                    "parts": [
-                        { "text": "Inspect this media" },
-                        part
-                    ]
-                }]
-            }))
-            .send()
-            .await
-            .unwrap();
-
-        assert_failure_response(response).await;
-        assert_no_upstream_request(&captured).await;
-    }
-}
-
 async fn assert_success_response(response: reqwest::Response) -> Value {
     let status = response.status();
     let body = response.text().await.unwrap();
@@ -1119,50 +1011,6 @@ fn assert_anthropic_pdf_url_document(request: &CapturedMockRequest) -> Result<()
     expect_pointer(
         &request.body,
         "/messages/0/content/1/source/url",
-        json!(REMOTE_PDF_URL),
-    )
-}
-
-fn assert_anthropic_gemini_pdf_documents(request: &CapturedMockRequest) -> Result<(), String> {
-    expect_pointer(&request.body, "/messages/0/role", json!("user"))?;
-    expect_pointer(
-        &request.body,
-        "/messages/0/content/0/text",
-        json!("Summarize these PDFs"),
-    )?;
-    expect_pointer(
-        &request.body,
-        "/messages/0/content/1/type",
-        json!("document"),
-    )?;
-    expect_pointer(
-        &request.body,
-        "/messages/0/content/1/source/type",
-        json!("base64"),
-    )?;
-    expect_pointer(
-        &request.body,
-        "/messages/0/content/1/source/media_type",
-        json!("application/pdf"),
-    )?;
-    expect_pointer(
-        &request.body,
-        "/messages/0/content/1/source/data",
-        json!(PDF_B64),
-    )?;
-    expect_pointer(
-        &request.body,
-        "/messages/0/content/2/type",
-        json!("document"),
-    )?;
-    expect_pointer(
-        &request.body,
-        "/messages/0/content/2/source/type",
-        json!("url"),
-    )?;
-    expect_pointer(
-        &request.body,
-        "/messages/0/content/2/source/url",
         json!(REMOTE_PDF_URL),
     )
 }

@@ -7,7 +7,6 @@ pub(crate) fn translation_target_label(format: UpstreamFormat) -> &'static str {
         UpstreamFormat::OpenAiCompletion => "OpenAI Chat Completions",
         UpstreamFormat::OpenAiResponses => "OpenAI Responses",
         UpstreamFormat::Anthropic => "Anthropic",
-        UpstreamFormat::Google => "Gemini",
     }
 }
 
@@ -38,24 +37,6 @@ pub(crate) fn single_required_array_item<'a>(
             items.len(),
         )),
         None => Err(format!("missing {field_name}")),
-    }
-}
-
-pub(crate) fn single_optional_array_item<'a>(
-    items: Option<&'a [Value]>,
-    source_label: &str,
-    target_label: &str,
-    field_name: &str,
-) -> Result<Option<&'a Value>, String> {
-    match items {
-        Some([item]) => Ok(Some(item)),
-        Some([]) | None => Ok(None),
-        Some(items) => Err(single_candidate_choice_contract_message(
-            source_label,
-            target_label,
-            field_name,
-            items.len(),
-        )),
     }
 }
 
@@ -104,10 +85,6 @@ pub(crate) fn anthropic_tool_result_order_not_portable_message(target_label: &st
     format!(
         "Anthropic user turns that mix `tool_result` blocks with surrounding content cannot be faithfully translated to {target_label} without reordering blocks"
     )
-}
-
-pub(crate) fn gemini_function_response_parts_not_portable_message(target_label: &str) -> String {
-    format!("Gemini functionResponse.parts cannot be faithfully translated to {target_label}")
 }
 
 pub(crate) fn openai_assistant_audio_not_portable_message(target_label: &str) -> String {

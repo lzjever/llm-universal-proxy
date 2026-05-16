@@ -306,141 +306,6 @@ data: {"type":"response.completed","response":{"id":"resp_duplicate","object":"r
 }
 
 #[test]
-fn translate_sse_event_openai_to_non_openai_single_frame_multi_choice_fails_closed() {
-    for client_format in [UpstreamFormat::Google, UpstreamFormat::OpenAiResponses] {
-        let mut state = StreamState::default();
-        let out = translate_sse_event(
-            UpstreamFormat::OpenAiCompletion,
-            client_format,
-            &serde_json::json!({
-                "id": "chatcmpl-msg123",
-                "model": "gpt-4o",
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": { "content": "candidate-0" },
-                        "finish_reason": null
-                    },
-                    {
-                        "index": 1,
-                        "delta": { "content": "candidate-1" },
-                        "finish_reason": null
-                    }
-                ]
-            }),
-            &mut state,
-        );
-
-        let joined = out
-            .iter()
-            .map(|bytes| String::from_utf8_lossy(bytes).to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            state.fatal_rejection.is_some(),
-            "client_format = {client_format:?}, out = {joined}"
-        );
-        if client_format == UpstreamFormat::Google {
-            assert!(
-                out.is_empty(),
-                "Gemini sink must not emit ad-hoc error frames"
-            );
-        } else {
-            assert!(
-                !out.is_empty(),
-                "Responses sink should surface incompatibility as response.failed"
-            );
-            assert!(
-                !joined.contains("candidate-0") && !joined.contains("candidate-1"),
-                "fatal reject must not leak mixed-choice content for {client_format:?}: {joined}"
-            );
-        }
-    }
-}
-
-#[test]
-fn translate_sse_event_openai_to_non_openai_cross_frame_multi_choice_rejects_and_suppresses() {
-    for client_format in [UpstreamFormat::Google, UpstreamFormat::OpenAiResponses] {
-        let mut state = StreamState::default();
-        let first = translate_sse_event(
-            UpstreamFormat::OpenAiCompletion,
-            client_format,
-            &serde_json::json!({
-                "id": "chatcmpl-msg123",
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "delta": { "content": "candidate-0" },
-                    "finish_reason": null
-                }]
-            }),
-            &mut state,
-        );
-        assert!(
-            state.fatal_rejection.is_none(),
-            "single-choice frame should not be rejected early for {client_format:?}: {first:?}"
-        );
-        let second = translate_sse_event(
-            UpstreamFormat::OpenAiCompletion,
-            client_format,
-            &serde_json::json!({
-                "id": "chatcmpl-msg123",
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 1,
-                    "delta": { "content": "candidate-1" },
-                    "finish_reason": null
-                }]
-            }),
-            &mut state,
-        );
-        let third = translate_sse_event(
-            UpstreamFormat::OpenAiCompletion,
-            client_format,
-            &serde_json::json!({
-                "id": "chatcmpl-msg123",
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "delta": { "content": "after-reject" },
-                    "finish_reason": null
-                }]
-            }),
-            &mut state,
-        );
-
-        let second_joined = second
-            .iter()
-            .map(|bytes| String::from_utf8_lossy(bytes).to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            state.fatal_rejection.is_some(),
-            "second frame should fatal reject mixed choice stream for {client_format:?}: {second_joined}"
-        );
-        if client_format == UpstreamFormat::Google {
-            assert!(
-                second.is_empty(),
-                "Gemini sink must not emit ad-hoc error frames for fatal rejection"
-            );
-        } else {
-            assert!(
-                !second.is_empty(),
-                "Responses sink should surface incompatibility as response.failed"
-            );
-            assert!(
-                !second_joined.contains("candidate-1"),
-                "fatal reject must not leak mixed-choice content for {client_format:?}: {second_joined}"
-            );
-        }
-        assert!(
-            third.is_empty(),
-            "follow-up after fatal reject should be suppressed for {client_format:?}"
-        );
-    }
-}
-
-#[test]
 fn stream_usage_detail_objects_match_non_stream_translation() {
     let responses_usage = serde_json::json!({
         "input_tokens": 11,
@@ -543,11 +408,10 @@ fn parse_sse_json_frame(bytes: &[u8]) -> Value {
     take_one_sse_event(&mut buf).expect("parse sse event")
 }
 
-fn translated_sse_matrix_formats() -> [UpstreamFormat; 4] {
+fn translated_sse_matrix_formats() -> [UpstreamFormat; 3] {
     [
         UpstreamFormat::OpenAiCompletion,
         UpstreamFormat::Anthropic,
-        UpstreamFormat::Google,
         UpstreamFormat::OpenAiResponses,
     ]
 }
@@ -577,16 +441,6 @@ fn translated_sse_matrix_valid_frame(upstream_format: UpstreamFormat, sentinel: 
                 }
             }),
         ),
-        UpstreamFormat::Google => format_sse_data(&serde_json::json!({
-            "responseId": "gemini-translated-guard",
-            "modelVersion": "gemini-test",
-            "candidates": [{
-                "content": {
-                    "role": "model",
-                    "parts": [{ "text": sentinel }]
-                }
-            }]
-        })),
         UpstreamFormat::OpenAiResponses => format_sse_event(
             "response.output_text.delta",
             &serde_json::json!({
@@ -622,49 +476,6 @@ async fn collect_translated_sse_strings(
 
 fn oversized_unterminated_sse_frame() -> Vec<u8> {
     vec![b'x'; crate::streaming::stream::DEFAULT_MAX_SSE_FRAME_BYTES + 1]
-}
-
-fn assert_gemini_frame_too_large_error(frames: &[String]) {
-    assert!(
-        !frames.is_empty(),
-        "Gemini client must observe an error frame"
-    );
-    let payloads = frames
-        .iter()
-        .map(|frame| parse_sse_json_frame(frame.as_bytes()))
-        .collect::<Vec<_>>();
-    let error = payloads
-        .iter()
-        .find_map(|payload| payload.get("error"))
-        .unwrap_or_else(|| panic!("Gemini client must observe an error payload: {frames:?}"));
-    assert_eq!(error["code"], 3);
-    assert_eq!(error["status"], "INVALID_ARGUMENT");
-    assert_eq!(
-        error["message"],
-        "Upstream SSE frame exceeded the maximum supported size."
-    );
-    assert_eq!(
-        error["details"][0]["@type"],
-        "type.googleapis.com/google.rpc.ErrorInfo"
-    );
-    assert_eq!(
-        error["details"][0]["reason"],
-        "upstream_sse_frame_too_large"
-    );
-    assert_eq!(
-        error["details"][0]["metadata"]["code"],
-        "upstream_sse_frame_too_large"
-    );
-    assert_eq!(
-        error["details"][0]["metadata"]["type"],
-        "invalid_request_error"
-    );
-    let joined = payloads
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!joined.contains("\"type\":\"server_error\""), "{joined}");
 }
 
 #[tokio::test]
@@ -704,28 +515,6 @@ async fn guarded_sse_stream_rejects_oversized_unterminated_frame_and_stops() {
     );
     assert!(!joined.contains("\"type\":\"server_error\""), "{joined}");
     assert!(!joined.contains(SENTINEL), "{joined}");
-}
-
-#[tokio::test]
-async fn guarded_sse_stream_google_rejects_oversized_unterminated_frame_observably() {
-    const SENTINEL: &str = "SAFE_AFTER_OVERSIZED_GUARDED_GEMINI_FRAME";
-
-    let inner = futures_util::stream::iter(vec![
-        Ok::<Bytes, std::io::Error>(Bytes::from(oversized_unterminated_sse_frame())),
-        Ok::<Bytes, std::io::Error>(Bytes::from(translated_sse_matrix_valid_frame(
-            UpstreamFormat::Google,
-            SENTINEL,
-        ))),
-    ]);
-    let mut stream = GuardedSseStream::new(inner, UpstreamFormat::Google);
-    let mut frames = Vec::new();
-    while let Some(frame) = stream.next().await {
-        let frame = frame.expect("guarded frame");
-        frames.push(String::from_utf8(frame.to_vec()).expect("utf8 frame"));
-    }
-
-    assert_gemini_frame_too_large_error(&frames);
-    assert!(!frames.join("\n").contains(SENTINEL), "{frames:?}");
 }
 
 #[tokio::test]
@@ -935,24 +724,6 @@ async fn translated_sse_stream_fails_closed_on_accumulated_state_cap() {
 }
 
 #[tokio::test]
-async fn translated_sse_stream_google_rejects_oversized_unterminated_frame_observably() {
-    const SENTINEL: &str = "SAFE_AFTER_OVERSIZED_TRANSLATED_GEMINI_FRAME";
-
-    let frames = collect_translated_sse_strings(
-        UpstreamFormat::OpenAiCompletion,
-        UpstreamFormat::Google,
-        vec![
-            oversized_unterminated_sse_frame(),
-            translated_sse_matrix_valid_frame(UpstreamFormat::OpenAiCompletion, SENTINEL),
-        ],
-    )
-    .await;
-
-    assert_gemini_frame_too_large_error(&frames);
-    assert!(!frames.join("\n").contains(SENTINEL), "{frames:?}");
-}
-
-#[tokio::test]
 async fn translated_sse_stream_malformed_raw_artifact_frames_fail_closed_for_all_cross_format_pairs(
 ) {
     const SENTINEL: &str = "SAFE_AFTER_MALFORMED_RAW_ARTIFACT_FRAME";
@@ -1108,102 +879,6 @@ async fn translate_sse_stream_closes_promptly_after_fatal_rejection() {
         1,
         "upstream should not be polled again after fatal rejection"
     );
-}
-
-#[tokio::test]
-async fn translate_sse_stream_gemini_to_anthropic_defers_finish_until_stream_end() {
-    let inner = futures_util::stream::iter(vec![
-        Ok::<Bytes, std::io::Error>(Bytes::from_static(
-            br#"data: {"candidates":[{"content":{"parts":[{"text":"think","thought":true}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"thoughtsTokenCount":1,"totalTokenCount":3}}
-
-"#,
-        )),
-        Ok::<Bytes, std::io::Error>(Bytes::from_static(
-            br#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"thoughtsTokenCount":1,"totalTokenCount":4}}
-
-"#,
-        )),
-    ]);
-    let mut stream =
-        TranslateSseStream::new(inner, UpstreamFormat::Google, UpstreamFormat::Anthropic);
-
-    let mut events = Vec::new();
-    while let Some(frame) = stream.next().await {
-        let frame = frame.expect("translated frame");
-        events.push(parse_sse_json_frame(&frame));
-    }
-
-    assert_eq!(events[0]["type"], "message_start");
-    assert_eq!(events[1]["type"], "content_block_start");
-    assert_eq!(events[1]["content_block"]["type"], "thinking");
-    assert_eq!(events[2]["type"], "content_block_delta");
-    assert_eq!(events[2]["delta"]["thinking"], "think");
-    assert_eq!(events[3]["type"], "content_block_stop");
-    assert_eq!(events[4]["type"], "content_block_start");
-    assert_eq!(events[4]["content_block"]["type"], "text");
-    assert_eq!(events[5]["type"], "content_block_delta");
-    assert_eq!(events[5]["delta"]["text"], "Hi");
-    assert_eq!(events[6]["type"], "content_block_stop");
-    assert_eq!(events[7]["type"], "message_delta");
-    assert_eq!(events[7]["delta"]["stop_reason"], "end_turn");
-    assert_eq!(events[8]["type"], "message_stop");
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["type"] == "message_stop")
-            .count(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn translate_sse_stream_gemini_to_responses_bridges_custom_tool_calls_without_prefix_leak() {
-    let inner = futures_util::stream::iter(vec![
-        Ok::<Bytes, std::io::Error>(Bytes::from_static(
-            br#"data: {"responseId":"resp_gemini_custom","modelVersion":"gemini-2.5-flash","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call_apply_patch","name":"apply_patch","args":{"input":"*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n"}}}]},"finishReason":"STOP"}]}
-
-"#,
-        )),
-        Ok::<Bytes, std::io::Error>(Bytes::from_static(
-            br#"data: {"responseId":"resp_gemini_custom","modelVersion":"gemini-2.5-flash","candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}]}
-
-"#,
-        )),
-    ]);
-    let mut stream = TranslateSseStream::new(
-        inner,
-        UpstreamFormat::Google,
-        UpstreamFormat::OpenAiResponses,
-    )
-    .with_request_scoped_tool_bridge_context(Some(typed_tool_bridge_context(
-        "apply_patch",
-        "custom_grammar",
-        "max_compat",
-    )));
-
-    let mut frames = Vec::new();
-    while let Some(frame) = stream.next().await {
-        let frame = frame.expect("translated frame");
-        frames.push(String::from_utf8(frame.to_vec()).expect("utf8 frame"));
-    }
-    let joined = frames.join("\n");
-
-    assert!(
-        joined.contains("response.custom_tool_call_input.delta"),
-        "{joined}"
-    );
-    assert!(
-        joined.contains("response.custom_tool_call_input.done"),
-        "{joined}"
-    );
-    assert!(joined.contains("\"type\":\"custom_tool_call\""), "{joined}");
-    assert!(joined.contains("\"name\":\"apply_patch\""), "{joined}");
-    assert!(
-        !joined.contains("response.function_call_arguments.delta"),
-        "{joined}"
-    );
-    assert!(!joined.contains("\"type\":\"function_call\""), "{joined}");
-    assert!(!joined.contains("__llmup_custom__"), "{joined}");
 }
 
 #[test]

@@ -125,7 +125,6 @@ pub(super) fn extract_forwardable_headers(headers: &HeaderMap) -> Vec<(String, S
         "x-api-key",
         "api-key",
         "openai-api-key",
-        "x-goog-api-key",
         "anthropic-api-key",
         "anthropic-version",
         "anthropic-beta",
@@ -174,14 +173,12 @@ fn upsert_header(headers: &mut Vec<(String, String)>, name: String, value: Strin
 /// Different providers use different header names:
 /// - OpenAI/Responses: `Authorization: Bearer xxx`
 /// - Anthropic: `x-api-key: xxx`
-/// - Google: `x-goog-api-key: xxx`
 fn auth_header_for_format(format: UpstreamFormat, api_key: &str) -> (String, String) {
     match format {
         UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses => {
             ("authorization".to_string(), format!("Bearer {api_key}"))
         }
         UpstreamFormat::Anthropic => ("x-api-key".to_string(), api_key.to_string()),
-        UpstreamFormat::Google => ("x-goog-api-key".to_string(), api_key.to_string()),
     }
 }
 
@@ -190,12 +187,7 @@ fn strip_auth_headers(headers: &mut Vec<(String, String)>) {
         let k = k.to_lowercase();
         !matches!(
             k.as_str(),
-            "authorization"
-                | "x-api-key"
-                | "api-key"
-                | "openai-api-key"
-                | "x-goog-api-key"
-                | "anthropic-api-key"
+            "authorization" | "x-api-key" | "api-key" | "openai-api-key" | "anthropic-api-key"
         )
     });
 }

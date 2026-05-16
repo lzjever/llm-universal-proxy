@@ -706,7 +706,6 @@ fn strip_client_credential_headers(headers: &mut HeaderMap) {
         HeaderName::from_static("x-api-key"),
         HeaderName::from_static("api-key"),
         HeaderName::from_static("openai-api-key"),
-        HeaderName::from_static("x-goog-api-key"),
         HeaderName::from_static("anthropic-api-key"),
         HeaderName::from_static(LEGACY_DATA_TOKEN_HEADER),
     ] {
@@ -721,7 +720,6 @@ fn extract_standard_credential(headers: &HeaderMap) -> Result<Option<String>, Cr
         "x-api-key",
         "api-key",
         "openai-api-key",
-        "x-goog-api-key",
         "anthropic-api-key",
     ] {
         collect_api_key_credentials(headers, name, &mut credentials)?;

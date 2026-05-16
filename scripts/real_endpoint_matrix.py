@@ -26,7 +26,6 @@ PERF_DEFAULT_TOTAL_MS = 15_000.0
 REAL_PROVIDER_REQUIRED_ENVS = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY",
     "MINIMAX_API_KEY",
 )
 REAL_PROVIDER_GATE = "real-provider-smoke"
@@ -47,7 +46,6 @@ COMPAT_ANTHROPIC_BASE_URL_ENV = "COMPAT_ANTHROPIC_BASE_URL"
 COMPAT_ANTHROPIC_MODEL_ENV = "COMPAT_ANTHROPIC_MODEL"
 REAL_OPENAI_DEFAULT_MODEL = "gpt-5-mini"
 REAL_ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
-REAL_GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 REAL_MINIMAX_DEFAULT_MODEL = "MiniMax-M2.7"
 SECRET_REDACTION_PLACEHOLDER_PREFIX = "[REDACTED:"
 MIN_SECRET_REDACTION_LENGTH = 4
@@ -296,51 +294,6 @@ def _anthropic_payload(model: str, *, stream: bool = False, tool: bool = False, 
     return payload
 
 
-def _gemini_payload(*, tool: bool = False, error: bool = False) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": "Reply with exactly OK"}],
-            }
-        ]
-    }
-    if tool:
-        payload["contents"] = [
-            {
-                "role": "user",
-                "parts": [{"text": "Weather in Tokyo?"}],
-            }
-        ]
-        payload["tools"] = [
-            {
-                "functionDeclarations": [
-                    {
-                        "name": "get_weather",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"city": {"type": "string"}},
-                        },
-                    }
-                ]
-            }
-        ]
-        payload["toolConfig"] = {
-            "functionCallingConfig": {
-                "mode": "ANY",
-                "allowedFunctionNames": ["get_weather"],
-            }
-        }
-    if error:
-        payload["contents"] = [
-            {
-                "role": "user",
-                "parts": [{"text": "force_error"}],
-            }
-        ]
-    return payload
-
-
 def build_mock_matrix_cases() -> list[MockMatrixCase]:
     cases: list[MockMatrixCase] = []
 
@@ -473,40 +426,6 @@ def build_mock_matrix_cases() -> list[MockMatrixCase]:
         markers=("forced mock error",),
     )
 
-    add(
-        "gemini_generate_content_unary",
-        "gemini_generate_content",
-        "unary",
-        "/google/v1beta/models/mock-gemini:generateContent",
-        _gemini_payload(),
-        markers=("OK from Gemini mock",),
-    )
-    add(
-        "gemini_generate_content_stream",
-        "gemini_generate_content",
-        "stream",
-        "/google/v1beta/models/mock-gemini:streamGenerateContent",
-        _gemini_payload(),
-        content_type="text/event-stream",
-        markers=("data:", "OK from Gemini mock"),
-    )
-    add(
-        "gemini_generate_content_tool",
-        "gemini_generate_content",
-        "tool",
-        "/google/v1beta/models/mock-gemini:generateContent",
-        _gemini_payload(tool=True),
-        markers=("functionCall", "get_weather"),
-    )
-    add(
-        "gemini_generate_content_error",
-        "gemini_generate_content",
-        "error",
-        "/google/v1beta/models/mock-gemini:generateContent",
-        _gemini_payload(error=True),
-        status=503,
-        markers=("forced mock error",),
-    )
 
     return cases
 
@@ -519,7 +438,6 @@ def build_perf_matrix_cases() -> list[MockMatrixCase]:
         "openai_responses_unary",
         "openai_responses_tool",
         "anthropic_messages_unary",
-        "gemini_generate_content_unary",
     )
     return [case_by_id[case_id] for case_id in perf_case_ids]
 
@@ -536,7 +454,6 @@ def build_real_provider_matrix_cases(
     *,
     openai_model: str = REAL_OPENAI_DEFAULT_MODEL,
     anthropic_model: str = REAL_ANTHROPIC_DEFAULT_MODEL,
-    gemini_model: str = REAL_GEMINI_DEFAULT_MODEL,
     minimax_model: str = REAL_MINIMAX_DEFAULT_MODEL,
 ) -> list[RealProviderMatrixCase]:
     cases: list[RealProviderMatrixCase] = []
@@ -695,63 +612,6 @@ def build_real_provider_matrix_cases(
         markers=("previous_response_id",),
     )
 
-    add(
-        "gemini_generate_content_unary",
-        "gemini",
-        "generateContent",
-        "unary",
-        "generate_content_unary",
-        "GEMINI_API_KEY",
-        gemini_model,
-        "real-gemini-generate-content",
-        "google",
-        "/google/v1beta/models/real-gemini-generate-content:generateContent",
-        _gemini_payload(),
-    )
-    add(
-        "gemini_stream_generate_content",
-        "gemini",
-        "streamGenerateContent",
-        "stream",
-        "stream_generate_content",
-        "GEMINI_API_KEY",
-        gemini_model,
-        "real-gemini-generate-content",
-        "google",
-        "/google/v1beta/models/real-gemini-generate-content:streamGenerateContent",
-        _gemini_payload(),
-        content_type="text/event-stream",
-        markers=("data:", "OK"),
-    )
-    add(
-        "gemini_function_declarations_tool",
-        "gemini",
-        "generateContent",
-        "tool",
-        "function_declarations",
-        "GEMINI_API_KEY",
-        gemini_model,
-        "real-gemini-generate-content",
-        "google",
-        "/google/v1beta/models/real-gemini-generate-content:generateContent",
-        _gemini_payload(tool=True),
-        markers=("functionCall", "get_weather"),
-    )
-    add(
-        "gemini_responses_high_risk_state_fail_closed",
-        "gemini",
-        "generateContent",
-        "fail_closed",
-        "high_risk_state",
-        "GEMINI_API_KEY",
-        gemini_model,
-        "real-gemini-generate-content",
-        "google",
-        "/openai/v1/responses",
-        _responses_high_risk_state_payload("real-gemini-generate-content"),
-        status=400,
-        markers=("previous_response_id",),
-    )
 
     add(
         "minimax_openai_chat_unary",
@@ -988,13 +848,6 @@ class MockProviderHandler(BaseHTTPRequestHandler):
             self._handle_anthropic_messages(body)
             return
 
-        if (
-            path.endswith(":generateContent")
-            or path.endswith(":streamGenerateContent")
-            or path.endswith("/generateContent")
-        ):
-            self._handle_gemini_generate_content(path, body)
-            return
 
         self._send_json(404, {"error": "not found", "path": path})
 
@@ -1157,65 +1010,13 @@ class MockProviderHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _handle_gemini_generate_content(self, path: str, body: object) -> None:
-        if path.endswith(":streamGenerateContent"):
-            self._send_sse(
-                'data: {"candidates":[{"content":{"parts":[{"text":"OK from Gemini mock"}],'
-                '"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-mock"}\n\n'
-            )
-            return
-        if _body_has_tool_request(body):
-            self._send_json(
-                200,
-                {
-                    "candidates": [
-                        {
-                            "content": {
-                                "role": "model",
-                                "parts": [
-                                    {
-                                        "functionCall": {
-                                            "id": "call_mock",
-                                            "name": "get_weather",
-                                            "args": {"city": "Tokyo"},
-                                        }
-                                    }
-                                ],
-                            },
-                            "finishReason": "STOP",
-                        }
-                    ],
-                    "modelVersion": "gemini-mock",
-                },
-            )
-            return
-        self._send_json(
-            200,
-            {
-                "candidates": [
-                    {
-                        "content": {
-                            "role": "model",
-                            "parts": [{"text": "OK from Gemini mock"}],
-                        },
-                        "finishReason": "STOP",
-                    }
-                ],
-                "usageMetadata": {
-                    "promptTokenCount": 1,
-                    "candidatesTokenCount": 1,
-                    "totalTokenCount": 2,
-                },
-            },
-        )
-
 
 def start_mock_provider() -> tuple[ThreadingHTTPServer, threading.Thread, str]:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), MockProviderHandler)
+    port = free_port()
+    server = ThreadingHTTPServer(("127.0.0.1", port), MockProviderHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    base_url = f"http://127.0.0.1:{server.server_port}"
-    return server, thread, base_url
+    return server, thread, f"http://127.0.0.1:{port}"
 
 
 def proxy_key_env() -> dict[str, str]:
@@ -1248,15 +1049,10 @@ upstreams:
     api_root: {json.dumps(mock_base_url + "/v1")}
     format: anthropic
     provider_key_env: {MOCK_PROVIDER_KEY_ENV}
-  MOCK_GOOGLE:
-    api_root: {json.dumps(mock_base_url + "/v1beta")}
-    format: google
-    provider_key_env: {MOCK_PROVIDER_KEY_ENV}
 model_aliases:
   mock-openai-chat: "MOCK_OPENAI_CHAT:gpt-mock"
   mock-openai-responses: "MOCK_OPENAI_RESPONSES:gpt-mock"
   mock-anthropic: "MOCK_ANTHROPIC:claude-mock"
-  mock-gemini: "MOCK_GOOGLE:gemini-mock"
 """
     path.write_text(config.strip() + "\n", encoding="utf-8")
 
@@ -1593,10 +1389,6 @@ upstreams:
     api_root: {json.dumps(args.anthropic_base_url)}
     format: anthropic
     provider_key_env: ANTHROPIC_API_KEY
-  REAL_GEMINI:
-    api_root: {json.dumps(args.gemini_base_url)}
-    format: google
-    provider_key_env: GEMINI_API_KEY
   REAL_MINIMAX_CHAT:
     api_root: {json.dumps(args.minimax_base_url)}
     format: openai-completion
@@ -1605,7 +1397,6 @@ model_aliases:
   real-openai-chat: {json.dumps(f"REAL_OPENAI_CHAT:{args.openai_model}")}
   real-openai-responses: {json.dumps(f"REAL_OPENAI_RESPONSES:{args.openai_model}")}
   real-anthropic-messages: {json.dumps(f"REAL_ANTHROPIC:{args.anthropic_model}")}
-  real-gemini-generate-content: {json.dumps(f"REAL_GEMINI:{args.gemini_model}")}
   real-minimax-chat: {json.dumps(f"REAL_MINIMAX_CHAT:{args.minimax_model}")}
 """
     path.write_text(config.strip() + "\n", encoding="utf-8")
@@ -1927,7 +1718,6 @@ def run_real_provider_smoke(args: argparse.Namespace) -> int:
     cases = build_real_provider_matrix_cases(
         openai_model=args.openai_model,
         anthropic_model=args.anthropic_model,
-        gemini_model=args.gemini_model,
         minimax_model=args.minimax_model,
     )
     missing_env = sorted(
@@ -2049,10 +1839,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("OPENAI_UPSTREAM_BASE_URL", "https://api.openai.com/v1"),
     )
     parser.add_argument(
-        "--gemini-base-url",
-        default=os.environ.get("GEMINI_UPSTREAM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
-    )
-    parser.add_argument(
         "--minimax-base-url",
         default=os.environ.get("MINIMAX_UPSTREAM_BASE_URL", os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.io/v1")),
     )
@@ -2063,10 +1849,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--openai-model",
         default=os.environ.get("OPENAI_UPSTREAM_MODEL", os.environ.get("OPENAI_MODEL", REAL_OPENAI_DEFAULT_MODEL)),
-    )
-    parser.add_argument(
-        "--gemini-model",
-        default=os.environ.get("GEMINI_UPSTREAM_MODEL", os.environ.get("GEMINI_MODEL", REAL_GEMINI_DEFAULT_MODEL)),
     )
     parser.add_argument(
         "--minimax-model",

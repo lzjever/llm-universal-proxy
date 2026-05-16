@@ -596,8 +596,7 @@ pub(crate) async fn read_resource_response_text_limited_with_cancellation(
         .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
 }
 
-/// Resolve upstream URL for the given format using config base URL.
-/// For Google (Gemini), pass the model so the path is .../models/{model}:generateContent.
+/// Resolve upstream URL for the given active wire format using config base URL.
 pub fn upstream_url(
     config: &Config,
     upstream: &UpstreamConfig,

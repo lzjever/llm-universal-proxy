@@ -9,7 +9,7 @@ Last updated: 2026-04-26
 
 This means:
 
-- do not model `Codex`, `Claude`, and `Gemini` as first-class data-plane identities
+- do not model client product brands as first-class data-plane identities
 - do model a unified `capability surface` for each local model alias
 - do keep `max_compat` as an explicit runtime policy mode
 - do keep provider-owned state and provider-native lifecycle features native-only
@@ -20,7 +20,7 @@ Locked contract:
 - The proxy must not rewrite the visible tool name supplied by the client.
 - `__llmup_custom__*` is an internal transport artifact, not a public contract.
 - `apply_patch` remains a public freeform tool on client-visible surfaces.
-- Real-client public editing contracts preserve each client's public tool name: Codex `apply_patch`, Claude Code `Edit`, and Gemini `replace`.
+- Real-client public editing contracts preserve each supported client's public tool name, such as Codex `apply_patch` and Claude Code `Edit`.
 - The intended translated-path bridge preserves the stable visible tool name and carries bridge provenance in request-scoped translation context.
 
 The current system has the architectural seams for this work:
@@ -41,7 +41,7 @@ The proxy already detects the client contract from request path and body shape:
 So a core field like:
 
 ```text
-client_profile = generic | codex | claude | gemini | auto
+client_profile = generic | codex | claude | auto
 ```
 
 would mix two different concerns:
@@ -86,7 +86,6 @@ Native extensions:
 
 - OpenAI hosted tools and Responses lifecycle state
 - Anthropic server tools and pause-turn semantics
-- Gemini built-in tools, caches, and interaction-specific state
 - provider-owned conversation or compaction resources
 
 ## Request Translation And State Continuity
@@ -118,7 +117,7 @@ Response-side reasoning encrypted_content is a separate translation concern. The
 
 ## Multimodal Phase 1 Boundary
 
-Multimodal support is currently a `max_compat` / request-policy protocol compatibility feature, not a blanket provider capability promise. The request policy gate recognizes typed media across OpenAI Chat/Responses, Anthropic Messages, and Gemini request shapes, then checks the effective `surface.modalities.input` for the routed alias. That surface value is a media-type gate only; source transport support is checked separately.
+Multimodal support is currently a `max_compat` / request-policy protocol compatibility feature, not a blanket provider capability promise. The request policy gate recognizes typed media across OpenAI Chat/Responses and Anthropic Messages, then checks the effective `surface.modalities.input` for the routed alias. That surface value is a media-type gate only; source transport support is checked separately.
 
 Current input modality meanings:
 
@@ -126,7 +125,7 @@ Current input modality meanings:
 | --- | --- |
 | `pdf` | Narrow document capability for PDF media. |
 | `file` | Generic file capability and includes PDF. |
-| `video` | First-phase gate for video media; Gemini video routed to non-Gemini targets must fail closed. |
+| `video` | First-phase gate for video media; unsupported target paths must fail closed. |
 
 Current translator boundaries:
 
@@ -135,10 +134,6 @@ Current translator boundaries:
 | OpenAI Chat/Responses images to Anthropic | Data URI images can become Anthropic base64 image blocks. HTTP(S) remote image URLs can become Anthropic `image.source.type=url`. |
 | OpenAI Chat/Responses PDFs to Anthropic | PDF `file` / `input_file` data URIs can become Anthropic `document.source.type=base64`. PDF `file_data` / `file_url` HTTP(S) URLs can become Anthropic `document.source.type=url` when PDF MIME or filename provenance is available and self-consistent. |
 | OpenAI Chat/Responses unsupported media to Anthropic | `input_audio`, non-PDF or generic files, unknown typed parts, provider `file_id`, and provider-native or local URIs such as `gs://`, `file://`, or `s3://` fail closed before contacting upstream. |
-| Anthropic remote images to Gemini | Anthropic image blocks using remote URL sources fail closed unless a future explicit fetch/upload adapter is documented. |
-| Gemini to OpenAI Chat/Responses | Gemini `inlineData` image, audio, and PDF content remains supported when the effective surface allows it. All Gemini `fileData.fileUri` sources, including HTTP(S), currently fail closed until an explicit fetch/upload adapter exists. |
-| OpenAI Chat/Responses to Gemini | OpenAI-supplied file URI or HTTP(S) file references can map to Gemini `fileData` when MIME provenance is available and self-consistent. |
-| Gemini video to non-Gemini | Fail closed before contacting upstream. |
 
 Provider/model availability still comes from configuration. Do not mark a live upstream as multimodal unless that provider integration and selected model are validated for the media shape. In particular, the live MiniMax test provider should remain text-only in first-party docs; current multimodal e2e coverage uses first-party mock upstreams rather than real MiniMax.
 
@@ -213,7 +208,7 @@ Implemented points:
 - `surface` on structured model aliases
 - `effective_model_surface()` in config resolution
 - compatibility mode and effective surface data carried into request policy
-- `llmup.surface` exposed from `/openai/v1/models`, `/anthropic/v1/models`, and `/google/v1beta/models`
+- `llmup.surface` exposed from `/openai/v1/models` and `/anthropic/v1/models`
 
 Wrappers consume the same effective surface and fail fast when live model profiles omit fields required for agent-client catalogs.
 
@@ -363,7 +358,7 @@ Delivered:
 - model catalog endpoints expose effective `llmup.surface` data.
 - wrappers consume live/effective surface metadata instead of relying only on legacy client-specific defaults.
 - live translated custom/freeform tool paths preserve stable names such as `apply_patch` and keep `__llmup_custom__*` internal.
-- strict safety tests, compatibility-mode policy tests, model-surface projection tests, and focused real-client matrix checks cover the public editing tool identity contract: Codex `apply_patch`, Claude Code `Edit`, and Gemini `replace`.
+- strict safety tests, compatibility-mode policy tests, model-surface projection tests, and focused real-client matrix checks cover the public editing tool identity contract, including Codex `apply_patch` and Claude Code `Edit`.
 
 Remaining work:
 

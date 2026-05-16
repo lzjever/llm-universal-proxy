@@ -1,5 +1,4 @@
 use super::anthropic_source::*;
-use super::gemini_source::*;
 use super::openai_sink::*;
 use super::responses_source::*;
 use super::state::*;
@@ -259,47 +258,6 @@ fn validate_anthropic_stream_event_tool_names(event: &Value) -> Result<(), Strin
     Ok(())
 }
 
-fn validate_gemini_stream_content_tool_names(content: &Value) -> Result<(), String> {
-    let Some(parts) = content.get("parts").and_then(Value::as_array) else {
-        return Ok(());
-    };
-    for part in parts {
-        for tool_part in [
-            part.get("functionCall")
-                .or_else(|| part.get("function_call")),
-            part.get("functionResponse")
-                .or_else(|| part.get("function_response")),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(name) = tool_part.get("name").and_then(Value::as_str) {
-                validate_public_tool_name_not_reserved(name)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_gemini_stream_response_tool_names(body: &Value) -> Result<(), String> {
-    if let Some(candidates) = body.get("candidates").and_then(Value::as_array) {
-        for candidate in candidates {
-            if let Some(content) = candidate.get("content") {
-                validate_gemini_stream_content_tool_names(content)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_gemini_stream_event_tool_names(event: &Value) -> Result<(), String> {
-    validate_gemini_stream_response_tool_names(event)?;
-    if let Some(response) = event.get("response") {
-        validate_gemini_stream_response_tool_names(response)?;
-    }
-    Ok(())
-}
-
 fn validate_responses_stream_item_tool_name(item: &Value) -> Result<(), String> {
     validate_responses_public_tool_call_item_identity(item)
 }
@@ -333,7 +291,6 @@ fn validate_public_stream_response_event_tool_names(
         UpstreamFormat::OpenAiCompletion => validate_openai_stream_event_tool_names(event),
         UpstreamFormat::OpenAiResponses => validate_responses_stream_event_tool_names(event),
         UpstreamFormat::Anthropic => validate_anthropic_stream_event_tool_names(event),
-        UpstreamFormat::Google => validate_gemini_stream_event_tool_names(event),
     }
 }
 
@@ -368,13 +325,6 @@ fn openai_chunks_to_client_sse(
             let mut out = Vec::new();
             for c in &openai_chunks {
                 out.extend(openai_chunk_to_claude_sse(c, state));
-            }
-            out
-        }
-        UpstreamFormat::Google => {
-            let mut out = Vec::new();
-            for c in &openai_chunks {
-                out.extend(openai_chunk_to_gemini_sse(c, state));
             }
             out
         }
@@ -416,60 +366,6 @@ fn reject_stream_resource_limit(
         }
     });
     anthropic_error_event_to_client_sse(&event, client_format, state)
-}
-
-fn gemini_stream_error_status(error_type: &str, code: Option<&str>) -> &'static str {
-    match code {
-        Some("rate_limit_exceeded") => "RESOURCE_EXHAUSTED",
-        Some(
-            "context_length_exceeded"
-            | "upstream_sse_frame_too_large"
-            | "upstream_stream_event_limit_exceeded"
-            | "upstream_stream_state_too_large",
-        ) => "INVALID_ARGUMENT",
-        Some("upstream_stream_idle_timeout" | "upstream_stream_max_duration_exceeded") => {
-            "DEADLINE_EXCEEDED"
-        }
-        Some("content_filter") => "FAILED_PRECONDITION",
-        Some("server_is_overloaded") => "UNAVAILABLE",
-        _ if error_type == "invalid_request_error" => "INVALID_ARGUMENT",
-        _ if error_type == "rate_limit_error" => "RESOURCE_EXHAUSTED",
-        _ if error_type == "server_error" => "UNAVAILABLE",
-        _ => "UNKNOWN",
-    }
-}
-
-fn gemini_stream_error_rpc_code(status: &str) -> u16 {
-    match status {
-        "INVALID_ARGUMENT" => 3,
-        "DEADLINE_EXCEEDED" => 4,
-        "RESOURCE_EXHAUSTED" => 8,
-        "FAILED_PRECONDITION" => 9,
-        "UNAVAILABLE" => 14,
-        _ => 2,
-    }
-}
-
-fn google_streaming_error_sse(error_type: &str, code: Option<&str>, message: &str) -> Vec<Vec<u8>> {
-    let stable_code = code.unwrap_or("upstream_stream_error");
-    let status = gemini_stream_error_status(error_type, code);
-    let payload = serde_json::json!({
-        "error": {
-            "code": gemini_stream_error_rpc_code(status),
-            "message": message,
-            "status": status,
-            "details": [{
-                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                "reason": stable_code,
-                "domain": "llm-universal-proxy",
-                "metadata": {
-                    "code": stable_code,
-                    "type": error_type
-                }
-            }]
-        }
-    });
-    vec![format_sse_data(&payload)]
 }
 
 pub fn translate_sse_event(
@@ -525,7 +421,6 @@ pub fn translate_sse_event(
     let openai_chunks: Vec<Value> = match upstream_format {
         UpstreamFormat::OpenAiCompletion => openai_event_as_chunk(event).into_iter().collect(),
         UpstreamFormat::Anthropic => claude_event_to_openai_chunks(event, state),
-        UpstreamFormat::Google => gemini_event_to_openai_chunks(event, state),
         UpstreamFormat::OpenAiResponses => responses_event_to_openai_chunks(event, state),
     };
     let openai_chunks = if upstream_format == UpstreamFormat::OpenAiCompletion
@@ -935,9 +830,6 @@ pub(super) fn anthropic_error_event_to_client_sse(
             });
             vec![format_sse_event("error", &sanitized)]
         }
-        UpstreamFormat::Google => {
-            google_streaming_error_sse(normalized_type, normalized_code, &message)
-        }
     }
 }
 
@@ -1246,24 +1138,6 @@ where
                 }
                 Poll::Ready(None) => {
                     this.drain_translated_frames();
-                    if !this.close_after_output && this.upstream_format == UpstreamFormat::Google {
-                        if let Some(chunk) = flush_pending_gemini_finish_chunk(&mut this.state) {
-                            let translated = match this.client_format {
-                                UpstreamFormat::OpenAiCompletion => vec![format_sse_data(&chunk)],
-                                UpstreamFormat::Anthropic => {
-                                    openai_chunk_to_claude_sse(&chunk, &mut this.state)
-                                }
-                                UpstreamFormat::Google => vec![format_sse_data(&chunk)],
-                                UpstreamFormat::OpenAiResponses => {
-                                    openai_chunk_to_responses_sse(&chunk, &mut this.state)
-                                }
-                            };
-                            this.output_queue.extend(translated);
-                            if this.reject_if_state_too_large() {
-                                continue;
-                            }
-                        }
-                    }
                     if !this.output_queue.is_empty() {
                         continue;
                     }

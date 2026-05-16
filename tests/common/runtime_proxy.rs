@@ -8,10 +8,8 @@ use tokio::net::TcpListener;
 
 pub fn upstream_api_root(upstream_base: &str, format: UpstreamFormat) -> String {
     let upstream_base = upstream_base.trim_end_matches('/');
-    match format {
-        UpstreamFormat::Google => format!("{upstream_base}/v1beta"),
-        _ => format!("{upstream_base}/v1"),
-    }
+    let _ = format;
+    format!("{upstream_base}/v1")
 }
 
 /// Start proxy with config; returns (proxy_base_url, _handle).

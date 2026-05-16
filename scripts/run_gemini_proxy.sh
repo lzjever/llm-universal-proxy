@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+cat >&2 <<'EOF'
+Native Gemini CLI wiring has been removed from llmup.
 
-exec python3 -B "${SCRIPT_DIR}/interactive_cli.py" --client gemini "$@"
+Use Gemini only as a Google OpenAI-compatible upstream:
+  api_root: https://generativelanguage.googleapis.com/v1beta/openai
+  format: openai-completion
+EOF
+exit 64

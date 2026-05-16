@@ -42,7 +42,6 @@ class ProjectDocsContractTests(unittest.TestCase):
                 "`scripts/interactive_cli.py`",
                 "`scripts/run_codex_proxy.sh`",
                 "`scripts/run_claude_proxy.sh`",
-                "`scripts/run_gemini_proxy.sh`",
                 "`scripts/fixtures/cli_matrix/default_proxy_test_matrix.yaml`",
                 "`preset-openai-compatible`",
                 "`preset-anthropic-compatible`",

@@ -1550,7 +1550,6 @@ pub(crate) fn is_forbidden_upstream_header_name(name: &str) -> bool {
             | "x-api-key"
             | "api-key"
             | "openai-api-key"
-            | "x-goog-api-key"
             | "anthropic-api-key"
     )
 }
@@ -1620,26 +1619,17 @@ fn default_max_accumulated_stream_state_bytes() -> usize {
 /// Best practice is to configure the official API root with an explicit version suffix:
 /// - OpenAI: `https://api.openai.com/v1`
 /// - Anthropic: `https://api.anthropic.com/v1`
-/// - Google: `https://generativelanguage.googleapis.com/v1beta`
 pub fn build_upstream_url(
     api_root: &str,
     format: UpstreamFormat,
-    model: Option<&str>,
-    stream: bool,
+    _model: Option<&str>,
+    _stream: bool,
 ) -> String {
     let base = api_root.trim_end_matches('/');
     match format {
         UpstreamFormat::OpenAiCompletion => format!("{base}/chat/completions"),
         UpstreamFormat::OpenAiResponses => format!("{base}/responses"),
         UpstreamFormat::Anthropic => format!("{base}/messages"),
-        UpstreamFormat::Google => {
-            let model = model.filter(|s| !s.is_empty()).unwrap_or("gemini-1.5");
-            if stream {
-                format!("{base}/models/{model}:streamGenerateContent?alt=sse")
-            } else {
-                format!("{base}/models/{model}:generateContent")
-            }
-        }
     }
 }
 
@@ -1698,28 +1688,6 @@ mod tests {
     }
 
     #[test]
-    fn build_upstream_url_google() {
-        assert_eq!(
-            build_upstream_url(
-                "https://generativelanguage.googleapis.com/v1beta",
-                UpstreamFormat::Google,
-                None,
-                false
-            ),
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5:generateContent"
-        );
-        assert_eq!(
-            build_upstream_url(
-                "https://generativelanguage.googleapis.com/v1beta",
-                UpstreamFormat::Google,
-                Some("gemini-2.0-flash"),
-                true
-            ),
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
-        );
-    }
-
-    #[test]
     fn build_upstream_resource_url_trims_slashes() {
         assert_eq!(
             build_upstream_resource_url("https://api.openai.com/v1/", "/responses/resp_1/cancel"),
@@ -1746,15 +1714,6 @@ mod tests {
                 false
             ),
             "https://api.anthropic.com/v1/messages"
-        );
-        assert_eq!(
-            build_upstream_url(
-                "https://generativelanguage.googleapis.com/v1beta",
-                UpstreamFormat::Google,
-                Some("gemini-2.0-flash"),
-                false
-            ),
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         );
         assert_eq!(
             build_upstream_url(
@@ -1797,6 +1756,29 @@ model_aliases:
         let alias = c.model_aliases.get("GLM-5").unwrap();
         assert_eq!(alias.upstream_name, "GLM-OFFICIAL");
         assert_eq!(alias.upstream_model, "GLM-5");
+    }
+
+    #[test]
+    fn config_from_yaml_rejects_removed_native_gemini_formats_with_migration_hint() {
+        for removed in ["google", "gemini"] {
+            let error = Config::from_yaml_str(&format!(
+                r#"
+upstreams:
+  google:
+    api_root: https://generativelanguage.googleapis.com/v1beta
+    format: {removed}
+"#
+            ))
+            .expect_err("native Gemini upstream formats must be removed");
+            assert!(
+                error.contains("format: openai-completion"),
+                "error should explain the OpenAI-compatible migration path: {error}"
+            );
+            assert!(
+                error.contains("generativelanguage.googleapis.com/v1beta/openai"),
+                "error should name the Google OpenAI-compatible endpoint: {error}"
+            );
+        }
     }
 
     #[test]
@@ -2164,14 +2146,6 @@ upstreams:
         assert!(c
             .upstream_url_for_format(upstream, UpstreamFormat::OpenAiResponses, None, false)
             .ends_with("/v1/responses"));
-        assert!(c
-            .upstream_url_for_format(
-                upstream,
-                UpstreamFormat::Google,
-                Some("gemini-2.0-flash"),
-                true
-            )
-            .ends_with(":streamGenerateContent?alt=sse"));
     }
 
     #[test]
@@ -2558,7 +2532,6 @@ upstreams:
             "x-api-key",
             "api-key",
             "openai-api-key",
-            "x-goog-api-key",
             "anthropic-api-key",
         ] {
             let c = Config::from_yaml_str(&format!(

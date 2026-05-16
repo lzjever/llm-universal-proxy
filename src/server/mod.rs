@@ -347,7 +347,6 @@ async fn run_server(
             "/anthropic/v1/models/:id",
             get(models::handle_anthropic_model),
         )
-        .route("/google/v1beta/models", get(models::handle_google_models))
         .route(
             "/namespaces/:namespace/openai/v1/chat/completions",
             post(proxy::handle_openai_chat_completions_namespaced),
@@ -416,19 +415,6 @@ async fn run_server(
         .route(
             "/namespaces/:namespace/anthropic/v1/models/:id",
             get(models::handle_anthropic_model_namespaced),
-        )
-        .route(
-            "/namespaces/:namespace/google/v1beta/models",
-            get(models::handle_google_models_namespaced),
-        )
-        .route(
-            "/google/v1beta/models/:id",
-            get(models::handle_google_model).post(proxy::handle_google_model_action),
-        )
-        .route(
-            "/namespaces/:namespace/google/v1beta/models/:id",
-            get(models::handle_google_model_namespaced)
-                .post(proxy::handle_google_model_action_namespaced),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -514,7 +500,6 @@ fn data_cors_layer_from_env() -> Result<Option<CorsLayer>, String> {
                 HeaderName::from_static("x-api-key"),
                 HeaderName::from_static("api-key"),
                 HeaderName::from_static("openai-api-key"),
-                HeaderName::from_static("x-goog-api-key"),
                 HeaderName::from_static("anthropic-api-key"),
                 HeaderName::from_static("anthropic-version"),
                 HeaderName::from_static("anthropic-beta"),

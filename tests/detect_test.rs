@@ -23,13 +23,13 @@ fn path_chat_completions_with_input_array_is_openai_responses() {
 }
 
 #[test]
-fn body_contents_is_google() {
+fn native_gemini_contents_body_no_longer_selects_removed_google_format() {
     let body = json!({
         "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
     });
     assert_eq!(
-        detect_request_format("/google/v1beta/models/gemini-local:generateContent", &body),
-        UpstreamFormat::Google
+        detect_request_format("/openai/v1/chat/completions", &body),
+        UpstreamFormat::OpenAiCompletion
     );
 }
 

@@ -428,7 +428,7 @@ pub(super) fn openai_file_data_reference_from_part<'a>(
 ) -> Result<OpenAiFileDataReference<'a>, String> {
     let Some((payload, field)) = openai_file_reference_payload(part)? else {
         return Err(
-            "OpenAI file parts require file_data or file_url to translate to Gemini.".to_string(),
+            "OpenAI file parts require file_data or file_url for portable cross-protocol file translation.".to_string(),
         );
     };
     let resolved_mime_type = openai_file_part_resolved_mime_type(part)?;

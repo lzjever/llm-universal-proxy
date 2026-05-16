@@ -5,10 +5,7 @@ use serde_json::Value;
 use crate::config::{CompatibilityMode, ModelModality, ModelSurface};
 use crate::formats::UpstreamFormat;
 
-use super::media::{
-    mime_type_from_filename, openai_file_part_mime_conflict_message,
-    openai_file_part_resolved_mime_type,
-};
+use super::media::{openai_file_part_mime_conflict_message, openai_file_part_resolved_mime_type};
 use super::messages::{
     custom_tool_format_downgraded_message, custom_tools_not_portable_message,
     openai_assistant_audio_history_not_portable_message, openai_request_audio_not_portable_message,
@@ -23,7 +20,6 @@ use super::openai_responses::{
     responses_compaction_summary_text, responses_input_item_is_compaction,
     responses_input_item_is_message, responses_input_item_type, responses_reasoning_summary_text,
 };
-use super::request_gemini::{gemini_generation_config_field, gemini_part_field};
 use super::tools::{
     normalized_responses_tool_definition, openai_custom_tool_format_is_plain_text,
     openai_custom_tool_format_supports_anthropic_bridge, openai_tool_arguments_to_structured_value,
@@ -34,7 +30,7 @@ use super::{
     anthropic_nonportable_content_block_message, anthropic_protocol_uses_cache_control,
     anthropic_request_has_nonportable_thinking_provenance,
     anthropic_request_nonportable_tool_definition_message,
-    anthropic_request_tool_result_order_message, gemini_request_nonportable_message,
+    anthropic_request_tool_result_order_message,
 };
 
 pub(super) fn responses_stateful_request_controls_for_translate(body: &Value) -> Vec<&'static str> {
@@ -64,22 +60,6 @@ pub(super) fn cross_protocol_store_warning_message(
         "{} request field `store` has provider-specific persistence semantics and will be dropped when translating to {}",
         translation_target_label(client_format),
         translation_target_label(upstream_format)
-    )
-}
-
-pub(super) fn gemini_top_k_warning_message(upstream_format: UpstreamFormat) -> String {
-    format!(
-        "Gemini generationConfig.topK has no direct equivalent in {} and will be dropped",
-        translation_target_label(upstream_format)
-    )
-}
-
-pub(super) fn openai_parallel_tool_calls_to_gemini_warning_message(
-    client_format: UpstreamFormat,
-) -> String {
-    format!(
-        "{} field `parallel_tool_calls=false` has no direct Gemini equivalent and will be dropped",
-        translation_target_label(client_format)
     )
 }
 
@@ -120,10 +100,6 @@ pub(super) fn shared_control_profile_for_target(
             parallel_tool_calls: true,
             ..SharedControlProfile::default()
         },
-        UpstreamFormat::Google => SharedControlProfile {
-            top_logprobs: true,
-            ..SharedControlProfile::default()
-        },
     }
 }
 
@@ -150,19 +126,6 @@ pub(super) fn responses_normalized_logprobs_controls(
 ) -> Option<NormalizedLogprobsControls> {
     let enabled = responses_include_requests_output_text_logprobs(body);
     let top_logprobs = body.get("top_logprobs").cloned();
-    (enabled || top_logprobs.is_some()).then_some(NormalizedLogprobsControls {
-        enabled,
-        top_logprobs,
-    })
-}
-
-pub(super) fn gemini_normalized_logprobs_controls(
-    body: &Value,
-) -> Option<NormalizedLogprobsControls> {
-    let enabled = gemini_generation_config_field(body, "responseLogprobs", "response_logprobs")
-        .and_then(Value::as_bool)
-        == Some(true);
-    let top_logprobs = gemini_generation_config_field(body, "logprobs", "logprobs").cloned();
     (enabled || top_logprobs.is_some()).then_some(NormalizedLogprobsControls {
         enabled,
         top_logprobs,
@@ -205,7 +168,7 @@ pub(super) fn normalized_openai_audio_contract(
     }
     if let Some(format) = audio.get("format").and_then(Value::as_str) {
         return Err(format!(
-            "OpenAI Chat audio field `audio.format` value `{format}` cannot be faithfully translated to Gemini because Gemini request speechConfig has no documented output encoding field."
+            "OpenAI Chat audio field `audio.format` value `{format}` is outside the portable cross-protocol audio subset."
         ));
     }
     let voice_name = match audio.get("voice") {
@@ -213,12 +176,12 @@ pub(super) fn normalized_openai_audio_contract(
         Some(Value::Object(voice)) => {
             let id = voice.get("id").and_then(Value::as_str).unwrap_or("");
             return Err(format!(
-                "OpenAI Chat audio voice `{id}` cannot be faithfully translated because Gemini only documents prebuilt voice names in speechConfig."
+                "OpenAI Chat audio voice `{id}` is outside the portable cross-protocol audio subset."
             ));
         }
         Some(_) => {
             return Err(
-                "OpenAI Chat audio voice must be a non-empty string to translate to Gemini."
+                "OpenAI Chat audio voice must be a non-empty string for portable cross-protocol audio translation."
                     .to_string(),
             )
         }
@@ -289,9 +252,7 @@ pub(super) fn responses_include_has_nonportable_items(
         !matches!(
             (target_format, *item),
             (
-                UpstreamFormat::OpenAiCompletion
-                    | UpstreamFormat::OpenAiResponses
-                    | UpstreamFormat::Google,
+                UpstreamFormat::OpenAiCompletion | UpstreamFormat::OpenAiResponses,
                 "message.output_text.logprobs"
             )
         )
@@ -424,23 +385,6 @@ pub(super) fn openai_warning_only_request_controls_for_translate(
     }
     if body.get("web_search_options").is_some() {
         controls.push("web_search_options".to_string());
-    }
-    controls
-}
-
-pub(super) fn gemini_warning_only_request_controls_for_translate(
-    body: &Value,
-    target_format: UpstreamFormat,
-) -> Vec<String> {
-    let profile = shared_control_profile_for_target(target_format);
-    let mut controls = Vec::new();
-    if let Some(logprobs) = gemini_normalized_logprobs_controls(body) {
-        if logprobs.enabled && !profile.top_logprobs {
-            controls.push("responseLogprobs".to_string());
-        }
-        if logprobs.top_logprobs.is_some() && !profile.top_logprobs {
-            controls.push("logprobs".to_string());
-        }
     }
     controls
 }
@@ -604,9 +548,7 @@ pub(super) fn responses_nonportable_tool_choice_message(
     match choice_type {
         "function" => None,
         "custom" => match target_format {
-            UpstreamFormat::OpenAiCompletion
-            | UpstreamFormat::Anthropic
-            | UpstreamFormat::Google => None,
+            UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic => None,
             _ => Some(format!(
                 "OpenAI Responses tool_choice.type `custom` cannot be faithfully translated to {target_label}"
             )),
@@ -618,9 +560,7 @@ pub(super) fn responses_nonportable_tool_choice_message(
                     Some("custom")
                         if matches!(
                             target_format,
-                            UpstreamFormat::OpenAiCompletion
-                                | UpstreamFormat::Anthropic
-                                | UpstreamFormat::Google
+                            UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
                         ) =>
                     {
                         None
@@ -687,7 +627,7 @@ pub(super) fn responses_custom_tool_format_reject_message(
 ) -> Option<String> {
     if !matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
     ) {
         return None;
     }
@@ -716,7 +656,7 @@ fn responses_custom_tool_bridge_mode_reject_message(
 ) -> Option<String> {
     if !matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
     ) {
         return None;
     }
@@ -757,7 +697,7 @@ fn responses_custom_tool_bridge_mode_warning_messages(
 ) -> Vec<String> {
     if !matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
     ) || compatibility_mode != CompatibilityMode::MaxCompat
     {
         return Vec::new();
@@ -1023,23 +963,6 @@ pub(super) fn cross_protocol_requested_choice_count(
 ) -> Option<(&'static str, u64)> {
     match client_format {
         UpstreamFormat::OpenAiCompletion => body.get("n").and_then(Value::as_u64).map(|n| ("n", n)),
-        UpstreamFormat::Google => {
-            let generation_config = body
-                .get("generationConfig")
-                .or_else(|| body.get("generation_config"));
-            generation_config
-                .and_then(|config| {
-                    config
-                        .get("candidateCount")
-                        .or_else(|| config.get("candidate_count"))
-                })
-                .or_else(|| {
-                    body.get("candidateCount")
-                        .or_else(|| body.get("candidate_count"))
-                })
-                .and_then(Value::as_u64)
-                .map(|count| ("candidateCount", count))
-        }
         _ => None,
     }
 }
@@ -1263,8 +1186,7 @@ fn request_has_surface_tooling(client_format: UpstreamFormat, body: &Value) -> b
     match client_format {
         UpstreamFormat::OpenAiCompletion
         | UpstreamFormat::OpenAiResponses
-        | UpstreamFormat::Anthropic
-        | UpstreamFormat::Google => body
+        | UpstreamFormat::Anthropic => body
             .get("tools")
             .and_then(Value::as_array)
             .is_some_and(|tools| !tools.is_empty()),
@@ -1286,7 +1208,6 @@ fn request_explicitly_enables_parallel_tool_calls(
                 .and_then(Value::as_bool)
                 == Some(false)
         }
-        UpstreamFormat::Google => false,
     }
 }
 
@@ -1297,7 +1218,7 @@ fn openai_request_file_mime_conflict_message(
     match client_format {
         UpstreamFormat::OpenAiCompletion => openai_completion_file_mime_conflict_message(body),
         UpstreamFormat::OpenAiResponses => openai_responses_file_mime_conflict_message(body),
-        UpstreamFormat::Anthropic | UpstreamFormat::Google => None,
+        UpstreamFormat::Anthropic => None,
     }
 }
 
@@ -1356,9 +1277,6 @@ fn request_input_modalities(
         }
         UpstreamFormat::Anthropic => {
             anthropic_collect_request_input_modalities(body, &mut modalities);
-        }
-        UpstreamFormat::Google => {
-            google_collect_request_input_modalities(body, &mut modalities);
         }
     }
     modalities
@@ -1518,66 +1436,6 @@ fn openai_file_part_modality(part: &Value) -> ModelModality {
         .unwrap_or(ModelModality::File)
 }
 
-fn filename_to_input_modality(filename: &str) -> Option<ModelModality> {
-    mime_type_from_filename(filename).and_then(mime_type_to_input_modality)
-}
-
-fn google_collect_request_input_modalities(body: &Value, modalities: &mut BTreeSet<ModelModality>) {
-    google_collect_content_input_modalities(
-        body.get("systemInstruction")
-            .or_else(|| body.get("system_instruction")),
-        modalities,
-    );
-    if let Some(contents) = body.get("contents").and_then(Value::as_array) {
-        for content in contents {
-            google_collect_content_input_modalities(Some(content), modalities);
-        }
-    }
-}
-
-fn google_collect_content_input_modalities(
-    content: Option<&Value>,
-    modalities: &mut BTreeSet<ModelModality>,
-) {
-    let Some(parts) = content.and_then(|content| content.get("parts").and_then(Value::as_array))
-    else {
-        return;
-    };
-    for part in parts {
-        google_collect_part_input_modalities(part, modalities);
-    }
-}
-
-fn google_collect_part_input_modalities(part: &Value, modalities: &mut BTreeSet<ModelModality>) {
-    if let Some(modality) = google_part_data_input_modality(part, "inlineData", "inline_data") {
-        insert_input_modality(modalities, modality);
-    }
-    if let Some(modality) = google_part_data_input_modality(part, "fileData", "file_data") {
-        insert_input_modality(modalities, modality);
-    }
-}
-
-fn google_part_data_input_modality(
-    part: &Value,
-    camel: &str,
-    snake: &str,
-) -> Option<ModelModality> {
-    let data = gemini_part_field(part, camel, snake)?;
-    data.get("mimeType")
-        .or_else(|| data.get("mime_type"))
-        .and_then(Value::as_str)
-        .and_then(mime_type_to_input_modality)
-        .or_else(|| google_part_data_name_modality(data))
-        .or(Some(ModelModality::File))
-}
-
-fn google_part_data_name_modality(data: &Value) -> Option<ModelModality> {
-    ["displayName", "display_name", "name", "filename"]
-        .iter()
-        .find_map(|field| data.get(*field).and_then(Value::as_str))
-        .and_then(filename_to_input_modality)
-}
-
 fn mime_type_to_input_modality(mime_type: &str) -> Option<ModelModality> {
     let mime_type = mime_type
         .split_once(';')
@@ -1612,7 +1470,6 @@ fn request_output_modalities(
             openai_collect_output_modalities(body, &mut modalities);
         }
         UpstreamFormat::Anthropic => {}
-        UpstreamFormat::Google => google_collect_output_modalities(body, &mut modalities),
     }
     modalities
 }
@@ -1632,29 +1489,6 @@ fn openai_collect_output_modalities(body: &Value, modalities: &mut BTreeSet<Mode
                 })
             })
     {
-        modalities.insert(ModelModality::Audio);
-    }
-}
-
-fn google_collect_output_modalities(body: &Value, modalities: &mut BTreeSet<ModelModality>) {
-    if let Some(requested_modalities) =
-        gemini_generation_config_field(body, "responseModalities", "response_modalities")
-            .and_then(Value::as_array)
-    {
-        for requested_modality in requested_modalities {
-            match requested_modality.as_str() {
-                Some(modality) if modality.eq_ignore_ascii_case("image") => {
-                    modalities.insert(ModelModality::Image);
-                }
-                Some(modality) if modality.eq_ignore_ascii_case("audio") => {
-                    modalities.insert(ModelModality::Audio);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if gemini_generation_config_field(body, "speechConfig", "speech_config").is_some() {
         modalities.insert(ModelModality::Audio);
     }
 }
@@ -1797,14 +1631,6 @@ pub(crate) fn assess_request_translation(
         }
     }
 
-    if upstream_format == UpstreamFormat::Google
-        && body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
-    {
-        assessment.warning(openai_parallel_tool_calls_to_gemini_warning_message(
-            client_format,
-        ));
-    }
-
     if body.get("store").is_some()
         && !(client_format == UpstreamFormat::OpenAiResponses
             && body.get("store").and_then(Value::as_bool) == Some(true))
@@ -1880,30 +1706,6 @@ pub(crate) fn assess_request_translation(
         }
     }
 
-    if client_format == UpstreamFormat::OpenAiCompletion
-        && upstream_format == UpstreamFormat::Google
-    {
-        if let Some(message) = normalized_openai_audio_contract(body).err() {
-            assessment.reject(message);
-        }
-        if openai_assistant_history_audio_present(body) {
-            assessment.reject(openai_assistant_audio_history_not_portable_message(
-                "Gemini",
-            ));
-        }
-        let controls = openai_warning_only_request_controls_for_translate(body, upstream_format);
-        if !controls.is_empty() {
-            let quoted = controls
-                .iter()
-                .map(|field| format!("`{field}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            assessment.warning(format!(
-                "OpenAI Chat Completions controls {quoted} are not portable to Gemini and will be dropped"
-            ));
-        }
-    }
-
     if client_format == UpstreamFormat::Anthropic && upstream_format != UpstreamFormat::Anthropic {
         let reject_controls = anthropic_nonportable_request_controls_for_translate(body);
         if !reject_controls.is_empty() {
@@ -1955,47 +1757,16 @@ pub(crate) fn assess_request_translation(
         }
     }
 
-    if client_format == UpstreamFormat::Google && upstream_format != UpstreamFormat::Google {
-        if let Some(message) =
-            gemini_request_nonportable_message(body, translation_target_label(upstream_format))
-        {
-            assessment.reject(message);
-        }
-        if gemini_generation_config_field(body, "topK", "top_k").is_some() {
-            assessment.warning(gemini_top_k_warning_message(upstream_format));
-        }
-        let controls = gemini_warning_only_request_controls_for_translate(body, upstream_format);
-        if !controls.is_empty() {
-            let quoted = controls
-                .iter()
-                .map(|field| format!("`{field}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            assessment.warning(format!(
-                "Gemini controls {quoted} are not portable to {} and will be dropped",
-                translation_target_label(upstream_format)
-            ));
-        }
-    }
-
     let responses_custom_bridge_supported = client_format == UpstreamFormat::OpenAiResponses
-        && matches!(
-            upstream_format,
-            UpstreamFormat::Anthropic | UpstreamFormat::Google
-        );
-    if matches!(
-        upstream_format,
-        UpstreamFormat::Anthropic | UpstreamFormat::Google
-    ) && request_has_custom_tools(client_format, body)
+        && upstream_format == UpstreamFormat::Anthropic;
+    if upstream_format == UpstreamFormat::Anthropic
+        && request_has_custom_tools(client_format, body)
         && !responses_custom_bridge_supported
     {
         assessment.reject(custom_tools_not_portable_message(upstream_format));
     }
 
-    if matches!(
-        upstream_format,
-        UpstreamFormat::Anthropic | UpstreamFormat::Google
-    ) {
+    if upstream_format == UpstreamFormat::Anthropic {
         if let Some(message) = request_invalid_structured_tool_arguments_message(
             client_format,
             body,

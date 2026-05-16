@@ -517,10 +517,10 @@ class GaDocsContractTests(unittest.TestCase):
         for snippet in (
             "OPENAI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
             "ANTHROPIC_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
-            "GEMINI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
             "`proxy_key` mode",
             "`client_provider_key` mode, set these SDK keys to the real provider key",
             "`provider_key_env`",
+            "provider_key_env: GEMINI_API_KEY",
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, manual)

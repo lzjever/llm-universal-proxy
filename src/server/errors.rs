@@ -50,17 +50,6 @@ pub(super) fn error_response(
             Json(anthropic_error_body(status, &normalized_error)),
         )
             .into_response(),
-        UpstreamFormat::Google => (
-            status,
-            Json(serde_json::json!({
-                "error": {
-                    "code": status.as_u16(),
-                    "message": normalized_error.message,
-                    "status": google_status_text(status),
-                }
-            })),
-        )
-            .into_response(),
     }
 }
 
@@ -307,19 +296,5 @@ pub(super) fn append_compatibility_warning_headers(
                 .headers_mut()
                 .append("x-proxy-compat-warning", value);
         }
-    }
-}
-
-fn google_status_text(status: StatusCode) -> &'static str {
-    match status {
-        StatusCode::BAD_REQUEST => "INVALID_ARGUMENT",
-        StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
-        StatusCode::FORBIDDEN => "PERMISSION_DENIED",
-        StatusCode::NOT_FOUND => "NOT_FOUND",
-        StatusCode::TOO_MANY_REQUESTS => "RESOURCE_EXHAUSTED",
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
-            "UNAVAILABLE"
-        }
-        _ => "INTERNAL",
     }
 }

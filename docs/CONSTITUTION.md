@@ -8,22 +8,21 @@ LLM Universal Proxy is a **format-agnostic protocol translation middleware** for
 
 **Enable supported LLM API clients to reach configured backends through one stable proxy, with explicit portability boundaries.**
 
-A client using OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, or Google Gemini should be able to route to configured upstreams through a matching local namespace. When protocols differ, the proxy translates portable core semantics and warns or rejects non-portable native extensions instead of hiding the mismatch.
+A client using OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages should be able to route to configured upstreams through a matching local namespace. When protocols differ, the proxy translates portable core semantics and warns or rejects non-portable native extensions instead of hiding the mismatch. Gemini models remain usable through Google OpenAI-compatible upstreams configured with `format: openai-completion`, not through a native Gemini client namespace.
 
 ## Core Principles
 
 ### 1. Universal Interoperability
 
-The proxy must support bidirectional translation between all major LLM API protocols:
+The proxy must support bidirectional translation between the active LLM API wire protocols:
 
 | Client Protocol | Upstream Protocol | Proxy Role |
 |----------------|-------------------|------------|
 | OpenAI Chat Completions | Supported upstream protocol | Translate if needed within the portability contract |
 | OpenAI Responses API | Supported upstream protocol | Translate if needed within the portability contract |
 | Anthropic Messages | Supported upstream protocol | Translate if needed within the portability contract |
-| Google Gemini | Supported upstream protocol | Translate if needed within the portability contract |
 
-The proxy is not opinionated about which protocol is "best." It treats all four as first-class citizens.
+The proxy is not opinionated about which protocol is "best." It treats the supported wire protocols as first-class citizens.
 
 ### 2. Maximally Faithful Translation
 
@@ -50,7 +49,6 @@ The proxy exposes namespaced endpoints for each client protocol:
 
 - `/openai/v1/...` — for OpenAI Chat Completions and Responses clients
 - `/anthropic/v1/...` — for Anthropic Messages clients
-- `/google/v1beta/...` — for Google Gemini clients
 
 Clients choose the namespace that matches their native protocol. The proxy handles the rest.
 
@@ -62,7 +60,7 @@ The proxy compiles to a single static binary with no runtime dependencies beyond
 
 The proxy does not favor any particular LLM provider. It works equally well with:
 
-- Official vendor APIs (OpenAI, Anthropic, Google)
+- Official vendor APIs (OpenAI, Anthropic, and Google OpenAI-compatible Gemini)
 - Third-party compatible endpoints (MiniMax, GLM, Kimi, DeepSeek, Mistral, etc.)
 - Self-hosted local models (vLLM, Ollama, llama.cpp, etc.)
 - Other endpoints that implement one of the supported protocols, within documented portability boundaries
@@ -130,4 +128,4 @@ This means adding a new protocol requires only two translators (new ↔ OpenAI),
 
 ## Reference
 
-The design draws inspiration from the 9router project (`/home/percy/works/mbos-v1/9router`), which implements a similar hub-and-spoke translation model in Node.js with OpenAI as the pivot format, and supports 12+ formats including OpenAI, Anthropic, Gemini, Codex, Cursor, Kiro, Ollama, and others.
+The design draws inspiration from the 9router project (`/home/percy/works/mbos-v1/9router`), which implements a similar hub-and-spoke translation model in Node.js with OpenAI as the pivot format, and supports many client and provider formats.

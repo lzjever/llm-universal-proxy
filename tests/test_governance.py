@@ -810,8 +810,8 @@ os.execv(real_git, [real_git, *args])
         for snippet in (
             "OPENAI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
             "ANTHROPIC_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
-            "GEMINI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY",
             "`client_provider_key` mode, set these SDK keys to the real provider key",
+            "provider_key_env: GEMINI_API_KEY",
         ):
             with self.subTest(clients_snippet=snippet):
                 self.assertIn(snippet, clients_doc)

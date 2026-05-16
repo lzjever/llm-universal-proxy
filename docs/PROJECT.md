@@ -63,7 +63,6 @@ scripts/
   real_endpoint_matrix.py
   run_codex_proxy.sh
   run_claude_proxy.sh
-  run_gemini_proxy.sh
   fixtures/cli_matrix/default_proxy_test_matrix.yaml
 
 .github/workflows/
@@ -106,7 +105,7 @@ docs/
 | `src/server/admin.rs` | Admin token middleware, namespace config/state handlers, and `GET` / `PUT` `/admin/data-auth` CAS handlers |
 | `src/server/data_auth.rs` | Provider-route auth policy: static `data_auth`, `LLM_UNIVERSAL_PROXY_AUTH_MODE`, `LLM_UNIVERSAL_PROXY_KEY`, `provider_key.inline`, `provider_key.env`, `provider_key_env`, and admin separation |
 | `src/server/body_limits.rs` | JSON request parsing with namespace `max_request_body_bytes` enforcement |
-| `src/server/proxy.rs` | Main request execution path for OpenAI, Anthropic, and Gemini surfaces |
+| `src/server/proxy.rs` | Main request execution path for OpenAI and Anthropic protocol surfaces |
 | `src/server/responses_resources.rs` | Native OpenAI Responses and Conversations lifecycle resource handlers |
 | `src/server/models.rs` | Model list/detail handlers and effective surface exposure |
 | `src/server/headers.rs` | Auth forwarding and protocol-specific upstream headers |
@@ -132,8 +131,8 @@ docs/
 
 | Path | Contributor entrypoint |
 | --- | --- |
-| `scripts/interactive_cli.py` | Interactive CLI wrapper implementation for Codex CLI, Claude Code, and Gemini CLI |
-| `scripts/run_codex_proxy.sh` / `scripts/run_claude_proxy.sh` / `scripts/run_gemini_proxy.sh` | Thin wrapper launchers that resolve `interactive_cli.py` relative to the script dir |
+| `scripts/interactive_cli.py` | Interactive CLI wrapper implementation for Codex CLI and Claude Code |
+| `scripts/run_codex_proxy.sh` / `scripts/run_claude_proxy.sh` | Thin wrapper launchers that resolve `interactive_cli.py` relative to the script dir |
 | `scripts/fixtures/cli_matrix/default_proxy_test_matrix.yaml` | Provider-neutral preset matrix fixture using `preset-openai-compatible` and `preset-anthropic-compatible` |
 | `scripts/real_cli_matrix.py` | Deterministic real CLI matrix harness and verifier logic |
 | `scripts/real_endpoint_matrix.py` | Endpoint matrix harness for mock, perf, real-provider, and `compatible-provider-smoke` modes |

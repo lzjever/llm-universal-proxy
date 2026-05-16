@@ -2,7 +2,7 @@
 name = "llm-universal-proxy"
 version = "0.2.28"
 edition = "2021"
-description = "Universal LLM endpoint proxy: single URL, 4 formats (Google, Anthropic, OpenAI completion, OpenAI responses), streaming, format conversion with passthrough when same."
+description = "Universal LLM endpoint proxy: single URL, OpenAI Chat/Responses and Anthropic formats, streaming, format conversion with passthrough when same."
 license = "MIT"
 repository = "https://github.com/agentsmith-project/llm-universal-proxy"
 

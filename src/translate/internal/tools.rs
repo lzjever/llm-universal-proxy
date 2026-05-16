@@ -156,9 +156,6 @@ pub(crate) fn responses_tool_output_to_openai_tool_content(
 ) -> Result<Value, String> {
     match output {
         None => Ok(Value::String(String::new())),
-        Some(Value::Array(items)) if target_format == UpstreamFormat::Google => {
-            Ok(Value::Array(items.clone()))
-        }
         Some(Value::Array(items)) => {
             let mut content = Vec::with_capacity(items.len());
             for item in items {

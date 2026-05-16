@@ -15,8 +15,7 @@ use crate::internal_artifacts::{
 };
 use crate::translate::{
     anthropic_tool_use_type_for_openai_tool_call, classify_openai_finish_for_anthropic,
-    classify_portable_non_success_terminal, custom_tools_not_portable_message,
-    gemini_finish_reason_to_openai, responses_failed_code_to_openai_finish,
+    classify_portable_non_success_terminal, responses_failed_code_to_openai_finish,
     validate_public_selector_visible_identity, validate_public_tool_name_not_reserved,
     validate_responses_public_output_tool_identity,
     validate_responses_public_response_object_tool_identity,
@@ -25,7 +24,6 @@ use crate::translate::{
 };
 
 mod anthropic_source;
-mod gemini_source;
 mod openai_sink;
 mod responses_source;
 mod state;
@@ -33,7 +31,6 @@ mod stream;
 mod wire;
 
 pub use anthropic_source::claude_event_to_openai_chunks;
-pub use gemini_source::gemini_event_to_openai_chunks;
 pub use responses_source::responses_event_to_openai_chunks;
 pub use state::{ClaudeToolUseState, StreamFatalRejection, StreamState, ToolCallState};
 pub use stream::{

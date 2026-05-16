@@ -199,28 +199,6 @@ async fn error_response_anthropic_raw_503_maps_to_api_error() {
     assert_eq!(body["error"]["message"], "Backend overloaded.");
 }
 
-#[tokio::test]
-async fn error_response_google_sanitizes_internal_artifacts() {
-    let response = error_response(
-        crate::formats::UpstreamFormat::Google,
-        StatusCode::BAD_GATEWAY,
-        r#"{"error":{"message":"provider leaked __llmup_custom__secret and _llmup_tool_bridge_context","type":"server_error"}}"#,
-    );
-
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body bytes");
-    let body_text = String::from_utf8(body.to_vec()).expect("utf8 body");
-
-    assert!(!body_text.contains("__llmup_custom__"), "{body_text}");
-    assert!(
-        !body_text.contains("_llmup_tool_bridge_context"),
-        "{body_text}"
-    );
-    assert!(!body_text.contains("secret"), "{body_text}");
-}
-
 #[test]
 fn streaming_error_response_returns_responses_failed_event() {
     let response = streaming_error_response(

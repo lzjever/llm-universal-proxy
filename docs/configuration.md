@@ -1,6 +1,6 @@
 # Configuration Guide
 
-For most deployments, a static YAML file passed through `--config` is the simplest way to run `llmup`. For Codex CLI, Claude Code, and Gemini CLI, the recommended user-entry path is a wrapper-managed config source that is rendered into static YAML before the proxy starts.
+For most deployments, a static YAML file passed through `--config` is the simplest way to run `llmup`. For Codex CLI and Claude Code, the recommended user-entry path is a wrapper-managed config source that is rendered into static YAML before the proxy starts.
 
 Start from [examples/quickstart-provider-neutral.yaml](../examples/quickstart-provider-neutral.yaml) for the provider-neutral wrapper path. It exposes two stable local aliases:
 
@@ -295,7 +295,7 @@ Practical rules:
 
 - `api_root` should point at the provider API root, not a model-specific path
 - include the version segment such as `/v1` or `/v1beta`
-- `upstream_headers` may add non-secret routing or tenant headers, but cannot override auth/secret headers such as `authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `openai-api-key`, `x-goog-api-key`, or `anthropic-api-key`
+- `upstream_headers` may add non-secret routing or tenant headers, but cannot override auth/secret headers such as `authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `openai-api-key`, or `anthropic-api-key`
 - use exactly one of `provider_key.inline`, `provider_key.env`, or
   `provider_key_env` when the global mode is `proxy_key`
 - normally omit provider credential sources when the global mode is

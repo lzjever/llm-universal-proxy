@@ -16,7 +16,7 @@
 #   `proxy` are omitted for that upstream.
 # - This file focuses on raw HTTP/proxy egress behavior, so it omits client-visible
 #   `surface_defaults` and alias `surface` metadata.
-# - If adapting it for Codex, Claude Code, or Gemini wrapper/live-profile flows, add at least
+# - If adapting it for Codex or Claude Code wrapper/live-profile flows, add at least
 #   the minimal text-only `surface_defaults` from the quickstart, or accurate alias `surface`
 #   metadata for the routed models.
 
@@ -45,9 +45,9 @@ upstreams:
     # Per-upstream override:
     # this wins over the namespace default proxy.
 
-  GOOGLE:
-    api_root: https://generativelanguage.googleapis.com/v1beta
-    format: google
+  GOOGLE-OPENAI-COMPATIBLE:
+    api_root: https://generativelanguage.googleapis.com/v1beta/openai
+    format: openai-completion
     provider_key_env: GEMINI_API_KEY
     proxy: direct
     # Explicit direct:
@@ -64,4 +64,4 @@ upstreams:
 model_aliases:
   gpt-4o: OPENAI:gpt-4o
   claude-sonnet: ANTHROPIC:claude-sonnet-4-5
-  gemini-flash: GOOGLE:gemini-2.0-flash
+  gemini-flash: GOOGLE-OPENAI-COMPATIBLE:gemini-2.0-flash

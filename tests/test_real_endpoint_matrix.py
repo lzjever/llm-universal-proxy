@@ -16,7 +16,6 @@ ENDPOINT_MATRIX_SCRIPT = REPO_ROOT / "scripts" / "real_endpoint_matrix.py"
 REQUIRED_REAL_PROVIDER_ENVS = {
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY",
     "MINIMAX_API_KEY",
 }
 REQUIRED_COMPAT_PROVIDER_CONFIG = {
@@ -48,6 +47,28 @@ def load_endpoint_matrix_module():
 
 
 class RealEndpointMatrixContractTests(unittest.TestCase):
+    def test_mock_provider_start_helper_serves_active_surfaces(self):
+        module = load_endpoint_matrix_module()
+
+        self.assertTrue(callable(module.start_mock_provider))
+        server, thread, base_url = module.start_mock_provider()
+        try:
+            self.assertTrue(thread.is_alive())
+            status, headers, body = module.http_json(
+                f"{base_url}/v1/chat/completions",
+                {
+                    "model": "mock-openai-chat",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", headers.get("content-type", ""))
+        self.assertIn("OK from OpenAI chat mock", body)
+
     def test_anthropic_default_model_tracks_current_api_id(self):
         module = load_endpoint_matrix_module()
 
@@ -217,10 +238,10 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         module = load_endpoint_matrix_module()
         cases = module.build_real_provider_matrix_cases()
 
-        self.assertGreaterEqual(len(cases), 16)
+        self.assertGreaterEqual(len(cases), 12)
         self.assertEqual(
             {case.provider for case in cases if case.required},
-            {"openai", "anthropic", "gemini", "minimax"},
+            {"openai", "anthropic", "minimax"},
         )
         self.assertEqual(
             {case.provider_key_env for case in cases if case.required},
@@ -236,10 +257,6 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
             ("anthropic", "messages", "stream", "messages_stream"),
             ("anthropic", "messages", "tool", "client_tool"),
             ("anthropic", "messages", "fail_closed", "high_risk_state"),
-            ("gemini", "generateContent", "unary", "generate_content_unary"),
-            ("gemini", "streamGenerateContent", "stream", "stream_generate_content"),
-            ("gemini", "generateContent", "tool", "function_declarations"),
-            ("gemini", "generateContent", "fail_closed", "high_risk_state"),
             ("minimax", "openai_chat", "unary", "chat_unary"),
             ("minimax", "openai_chat", "stream", "chat_stream"),
             ("minimax", "openai_chat", "tool", "chat_tool"),
@@ -280,7 +297,6 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
                 "openai_chat",
                 "openai_responses",
                 "anthropic_messages",
-                "gemini_generate_content",
             },
         )
 
@@ -355,11 +371,9 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         args = types.SimpleNamespace(
             openai_base_url="https://openai.example/v1",
             anthropic_base_url="https://anthropic.example/v1",
-            gemini_base_url="https://gemini.example/v1beta",
             minimax_base_url="https://minimax.example/v1",
             openai_model="gpt-contract",
             anthropic_model="claude-contract",
-            gemini_model="gemini-contract",
             minimax_model="minimax-contract",
         )
 
@@ -565,7 +579,7 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
         self.assertEqual(set(report["missing_env"]), REQUIRED_REAL_PROVIDER_ENVS)
         self.assertEqual(report["passed"], 0)
         self.assertEqual(report["skipped"], 0)
-        self.assertGreaterEqual(report["failed"], 16)
+        self.assertGreaterEqual(report["failed"], 12)
 
         required_result_fields = {
             "case_id",
@@ -605,7 +619,7 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
                     import threading
                     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-                    EXPECTED_POSTS = 16
+                    EXPECTED_POSTS = 12
                     post_count = 0
                     post_lock = threading.Lock()
 
@@ -654,13 +668,6 @@ class RealEndpointMatrixContractTests(unittest.TestCase):
 
                             if "previous_response_id" in body_text:
                                 self._send_json(400, {"error": {"message": "previous_response_id rejected"}})
-                            elif path.endswith(":streamGenerateContent"):
-                                self._send_sse('data: {"text":"OK"}\n\n')
-                            elif path.endswith(":generateContent"):
-                                if "functionDeclarations" in body_text:
-                                    self._send_json(200, {"candidates": [{"content": {"parts": [{"functionCall": {"name": "get_weather"}}]}}]})
-                                else:
-                                    self._send_json(200, {"candidates": [{"content": {"parts": [{"text": "OK"}]}}]})
                             elif path == "/anthropic/v1/messages":
                                 if body.get("stream"):
                                     self._send_sse("event: message_start\ndata: {}\n\nevent: message_stop\ndata: {}\n\n")

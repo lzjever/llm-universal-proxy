@@ -923,7 +923,6 @@ check_absent "docs/clients.md" "ANTHROPIC_API_KEY=dummy"
 check_absent "docs/clients.md" "GEMINI_API_KEY=dummy"
 check_contains "docs/clients.md" 'OPENAI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY'
 check_contains "docs/clients.md" 'ANTHROPIC_API_KEY=$LLM_UNIVERSAL_PROXY_KEY'
-check_contains "docs/clients.md" 'GEMINI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY'
 check_contains "docs/clients.md" 'client_provider_key` mode, set these SDK keys to the real provider key'
 check_contains "docs/admin-dynamic-config.md" "do not introduce a separate service key"
 check_absent "docs/admin-dynamic-config.md" "fallback credential"

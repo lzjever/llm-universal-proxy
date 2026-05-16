@@ -5,8 +5,7 @@
 
 pub(crate) use super::internal::classify_portable_non_success_terminal;
 pub(crate) use super::internal::response_protocols::{
-    classify_openai_finish_for_anthropic, gemini_finish_reason_to_openai,
-    responses_failed_code_to_openai_finish, AnthropicTerminal,
+    classify_openai_finish_for_anthropic, responses_failed_code_to_openai_finish, AnthropicTerminal,
 };
 pub use super::internal::translate_response;
 pub(crate) use super::internal::{translate_response_with_context, ResponseTranslationContext};

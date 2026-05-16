@@ -32,9 +32,13 @@ class ProtocolDocsContractTests(unittest.TestCase):
             "OpenAI-compatible completions/chat-completions",
             "OpenAI-compatible completions surface",
             "OpenAI-compatible completions and",
+            "Gemini `generateContent` | Where to read more",
+            "OpenAI-to-Gemini tool-call translation",
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, text)
+        self.assertIn("Google OpenAI-compatible upstream", text)
+        self.assertIn("`format: openai-completion`", text)
 
     def test_prd_uses_same_provider_native_boundary(self):
         text = read_doc("docs/PRD.md")
@@ -47,6 +51,48 @@ class ProtocolDocsContractTests(unittest.TestCase):
         ):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, text)
+
+    def test_active_docs_do_not_promise_native_gemini_wire_format(self):
+        active_docs = (
+            "docs/README.md",
+            "docs/PRD.md",
+            "docs/CONSTITUTION.md",
+            "docs/DESIGN.md",
+            "docs/PROJECT.md",
+            "docs/ga-readiness-review.md",
+            "docs/max-compat-design.md",
+            "docs/container.md",
+        )
+        forbidden = (
+            "Gemini wrapper setup plus common client notes",
+            "Google Gemini should be able to route",
+            "all four protocols",
+            "| 4 | OpenAI Chat Completions | Google Gemini |",
+            "| 13 | Google Gemini | OpenAI Chat Completions |",
+            "All 16 combinations",
+            "**Google Gemini**: `candidates` chunks",
+            "`systemInstruction` (Gemini)",
+            "`functionCall` parts (Gemini)",
+            "`functionResponse` parts (Gemini)",
+            "`promptTokenCount/candidatesTokenCount`",
+            "`thought` parts (Gemini)",
+            "Data plane HTTP API for OpenAI, Anthropic, and Google/Gemini-compatible clients",
+            "Main request execution path for OpenAI, Anthropic, and Gemini surfaces",
+            "Gemini GenerateContent unary",
+            "official Gemini live smoke",
+            "Gemini `replace`",
+            "Gemini request shapes",
+            "Gemini to OpenAI Chat/Responses",
+            "OpenAI Chat/Responses to Gemini",
+        )
+
+        combined = "\n".join(read_doc(path) for path in active_docs)
+        for snippet in forbidden:
+            with self.subTest(snippet=snippet):
+                self.assertNotIn(snippet, combined)
+
+        self.assertIn("Google OpenAI-compatible Gemini", combined)
+        self.assertIn("`format: openai-completion`", combined)
 
     def test_tools_baseline_preserves_hosted_tools_only_on_native_or_shim_lanes(self):
         text = read_doc("docs/protocol-baselines/capabilities/tools.md")

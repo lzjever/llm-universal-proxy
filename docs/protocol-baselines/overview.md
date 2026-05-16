@@ -26,17 +26,17 @@ The summary matrices deliberately split provider-surface coverage from portabili
 | OpenAI Responses | [`openai-responses.md`](openai-responses.md) | Resource-oriented: responses, conversations, follow-up IDs, compaction | Rich typed SSE events | Function tools plus hosted tools and remote MCP | This is the fastest-moving surface and now the main source of OpenAI-specific stateful semantics. |
 | OpenAI Chat Completions | [`openai-chat-completions.md`](openai-chat-completions.md) | Stateless message replay | Delta SSE plus `[DONE]` | Mostly function-style tool schema | Best portability pivot, but no longer the feature superset in OpenAI's own docs. |
 | Anthropic Messages | [`anthropic-messages.md`](anthropic-messages.md) | Stateless messages with growing beta context-management surfaces | Typed SSE block lifecycle | Client tools, server tools, MCP connector | Stop reasons and tool loops carry workflow semantics that do not map cleanly to OpenAI. |
-| Google Gemini `generateContent` | [`google-gemini.md`](google-gemini.md) | Stateless request with optional cached-content references | `streamGenerateContent` family | Function declarations plus built-in/server-side tools, including code execution, search, URL context, file search, computer use, and MCP servers | Gemini mixes core request fields with adjacent caching and tool resources. |
+| Google Gemini `generateContent` | [`google-gemini.md`](google-gemini.md) | Retired historical reference | Retired historical reference | Retired historical reference | Native Gemini is no longer an active proxy surface; use Google OpenAI-compatible upstreams with `format: openai-completion`. |
 
 ## Cross-provider headlines
 
 | Capability | Fast takeaway | Detailed doc |
 | --- | --- | --- |
-| Reasoning | All four surfaces expose reasoning signals, but only OpenAI Responses treats reasoning as a first-class typed item family. | [`capabilities/reasoning.md`](capabilities/reasoning.md) |
-| Caching | OpenAI, Anthropic, and Gemini all support caching, but they model it differently: cache hint, cache breakpoint, and named cache resource. | [`capabilities/cache.md`](capabilities/cache.md) |
-| Tools | All four surfaces now document more than plain function calling, but function calling is still the only stable portability core. Hosted/server tools stay vendor-specific. | [`capabilities/tools.md`](capabilities/tools.md) |
-| Streaming | All four surfaces support streaming delivery, but only some expose rich named lifecycle events and their terminal semantics do not line up. | [`capabilities/streaming.md`](capabilities/streaming.md) |
-| State continuity | OpenAI Responses has the richest explicit state surface. Anthropic and Gemini mostly rely on replay plus provider-specific context helpers. | [`capabilities/state-continuity.md`](capabilities/state-continuity.md) |
+| Reasoning | OpenAI Responses and Anthropic expose native reasoning signals, but only OpenAI Responses treats reasoning as a first-class typed item family. | [`capabilities/reasoning.md`](capabilities/reasoning.md) |
+| Caching | OpenAI and Anthropic both support caching, but they model it differently: cache hint versus cache breakpoint. | [`capabilities/cache.md`](capabilities/cache.md) |
+| Tools | Active surfaces document more than plain function calling, but function calling is still the only stable portability core. Hosted/server tools stay vendor-specific. | [`capabilities/tools.md`](capabilities/tools.md) |
+| Streaming | Active surfaces support streaming delivery, but only some expose rich named lifecycle events and their terminal semantics do not line up. | [`capabilities/streaming.md`](capabilities/streaming.md) |
+| State continuity | OpenAI Responses has the richest explicit state surface. Anthropic mostly relies on replay plus provider-specific context helpers. | [`capabilities/state-continuity.md`](capabilities/state-continuity.md) |
 
 ## Matrix entrypoints
 

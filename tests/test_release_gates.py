@@ -494,7 +494,6 @@ class ReleaseGateWorkflowContractTests(unittest.TestCase):
             "openai_chat",
             "openai_responses",
             "anthropic_messages",
-            "gemini_generate_content",
         }
         expected_modes = {"unary", "stream", "tool", "error"}
         actual_pairs = {(case.surface, case.mode) for case in cases}

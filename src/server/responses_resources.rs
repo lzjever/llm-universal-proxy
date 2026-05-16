@@ -1380,7 +1380,6 @@ fn test_client_provider_key_from_headers(headers: &HeaderMap) -> Option<String> 
                 "x-api-key",
                 "api-key",
                 "openai-api-key",
-                "x-goog-api-key",
                 "anthropic-api-key",
             ]
             .into_iter()

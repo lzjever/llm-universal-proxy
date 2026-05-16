@@ -6,6 +6,7 @@
 - Proxy posture updated date: 2026-04-26
 - Audience: proxy implementers, test authors, and maintainers refreshing protocol docs
 - This file is intentionally only an entrypoint and update guide.
+- Native Google/Gemini `generateContent` docs in this directory are retained as retired historical vendor-reference material. They are not active proxy support commitments; Gemini provider access should use Google's OpenAI-compatible endpoint with `format: openai-completion`.
 
 ## What lives here
 

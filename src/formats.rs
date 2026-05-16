@@ -1,14 +1,11 @@
-//! Format identifiers for the four supported LLM API shapes.
+//! Format identifiers for the supported LLM API shapes.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
-/// The four supported endpoint formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The supported endpoint formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum UpstreamFormat {
-    /// Google (Gemini) — e.g. generateContent, contents[].
-    #[serde(rename = "google", alias = "gemini")]
-    Google,
     /// Anthropic (Claude) — e.g. /v1/messages, messages[], content blocks.
     #[serde(rename = "anthropic", alias = "claude")]
     Anthropic,
@@ -20,10 +17,13 @@ pub enum UpstreamFormat {
     OpenAiResponses,
 }
 
+pub(crate) fn removed_native_gemini_format_message() -> String {
+    "native Gemini format support has been removed; use Google OpenAI-compatible endpoint https://generativelanguage.googleapis.com/v1beta/openai with format: openai-completion".to_string()
+}
+
 impl fmt::Display for UpstreamFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UpstreamFormat::Google => write!(f, "google"),
             UpstreamFormat::Anthropic => write!(f, "anthropic"),
             UpstreamFormat::OpenAiCompletion => write!(f, "openai-completion"),
             UpstreamFormat::OpenAiResponses => write!(f, "openai-responses"),
@@ -36,7 +36,7 @@ impl std::str::FromStr for UpstreamFormat {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "google" | "gemini" => Ok(UpstreamFormat::Google),
+            "google" | "gemini" => Err(removed_native_gemini_format_message()),
             "anthropic" | "claude" => Ok(UpstreamFormat::Anthropic),
             "openai" | "openai-completion" | "chat" => Ok(UpstreamFormat::OpenAiCompletion),
             "openai-responses" | "responses" => Ok(UpstreamFormat::OpenAiResponses),
@@ -45,24 +45,35 @@ impl std::str::FromStr for UpstreamFormat {
     }
 }
 
+impl<'de> Deserialize<'de> for UpstreamFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn from_str_google_gemini() {
-        assert_eq!(
-            "google".parse::<UpstreamFormat>().unwrap(),
-            UpstreamFormat::Google
-        );
-        assert_eq!(
-            "gemini".parse::<UpstreamFormat>().unwrap(),
-            UpstreamFormat::Google
-        );
-        assert_eq!(
-            "GOOGLE".parse::<UpstreamFormat>().unwrap(),
-            UpstreamFormat::Google
-        );
+    fn from_str_rejects_removed_native_gemini_formats_with_migration_hint() {
+        for removed in ["google", "gemini", "GOOGLE"] {
+            let error = removed
+                .parse::<UpstreamFormat>()
+                .expect_err("native Gemini formats must be removed");
+            assert!(
+                error.contains("format: openai-completion"),
+                "error should explain the OpenAI-compatible migration path: {error}"
+            );
+            assert!(
+                error.contains("generativelanguage.googleapis.com/v1beta/openai"),
+                "error should name the Google OpenAI-compatible endpoint: {error}"
+            );
+        }
     }
 
     #[test]
@@ -113,7 +124,6 @@ mod tests {
 
     #[test]
     fn display() {
-        assert_eq!(UpstreamFormat::Google.to_string(), "google");
         assert_eq!(UpstreamFormat::Anthropic.to_string(), "anthropic");
         assert_eq!(
             UpstreamFormat::OpenAiCompletion.to_string(),

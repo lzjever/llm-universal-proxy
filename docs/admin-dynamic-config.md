@@ -220,7 +220,7 @@ not set through the namespace payload.
 
 In `client_provider_key` mode, `provider_key.env` and `provider_key_env` are not rejected if present, but they are not used.
 
-Runtime writes use the same client-visible surface contract as static YAML. Raw HTTP tests can omit `surface_defaults`, but Codex, Claude Code, and Gemini wrapper/live-profile flows should provide at least the conservative text-only surface shown below, or an accurate alias-level `surface`.
+Runtime writes use the same client-visible surface contract as static YAML. Raw HTTP tests can omit `surface_defaults`, but Codex, Claude Code, and other supported wrapper/live-profile flows should provide at least the conservative text-only surface shown below, or an accurate alias-level `surface`.
 
 Responses reasoning/compaction continuity follows the same compatibility policy
 in dynamically written namespaces: default/max_compat may drop an opaque carrier

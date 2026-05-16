@@ -15,7 +15,7 @@ Earlier versions of this document described a much smaller v0 proxy with a singl
 
 The current binary contains four major runtime surfaces:
 
-1. Data plane HTTP API for OpenAI, Anthropic, and Google/Gemini-compatible clients.
+1. Data plane HTTP API for OpenAI and Anthropic client protocols.
 2. Admin control plane for runtime namespace configuration and redacted state inspection.
 3. Optional local dashboard driven from live runtime snapshots and metrics.
 4. Optional observability sinks: async hooks and local debug trace.
@@ -79,10 +79,8 @@ The data plane is protocol-namespaced and also supports namespace-prefixed varia
 
 - `/openai/v1/...`
 - `/anthropic/v1/...`
-- `/google/v1beta/...`
 - `/namespaces/:namespace/openai/v1/...`
 - `/namespaces/:namespace/anthropic/v1/...`
-- `/namespaces/:namespace/google/v1beta/...`
 
 Router assembly lives in `src/server/mod.rs`, while the behavior is split across `src/server/proxy.rs`, `src/server/responses_resources.rs`, `src/server/models.rs`, `src/server/errors.rs`, and `src/server/headers.rs`.
 

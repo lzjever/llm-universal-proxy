@@ -675,57 +675,6 @@ fn anthropic_protocol_terminal(
     }
 }
 
-fn google_protocol_terminal(event: &Value) -> Option<ProtocolTerminal> {
-    let response = event.get("response").unwrap_or(event);
-
-    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
-        return Some(ProtocolTerminal {
-            kind: ProtocolTerminalKind::Failed,
-            event_type: "error".to_string(),
-            finish_reason: None,
-            incomplete_reason: None,
-            error: Some(error.clone()),
-        });
-    }
-
-    if let Some(block_reason) = response
-        .get("promptFeedback")
-        .and_then(|feedback| feedback.get("blockReason"))
-        .and_then(Value::as_str)
-    {
-        return Some(ProtocolTerminal {
-            kind: ProtocolTerminalKind::Incomplete,
-            event_type: "prompt_feedback".to_string(),
-            finish_reason: Some(block_reason.to_string()),
-            incomplete_reason: Some(block_reason.to_string()),
-            error: None,
-        });
-    }
-
-    let finish_reason = response
-        .get("candidates")
-        .and_then(Value::as_array)
-        .and_then(|candidates| candidates.first())
-        .and_then(|candidate| candidate.get("finishReason"))
-        .and_then(Value::as_str)?;
-    let kind = match finish_reason {
-        "MAX_TOKENS" | "SAFETY" | "RECITATION" => ProtocolTerminalKind::Incomplete,
-        "MALFORMED_FUNCTION_CALL"
-        | "UNEXPECTED_TOOL_CALL"
-        | "TOO_MANY_TOOL_CALLS"
-        | "MISSING_THOUGHT_SIGNATURE" => ProtocolTerminalKind::Failed,
-        _ => ProtocolTerminalKind::Success,
-    };
-    Some(ProtocolTerminal {
-        kind,
-        event_type: "candidate".to_string(),
-        finish_reason: Some(finish_reason.to_string()),
-        incomplete_reason: matches!(kind, ProtocolTerminalKind::Incomplete)
-            .then_some(finish_reason.to_string()),
-        error: None,
-    })
-}
-
 fn extract_request_delta(format: UpstreamFormat, body: &Value, max_text_chars: usize) -> Value {
     match format {
         UpstreamFormat::OpenAiCompletion => {
@@ -785,7 +734,6 @@ fn extract_request_delta(format: UpstreamFormat, body: &Value, max_text_chars: u
                     .collect(),
             )
         }
-        UpstreamFormat::Google => body.clone(),
     }
 }
 
@@ -827,12 +775,6 @@ fn summarize_request_body(format: UpstreamFormat, body: &Value, max_text_chars: 
             "message_roles": body.get("messages").and_then(Value::as_array).map(|messages| message_roles(messages)),
             "messages_tail": extract_request_delta(format, body, max_text_chars),
         }),
-        UpstreamFormat::Google => json!({
-            "model": body.get("model"),
-            "contents_count": body.get("contents").and_then(Value::as_array).map(|a| a.len()),
-            "tool_names": body.get("tools").and_then(Value::as_array).map(|tools| tool_names_from_google_tools(tools)),
-            "toolConfig": google_request_field(body, "toolConfig", "tool_config"),
-        }),
     }
 }
 
@@ -860,28 +802,6 @@ fn tool_names_from_claude_tools(tools: &[Value]) -> Vec<String> {
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
         .collect()
-}
-
-fn tool_names_from_google_tools(tools: &[Value]) -> Vec<String> {
-    tools
-        .iter()
-        .flat_map(|tool| {
-            google_request_field(tool, "functionDeclarations", "function_declarations")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|declaration| {
-            declaration
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect()
-}
-
-fn google_request_field<'a>(value: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
-    value.get(camel).or_else(|| value.get(snake))
 }
 
 fn message_roles(messages: &[Value]) -> Vec<String> {
@@ -1037,9 +957,6 @@ fn summarize_non_stream_response(
             }).unwrap_or_default(),
             "error": body.get("error"),
         }),
-        UpstreamFormat::Google => json!({
-            "body": truncate_text(&value_to_display_string(body), max_text_chars),
-        }),
     }
 }
 
@@ -1048,7 +965,6 @@ fn accumulate_event(format: UpstreamFormat, event: &Value, summary: &mut Respons
         UpstreamFormat::OpenAiCompletion => accumulate_openai_completion_event(event, summary),
         UpstreamFormat::OpenAiResponses => accumulate_responses_event(event, summary),
         UpstreamFormat::Anthropic => accumulate_claude_event(event, summary),
-        UpstreamFormat::Google => accumulate_google_event(event, summary),
     }
 }
 
@@ -1195,44 +1111,6 @@ fn accumulate_claude_event(event: &Value, summary: &mut ResponseSummary) {
     }
 }
 
-fn accumulate_google_event(event: &Value, summary: &mut ResponseSummary) {
-    let response = event.get("response").unwrap_or(event);
-
-    let candidate = response
-        .get("candidates")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.first());
-
-    if let Some(parts) = candidate
-        .and_then(|candidate| candidate.get("content"))
-        .and_then(|content| content.get("parts"))
-        .and_then(Value::as_array)
-    {
-        for part in parts {
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                if part.get("thought").and_then(Value::as_bool) == Some(true) {
-                    summary.reasoning.push_str(text);
-                } else {
-                    summary.text.push_str(text);
-                }
-            }
-            if part.get("functionCall").is_some() {
-                summary.tool_calls.push(part.clone());
-            }
-        }
-    }
-
-    if let Some(terminal) = google_protocol_terminal(response) {
-        summary.terminal_event = Some(terminal.event_type.clone());
-        summary.finish_reason = terminal
-            .finish_reason
-            .clone()
-            .or_else(|| terminal.incomplete_reason.clone());
-        summary.error = terminal.error.clone();
-        summary.protocol_terminal = Some(terminal);
-    }
-}
-
 fn truncate_text(text: &str, max_text_chars: usize) -> String {
     let chars = text.chars().count();
     if chars <= max_text_chars {
@@ -1329,71 +1207,6 @@ mod tests {
             project_trace_outcome(TransportOutcome::ClientDisconnected, &summary),
             TraceOutcome::Incomplete
         ));
-    }
-
-    #[test]
-    fn google_request_summary_includes_function_declaration_tool_names_and_selectors() {
-        let body = json!({
-            "model": "gemini-2.5-flash",
-            "contents": [{ "role": "user", "parts": [{ "text": "edit file" }] }],
-            "tools": [{
-                "functionDeclarations": [
-                    { "name": "replace", "parameters": { "type": "object" } },
-                    { "name": "lookup_workspace", "parameters": { "type": "object" } }
-                ]
-            }],
-            "toolConfig": {
-                "functionCallingConfig": {
-                    "mode": "ANY",
-                    "allowedFunctionNames": ["replace"]
-                }
-            }
-        });
-
-        let summary = summarize_request_body(UpstreamFormat::Google, &body, 128);
-
-        assert_eq!(
-            summary["tool_names"],
-            json!(["replace", "lookup_workspace"])
-        );
-        assert_eq!(
-            summary["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
-            json!(["replace"])
-        );
-    }
-
-    #[test]
-    fn google_request_summary_omits_internal_bridge_context_artifacts() {
-        let body = json!({
-            "model": "gemini-2.5-flash",
-            "contents": [{ "role": "user", "parts": [{ "text": "edit file" }] }],
-            "tools": [{
-                "functionDeclarations": [
-                    { "name": "replace", "parameters": { "type": "object" } }
-                ]
-            }],
-            "_llmup_tool_bridge_context": {
-                "version": 1,
-                "compatibility_mode": "max_compat",
-                "entries": {
-                    "__llmup_custom__replace": {
-                        "stable_name": "__llmup_custom__replace",
-                        "source_kind": "custom_text",
-                        "transport_kind": "function_object_wrapper",
-                        "wrapper_field": "input",
-                        "expected_canonical_shape": "single_required_string"
-                    }
-                }
-            }
-        });
-
-        let summary = summarize_request_body(UpstreamFormat::Google, &body, 128);
-
-        assert_eq!(summary["tool_names"], json!(["replace"]));
-        assert!(
-            !summary.to_string().contains("__llmup_custom__"),
-            "summary = {summary:?}"
-        );
     }
 
     #[test]
@@ -1531,86 +1344,6 @@ mod tests {
     }
 
     #[test]
-    fn google_stream_event_accumulates_text_tool_call_and_terminal_summary() {
-        let mut summary = ResponseSummary::new(128);
-
-        accumulate_event(
-            UpstreamFormat::Google,
-            &json!({
-                "candidates": [{
-                    "content": {
-                        "parts": [
-                            { "text": "Hi" },
-                            {
-                                "functionCall": {
-                                    "id": "call_1",
-                                    "name": "lookup_weather",
-                                    "args": { "city": "Tokyo" }
-                                }
-                            }
-                        ],
-                        "role": "model"
-                    },
-                    "finishReason": "STOP"
-                }],
-                "modelVersion": "gemini-2.5"
-            }),
-            &mut summary,
-        );
-
-        assert_eq!(summary.text_for_record(), "Hi");
-        assert_eq!(summary.terminal_event_for_record(), Some("candidate"));
-        assert_eq!(summary.finish_reason_for_record(), Some("STOP"));
-        assert_eq!(
-            summary
-                .protocol_terminal
-                .as_ref()
-                .map(|terminal| terminal.kind),
-            Some(ProtocolTerminalKind::Success)
-        );
-        let tool_calls = summary.tool_calls_for_record();
-        assert_eq!(tool_calls.len(), 1, "{tool_calls:?}");
-        assert_eq!(tool_calls[0]["functionCall"]["id"], "call_1");
-        assert_eq!(tool_calls[0]["functionCall"]["name"], "lookup_weather");
-        assert_eq!(tool_calls[0]["functionCall"]["args"]["city"], "Tokyo");
-    }
-
-    #[test]
-    fn google_prompt_feedback_accumulates_incomplete_terminal_summary() {
-        let mut summary = ResponseSummary::new(64);
-
-        accumulate_event(
-            UpstreamFormat::Google,
-            &json!({
-                "promptFeedback": {
-                    "blockReason": "SAFETY",
-                    "safetyRatings": [{
-                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                        "probability": "HIGH"
-                    }]
-                },
-                "modelVersion": "gemini-2.5"
-            }),
-            &mut summary,
-        );
-
-        assert_eq!(summary.terminal_event_for_record(), Some("prompt_feedback"));
-        assert_eq!(summary.finish_reason_for_record(), Some("SAFETY"));
-        assert_eq!(
-            summary
-                .protocol_terminal
-                .as_ref()
-                .map(|terminal| terminal.kind),
-            Some(ProtocolTerminalKind::Incomplete)
-        );
-        assert_eq!(
-            project_trace_outcome(TransportOutcome::ClientDisconnected, &summary),
-            TraceOutcome::Incomplete
-        );
-        assert_eq!(summary.error_for_record(), None);
-    }
-
-    #[test]
     fn response_summary_bounds_text_reasoning_and_tool_calls_during_accumulation() {
         let mut summary = ResponseSummary::new(12);
 
@@ -1667,98 +1400,5 @@ mod tests {
         assert!(tool_calls
             .iter()
             .any(|value| { value.get("type").and_then(Value::as_str) == Some("truncated") }));
-    }
-
-    #[test]
-    fn google_stream_events_accumulate_reasoning_and_multi_frame_summaries() {
-        let mut summary = ResponseSummary::new(128);
-
-        accumulate_event(
-            UpstreamFormat::Google,
-            &json!({
-                "candidates": [{
-                    "content": {
-                        "parts": [
-                            { "text": "Thinking...", "thought": true },
-                            { "text": "Hello " },
-                            {
-                                "functionCall": {
-                                    "id": "call_1",
-                                    "name": "lookup_weather",
-                                    "args": { "city": "Tokyo" }
-                                }
-                            }
-                        ],
-                        "role": "model"
-                    }
-                }]
-            }),
-            &mut summary,
-        );
-        accumulate_event(
-            UpstreamFormat::Google,
-            &json!({
-                "candidates": [{
-                    "content": {
-                        "parts": [{ "text": "world" }],
-                        "role": "model"
-                    },
-                    "finishReason": "STOP"
-                }],
-                "modelVersion": "gemini-2.5"
-            }),
-            &mut summary,
-        );
-
-        assert_eq!(summary.text_for_record(), "Hello world");
-        assert_eq!(summary.reasoning_for_record(), "Thinking...");
-        assert_eq!(summary.tool_calls_for_record().len(), 1);
-        assert_eq!(
-            summary.tool_calls_for_record()[0]["functionCall"]["name"],
-            "lookup_weather"
-        );
-        assert_eq!(summary.terminal_event_for_record(), Some("candidate"));
-        assert_eq!(summary.finish_reason_for_record(), Some("STOP"));
-        assert_eq!(
-            summary
-                .protocol_terminal
-                .as_ref()
-                .map(|terminal| terminal.kind),
-            Some(ProtocolTerminalKind::Success)
-        );
-    }
-
-    #[test]
-    fn google_error_event_accumulates_failed_terminal_summary() {
-        let mut summary = ResponseSummary::new(128);
-
-        accumulate_event(
-            UpstreamFormat::Google,
-            &json!({
-                "error": {
-                    "code": 400,
-                    "message": "Gemini stream failed",
-                    "status": "INVALID_ARGUMENT"
-                }
-            }),
-            &mut summary,
-        );
-
-        assert_eq!(summary.terminal_event_for_record(), Some("error"));
-        assert_eq!(
-            summary
-                .protocol_terminal
-                .as_ref()
-                .map(|terminal| terminal.kind),
-            Some(ProtocolTerminalKind::Failed)
-        );
-        assert_eq!(
-            summary.error_for_record(),
-            Some(&json!({
-                "code": 400,
-                "message": "Gemini stream failed",
-                "status": "INVALID_ARGUMENT"
-            }))
-        );
     }
 }

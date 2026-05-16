@@ -722,13 +722,10 @@ pub(super) fn responses_to_messages(
 ) -> Result<(), String> {
     let use_request_scoped_openai_custom_bridge = matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
     );
     let bridge_custom_responses_semantics = use_request_scoped_openai_custom_bridge;
-    let degrade_marked_tool_calls = matches!(
-        target_format,
-        UpstreamFormat::Anthropic | UpstreamFormat::Google
-    );
+    let degrade_marked_tool_calls = target_format == UpstreamFormat::Anthropic;
     if bridge_custom_responses_semantics {
         validate_responses_request_for_custom_bridge(body)?;
     }
@@ -1579,7 +1576,7 @@ fn responses_tool_choice_to_openai_tool_choice(
 ) -> Result<Option<Value>, String> {
     let use_request_scoped_openai_custom_bridge = matches!(
         target_format,
-        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic | UpstreamFormat::Google
+        UpstreamFormat::OpenAiCompletion | UpstreamFormat::Anthropic
     );
     let bridge_custom_responses_semantics = use_request_scoped_openai_custom_bridge;
     if choice.is_string() {

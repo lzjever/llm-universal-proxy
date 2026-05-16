@@ -311,68 +311,6 @@ async fn openai_models_list_redacts_alias_and_metadata_known_secrets() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn google_model_object_success_redacts_alias_metadata_and_description() {
-    let alias = format!("alias-{PROVIDER_INLINE_REDACTION_SECRET}-{PROXY_INLINE_REDACTION_SECRET}");
-    let upstream_name =
-        format!("upstream-{PROVIDER_INLINE_REDACTION_SECRET}-{PROXY_INLINE_REDACTION_SECRET}");
-    let upstream_model =
-        format!("model-{PROVIDER_INLINE_REDACTION_SECRET}-{PROXY_INLINE_REDACTION_SECRET}");
-    let access = data_auth::DataAccess::ProxyKey {
-        key: PROXY_INLINE_REDACTION_SECRET.to_string(),
-    };
-    let state = state_for_models_config(
-        models_catalog_config(
-            &alias,
-            &upstream_name,
-            &upstream_model,
-            crate::formats::UpstreamFormat::Google,
-            Some(PROVIDER_INLINE_REDACTION_SECRET),
-        ),
-        access.clone(),
-    )
-    .await;
-    let runtime = state.runtime.read().await.clone();
-    let auth_context = request_auth_context_for_runtime(
-        runtime,
-        access,
-        data_auth::RequestAuthorization::ProxyKey,
-    );
-
-    let response = crate::server::models::handle_google_model(
-        State(state),
-        Path(alias),
-        Some(axum::Extension(auth_context)),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body_text = models_response_text(response).await;
-    assert_models_response_redacted(
-        &body_text,
-        &[
-            PROVIDER_INLINE_REDACTION_SECRET,
-            PROXY_INLINE_REDACTION_SECRET,
-        ],
-        "Google model object",
-    );
-    let body: Value = serde_json::from_str(&body_text).expect("model object JSON");
-    assert!(
-        body["name"].as_str().unwrap_or("").contains("[REDACTED]"),
-        "{body_text}"
-    );
-    assert!(
-        body["description"]
-            .as_str()
-            .unwrap_or("")
-            .contains("[REDACTED]"),
-        "{body_text}"
-    );
-    assert_eq!(body["llmup"]["limits"], Value::Null);
-    assert!(body["llmup"].get("surface").is_some(), "{body_text}");
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn openai_model_not_found_redacts_client_and_server_keys() {
     let provider_state = state_for_models_config(
         models_not_found_config(

@@ -386,76 +386,6 @@ pub(super) async fn handle_anthropic_messages_namespaced(
     .await
 }
 
-pub(super) async fn handle_google_model_action(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    request: Request,
-) -> Response<Body> {
-    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
-        return data_auth::missing_request_auth_context_response(UpstreamFormat::Google);
-    };
-    let (headers, body) = match read_limited_json_request(
-        &state,
-        DEFAULT_NAMESPACE,
-        UpstreamFormat::Google,
-        &auth_context,
-        request,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    handle_google_model_action_inner(
-        state,
-        DEFAULT_NAMESPACE.to_string(),
-        id,
-        downstream_cancellation
-            .map(|Extension(cancellation)| cancellation)
-            .unwrap_or_else(DownstreamCancellation::disabled),
-        headers,
-        body,
-        auth_context,
-    )
-    .await
-}
-
-pub(super) async fn handle_google_model_action_namespaced(
-    State(state): State<Arc<AppState>>,
-    Path((namespace, id)): Path<(String, String)>,
-    downstream_cancellation: Option<Extension<DownstreamCancellation>>,
-    request: Request,
-) -> Response<Body> {
-    let Some(auth_context) = data_auth::request_auth_context_from_request(&request) else {
-        return data_auth::missing_request_auth_context_response(UpstreamFormat::Google);
-    };
-    let (headers, body) = match read_limited_json_request(
-        &state,
-        &namespace,
-        UpstreamFormat::Google,
-        &auth_context,
-        request,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    handle_google_model_action_inner(
-        state,
-        namespace,
-        id,
-        downstream_cancellation
-            .map(|Extension(cancellation)| cancellation)
-            .unwrap_or_else(DownstreamCancellation::disabled),
-        headers,
-        body,
-        auth_context,
-    )
-    .await
-}
-
 async fn handle_openai_chat_completions_inner(
     state: Arc<AppState>,
     namespace: String,
@@ -535,48 +465,6 @@ async fn handle_anthropic_messages_inner(
         requested_model,
         UpstreamFormat::Anthropic,
         None,
-        auth_context,
-    )
-    .await
-}
-
-async fn handle_google_model_action_inner(
-    state: Arc<AppState>,
-    namespace: String,
-    id: String,
-    downstream_cancellation: DownstreamCancellation,
-    headers: HeaderMap,
-    body: Value,
-    auth_context: RequestAuthContext,
-) -> Response<Body> {
-    let Some((requested_model, action)) = id.split_once(':') else {
-        return error_response(
-            UpstreamFormat::Google,
-            StatusCode::BAD_REQUEST,
-            "google model action path must end with :generateContent or :streamGenerateContent",
-        );
-    };
-    let forced_stream = match action {
-        "generateContent" => false,
-        "streamGenerateContent" => true,
-        _ => {
-            return error_response(
-                UpstreamFormat::Google,
-                StatusCode::BAD_REQUEST,
-                "unsupported google model action",
-            );
-        }
-    };
-    handle_request_core_with_downstream_cancellation(
-        state,
-        namespace,
-        downstream_cancellation,
-        headers,
-        format!("/google/v1beta/models/{id}"),
-        body,
-        requested_model.to_string(),
-        UpstreamFormat::Google,
-        Some(forced_stream),
         auth_context,
     )
     .await
@@ -695,7 +583,6 @@ fn test_client_provider_key_from_headers(headers: &HeaderMap) -> Option<String> 
                 "x-api-key",
                 "api-key",
                 "openai-api-key",
-                "x-goog-api-key",
                 "anthropic-api-key",
             ]
             .into_iter()
@@ -895,11 +782,7 @@ async fn handle_request_core_with_downstream_cancellation(
     let upstream_format = capability.upstream_format_for_request(client_format);
     if let Some(obj) = body.as_object_mut() {
         if let Some(forced_stream) = forced_stream {
-            if !(client_format == UpstreamFormat::Google
-                && upstream_format == UpstreamFormat::Google)
-            {
-                obj.insert("stream".to_string(), Value::Bool(forced_stream));
-            }
+            obj.insert("stream".to_string(), Value::Bool(forced_stream));
         }
     }
 
@@ -947,9 +830,6 @@ async fn handle_request_core_with_downstream_cancellation(
 
     if let Some(obj) = body.as_object_mut() {
         match upstream_format {
-            UpstreamFormat::Google => {
-                obj.remove("model");
-            }
             _ if client_format == UpstreamFormat::OpenAiResponses
                 && upstream_format == UpstreamFormat::OpenAiResponses
                 && requested_model.trim().is_empty()
@@ -1039,11 +919,7 @@ async fn handle_request_core_with_downstream_cancellation(
         &namespace_state.config,
         &upstream_state.config,
         upstream_format,
-        if upstream_format == UpstreamFormat::Google {
-            Some(resolved_model.upstream_model.as_str())
-        } else {
-            None
-        },
+        None,
         stream,
     );
     debug!(

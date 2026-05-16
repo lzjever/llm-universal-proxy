@@ -326,7 +326,6 @@ fn request_scoped_credential_secrets(headers: &HeaderMap) -> Vec<String> {
         "x-api-key",
         "api-key",
         "openai-api-key",
-        "x-goog-api-key",
         "anthropic-api-key",
     ] {
         for value in headers.get_all(HeaderName::from_static(name)) {

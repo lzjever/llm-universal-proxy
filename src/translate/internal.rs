@@ -2,7 +2,7 @@
 //!
 //! Reference: 9router open-sse/translator/index.js — source → openai → target.
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::config::{CompatibilityMode, ModelSurface};
 use crate::formats::UpstreamFormat;
@@ -374,20 +374,6 @@ fn apply_request_translation_policy_default_output_limit(
                 Value::from(max_output_tokens),
             );
         }
-        UpstreamFormat::Google => {
-            let generation_config = obj
-                .entry("generationConfig".to_string())
-                .or_insert_with(|| Value::Object(Map::new()));
-            if !generation_config.is_object() {
-                *generation_config = Value::Object(Map::new());
-            }
-            if let Some(generation_config_obj) = generation_config.as_object_mut() {
-                generation_config_obj.insert(
-                    "maxOutputTokens".to_string(),
-                    Value::from(max_output_tokens),
-                );
-            }
-        }
     }
 }
 
@@ -426,7 +412,6 @@ fn apply_request_translation_policy_parallel_tool_gate(
                 .entry("disable_parallel_tool_use".to_string())
                 .or_insert(Value::Bool(true));
         }
-        UpstreamFormat::Google => {}
     }
 }
 
@@ -441,17 +426,7 @@ fn request_body_has_explicit_output_limit(target_format: UpstreamFormat, body: &
             obj.get("max_completion_tokens").is_some() || obj.get("max_tokens").is_some()
         }
         UpstreamFormat::OpenAiResponses => obj.get("max_output_tokens").is_some(),
-        UpstreamFormat::Google => {
-            google_generation_config_has_output_limit(obj.get("generationConfig"))
-                || google_generation_config_has_output_limit(obj.get("generation_config"))
-        }
     }
-}
-
-fn google_generation_config_has_output_limit(config: Option<&Value>) -> bool {
-    config.and_then(Value::as_object).is_some_and(|config| {
-        config.get("maxOutputTokens").is_some() || config.get("max_output_tokens").is_some()
-    })
 }
 
 fn request_body_has_explicit_parallel_tool_calls_preference(
@@ -469,7 +444,6 @@ fn request_body_has_explicit_parallel_tool_calls_preference(
             .and_then(|tool_choice| tool_choice.get("disable_parallel_tool_use"))
             .and_then(Value::as_bool)
             .is_some(),
-        UpstreamFormat::Google => false,
     }
 }
 
@@ -478,10 +452,6 @@ fn request_body_has_tool_definitions(target_format: UpstreamFormat, body: &Value
         UpstreamFormat::OpenAiCompletion
         | UpstreamFormat::OpenAiResponses
         | UpstreamFormat::Anthropic => body
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| !tools.is_empty()),
-        UpstreamFormat::Google => body
             .get("tools")
             .and_then(Value::as_array)
             .is_some_and(|tools| !tools.is_empty()),
@@ -726,16 +696,13 @@ fn client_to_openai_completion(
         UpstreamFormat::Anthropic => {
             claude_to_openai(body, target_format == UpstreamFormat::OpenAiResponses)?;
         }
-        UpstreamFormat::Google => {
-            gemini_to_openai(body, target_format)?;
-        }
     }
     Ok(())
 }
 
 fn openai_completion_to_upstream(
     to: UpstreamFormat,
-    target_model: &str,
+    _target_model: &str,
     body: &mut Value,
 ) -> Result<(), String> {
     match to {
@@ -746,9 +713,6 @@ fn openai_completion_to_upstream(
         UpstreamFormat::Anthropic => {
             openai_to_claude(body)?;
         }
-        UpstreamFormat::Google => {
-            openai_to_gemini(body, target_model)?;
-        }
     }
     Ok(())
 }
@@ -757,7 +721,6 @@ mod openai_family;
 mod openai_responses;
 #[cfg(test)]
 mod regression_tests;
-mod request_gemini;
 mod response_logprobs;
 pub(crate) mod response_protocols;
 pub(crate) mod tools;
@@ -771,17 +734,17 @@ use media::{
 use messages::{
     anthropic_request_tool_definition_not_portable_message,
     anthropic_tool_result_order_not_portable_message, custom_tools_not_portable_message,
-    gemini_function_response_parts_not_portable_message,
-    openai_assistant_audio_not_portable_message, single_optional_array_item,
-    single_required_array_item, translation_target_label,
+    openai_assistant_audio_not_portable_message, translation_target_label,
 };
 use models::{
-    NormalizedOpenAiFamilyToolCall, NormalizedToolPolicy, SemanticToolKind, TranslationDecision,
+    NormalizedOpenAiFamilyToolCall, NormalizedOutputShape, NormalizedToolPolicy, SemanticToolKind,
+    TranslationDecision,
 };
 use openai_family::{
     collapse_openai_text_parts, copy_remaining_usage_fields, extract_openai_content_text,
-    extract_openai_refusal, extract_responses_text_content, openai_normalized_request_controls,
-    openai_response_has_assistant_audio,
+    extract_openai_refusal, extract_responses_text_content, openai_declared_function_tools,
+    openai_normalized_request_controls, openai_response_has_assistant_audio,
+    openai_select_function_tools_by_name,
 };
 use openai_responses::{
     append_openai_message_anthropic_reasoning_replay_blocks, messages_to_responses,
@@ -789,25 +752,9 @@ use openai_responses::{
     responses_response_to_openai, responses_response_to_openai_for_anthropic,
     responses_to_messages,
 };
-#[cfg(test)]
-use request_gemini::convert_gemini_content_to_openai;
-use request_gemini::{
-    gemini_function_declaration_output_schema_field,
-    gemini_function_output_schema_not_portable_message,
-    gemini_function_response_has_nonportable_parts, gemini_openai_function_tools_from_request,
-    gemini_part_field, gemini_request_function_calling_config_from_object,
-    gemini_request_nonportable_output_shape_message, gemini_request_tool_config,
-    gemini_request_tools, gemini_to_openai, gemini_tool_function_declarations,
-    gemini_validated_allowed_function_names, normalized_output_shape_to_claude_output_config,
-    openai_content_to_gemini_parts, openai_portable_function_tools, openai_to_gemini,
-};
-use response_logprobs::{
-    normalized_response_logprobs_from_openai_choice, normalized_response_logprobs_to_gemini_fields,
-};
 use response_protocols::{
-    gemini_response_to_openai, is_minimax_model, normalize_openai_completion_response,
-    openai_finish_reason_to_gemini, openai_message_reasoning_text, openai_response_to_claude,
-    push_gemini_function_call_part,
+    is_minimax_model, normalize_openai_completion_response, openai_message_reasoning_text,
+    openai_response_to_claude,
 };
 use tools::{
     anthropic_tool_use_type_for_openai_tool_call, copy_non_replayable_tool_call_marker,
@@ -907,22 +854,17 @@ fn upstream_response_to_openai(
     match upstream_format {
         UpstreamFormat::OpenAiCompletion => Ok(normalize_openai_completion_response(body)),
         UpstreamFormat::Anthropic => claude_response_to_openai(body, bridge_context),
-        UpstreamFormat::Google => gemini_response_to_openai(body),
         UpstreamFormat::OpenAiResponses => responses_response_to_openai(body),
     }
 }
 
-/// Convert OpenAI completion response to client format (Responses, Claude, Gemini).
+/// Convert OpenAI completion response to client format (Responses or Claude).
 fn openai_response_to_client(
     client_format: UpstreamFormat,
     body: &Value,
     bridge_context: Option<&tools::ToolBridgeContext>,
 ) -> Result<Value, String> {
-    if matches!(
-        client_format,
-        UpstreamFormat::Anthropic | UpstreamFormat::Google
-    ) && openai_response_has_assistant_audio(body)
-    {
+    if client_format == UpstreamFormat::Anthropic && openai_response_has_assistant_audio(body) {
         return Err(openai_assistant_audio_not_portable_message(
             translation_target_label(client_format),
         ));
@@ -931,7 +873,6 @@ fn openai_response_to_client(
         UpstreamFormat::OpenAiCompletion => Ok(body.clone()),
         UpstreamFormat::OpenAiResponses => openai_response_to_responses(body, bridge_context),
         UpstreamFormat::Anthropic => openai_response_to_claude(body),
-        UpstreamFormat::Google => openai_response_to_gemini(body),
     }
 }
 
@@ -940,7 +881,6 @@ fn validate_public_request_tool_names(format: UpstreamFormat, body: &Value) -> R
         UpstreamFormat::OpenAiCompletion => validate_openai_request_tool_names(body),
         UpstreamFormat::OpenAiResponses => validate_responses_request_tool_names(body),
         UpstreamFormat::Anthropic => validate_anthropic_body_tool_names(body),
-        UpstreamFormat::Google => validate_gemini_request_tool_names(body),
     }
 }
 
@@ -949,7 +889,6 @@ fn validate_public_response_tool_names(format: UpstreamFormat, body: &Value) -> 
         UpstreamFormat::OpenAiCompletion => validate_openai_response_tool_names(body),
         UpstreamFormat::OpenAiResponses => validate_responses_response_tool_names(body),
         UpstreamFormat::Anthropic => validate_anthropic_body_tool_names(body),
-        UpstreamFormat::Google => validate_gemini_response_tool_names(body),
     }
 }
 
@@ -1087,90 +1026,6 @@ fn validate_anthropic_content_tool_names(content: &Value) -> Result<(), String> 
             Some("tool_use" | "server_tool_use")
         ) {
             if let Some(name) = block.get("name").and_then(Value::as_str) {
-                validate_public_tool_name_not_reserved(name)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_gemini_request_tool_names(body: &Value) -> Result<(), String> {
-    if let Some(tool_choice) = body.get("tool_choice").filter(|value| !value.is_null()) {
-        validate_public_selector_visible_identity(tool_choice)?;
-    }
-    if let Some(tools) = gemini_request_tools(body) {
-        for tool in tools {
-            validate_public_selector_visible_identity(tool)?;
-            if let Some(declarations) = gemini_tool_function_declarations(tool) {
-                for declaration in declarations {
-                    if let Some(name) = declaration.get("name").and_then(Value::as_str) {
-                        validate_public_tool_name_not_reserved(name)?;
-                    }
-                }
-            }
-        }
-    }
-    if let Some(tool_config) = gemini_request_tool_config(body) {
-        if let Some(function_calling_config) =
-            gemini_request_function_calling_config_from_object(tool_config)
-        {
-            for key in ["allowedFunctionNames", "allowed_function_names"] {
-                if let Some(allowed_names) = function_calling_config.get(key) {
-                    validate_public_selector_visible_identities(allowed_names)?;
-                }
-            }
-        }
-    }
-    if let Some(contents) = body.get("contents").and_then(Value::as_array) {
-        for content in contents {
-            validate_gemini_content_tool_names(content)?;
-        }
-    }
-    if let Some(candidates) = body.get("candidates").and_then(Value::as_array) {
-        for candidate in candidates {
-            if let Some(content) = candidate.get("content") {
-                validate_gemini_content_tool_names(content)?;
-            }
-        }
-    }
-    if let Some(response) = body.get("response") {
-        validate_gemini_response_candidate_tool_names(response)?;
-    }
-    Ok(())
-}
-
-fn validate_gemini_response_tool_names(body: &Value) -> Result<(), String> {
-    validate_gemini_response_candidate_tool_names(body)?;
-    if let Some(response) = body.get("response") {
-        validate_gemini_response_candidate_tool_names(response)?;
-    }
-    Ok(())
-}
-
-fn validate_gemini_response_candidate_tool_names(body: &Value) -> Result<(), String> {
-    if let Some(candidates) = body.get("candidates").and_then(Value::as_array) {
-        for candidate in candidates {
-            if let Some(content) = candidate.get("content") {
-                validate_gemini_content_tool_names(content)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_gemini_content_tool_names(content: &Value) -> Result<(), String> {
-    let Some(parts) = content.get("parts").and_then(Value::as_array) else {
-        return Ok(());
-    };
-    for part in parts {
-        for tool_part in [
-            gemini_part_field(part, "functionCall", "function_call"),
-            gemini_part_field(part, "functionResponse", "function_response"),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(name) = tool_part.get("name").and_then(Value::as_str) {
                 validate_public_tool_name_not_reserved(name)?;
             }
         }
@@ -1354,208 +1209,6 @@ fn anthropic_request_nonportable_tool_definition_message(
         }
     }
     None
-}
-
-fn gemini_request_nonportable_function_response_message(
-    body: &Value,
-    target_label: &str,
-) -> Option<String> {
-    let contents = body.get("contents").and_then(Value::as_array)?;
-    for content in contents {
-        let Some(parts) = content.get("parts").and_then(Value::as_array) else {
-            continue;
-        };
-        for part in parts {
-            let Some(function_response) =
-                gemini_part_field(part, "functionResponse", "function_response")
-            else {
-                continue;
-            };
-            if gemini_function_response_has_nonportable_parts(function_response) {
-                return Some(gemini_function_response_parts_not_portable_message(
-                    target_label,
-                ));
-            }
-        }
-    }
-    None
-}
-
-fn gemini_request_nonportable_provider_field_message(
-    body: &Value,
-    target_label: &str,
-) -> Option<String> {
-    for (camel, snake, risk) in [
-        ("cachedContent", "cached_content", "provider cache state"),
-        (
-            "safetySettings",
-            "safety_settings",
-            "provider safety policy",
-        ),
-    ] {
-        if body.get(camel).is_some() {
-            return Some(format!(
-                "Gemini request field `{camel}` carries {risk} and cannot be faithfully translated to {target_label}"
-            ));
-        }
-        if body.get(snake).is_some() {
-            return Some(format!(
-                "Gemini request field `{snake}` carries {risk} and cannot be faithfully translated to {target_label}"
-            ));
-        }
-    }
-
-    if let Some(field) = gemini_request_thought_signature_field(body) {
-        return Some(gemini_request_thought_signature_not_portable_message(
-            field,
-            target_label,
-        ));
-    }
-    None
-}
-
-fn gemini_request_thought_signature_field(value: &Value) -> Option<&'static str> {
-    match value {
-        Value::Object(object) => {
-            if object.contains_key("thoughtSignature") {
-                return Some("thoughtSignature");
-            }
-            if object.contains_key("thought_signature") {
-                return Some("thought_signature");
-            }
-            object
-                .values()
-                .find_map(gemini_request_thought_signature_field)
-        }
-        Value::Array(items) => items
-            .iter()
-            .find_map(gemini_request_thought_signature_field),
-        _ => None,
-    }
-}
-
-fn gemini_request_thought_signature_not_portable_message(
-    field: &str,
-    target_label: &str,
-) -> String {
-    format!(
-        "Gemini content part field `{field}` carries provider thought-signature state and cannot be faithfully translated to {target_label}"
-    )
-}
-
-fn gemini_request_nonportable_tool_message(body: &Value, target_label: &str) -> Option<String> {
-    if let Some(tools) = gemini_request_tools(body) {
-        for tool in tools {
-            let Some(tool_obj) = tool.as_object() else {
-                return Some(format!(
-                    "Gemini tools must be objects; this tool entry cannot be faithfully translated to {target_label}"
-                ));
-            };
-            for (key, value) in tool_obj {
-                if value.is_null() {
-                    continue;
-                }
-                if !matches!(
-                    key.as_str(),
-                    "functionDeclarations" | "function_declarations"
-                ) {
-                    return Some(format!(
-                        "Gemini tool branch `{key}` cannot be faithfully translated to {target_label}; only pure functionDeclarations are portable cross-protocol"
-                    ));
-                }
-            }
-            if let Some(declarations) = gemini_tool_function_declarations(tool) {
-                for declaration in declarations {
-                    if let Some((field_name, _)) =
-                        gemini_function_declaration_output_schema_field(declaration)
-                    {
-                        return Some(gemini_function_output_schema_not_portable_message(
-                            declaration,
-                            field_name,
-                            target_label,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    let openai_tools = match gemini_openai_function_tools_from_request(body) {
-        Ok(tools) => tools,
-        Err(message) => return Some(message),
-    };
-
-    let tool_config = gemini_request_tool_config(body)?;
-
-    for (key, value) in tool_config {
-        if value.is_null() {
-            continue;
-        }
-        match key.as_str() {
-            "functionCallingConfig" | "function_calling_config" => {}
-            "includeServerSideToolInvocations" | "include_server_side_tool_invocations" => {
-                return Some(format!(
-                    "Gemini toolConfig `{key}` cannot be faithfully translated to {target_label}"
-                ));
-            }
-            _ => {
-                return Some(format!(
-                    "Gemini toolConfig `{key}` cannot be faithfully translated to {target_label}"
-                ));
-            }
-        }
-    }
-
-    let function_calling_config = gemini_request_function_calling_config_from_object(tool_config)?;
-
-    for (key, value) in function_calling_config {
-        if value.is_null() {
-            continue;
-        }
-        if !matches!(
-            key.as_str(),
-            "mode" | "allowedFunctionNames" | "allowed_function_names"
-        ) {
-            return Some(format!(
-                "Gemini functionCallingConfig field `{key}` cannot be faithfully translated to {target_label}"
-            ));
-        }
-    }
-
-    let mode = function_calling_config.get("mode").and_then(Value::as_str);
-    match mode {
-        Some("AUTO") | Some("NONE") | Some("ANY") | None => {}
-        Some("VALIDATED") => {
-            return Some(format!(
-                "Gemini functionCallingConfig.mode = VALIDATED cannot be faithfully translated to {target_label}"
-            ));
-        }
-        Some(other) => {
-            return Some(format!(
-                "Gemini functionCallingConfig.mode = {other} cannot be faithfully translated to {target_label}"
-            ));
-        }
-    }
-
-    let allowed_names =
-        match gemini_validated_allowed_function_names(function_calling_config, &openai_tools) {
-            Ok(allowed_names) => allowed_names,
-            Err(message) => return Some(message),
-        };
-    if allowed_names.is_some() && mode != Some("ANY") {
-        return Some(format!(
-            "Gemini functionCallingConfig.allowedFunctionNames is only portable with mode ANY when translating to {target_label}"
-        ));
-    }
-
-    None
-}
-
-fn gemini_request_nonportable_message(body: &Value, target_label: &str) -> Option<String> {
-    gemini_request_nonportable_provider_field_message(body, target_label)
-        .or_else(|| gemini_request_nonportable_tool_message(body, target_label))
-        .or_else(|| gemini_request_nonportable_output_shape_message(body, target_label))
-        .or_else(|| gemini_request_nonportable_function_response_message(body, target_label))
 }
 
 fn anthropic_user_turn_requires_tool_result_reordering(blocks: &[Value]) -> bool {
@@ -1838,109 +1491,6 @@ pub(crate) fn classify_portable_non_success_terminal(code_or_reason: Option<&str
     }
 
     "error"
-}
-
-fn openai_response_to_gemini(body: &Value) -> Result<Value, String> {
-    let choice = single_required_array_item(
-        body.get("choices")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice),
-        "OpenAI response",
-        "Gemini",
-        "choices",
-    )?;
-    let message = choice.get("message").ok_or("missing message")?;
-    let response_logprobs = normalized_response_logprobs_from_openai_choice(choice, "Gemini")?;
-    let mut parts: Vec<Value> = vec![];
-    if let Some(rc) = openai_message_reasoning_text(message) {
-        if !rc.is_empty() {
-            parts.push(serde_json::json!({ "thought": true, "text": rc }));
-        }
-    }
-    parts.extend(openai_content_to_gemini_parts(message.get("content"))?);
-    if let Some(refusal) = extract_openai_refusal(message) {
-        if !refusal.is_empty() {
-            parts.push(serde_json::json!({ "text": refusal }));
-        }
-    }
-    if let Some(tc) = message.get("tool_calls").and_then(Value::as_array) {
-        for (idx, t) in tc.iter().enumerate() {
-            push_gemini_function_call_part(&mut parts, t, idx == 0)?;
-        }
-    }
-    if parts.is_empty() {
-        parts.push(serde_json::json!({ "text": "" }));
-    }
-    let finish = openai_finish_reason_to_gemini(
-        choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .unwrap_or("stop"),
-    );
-    let mut result = serde_json::json!({
-        "candidates": [{
-            "content": { "role": "model", "parts": parts },
-            "finishReason": finish
-        }],
-        "usageMetadata": openai_usage_to_gemini_usage(body.get("usage")),
-        "modelVersion": body.get("model").cloned().unwrap_or(serde_json::Value::Null)
-    });
-    if let Some(content_logprobs) = response_logprobs {
-        let (avg_logprobs, logprobs_result) =
-            normalized_response_logprobs_to_gemini_fields(&content_logprobs);
-        result["candidates"][0]["logprobsResult"] = logprobs_result;
-        if let Some(avg_logprobs) = avg_logprobs {
-            result["candidates"][0]["avgLogprobs"] = avg_logprobs;
-        }
-    }
-    if let Some(id) = body.get("id") {
-        result["responseId"] = id.clone();
-    }
-    Ok(result)
-}
-
-fn openai_usage_to_gemini_usage(usage: Option<&Value>) -> Value {
-    let Some(usage) = usage else {
-        return serde_json::json!({});
-    };
-
-    let prompt_tokens = usage
-        .get("prompt_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let completion_tokens = usage
-        .get("completion_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(prompt_tokens + completion_tokens);
-    let reasoning_tokens = usage
-        .get("completion_tokens_details")
-        .and_then(|d| d.get("reasoning_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached_tokens = usage
-        .get("prompt_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-
-    let mut mapped = serde_json::json!({
-        "promptTokenCount": prompt_tokens,
-        "candidatesTokenCount": completion_tokens.saturating_sub(reasoning_tokens),
-        "totalTokenCount": total_tokens
-    });
-
-    if reasoning_tokens > 0 {
-        mapped["thoughtsTokenCount"] = reasoning_tokens.into();
-    }
-    if cached_tokens > 0 {
-        mapped["cachedContentTokenCount"] = cached_tokens.into();
-    }
-
-    mapped
 }
 
 fn claude_to_openai(body: &mut Value, preserve_reasoning_replay: bool) -> Result<(), String> {
@@ -2612,10 +2162,7 @@ fn openai_file_part_to_claude_document_block(part: &Value) -> Result<Value, Stri
                 "source": { "type": "base64", "media_type": "application/pdf", "data": data }
             }))
         }
-        OpenAiFileDataReference::HttpRemoteUrl {
-            mime_type,
-            url,
-        } => {
+        OpenAiFileDataReference::HttpRemoteUrl { mime_type, url } => {
             if !is_pdf_mime(&mime_type) {
                 return Err(openai_file_part_error_to_anthropic(
                     "file/input_file",
@@ -2627,15 +2174,17 @@ fn openai_file_part_to_claude_document_block(part: &Value) -> Result<Value, Stri
                 "source": { "type": "url", "url": url }
             }))
         }
-        OpenAiFileDataReference::ProviderOrLocalUri { uri, .. } => Err(
-            openai_file_part_error_to_anthropic(
+        OpenAiFileDataReference::ProviderOrLocalUri { mime_type, uri } => {
+            let _ = mime_type;
+            Err(openai_file_part_error_to_anthropic(
                 "file/input_file",
                 &format!(
                     "Anthropic document URL sources only support http:// or https:// PDF URLs; provider/local URI `{uri}` is not portable."
                 ),
-            ),
-        ),
-        OpenAiFileDataReference::BareBase64 { mime_type, .. } => {
+            ))
+        }
+        OpenAiFileDataReference::BareBase64 { mime_type, data } => {
+            let _ = data;
             let mime = resolved_mime.or(mime_type);
             let detail = mime
                 .as_deref()
@@ -2712,6 +2261,37 @@ fn openai_system_part_to_claude_block(role: &str, part: &Value) -> Result<Option
             openai_system_content_part_label(other),
             "system/developer content arrays only support text/refusal parts; unsupported typed parts must not be silently dropped.",
         )),
+    }
+}
+
+fn normalized_output_shape_to_claude_output_config(
+    shape: &NormalizedOutputShape,
+) -> Result<Option<Value>, String> {
+    match shape {
+        NormalizedOutputShape::Text => Ok(None),
+        NormalizedOutputShape::JsonSchema(schema) => Ok(Some(serde_json::json!({
+            "format": {
+                "type": "json_schema",
+                "schema": schema.schema.clone()
+            }
+        }))),
+        NormalizedOutputShape::JsonObject => Err(
+            "OpenAI/Responses `json_object` structured output cannot be faithfully translated to Anthropic structured outputs"
+                .to_string(),
+        ),
+    }
+}
+
+fn openai_portable_function_tools(
+    body: &Value,
+    restricted_tool_names: Option<&[String]>,
+    selector_label: &str,
+) -> Result<Vec<Value>, String> {
+    let declared_tools = openai_declared_function_tools(body);
+    if let Some(selected_names) = restricted_tool_names {
+        openai_select_function_tools_by_name(&declared_tools, selected_names, selector_label)
+    } else {
+        Ok(declared_tools)
     }
 }
 

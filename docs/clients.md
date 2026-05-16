@@ -1,6 +1,6 @@
 # Client Setup Guide
 
-This guide explains how to connect Codex CLI, Claude Code, and Gemini CLI to `llmup`.
+This guide explains how to connect Codex CLI and Claude Code to `llmup`.
 
 Use the wrapper scripts first. They are the least fragile path because they isolate local client state, hydrate provider-neutral preset variables, inject the correct base URL, and add client-specific metadata where needed.
 
@@ -30,7 +30,6 @@ Use the wrapper scripts in `scripts/`:
 
 - `scripts/run_codex_proxy.sh`
 - `scripts/run_claude_proxy.sh`
-- `scripts/run_gemini_proxy.sh`
 
 Each wrapper supports two modes:
 
@@ -89,27 +88,6 @@ Attach to an existing proxy:
 
 For throwaway harness work only, `--dangerous-harness` allows the wrapper to pass Claude's permission-skip flag. Leave it off for normal use.
 
-### Gemini CLI
-
-```bash
-./scripts/run_gemini_proxy.sh \
-  --config-source examples/quickstart-provider-neutral.yaml \
-  --workspace "$PWD" \
-  --model preset-openai-compatible
-```
-
-Attach to an existing proxy:
-
-```bash
-./scripts/run_gemini_proxy.sh \
-  --proxy-base http://127.0.0.1:8080 \
-  --config-source examples/quickstart-provider-neutral.yaml \
-  --workspace "$PWD" \
-  --model preset-openai-compatible
-```
-
-For throwaway harness work only, `--dangerous-harness` allows the wrapper to pass Gemini's no-sandbox and `yolo` flags. Leave it off for normal use.
-
 ## Client Base URL vs Server Route
 
 The wrapper configures the client base URL, and the client appends its own protocol path on top.
@@ -122,9 +100,8 @@ For Codex specifically, the wrapper currently fixes `wire_api="responses"`. That
 | --- | --- | --- | --- |
 | Codex CLI | `OPENAI_BASE_URL=<proxy>/openai/v1` | `/responses` | `/openai/v1/responses` |
 | Claude Code | `ANTHROPIC_BASE_URL=<proxy>/anthropic` | `/v1/messages` | `/anthropic/v1/messages` |
-| Gemini CLI | `GOOGLE_GEMINI_BASE_URL=<proxy>/google` | `/v1beta/models/...` | `/google/v1beta/models/...` |
 
-That is why the homepage no longer presents one flat endpoint table for manual client setup. For Codex, Claude, and Gemini, the wrapper-level base URL and the server-side route live at different layers.
+That is why the homepage no longer presents one flat endpoint table for manual client setup. For Codex and Claude, the wrapper-level base URL and the server-side route live at different layers.
 
 ## Reasoning And Continuity Boundaries
 
@@ -136,7 +113,7 @@ Responses reasoning/compaction continuity is intentionally bounded for cross-pro
 
 Wrappers are still recommended, but the underlying client contracts are straightforward if you prefer to wire things by hand.
 
-The release CLI wrapper matrix currently gates the wrapper surface in two deterministic parts: a structure gate that expands the tracked basic matrix for Codex CLI, Claude Code, and Gemini CLI, plus a hermetic scripted interactive Codex wrapper gate. That gate executes `scripts/run_codex_proxy.sh` with a fake Codex binary and fake local proxy for two stdin turns. This is not a full live multi-client/provider matrix; real live client evidence remains final GA/operator validation when those CLIs and provider credentials are available.
+The release CLI wrapper matrix currently gates the wrapper surface in two deterministic parts: a structure gate that expands the tracked basic matrix for Codex CLI and Claude Code, plus a hermetic scripted interactive Codex wrapper gate. That gate executes `scripts/run_codex_proxy.sh` with a fake Codex binary and fake local proxy for two stdin turns. This is not a full live multi-client/provider matrix; real live client evidence remains final GA/operator validation when those CLIs and provider credentials are available.
 
 Prefer static `data_auth` for the proxy key; `LLM_UNIVERSAL_PROXY_AUTH_MODE` and `LLM_UNIVERSAL_PROXY_KEY` remain the compatibility environment fallback when `data_auth` is omitted. In `proxy_key` mode, set each client SDK key below to `$LLM_UNIVERSAL_PROXY_KEY`; configure the upstream provider credential server-side with `provider_key.inline`, `provider_key.env`, or legacy `provider_key_env`. In `client_provider_key` mode, set these SDK keys to the real provider key for the selected upstream.
 
@@ -167,14 +144,21 @@ Set:
 
 Claude then appends `/v1/messages`, which lands on `POST /anthropic/v1/messages`.
 
-### Gemini CLI
+### Gemini Models
 
-Set:
+Gemini remains usable as a provider brand through Google's OpenAI-compatible endpoint. Configure it as an OpenAI-compatible upstream and use Codex or any OpenAI-compatible client surface:
 
-- `GEMINI_API_KEY=$LLM_UNIVERSAL_PROXY_KEY`
-- `GOOGLE_GEMINI_BASE_URL=<proxy>/google`
+```yaml
+upstreams:
+  GOOGLE-OPENAI-COMPATIBLE:
+    api_root: https://generativelanguage.googleapis.com/v1beta/openai
+    format: openai-completion
+    provider_key_env: GEMINI_API_KEY
+model_aliases:
+  gemini-flash: GOOGLE-OPENAI-COMPATIBLE:gemini-2.0-flash
+```
 
-Gemini then appends `/v1beta/models/...`, which lands on `POST /google/v1beta/models/...`.
+Native Gemini CLI wiring and the `/google/v1beta/*` proxy surface are retired; `format: google` and `format: gemini` fail closed at config load.
 
 ## Picking Model Names
 
@@ -191,7 +175,7 @@ If you are new to the project, use this order:
 
 1. start from [examples/quickstart-provider-neutral.yaml](../examples/quickstart-provider-neutral.yaml)
 2. export the four `PRESET_*` variables
-3. attach Codex or Gemini with `--model preset-openai-compatible`, or Claude Code with `--model preset-anthropic-compatible`
+3. attach Codex with `--model preset-openai-compatible`, or Claude Code with `--model preset-anthropic-compatible`
 4. confirm the wrapper-managed session works
 5. replace the preset endpoints with a concrete provider config only after the provider-neutral path is healthy
 

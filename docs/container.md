@@ -397,7 +397,7 @@ CI uses the same shape as local smoke:
   uploads `artifacts/compatible-provider-smoke.json` as the
   `compatible-provider-smoke` GitHub Actions artifact for external release evidence; it is not a GitHub Release asset unless the workflow is changed to
   attach it to the release.
-- Official OpenAI Responses, Gemini, and broader four-provider live smoke can be
+- Official OpenAI Responses and broader compatible-provider live smoke can be
   kept as optional extended evidence, but they do not block portable-core GA
   once the provider-neutral compatible smoke and deterministic gates pass.
 - The GHCR image tags, including `latest`, are published only after those

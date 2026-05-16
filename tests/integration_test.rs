@@ -5,7 +5,7 @@ mod common;
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::State,
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{any, post},
@@ -52,7 +52,6 @@ const CORS_ALLOWED_ORIGINS_ENV: &str = "LLM_UNIVERSAL_PROXY_CORS_ALLOWED_ORIGINS
 const TEST_PROVIDER_KEY: &str = "provider-secret";
 
 type CapturedDiscoveryRequests = Arc<Mutex<Vec<(String, String, String)>>>;
-type CapturedGoogleRequests = Arc<Mutex<Vec<(String, Value)>>>;
 
 #[derive(Clone)]
 struct Client {
@@ -138,7 +137,6 @@ fn is_test_credential_header(name: &str) -> bool {
         "x-api-key",
         "api-key",
         "openai-api-key",
-        "x-goog-api-key",
         "anthropic-api-key",
         "x-llmup-data-token",
     ]
@@ -992,135 +990,6 @@ fn pinned_responses_plus_auto_discovery_config(
         resource_limits: Default::default(),
         data_auth: None,
     }
-}
-
-async fn spawn_google_capture_mock() -> (String, tokio::task::JoinHandle<()>, CapturedGoogleRequests)
-{
-    async fn handler(
-        State(captured): State<CapturedGoogleRequests>,
-        Path(model_action): Path<String>,
-        Json(body): Json<Value>,
-    ) -> impl IntoResponse {
-        captured
-            .lock()
-            .unwrap()
-            .push((model_action.clone(), body.clone()));
-        if model_action.contains(":streamGenerateContent") {
-            let body = r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-mock"}"#
-                .to_string()
-                + "\n\n";
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/event-stream")
-                .body(Body::from(body))
-                .unwrap()
-        } else {
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "candidates": [{ "content": { "parts": [{ "text": "Hi" }], "role": "model" }, "finishReason": "STOP" }],
-                    "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2 }
-                })),
-            )
-                .into_response()
-        }
-    }
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{port}");
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let app = Router::new()
-        .route("/v1beta/models/:model_action", post(handler))
-        .route("/models/:model_action", post(handler))
-        .with_state(captured.clone());
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (base, handle, captured)
-}
-
-async fn spawn_google_prompt_feedback_mock() -> (String, tokio::task::JoinHandle<()>) {
-    async fn handler(
-        Path(_model_action): Path<String>,
-        Json(_body): Json<Value>,
-    ) -> impl IntoResponse {
-        (
-            StatusCode::OK,
-            Json(json!({
-                "promptFeedback": { "blockReason": "SAFETY" },
-                "usageMetadata": { "promptTokenCount": 3, "totalTokenCount": 3 },
-                "modelVersion": "gemini-2.5"
-            })),
-        )
-    }
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{port}");
-    let app = Router::new()
-        .route("/v1beta/models/:model_action", post(handler))
-        .route("/models/:model_action", post(handler));
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (base, handle)
-}
-
-async fn spawn_google_debug_trace_stream_mock() -> (String, tokio::task::JoinHandle<()>) {
-    async fn handler(
-        Path(model_action): Path<String>,
-        Json(_body): Json<Value>,
-    ) -> impl IntoResponse {
-        if model_action.contains(":streamGenerateContent") {
-            let body = concat!(
-                "data: {\"candidates\":[{\"content\":{\"parts\":[",
-                "{\"text\":\"Hi\"},",
-                "{\"functionCall\":{\"id\":\"call_1\",\"name\":\"lookup_weather\",\"args\":{\"city\":\"Tokyo\"}}}",
-                "],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"modelVersion\":\"gemini-debug-trace\"}\n\n"
-            );
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/event-stream")
-                .body(Body::from(body))
-                .unwrap()
-        } else {
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "candidates": [{
-                        "content": {
-                            "parts": [
-                                { "text": "Hi" },
-                                {
-                                    "functionCall": {
-                                        "id": "call_1",
-                                        "name": "lookup_weather",
-                                        "args": { "city": "Tokyo" }
-                                    }
-                                }
-                            ],
-                            "role": "model"
-                        },
-                        "finishReason": "STOP"
-                    }],
-                    "modelVersion": "gemini-debug-trace"
-                })),
-            )
-                .into_response()
-        }
-    }
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{port}");
-    let app = Router::new()
-        .route("/v1beta/models/:model_action", post(handler))
-        .route("/models/:model_action", post(handler));
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
-    (base, handle)
 }
 
 async fn spawn_anthropic_context_window_mock() -> (String, tokio::task::JoinHandle<()>) {
@@ -4538,7 +4407,6 @@ async fn assert_responses_context_management_rejects_on_live_proxy_path(
     let (mock_base, _mock, captured) = match upstream_format {
         UpstreamFormat::OpenAiCompletion => spawn_capture_openai_completion_mock().await,
         UpstreamFormat::Anthropic => spawn_capture_anthropic_mock().await,
-        UpstreamFormat::Google => spawn_capture_google_mock().await,
         UpstreamFormat::OpenAiResponses => unreachable!("same-provider passthrough is allowed"),
     };
     let config = proxy_config(&mock_base, upstream_format);
@@ -4580,12 +4448,8 @@ async fn assert_responses_context_management_rejects_on_live_proxy_path(
 }
 
 #[tokio::test]
-async fn responses_context_management_fails_closed_for_all_cross_provider_live_paths() {
-    for upstream_format in [
-        UpstreamFormat::OpenAiCompletion,
-        UpstreamFormat::Anthropic,
-        UpstreamFormat::Google,
-    ] {
+async fn responses_context_management_fails_closed_for_cross_provider_live_paths() {
+    for upstream_format in [UpstreamFormat::OpenAiCompletion, UpstreamFormat::Anthropic] {
         assert_responses_context_management_rejects_on_live_proxy_path(upstream_format).await;
     }
 }
@@ -5204,18 +5068,34 @@ async fn native_anthropic_stream_error_preserves_upstream_protocol_headers() {
 }
 
 #[tokio::test]
-async fn google_namespace_generate_content_works() {
-    let (mock_base, _mock) = spawn_google_mock().await;
+async fn native_google_routes_are_not_registered() {
+    let (mock_base, _mock) = spawn_openai_completion_mock().await;
     let config = config_with_alias(
         &mock_base,
-        UpstreamFormat::Google,
+        UpstreamFormat::OpenAiCompletion,
         "gemini-local",
         "gemini-1.5",
     );
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let client = Client::new();
-    let res = client
+    let models = client
+        .get(format!("{proxy_base}/google/v1beta/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(models.status(), StatusCode::NOT_FOUND);
+
+    let namespaced_models = client
+        .get(format!(
+            "{proxy_base}/namespaces/default/google/v1beta/models"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(namespaced_models.status(), StatusCode::NOT_FOUND);
+
+    let generate = client
         .post(format!(
             "{proxy_base}/google/v1beta/models/gemini-local:generateContent"
         ))
@@ -5225,21 +5105,89 @@ async fn google_namespace_generate_content_works() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "Hi");
+    assert_eq!(generate.status(), StatusCode::NOT_FOUND);
+
+    let namespaced_generate = client
+        .post(format!(
+            "{proxy_base}/namespaces/default/google/v1beta/models/gemini-local:generateContent"
+        ))
+        .json(&json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(namespaced_generate.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn gemini_prompt_feedback_without_candidates_does_not_500() {
-    let (mock_base, _mock) = spawn_google_prompt_feedback_mock().await;
-    let config = proxy_config(&mock_base, UpstreamFormat::Google);
+async fn gemini_brand_model_can_use_openai_compatible_upstream() {
+    #[derive(Clone)]
+    struct CaptureState {
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
+    }
+
+    async fn capture_openai_compatible_gemini(
+        uri: Uri,
+        State(state): State<CaptureState>,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .push((uri.path().to_string(), body.clone()));
+        (
+            StatusCode::OK,
+            Json(json!({
+                "id": "chatcmpl-gemini-openai-compatible",
+                "object": "chat.completion",
+                "created": 1,
+                "model": body.get("model").cloned().unwrap_or_else(|| json!("gemini-mock")),
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "OK from Gemini OpenAI-compatible mock" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+            })),
+        )
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/v1beta/openai/chat/completions",
+            post(capture_openai_compatible_gemini),
+        )
+        .with_state(CaptureState {
+            requests: requests.clone(),
+        });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_base = format!("http://{}", listener.local_addr().unwrap());
+    let mock = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    let config = Config {
+        upstreams: vec![UpstreamConfig {
+            name: "gemini-openai-compatible".to_string(),
+            api_root: format!("{upstream_base}/v1beta/openai"),
+            fixed_upstream_format: Some(UpstreamFormat::OpenAiCompletion),
+            provider_key_env: None,
+            provider_key: None,
+            upstream_headers: Vec::new(),
+            proxy: None,
+            limits: None,
+            surface_defaults: None,
+        }],
+        ..proxy_config(&upstream_base, UpstreamFormat::OpenAiCompletion)
+    };
     let (proxy_base, _proxy) = start_proxy(config).await;
 
     let res = Client::new()
         .post(format!("{proxy_base}/openai/v1/chat/completions"))
         .json(&json!({
-            "model": "gemini-2.5",
+            "model": "gemini-3-flash-preview",
             "messages": [{ "role": "user", "content": "Hi" }],
             "stream": false
         }))
@@ -5247,93 +5195,18 @@ async fn gemini_prompt_feedback_without_candidates_does_not_500() {
         .await
         .unwrap();
 
-    assert!(res.status().is_success(), "status: {}", res.status());
+    assert!(res.status().is_success(), "status = {}", res.status());
     let body: Value = res.json().await.unwrap();
-    assert_eq!(body["object"], "chat.completion");
-    assert_eq!(body["choices"][0]["finish_reason"], "content_filter");
-    assert_eq!(body["usage"]["prompt_tokens"], 3);
-}
-
-#[tokio::test]
-async fn google_namespace_stream_generate_content_works() {
-    let (mock_base, _mock) = spawn_google_mock().await;
-    let config = config_with_alias(
-        &mock_base,
-        UpstreamFormat::Google,
-        "gemini-local",
-        "gemini-1.5",
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "OK from Gemini OpenAI-compatible mock"
     );
-    let (proxy_base, _proxy) = start_proxy(config).await;
+    let captured = requests.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1, "captured = {captured:?}");
+    assert_eq!(captured[0].0, "/v1beta/openai/chat/completions");
+    assert_eq!(captured[0].1["model"], "gemini-3-flash-preview");
 
-    let client = Client::new();
-    let res = client
-        .post(format!(
-            "{proxy_base}/google/v1beta/models/gemini-local:streamGenerateContent"
-        ))
-        .json(&json!({
-            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
-    let content_type = res
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let body = res.text().await.unwrap();
-    assert!(content_type.contains("text/event-stream"));
-    assert!(body.contains("\"candidates\""));
-}
-
-#[tokio::test]
-async fn google_passthrough_does_not_inject_top_level_stream_field() {
-    let (mock_base, _mock, captured) = spawn_google_capture_mock().await;
-    let config = config_with_alias(
-        &mock_base,
-        UpstreamFormat::Google,
-        "gemini-local",
-        "gemini-local",
-    );
-    let (proxy_base, _proxy) = start_proxy(config).await;
-    let client = Client::new();
-
-    let non_stream = client
-        .post(format!(
-            "{proxy_base}/google/v1beta/models/gemini-local:generateContent"
-        ))
-        .json(&json!({
-            "contents": [{ "parts": [{ "text": "Hi" }] }]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        non_stream.status().is_success(),
-        "status: {}",
-        non_stream.status()
-    );
-
-    let stream = client
-        .post(format!(
-            "{proxy_base}/google/v1beta/models/gemini-local:streamGenerateContent"
-        ))
-        .json(&json!({
-            "contents": [{ "parts": [{ "text": "Hi" }] }]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(stream.status().is_success(), "status: {}", stream.status());
-    let _ = stream.text().await.unwrap();
-
-    let captured = captured.lock().unwrap();
-    assert_eq!(captured.len(), 2, "captured = {captured:?}");
-    for (_, body) in captured.iter() {
-        assert!(body.get("stream").is_none(), "body = {body}");
-    }
+    mock.abort();
 }
 
 #[tokio::test]
@@ -5527,96 +5400,6 @@ async fn openai_models_endpoint_retrieves_local_alias_object_with_llmup_owner() 
 }
 
 #[tokio::test]
-async fn google_models_endpoint_lists_local_aliases() {
-    let (mock_base, _mock) = spawn_google_mock().await;
-    let mut config = config_with_alias_limits(
-        &mock_base,
-        UpstreamFormat::Google,
-        "flash",
-        "gemini-2.0-flash",
-        Some(ModelLimits {
-            context_window: Some(200_000),
-            max_output_tokens: Some(128_000),
-        }),
-    );
-    config.compatibility_mode = CompatibilityMode::MaxCompat;
-    config.upstreams[0].surface_defaults = Some(ModelSurfacePatch {
-        modalities: Some(ModelModalities {
-            input: Some(vec![ModelModality::Text]),
-            output: Some(vec![ModelModality::Text]),
-        }),
-        tools: Some(ModelToolSurface {
-            supports_search: Some(true),
-            supports_view_image: Some(true),
-            apply_patch_transport: Some(ApplyPatchTransport::Function),
-            supports_parallel_calls: Some(true),
-        }),
-    });
-    config.model_aliases.get_mut("flash").unwrap().surface = Some(ModelSurfacePatch {
-        modalities: Some(ModelModalities {
-            input: Some(vec![ModelModality::Text, ModelModality::Image]),
-            output: None,
-        }),
-        tools: Some(ModelToolSurface {
-            supports_search: Some(false),
-            supports_view_image: None,
-            apply_patch_transport: Some(ApplyPatchTransport::Freeform),
-            supports_parallel_calls: Some(false),
-        }),
-    });
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let client = Client::new();
-    let res = client
-        .get(format!("{proxy_base}/google/v1beta/models"))
-        .send()
-        .await
-        .unwrap();
-    assert!(res.status().is_success());
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["models"][0]["name"], "models/flash");
-    assert_eq!(
-        body["models"][0]["supportedGenerationMethods"][0],
-        "generateContent"
-    );
-    assert_eq!(body["models"][0]["version"], "llmup");
-    assert_eq!(
-        body["models"][0]["description"],
-        "llmup alias -> default:gemini-2.0-flash"
-    );
-    assert_eq!(body["models"][0]["inputTokenLimit"], 200_000);
-    assert_eq!(body["models"][0]["outputTokenLimit"], 128_000);
-    assert_eq!(
-        body["models"][0]["llmup"]["surface"]["limits"]["context_window"],
-        200_000
-    );
-    assert_eq!(
-        body["models"][0]["llmup"]["surface"]["modalities"]["input"][0],
-        "text"
-    );
-    assert_eq!(
-        body["models"][0]["llmup"]["surface"]["modalities"]["input"][1],
-        "image"
-    );
-    assert_eq!(
-        body["models"][0]["llmup"]["surface"]["tools"]["supports_search"],
-        false
-    );
-    assert_eq!(
-        body["models"][0]["llmup"]["surface"]["tools"]["supports_view_image"],
-        true
-    );
-    assert_eq!(
-        body["models"][0]["llmup"]["surface"]["tools"]["apply_patch_transport"],
-        "freeform"
-    );
-    assert_eq!(
-        body["models"][0]["llmup"]["surface"]["tools"]["supports_parallel_calls"],
-        false
-    );
-}
-
-#[tokio::test]
 async fn openai_models_endpoint_resolves_direct_upstream_model_surface() {
     let (mock_base, _mock) = spawn_openai_completion_mock().await;
     let mut config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
@@ -5672,40 +5455,6 @@ async fn openai_models_endpoint_resolves_direct_upstream_model_surface() {
         body["llmup"]["surface"]["tools"]["supports_parallel_calls"],
         true
     );
-}
-
-#[tokio::test]
-async fn google_models_endpoint_resolves_direct_upstream_model_with_llmup_labels() {
-    let (mock_base, _mock) = spawn_google_mock().await;
-    let mut config = proxy_config(&mock_base, UpstreamFormat::Google);
-    config.compatibility_mode = CompatibilityMode::MaxCompat;
-    config.upstreams[0].name = "MINIMAX-GOOGLE".to_string();
-    config.upstreams[0].limits = Some(ModelLimits {
-        context_window: Some(200_000),
-        max_output_tokens: Some(128_000),
-    });
-    config.model_aliases.clear();
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let client = Client::new();
-    let res = client
-        .get(format!(
-            "{proxy_base}/google/v1beta/models/MINIMAX-GOOGLE:gemini-2.0-flash"
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert!(res.status().is_success());
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["name"], "models/MINIMAX-GOOGLE:gemini-2.0-flash");
-    assert_eq!(body["version"], "llmup");
-    assert_eq!(
-        body["description"],
-        "llmup route -> MINIMAX-GOOGLE:gemini-2.0-flash"
-    );
-    assert!(body.get("proxec").is_none(), "body = {body:?}");
-    assert_eq!(body["llmup"]["upstream_name"], "MINIMAX-GOOGLE");
-    assert_eq!(body["llmup"]["upstream_model"], "gemini-2.0-flash");
 }
 
 #[tokio::test]
@@ -5929,35 +5678,6 @@ async fn responses_endpoint_preserves_anthropic_reasoning_non_streaming() {
     assert_eq!(body["output"][0]["summary"][0]["text"], "think");
     assert_eq!(body["output"][1]["type"], "message");
     assert_eq!(body["usage"]["output_tokens"], 2);
-}
-
-#[tokio::test]
-async fn upstream_google_passthrough_non_streaming() {
-    let (mock_base, _mock) = spawn_google_mock().await;
-    let config = config_with_alias(
-        &mock_base,
-        UpstreamFormat::Google,
-        "gemini-1.5",
-        "gemini-1.5",
-    );
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let client = Client::new();
-    let res = client
-        .post(format!(
-            "{proxy_base}/google/v1beta/models/gemini-1.5:generateContent"
-        ))
-        .json(&json!({
-            "contents": [{ "parts": [{ "text": "Hi" }] }]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
-    let body: serde_json::Value = res.json().await.unwrap();
-    // Passthrough: response is native Gemini format
-    assert!(body.get("candidates").and_then(|c| c.get(0)).is_some());
-    assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "Hi");
 }
 
 #[tokio::test]
@@ -7424,35 +7144,6 @@ async fn codex_minimax_anth_streaming_plain_thinking_succeeds() {
 }
 
 #[tokio::test]
-async fn gemini_minimax_anth_streaming_plain_thinking_succeeds() {
-    let (mock_base, _mock) = spawn_anthropic_thinking_mock().await;
-    let config = config_with_alias(
-        &mock_base,
-        UpstreamFormat::Anthropic,
-        "minimax-anth",
-        "MiniMax-M2.7-highspeed",
-    );
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let client = Client::new();
-    let res = client
-        .post(format!(
-            "{proxy_base}/google/v1beta/models/minimax-anth:streamGenerateContent"
-        ))
-        .json(&json!({
-            "contents": [{ "role": "user", "parts": [{ "text": "Hi" }] }]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
-    let body = res.text().await.unwrap();
-    assert!(body.contains("\"thought\":true"), "body = {body}");
-    assert!(body.contains("\"text\":\"think\""), "body = {body}");
-    assert!(body.contains("\"text\":\"Hi\""), "body = {body}");
-}
-
-#[tokio::test]
 async fn debug_trace_records_request_delta_and_stream_summary() {
     let (mock_base, _mock) = spawn_anthropic_mock().await;
     let mut config = proxy_config(&mock_base, UpstreamFormat::Anthropic);
@@ -7494,73 +7185,6 @@ async fn debug_trace_records_request_delta_and_stream_summary() {
         "log = {log}"
     );
     assert!(log.contains("\"text\":\"Hi\""), "log = {log}");
-
-    let _ = std::fs::remove_file(trace_path);
-}
-
-#[tokio::test]
-async fn debug_trace_records_google_stream_protocol_summary() {
-    let (mock_base, _mock) = spawn_google_debug_trace_stream_mock().await;
-    let mut config = proxy_config(&mock_base, UpstreamFormat::Google);
-    let trace_path = std::env::temp_dir().join(format!(
-        "llm-proxy-google-debug-trace-{}.jsonl",
-        uuid::Uuid::new_v4()
-    ));
-    config.debug_trace = DebugTraceConfig {
-        path: Some(trace_path.display().to_string()),
-        max_text_chars: 256,
-    };
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let client = Client::new();
-    let res = client
-        .post(format!(
-            "{proxy_base}/google/v1beta/models/gemini-debug:streamGenerateContent"
-        ))
-        .json(&json!({
-            "contents": [{
-                "role": "user",
-                "parts": [{ "text": "Hi" }]
-            }]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
-    let body = res.text().await.unwrap();
-    assert!(body.contains("functionCall"), "body = {body}");
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let response_entry = loop {
-        if let Ok(contents) = std::fs::read_to_string(&trace_path) {
-            let parsed = contents
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .find(|value| value.get("phase").and_then(Value::as_str) == Some("response"));
-            if let Some(value) = parsed {
-                break value;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for google debug trace response entry"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-
-    assert_eq!(response_entry["client_format"], "google");
-    assert_eq!(response_entry["response"]["terminal_event"], "candidate");
-    assert_eq!(response_entry["response"]["finish_reason"], "STOP");
-    assert_eq!(response_entry["response"]["text"], "Hi");
-    let tool_call = &response_entry["response"]["tool_calls"][0];
-    let function_call = if tool_call.get("functionCall").is_some() {
-        &tool_call["functionCall"]
-    } else {
-        tool_call
-    };
-    assert_eq!(function_call["id"], "call_1");
-    assert_eq!(function_call["name"], "lookup_weather");
-    assert_eq!(function_call["args"]["city"], "Tokyo");
 
     let _ = std::fs::remove_file(trace_path);
 }
@@ -7623,59 +7247,6 @@ async fn messages_endpoint_preserves_responses_reasoning_as_thinking_stream() {
     );
     assert!(body.contains("event: message_stop"), "body = {body}");
     assert!(!body.contains("event: error"), "body = {body}");
-}
-
-#[tokio::test]
-async fn upstream_google_client_openai_translated_non_streaming() {
-    let (mock_base, _mock) = spawn_google_mock().await;
-    let config = proxy_config(&mock_base, UpstreamFormat::Google);
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let client = Client::new();
-    let res = client
-        .post(format!("{proxy_base}/openai/v1/chat/completions"))
-        .json(&json!({
-            "model": "gpt-4",
-            "messages": [{ "role": "user", "content": "Hi" }],
-            "stream": false
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
-    let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["object"], "chat.completion");
-    assert_eq!(body["choices"][0]["message"]["content"], "Hi");
-}
-
-#[tokio::test]
-async fn upstream_google_client_openai_accepts_snake_case_input_parts() {
-    let (mock_base, _mock) = spawn_openai_completion_mock().await;
-    let config = proxy_config(&mock_base, UpstreamFormat::OpenAiCompletion);
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let client = Client::new();
-    let res = client
-        .post(format!(
-            "{proxy_base}/google/v1beta/models/gemini-local:generateContent"
-        ))
-        .json(&json!({
-            "model": "gemini-local",
-            "contents": [{
-                "parts": [{
-                    "inline_data": {
-                        "mime_type": "image/jpeg",
-                        "data": "abcd"
-                    }
-                }]
-            }]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(res.status().is_success(), "status: {}", res.status());
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "Hi");
 }
 
 #[tokio::test]
@@ -7876,35 +7447,4 @@ async fn openai_completion_non_streaming_explicit_false() {
     );
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "Hi");
-}
-
-#[tokio::test]
-async fn upstream_google_streaming_client_openai() {
-    let (mock_base, _mock) = spawn_google_mock().await;
-    let config = proxy_config(&mock_base, UpstreamFormat::Google);
-    let (proxy_base, _proxy) = start_proxy(config).await;
-
-    let client = Client::new();
-    let res = client
-        .post(format!("{proxy_base}/openai/v1/chat/completions"))
-        .json(&json!({
-            "model": "gpt-4",
-            "messages": [{ "role": "user", "content": "Hi" }],
-            "stream": true
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(res.status().is_success());
-    assert_eq!(
-        res.headers()
-            .get("Content-Type")
-            .and_then(|v| v.to_str().ok()),
-        Some("text/event-stream")
-    );
-    let text = res.text().await.unwrap();
-    assert!(text.contains("data:"));
-    assert!(
-        text.contains("chat.completion.chunk") || text.contains("Hi") || text.contains("[DONE]")
-    );
 }

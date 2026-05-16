@@ -168,9 +168,6 @@ pub struct StreamState {
     pub text_block_closed: bool,
     pub fatal_rejection: Option<StreamFatalRejection>,
     pub tool_block_indices: std::collections::HashMap<usize, usize>,
-    // Gemini state
-    pub function_index: usize,
-    pub(super) gemini_candidate_index: Option<usize>,
     pub(super) openai_choice_index: Option<usize>,
     pub openai_role_sent: bool,
     // OpenAI Responses API client output state
@@ -196,7 +193,6 @@ pub struct StreamState {
     pub openai_seen_reasoning: String,
     pub openai_terminal_error: Option<Value>,
     pub responses_terminal_sent: bool,
-    pub gemini_next_tool_call_to_emit: usize,
 }
 
 #[derive(Debug, Default)]
@@ -210,7 +206,6 @@ pub struct ToolCallState {
     pub custom_input_done: bool,
     pub tool_type: Option<String>,
     pub proxied_tool_kind: Option<String>,
-    pub gemini_emitted_arguments: Option<String>,
     pub arguments_seeded_from_start: bool,
     pub block_index: Option<usize>,
     pub responses_item_id: Option<String>,
@@ -274,9 +269,6 @@ pub(super) fn dedupe_tool_call_state_by_call_id(
             }
             if entry.proxied_tool_kind.is_none() {
                 entry.proxied_tool_kind = existing_entry.proxied_tool_kind.clone();
-            }
-            if entry.gemini_emitted_arguments.is_none() {
-                entry.gemini_emitted_arguments = existing_entry.gemini_emitted_arguments.clone();
             }
             if entry.block_index.is_none() {
                 entry.block_index = existing_entry.block_index;
@@ -355,14 +347,6 @@ pub(super) fn request_scoped_openai_custom_bridge_expects_canonical_input_wrappe
         .is_some_and(|ctx| ctx.expects_canonical_input_wrapper(name))
 }
 
-pub(super) fn gemini_candidate_index(candidate: &Value) -> usize {
-    candidate
-        .get("index")
-        .or_else(|| candidate.get("candidateIndex"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize
-}
-
 pub(super) fn tool_call_state_type(state: &ToolCallState) -> &str {
     state.tool_type.as_deref().unwrap_or("function")
 }
@@ -422,112 +406,6 @@ pub(super) fn copy_unknown_usage_fields(
 pub(super) fn clone_usage_details_object_stream(details: Option<&Value>) -> Option<Value> {
     let details = details?.as_object()?;
     (!details.is_empty()).then(|| Value::Object(details.clone()))
-}
-
-pub(super) fn gemini_usage_field_u64(value: &Value, key: &str) -> u64 {
-    value.get(key).and_then(Value::as_u64).unwrap_or(0)
-}
-
-pub(super) fn gemini_merge_usage_metadata_into_state(state: &mut StreamState, usage_meta: &Value) {
-    let existing = state.usage.clone().unwrap_or_else(|| serde_json::json!({}));
-    let existing_prompt = gemini_usage_field_u64(&existing, "prompt_tokens");
-    let existing_completion = gemini_usage_field_u64(&existing, "completion_tokens");
-    let existing_total = gemini_usage_field_u64(&existing, "total_tokens");
-    let existing_reasoning = existing
-        .get("completion_tokens_details")
-        .and_then(|details| details.get("reasoning_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let existing_cached = existing
-        .get("prompt_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let existing_candidates = existing_completion.saturating_sub(existing_reasoning);
-
-    let prompt_tokens = usage_meta
-        .get("promptTokenCount")
-        .and_then(Value::as_u64)
-        .map(|value| value.max(existing_prompt))
-        .unwrap_or(existing_prompt);
-    let candidates_tokens = usage_meta
-        .get("candidatesTokenCount")
-        .and_then(Value::as_u64)
-        .map(|value| value.max(existing_candidates))
-        .unwrap_or(existing_candidates);
-    let thoughts_tokens = usage_meta
-        .get("thoughtsTokenCount")
-        .and_then(Value::as_u64)
-        .map(|value| value.max(existing_reasoning))
-        .unwrap_or(existing_reasoning);
-    let completion_tokens = candidates_tokens + thoughts_tokens;
-    let total_tokens = usage_meta
-        .get("totalTokenCount")
-        .and_then(Value::as_u64)
-        .map(|value| value.max(existing_total))
-        .unwrap_or_else(|| existing_total.max(prompt_tokens + completion_tokens));
-    let cached_tokens = usage_meta
-        .get("cachedContentTokenCount")
-        .and_then(Value::as_u64)
-        .map(|value| value.max(existing_cached))
-        .unwrap_or(existing_cached);
-
-    let mut merged = existing;
-    merged["prompt_tokens"] = serde_json::json!(prompt_tokens);
-    merged["completion_tokens"] = serde_json::json!(completion_tokens);
-    merged["total_tokens"] = serde_json::json!(total_tokens);
-
-    if cached_tokens > 0 {
-        if !merged["prompt_tokens_details"].is_object() {
-            merged["prompt_tokens_details"] = serde_json::json!({});
-        }
-        merged["prompt_tokens_details"]["cached_tokens"] = serde_json::json!(cached_tokens);
-    }
-    if thoughts_tokens > 0 {
-        if !merged["completion_tokens_details"].is_object() {
-            merged["completion_tokens_details"] = serde_json::json!({});
-        }
-        merged["completion_tokens_details"]["reasoning_tokens"] =
-            serde_json::json!(thoughts_tokens);
-    }
-
-    state.usage = Some(merged);
-}
-
-pub(super) fn gemini_candidate_less_partial_is_bufferable(response: &Value) -> bool {
-    response
-        .as_object()
-        .map(|obj| {
-            obj.keys().all(|key| {
-                matches!(
-                    key.as_str(),
-                    "responseId"
-                        | "response_id"
-                        | "modelVersion"
-                        | "model_version"
-                        | "usageMetadata"
-                        | "usage_metadata"
-                        | "createTime"
-                        | "create_time"
-                )
-            })
-        })
-        .unwrap_or(false)
-}
-
-pub(super) fn gemini_nonportable_tool_call_message(
-    tool_type: &str,
-    proxied_tool_kind: Option<&str>,
-) -> String {
-    if tool_type == "custom" {
-        return custom_tools_not_portable_message(UpstreamFormat::Google);
-    }
-    if let Some(kind) = proxied_tool_kind {
-        return format!(
-            "OpenAI proxied tool kind `{kind}` cannot be faithfully translated to Gemini."
-        );
-    }
-    "OpenAI tool call cannot be faithfully translated to Gemini.".to_string()
 }
 
 pub(super) fn openai_chunk(
@@ -632,7 +510,6 @@ impl ToolCallState {
             .saturating_add(optional_string_len(&self.custom_input_text))
             .saturating_add(optional_string_len(&self.tool_type))
             .saturating_add(optional_string_len(&self.proxied_tool_kind))
-            .saturating_add(optional_string_len(&self.gemini_emitted_arguments))
             .saturating_add(optional_string_len(&self.responses_item_id))
     }
 }
